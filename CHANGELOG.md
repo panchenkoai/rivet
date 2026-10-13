@@ -2,6 +2,315 @@
 
 ## Unreleased
 
+- **Fix: a `FROM` inside an SQL comment is no longer read as the table a `query:` reads.**
+  PostgreSQL and SQL Server exports with a hand-written `query:`; the preflight probe of
+  `rivet check` on every SQL engine. Reproduced on rivet 0.31.0 with PostgreSQL and SQL Server.
+  - **What was wrong in 0.31.0 and earlier.** To give a `NUMERIC` / `DECIMAL` column its
+    declared precision and scale, rivet reads the table name out of the query text and asks
+    the catalog. The reader did not skip comments, so a `-- ...` line or a `/* ... */` block
+    holding the word `from` before the query's own `FROM` named the table. Measured on a
+    table with a `numeric(10,2)` column:
+    - `-- rows from the last week` (no table of that name): the export failed, exit 1,
+      `1 column(s) have no safe Rivet mapping`, no file written. The same query without
+      the comment exported `decimal(10,2)`.
+    - `-- taken from legacy`, where `legacy` has that column as `numeric(20,6)`: exit 0, and
+      the column was written as `decimal(20,6)`, the other table's type. The values were
+      right.
+    - the same with `legacy` holding `numeric(6,0)`: the export failed, exit 1,
+      `cannot parse DECIMAL "12345.67" as decimal(scale=0)`.
+    - A comment AFTER the table name (`FROM t -- from b`) made the reader give up, with the
+      first outcome.
+    - SQL Server, the same table as `decimal(10,2)`: every one of these exported, exit 0,
+      with another type for the column. With no table of the commented name, or with the
+      comment after the table name, the column was written as `decimal(38,2)`; with
+      `legacy` holding `decimal(20,6)` it was written as `decimal(20,6)`.
+    No wrong value was delivered in any of these; the column's declared type was.
+  - **Now** one reader finds the outermost `FROM` for every caller, and a comment counts as
+    whitespace wherever it stands. Every query above exports `decimal(10,2)` on both engines.
+  - **Also read now, where the reader gave up before:** a query ending in `;`, a table name
+    with a non-ASCII letter (`FROM café`), and on SQL Server a double-quoted name
+    (`FROM "s"."t"`). The preflight probe no longer takes `from x` inside a string literal
+    for the table, and reads `s . t` as `s.t`.
+  - **Unchanged:** a join, a comma list, a subquery or a function call in `FROM` still
+    gives no table, and the column needs a `columns:` override as before. A MySQL `#`
+    comment is not skipped: `#` is an operator in PostgreSQL, and the reader is told no
+    engine.
+  - **Stored progress (unreleased builds only):** the stream of a query's stored progress is
+    read by the same reader, so a query with such a comment now names its real table there.
+    No released version stores a stream.
+
+- **Fix: an Oracle export whose table loses a column while it is being read stops with an
+  error instead of a panic.** Oracle only; every batch mode. Seen once in CI on main
+  (`07e3e9b7`..`97d3f57b`) as exit 101 of a range-chunked run; not reported from the field.
+  - **What was wrong in 0.30.0 and 0.31.0.** Each Oracle read describes its query's columns,
+    then runs the query. When the query needs no column rewritten (no LOB, no type read
+    through a conversion) it is sent as written, so a column dropped between the two
+    statements came back as a narrower result, and the reader indexed that result by the
+    wider description: `index out of bounds`, exit 101 (an abort in a release build). The run
+    ended without recording its failure: its `run_status` and `export_metrics` rows stayed
+    `running`.
+  - **Now** that read stops with `RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ` (kind:
+    environment), the run is recorded as failed, and the next run reads the table as it is.
+  - **Proof and its limit.** A unit test pins the column layout on a result narrower than
+    its probe; it panicked before the change. The window between the two statements is a
+    few milliseconds, so no live cell hits it on demand: the existing cell
+    `a_column_dropped_under_a_live_run_delivers_or_fails_loudly_oracle` reaches it by chance.
+  - **Unchanged:** a query whose columns are rewritten names each column, and Oracle itself
+    refuses a dropped one (`ORA-00904`). A column ADDED between the two statements is still
+    delivered as an extra column of that read.
+
+- **Fix: masking a URL password in a log line or an error text takes one pass over the
+  text.** Applies to every command and every engine: each emitted log line and each error
+  text goes through this scan.
+  - **What was wrong in 0.31.0 and earlier.** The scan for `scheme://user:password@` started
+    a new read at every byte: from each letter to the end of the run of letters, digits and
+    `+ . -` it stands in, and from each `://` to the next whitespace. The time grew with the
+    square of the longest such run. Measured on that function compiled alone with
+    optimisations: a run of 16 KiB took 0.1 s, 64 KiB 1.1 s, 256 KiB 18.6 s. The text
+    came out correct; only the time was wrong. Whether a real driver message holds a run
+    that long (a hex or base64 value quoted in an error) was not observed in the field: the
+    defect was found by reading the code under mutants that hung its tests.
+  - **Now** the same 256 KiB take 0.7 ms and 16 MiB take 34 ms. What is masked is
+    unchanged: the new scan and the previous one give byte-identical output on 400,000
+    generated texts of URL punctuation, whitespace and multi-byte characters, and that
+    comparison stays in the test suite.
+  - **Also fixed: a secret query parameter with a name longer than 64 characters was not
+    masked** (`?<65+ characters>_token=...`, since 0.25.0). The length limit is removed;
+    a name of any length ending in a secret word is masked.
+  - **Removed, no behaviour change:** two config checks that no config could reach, because
+    an earlier check refuses the same input first — the `..` check of a local destination
+    `path`/`prefix` (every destination's `..` segment is refused before it), and "cdc mode
+    reads the transaction log, not a query" (a `query:` beside `table:` is refused as two
+    sources, and a `query:` alone as a missing `table:`). The messages an operator sees are
+    the ones they saw before.
+
+- **Fix: a PostgreSQL run through a transaction-mode pooler no longer leaves session settings
+  on the pooled server connection.** PostgreSQL batch connections and `mode: cdc`. Reproduced
+  on rivet 0.31.0 behind pgBouncer 1.26.0 in transaction mode, with pool sizes 1 and 5.
+  - **What was wrong in 0.30.0 and 0.31.0.** Each connection rivet opened for `run`, `check`,
+    `plan`, `doctor`, `init`, a PostgreSQL state database and `rivet-mcp` sent
+    `SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; SET IntervalStyle = 'postgres';
+    SET bytea_output = 'hex'` as session settings, unless it detected a transaction pooler.
+    The detection compares the backend pid of two statements, and an idle pooler answers both
+    from one server connection, so the settings were sent and stayed on the connection the
+    pooler then gave to its other clients.
+    - Who was affected: other clients of the same pooler, not rivet. pgBouncer puts back the
+      parameters it tracks for each client (`TimeZone`, `DateStyle` and `IntervalStyle` in
+      1.26), so the setting another client read differently is `bytea_output`. Measured on a
+      database whose default is `escape`: after one `rivet run`, another client's
+      `bytea::text` came back in `hex`. A pooler that tracks fewer parameters hands on more
+      of the four.
+    - `mode: cdc` had no pooler detection at all: every connection its `test_decoding` reader
+      opened sent the same four and `SET extra_float_digits = 3`, a refused run included (the
+      reader has set session formats since 0.19.1, by `git log`; measured on 0.31.0). Through
+      pgBouncer on a database whose defaults are `escape` and `extra_float_digits = 0`, one CDC
+      run left `bytea_output = hex` and `extra_float_digits = 3` on the pooled connection for
+      the pooler's other clients.
+    - rivet's own output was correct.
+  - **Now** a batch connection sends no session-level `SET`. The export, the bound and count
+    probes of a run, the range and plan probes of `check` and `plan`, and the table
+    statistics of `rivet-mcp` set the four formats with `SET LOCAL` inside the transaction
+    that reads, on a direct connection and behind a pooler alike, and nothing outlives the
+    transaction. On a direct connection the delivered files and the `check` output are the
+    same as in 0.31.0 (compared under a role whose defaults are Asia/Tokyo, `German, DMY`,
+    `sql_standard` and `escape`).
+    - Behind a pooler busy enough for 0.31.0 to detect it, the probes and `check` ran in the
+      role's zone and formats while the export ran in UTC. They now read in UTC as well.
+    - `mode: cdc` sends no session-level `SET` either. Each read of the slot runs in a
+      transaction of its own that sets the four formats and `extra_float_digits = 3` with
+      `SET LOCAL` (two round trips more per read of the slot, which holds up to one part's
+      changes). On a direct connection the delivered changes are the same as in 0.31.0
+      (one window of inserts, updates and deletes over `float8`, `float4`, `timestamptz`,
+      `timestamp`, `date`, `bytea`, `interval` and `numeric`, read under a role whose defaults
+      are Asia/Tokyo, `German, DMY`, `sql_standard`, `escape` and `extra_float_digits = 0`).
+      - Checked by hand through pgBouncer 1.26.0 in transaction mode with one server
+        connection, in front of a `wal_level = logical` server: a refused run, a run that
+        read changes and a run that found none each left the five settings and their
+        `pg_settings.source` as they were, on the same backend. The test suite covers a
+        refused capture through the pooler and, offline, the statements the reader sends;
+        it has no pooler in front of a logical server.
+    - A setting an earlier release left behind stays on the pooled server connection until
+      the pooler closes it (pgBouncer: `server_lifetime`, one hour by default) or is restarted.
+- **Fix: a `query:` holding a non-ASCII character no longer ends the run in a panic.**
+  Applies to every source engine. Reproduced on rivet 0.31.0 with PostgreSQL, MySQL,
+  SQL Server and MongoDB.
+  - **What was wrong in 0.31.0 and earlier.** Two readers of the query text cut it at a
+    byte offset, and a cut inside a multi-byte character stopped the process: exit 101,
+    `byte index N is not a char boundary`, on every run.
+    - Every export, in every mode: a multi-byte character across byte 6 of the query (a
+      comment or a CTE name that opens it: `/* <non-ASCII comment> */ SELECT ...`,
+      `WITH é AS (...) SELECT ...`), or across byte 4 of what follows `SELECT *`
+      (`SELECT *, 'été' AS label FROM t`). On MongoDB the same text crashed in place of the
+      refusal a hand-written `query:` gets there.
+    - Range-chunked exports (`chunk_column`), and the value-partition and split planners
+      that probe a query's bounds the same way: any non-ASCII character before the
+      query's first `FROM` (`SELECT id, 'café' AS label FROM t`).
+    - A non-ASCII character anywhere else (a `WHERE` literal, a table name after `FROM`)
+      was read correctly.
+    - Nothing was written to the destination: no part, no manifest, no `_SUCCESS`, no run
+      summary. The state database kept one `run_status` row in `running` for each crashed
+      run and the export's schema baseline.
+    - The cut at the query's start dates from 0.6.0 and every export's query has gone
+      through it since 0.18.0; the scan for `FROM` dates from 0.16.0.
+  - **Now** both readers compare bytes and never cut the text inside a character. Such a
+    query runs and delivers what its ASCII spelling delivers; on MongoDB it is refused by
+    name like any `query:`. An export that crashed needs nothing but the upgrade: run after
+    two crashes of 0.31.0 on the same state, this build exited 0 and delivered every row.
+    The `running` rows the crashes left stay in `run_status`, behind the newer run.
+  - **Unchanged:** what is recognised in an ASCII query. The `SELECT * FROM t` and plain
+    column-list shortcuts, the position of the outer `FROM` and every SQL text rivet builds
+    from a query are byte-identical for 575,270 query texts that did not crash before
+    (568,212 of them ASCII), compared between the previous code and this one. A query with a
+    non-ASCII identifier (`SELECT id, café FROM t`) is not taken for the bare-table
+    shortcut: its bounds are read from the query, wrapped as `FROM (<query>) AS _rivet`.
+
+- **`rivet load --pool N` keeps at most 16 storage requests in flight for the whole
+  process.** Every table loaded at once used to send its storage requests (list, read,
+  delete) with no shared limit, each request in flight on a connection of its own: a load
+  of 16 tables with `--pool 16` held 46 connections to Cloud Storage and 145 open files,
+  measured on macOS with a release build. It now holds 16 and 117, in the same time
+  (15.0 s before, 14.5 s after, one run each). The budget counts requests, not
+  connections: a connection can outlive its request for a moment, and a debug build
+  sampled every 50 ms held up to 22. A pool larger than the budget waits for a free
+  request instead of opening more connections. The export side (`rivet run` writing to a
+  bucket) is unchanged. No config key: the budget is a constant.
+
+- **Fix (behaviour change): on a PostgreSQL state, `rivet load` and `rivet compact` stop
+  instead of writing a table under a lease nothing renews.** Applies only with
+  `RIVET_STATE_URL=postgresql://...`; a SQLite state takes its lease as a file lock and is
+  unchanged. No state table, config key or TTL changed, and 0.31.0 and this release
+  exclude each other on the same lease rows.
+  - **What could happen in 0.31.0 and earlier.** Every lease (one per table being loaded
+    or compacted, one more per table with `cleanup_source`, one per checkpointed export
+    run) was renewed by a thread of its own on a connection of its own, opened after the
+    lease was granted. When that connection could not be opened the load went on, printed
+    `LOAD OK` and exited 0; the lease lapsed after `RIVET_STATE_LEASE_TTL_S` (30 s by
+    default), and a second `rivet load` or `rivet compact` of the same table could then
+    run beside the first. It took three conditions together: a PostgreSQL state; the
+    renewing connection failing to open (the process short of file descriptors, where the
+    PostgreSQL client crashed its thread, or the state server out of connections for the
+    role); and a load of that table still running after the TTL while another one started.
+    A lease another process had taken after a stall was logged and not acted on.
+  - **Now** one connection and one thread per process renew every lease the process
+    holds, and they are started before the first lease is granted.
+    - If that connection cannot be opened, the table is not loaded: the command fails with
+      `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE`, having written nothing to the warehouse and
+      nothing to the load ledger, on every run until a connection is free. Free a
+      connection on the state database, raise the open-file limit, or lower `--pool`.
+    - A load or compact whose lease is no longer its own (not renewed within the TTL, or
+      taken by another process) stops before the warehouse write with exit 5
+      `RIVET_STATE_LEASE_LOST`, recorded `refused` in the load ledger; the next
+      `rivet load` loads the table. When the loss is found only after the write, the
+      command fails with exit 3 `RIVET_LOAD_LEASE_LOST_DURING_WRITE` and the ledger row
+      is `failed`, not `success`: another load or compact may have written the table at
+      the same time, and the next `rivet load` loads the same runs again.
+    - A checkpointed `rivet run` takes its run lease through the same connection and is
+      refused with `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE` when it cannot be opened. A
+      PostgreSQL state that cannot be reached for want of file descriptors is an `Error:`
+      line and exit 1, where 0.31.0 crashed with exit 101.
+  - **Connections.** A pooled load or compact holds one state connection per worker plus
+    one, so `--pool 16` is at most 17 connections to the PostgreSQL state where 0.31.0
+    held 32 (48 with `cleanup_source`). Count N + 1 against the role's and the server's
+    connection limits.
+
+- **Fix: `rivet load` into BigQuery opens fewer files per table loaded at once.** Each
+  table of a `--pool N` load built its own HTTP client for the BigQuery API (a thread, an
+  event queue and its connections apiece); one client now serves every table of the
+  process. Measured on macOS, 16 tables from GCS at `--pool 16`: the peak of open files
+  goes from 204 to 139 (event queues 51 to 6), the load takes the same 14 s, and
+  `--pool 1` and `--pool 4` are unchanged at 18 and 30. The rest of the peak is one state
+  connection and the storage connections of each table, which this change does not touch.
+  No config, state or file format change.
+
+- **Fix: a PostgreSQL export through a transaction-mode pgBouncer that keeps prepared
+  statements is delivered under its own columns.** Applies to every batch mode (`full`,
+  `chunked` by key or by range, `incremental`) when the source URL points at pgBouncer in
+  transaction pooling mode with `max_prepared_statements` above zero (pgBouncer's
+  documented default is 200). Reproduced on pgBouncer 1.26.0 with rivet 0.31.0; a direct
+  connection was never affected, and neither was MySQL through ProxySQL.
+  - **What was wrong in 0.31.0 and earlier.** rivet read every table through a statement
+    of one text, `FETCH n FROM _rivet`. Such a pooler keeps a prepared statement by its text
+    and reuses it for every client, and PostgreSQL keeps the columns it described when that
+    text was first parsed. A table read after another one through the same pooled server
+    connection was decoded as the earlier table:
+    - with the same number of columns the run exited 0 with a success manifest, and the
+      part carried the earlier table's column names and types (a `double precision` 1.5
+      delivered as the `BIGINT` 4609434218613702656);
+    - one table whose column type was altered between two runs was delivered under the old
+      type, exit 0;
+    - with another number of columns, or after `ALTER TABLE .. ADD COLUMN`, the run failed
+      with `DataRow field count does not match the number of columns`, on every run until
+      the pooler dropped its server connection;
+    - after a chunk key was widened the run failed with `cached plan must not change result
+      type` or `sent a malformed wire payload`, and a chunked run skipped its schema-drift
+      check with `could not resolve schema for drift check (skipping)`.
+  - **Now** every statement whose columns follow a table (the cursor `FETCH`, the bound and
+    count probes, the type probe) is prepared under a text of its own, so the pooler never
+    answers it with a statement another read left. The first run of this release through a
+    pooler that still holds statements of an older rivet delivers the table as the source
+    holds it.
+  - **If you ran 0.31.0 or earlier through such a pooler:** compare each delivered part's
+    column names and types with the source table (`DESCRIBE SELECT * FROM
+    read_parquet('<part>')` in DuckDB against `\d <table>` in psql). A part whose columns
+    are the table's own was decoded as that table. A part with another table's columns, or
+    a column under a type the table does not have, holds wrong values: remove it and
+    extract the export again with this release (`rivet state reset -c <config> --export
+    <name>` first for an `incremental` or checkpointed export, so the pass is a full one).
+
+- **Breaking: a destination or format edited under stored progress is refused, and a run
+  resumed after a crash delivers the rows that arrived since.** Applies to `incremental`,
+  `keyset_incremental`, MongoDB `resume` and `chunk_checkpoint` exports on every source
+  engine.
+  - **A moved destination or another format under a stored cursor is refused.** Before, an
+    export that continues from a cursor kept it when its `destination` (bucket, `path`,
+    `prefix` or store) or its `format` was edited with no reset: exit 0, and the new
+    location held only the rows past the cursor, or one prefix held parts of two formats.
+    Now the run is refused with exit 5 `RIVET_STATE_CURSOR_DESTINATION_MISMATCH`, naming
+    where the cursor was delivered and where the config points, on every run. Restore the
+    destination and format to continue, or run
+    `rivet state reset -c <config> --export <name>` for a full pass delivered where the
+    config points now. The parts already delivered are not moved or removed: empty that
+    location first if the full pass lands in it too. `rivet state accept` does not lift
+    this refusal. The destination is compared as written, so a `{date}`, `{export}`,
+    `{table}` or `{run_id}` placeholder is one destination on every day, and a `rivet plan`
+    artifact sealed before this release still applies. A destination that comes from
+    `${VAR}` is compared after substitution: a value that moves the path between runs is
+    refused, so spell a per-run prefix with `{date}`.
+  - **An unfinished checkpointed run is not finished in another format.** Before, a
+    `chunk_checkpoint` run interrupted while writing parquet and continued after
+    `format: csv` exited 0 over one success manifest naming parts of both formats. Now the
+    run, and `rivet run --resume`, is refused with exit 5
+    `RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, naming both formats. Restore the format
+    and run once to finish it, or abandon it (`rivet state reset-chunks` for a range-chunk
+    run, `rivet state reset` for a keyset run) and the next run starts a full pass in the
+    new format. This holds for a run 0.31 or earlier left unfinished too.
+  - **A resumed chunk-checkpoint run reads the source's key span again.** Before, a plain
+    run or `--resume` that continued a crashed `chunk_column` + `chunk_checkpoint` run
+    finished the plan the crashed run had stored: rows that reached the source past it
+    were in no part, under exit 0 and `_SUCCESS`, and an empty table that filled after the
+    crash was delivered as 0 rows. Now the resumed run detects the key span again, adds
+    tasks for the keys outside the stored plan, and plans a run that committed no part
+    again whole. The windows the crashed run committed are not read again. The units of
+    `rivet apply --pool --split --resume` resume the same way, so rows gained past the top
+    key land in the last unit (before, the resumed split delivered the keys of the crashed
+    plan only). `rivet apply` of a sealed plan artifact replays the ranges its plan
+    sealed, as before. A resume now runs the `min`/`max` and NULL-key probes a fresh run
+    does and fails where a fresh run would (a NULL key, a key span past the sparse-plan
+    limit).
+  - **A resumed parallel keyset run reads past its last range.** Before, a `chunk_by_key` +
+    `parallel` + `chunk_checkpoint` run whose last key range had committed before the crash
+    read no key above it on resume. Now it reads the keys past the highest one that range
+    delivered. A range committed by 0.31 or earlier recorded no such key: it is read again
+    whole, and none of its parts is declared twice.
+  - **A chunk run whose task rows are gone is planned again.** Before, a resume over a
+    `chunk_run` with no `chunk_task` rows wrote a success manifest with 0 rows.
+  - Upgrading: nothing to migrate, and the state schema version does not change. A cursor
+    row written by 0.31 or earlier holds no destination: the first run of this release
+    records where the export delivers, logs one `predates destination tracking` warning
+    and continues, so an edit of the destination or format made in the same step as the
+    upgrade is not seen; make the upgrade and the edit two separate runs. A run that 0.31
+    left unfinished is resumed with the behaviour above.
+
 - **Behaviour change: a table that is empty at its CDC baseline gets an empty warehouse
   table.** Applies to a `mode: cdc` export with `cdc.backfill:` loaded under
   `load.layout: base_buffer` (BigQuery), every source engine.
@@ -175,6 +484,40 @@
     continue is refused as before ("nothing to continue; run without --resume").
   - A script that matched exit 1 or the old text of this refusal must match exit 5 or the
     code.
+- **Behaviour change: a CDC run that refuses a prerequisite leaves nothing behind, and
+  `rivet doctor` agrees with `rivet run`.** Applies to `mode: cdc` and `rivet cdc` on
+  PostgreSQL and MySQL.
+  - Before, on PostgreSQL a run refused for a table that does not exist had already created
+    its replication slot (inactive, pinning WAL); a bounded run on a standby was refused only
+    after the slot, the baseline and `snapshot/_SUCCESS` were written. On MySQL a first run
+    refused for binlog compression, a replica that does not re-log, or an unroutable table had
+    already written its checkpoint. `rivet doctor` reported `All checks passed` for a
+    PostgreSQL server with `wal_level` below `logical` and for a MySQL replica with
+    `log_replica_updates = OFF`.
+  - Now every prerequisite is asked before the first durable write, and these refusals carry
+    `RIVET_SOURCE_CDC_PREREQUISITE` (exit 1, as before): no slot, checkpoint, baseline or state
+    row is left. A PostgreSQL table that does not exist and `wal_level` below `logical` are
+    named by rivet instead of by the server's error. Doctor asks the same function the run
+    refuses by and fails a `CDC run prerequisites` check with the run's own message.
+  - `rivet init --mode cdc` against a PostgreSQL standby writes `until_current: false`, the
+    mode a standby runs; it wrote `until_current: true`, which the run refuses there.
+  - Upgrading: nothing to do for a healthy stream. A slot or checkpoint left by a run 0.31
+    refused is reused as it is once the prerequisite is met; if the export was abandoned
+    instead, drop the slot (`SELECT pg_drop_replication_slot('<slot>')`) or delete the
+    checkpoint file.
+- **Behaviour change: `rivet cdc` to stdout emits each change once on PostgreSQL.** Before,
+  a drain to stdout never advanced the slot, so every run printed every change since the slot
+  was created, with or without `--checkpoint`, and the slot pinned WAL without bound. Now a
+  drain acknowledges the last commit it printed when it ends. Upgrading: the first drain with
+  this version prints the backlog the slot still holds once more, then the slot advances. A
+  consumer that relied on each run re-printing the history must keep its own copy.
+- **Fix: PostgreSQL CDC with `rollover: 1` (`--rollover 1`) delivers the pending changes.**
+  A bounded run leaves its drain barrier (a logical message) in the WAL; at `rollover: 1` the
+  next run's one-change read window held only that message, and the run exited 0 with a
+  Success manifest of 0 rows while commits were pending, on every run. With `rollover: N` the
+  same happened after N idle bounded runs in a row. Messages outside a transaction are now
+  stepped over, up to the run's open-time bound. Upgrading: the first run with this version
+  delivers what such a slot was holding.
 - **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
   Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
   - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture

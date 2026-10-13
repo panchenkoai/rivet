@@ -10,6 +10,13 @@ use crate::error::Result;
 pub const COL_EXPORTED_AT: &str = "_rivet_exported_at";
 pub const COL_ROW_HASH: &str = "_rivet_row_hash";
 
+/// The soft-delete flag column the view exposes: `true` when the latest change
+/// for a PK was a delete. In rivet's reserved `__` namespace so a plain
+/// `is_deleted` source column cannot collide with it — see
+/// [`crate::load::cdc::is_reserved_column`], which is what makes "reserved" true rather than
+/// merely intended.
+pub const DELETE_FLAG_COLUMN: &str = "__is_deleted";
+
 /// The identity of the row hash's rendering, recorded next to the data.
 ///
 /// Any change to how the canonical bytes are built — the field framing, the NULL
@@ -109,7 +116,7 @@ pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef
         // The base table's delete flag, written as data: constant `false` on a
         // baseline row. Same reserved name the changelog view projects.
         fields.push(Arc::new(Field::new(
-            crate::load::cdc::DELETE_FLAG_COLUMN,
+            DELETE_FLAG_COLUMN,
             DataType::Boolean,
             false,
         )));

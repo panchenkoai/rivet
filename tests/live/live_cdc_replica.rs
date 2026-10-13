@@ -207,12 +207,7 @@ fn cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing()
     };
     wait(&mut r, 0);
 
-    let rig = Rig::mysql_cdc(&table)
-        .oracle_known_defect(
-            "a failed run left: cdc-checkpoint",
-            "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
-        )
-        .source_url(NOLOG_RIVET);
+    let rig = Rig::mysql_cdc(&table).source_url(NOLOG_RIVET);
     let refused = |out: &std::process::Output| {
         let said = format!(
             "{}{}",

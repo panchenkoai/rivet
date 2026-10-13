@@ -1,0 +1,14 @@
+diff --git a/src/init/mod.rs b/src/init/mod.rs
+--- a/src/init/mod.rs
++++ b/src/init/mod.rs
+@@ -1073,8 +1073,8 @@
+ /// Whether the PostgreSQL server at `source_url` answers that it is in recovery (a standby); an unanswered probe is not one.
+ fn pg_in_recovery(source_url: &str, tls: Option<&crate::config::TlsConfig>) -> bool {
+     crate::source::postgres::connect_client(source_url, tls)
+-        .and_then(|mut c| Ok(c.query_one("SELECT pg_is_in_recovery()", &[])?.get(0)))
+-        .unwrap_or(false)
++        .and_then(|mut c| Ok(c.query_one("SELECT pg_is_in_recovery()", &[])?.get::<_, bool>(0)))
++        .is_err()
+ }
+ 
+ #[allow(clippy::too_many_arguments)] // mirrors `init`'s own surface; a params

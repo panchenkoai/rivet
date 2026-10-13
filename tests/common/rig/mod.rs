@@ -17,7 +17,7 @@ use super::runner::RIVET_BIN;
 /// every backend (two renderers per backend is the drift the rig exists to
 /// prevent).
 mod beside;
-pub use beside::{Local, Met, ReadOnly};
+pub use beside::{Local, Met, ReadOnly, TinyVolume};
 mod init;
 pub use init::InitConfig;
 mod invoke;
@@ -96,6 +96,10 @@ pub struct Rig {
     /// Key column for the census DISTINCT legs (see `Rig::census_key`).
     census_key: Option<String>,
     /// Why this rig opted out of the default oracle (see `Rig::no_oracle`).
+    /// The binary this rig's invocations run instead of this tree's build.
+    bin: Option<PathBuf>,
+    /// The most files an invocation of this rig may hold open (`RLIMIT_NOFILE`).
+    open_files: Option<u64>,
     oracle_off: Option<String>,
     /// A product defect the oracle must keep catching (see `Rig::oracle_known_defect`).
     oracle_xfail: Option<(String, String)>,
@@ -171,6 +175,8 @@ impl Rig {
             ckpt_override: None,
             dest_stdout: false,
             census_key: None,
+            bin: None,
+            open_files: None,
             oracle_off: None,
             oracle_xfail: None,
             oracle_xfailed: std::cell::Cell::new(false),
@@ -447,6 +453,18 @@ impl Rig {
         self
     }
 
+    /// Cap the files each invocation of this rig may hold open.
+    pub fn open_files(mut self, most: u64) -> Self {
+        self.open_files = Some(most);
+        self
+    }
+
+    /// Keep the config, and so the SQLite state beside it, in `dir` instead of the rig's tempdir.
+    pub fn config_dir(mut self, dir: PathBuf) -> Self {
+        self.config_dir_override = Some(dir);
+        self
+    }
+
     /// Point the destination somewhere outside the rig's tempdir (e.g. a
     /// mounted tiny filesystem for ENOSPC scenarios).
     pub fn dest_path(mut self, path: PathBuf) -> Self {
@@ -675,6 +693,40 @@ impl Rig {
         self.oracle_container_dir
             .as_deref()
             .expect("oracle_dir needs Rig::duckdb_oracle() at construction")
+    }
+}
+
+/// One destination several runs deliver into, read run by run: an export that keeps a cursor is refused another destination, so a cell that reads each run's delta reads the parts that run added.
+pub struct Stages {
+    out: tempfile::TempDir,
+    seen: std::cell::RefCell<std::collections::BTreeSet<PathBuf>>,
+}
+
+impl Stages {
+    /// An empty destination directory.
+    pub fn fresh() -> Self {
+        Stages {
+            out: tempfile::tempdir().expect("a destination directory"),
+            seen: Default::default(),
+        }
+    }
+
+    /// The destination every stage delivers into.
+    pub fn path(&self) -> &Path {
+        self.out.path()
+    }
+
+    /// A directory holding copies of the parquet parts the destination gained since the last call: what the runs in between delivered.
+    pub fn added(&self) -> tempfile::TempDir {
+        let delta = tempfile::tempdir().expect("a directory for one stage's parts");
+        let mut seen = self.seen.borrow_mut();
+        for part in super::runner::files_with_extension(self.path(), "parquet") {
+            if seen.insert(part.clone()) {
+                let name = part.file_name().expect("a part has a file name");
+                std::fs::copy(&part, delta.path().join(name)).expect("copy a part");
+            }
+        }
+        delta
     }
 }
 
@@ -965,14 +1017,7 @@ impl CdcScenario {
             table: table.clone(),
             ci: ci.clone(),
         };
-        super::mssql::mssql_cdc_exec(
-            "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' \
-              AND is_cdc_enabled=1) EXEC sys.sp_cdc_enable_db;",
-        );
-        super::mssql::mssql_cdc_exec(&format!(
-            "EXEC sys.sp_cdc_enable_table @source_schema=N'dbo', \
-             @source_name=N'{table}', @role_name=NULL, @capture_instance=N'{ci}';"
-        ));
+        super::mssql::enable_cdc(&table, &ci);
         Self {
             rig: shape(Rig::mssql_cdc(&table, &ci), &table),
             table,

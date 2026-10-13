@@ -73,6 +73,48 @@ impl StateStore {
         })
     }
 
+    /// Add the open-ended range `(lo, +inf)` as range `range_index` of the resumed run `run_id`, not done.
+    pub fn append_keyset_range(
+        &self,
+        export_name: &str,
+        source: &str,
+        run_id: &str,
+        key_column: &str,
+        range_index: i64,
+        lo: &str,
+    ) -> Result<()> {
+        self.execute(
+            "INSERT INTO keyset_range \
+             (export_name, source, run_id, range_index, lo, hi, done, updated_at, key_column) \
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0, ?6, ?7)",
+            &[
+                export_name.into(),
+                source.into(),
+                run_id.into(),
+                range_index.into(),
+                lo.into(),
+                chrono::Utc::now().to_rfc3339().into(),
+                key_column.into(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Mark range `range_index` of run `run_id` not done, so a resume reads it again from its lower bound.
+    pub fn reopen_keyset_range(
+        &self,
+        export_name: &str,
+        run_id: &str,
+        range_index: i64,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE keyset_range SET done = 0, max_key = NULL \
+             WHERE export_name = ?1 AND run_id = ?2 AND range_index = ?3",
+            &[export_name.into(), run_id.into(), range_index.into()],
+        )?;
+        Ok(())
+    }
+
     /// Load the persisted ranges for a resuming run, ordered by `range_index`.
     /// Filtered by `run_id` so a stale set from a superseded run is ignored, and by
     /// `key_column`: ranges sampled on another key bound nothing on this one, so a
@@ -251,6 +293,62 @@ mod tests {
         assert_eq!(loaded[0].hi.as_deref(), Some("k0500"));
         assert_eq!(loaded[2].hi, None);
         assert!(loaded.iter().all(|r| !r.done), "fresh ranges are not done");
+    }
+
+    #[test]
+    fn a_resumed_run_gains_an_open_range_and_reopens_one_of_its_own() {
+        let s = store();
+        let two = [
+            (None, Some("500".to_string())),
+            (Some("500".to_string()), None),
+        ];
+        s.persist_keyset_ranges("exp", "src", "run-1", "id", &two)
+            .unwrap();
+        s.persist_keyset_ranges("other", "src", "run-1", "id", &two)
+            .unwrap();
+        for export in ["exp", "other"] {
+            for range in 0..2 {
+                s.commit_keyset_range("run-1", export, (range, Some("900")), &[], "parquet", None)
+                    .unwrap();
+            }
+        }
+        s.append_keyset_range("exp", "src", "run-1", "id", 2, "900")
+            .unwrap();
+        s.reopen_keyset_range("exp", "run-1", 1).unwrap();
+        let ranges = |export: &str| -> Vec<String> {
+            let rows = s.load_keyset_ranges(export, "run-1", "id").unwrap();
+            let worded = |r: &KeysetRangeRow| {
+                let key = |k: &Option<String>| k.clone().unwrap_or_else(|| "-".into());
+                let (lo, hi, top) = (key(&r.lo), key(&r.hi), key(&r.max_key));
+                format!("{} ({lo}, {hi}] done={} top={top}", r.range_index, r.done)
+            };
+            rows.iter().map(worded).collect()
+        };
+        assert_eq!(
+            ranges("exp"),
+            [
+                "0 (-, 500] done=true top=900",
+                "1 (500, -] done=false top=-",
+                "2 (900, -] done=false top=-",
+            ]
+        );
+        assert_eq!(
+            ranges("other"),
+            [
+                "0 (-, 500] done=true top=900",
+                "1 (500, -] done=true top=900",
+            ],
+            "another export's ranges"
+        );
+        assert_eq!(
+            s.query(
+                "SELECT source FROM keyset_range WHERE range_index = 2",
+                &[],
+                |r| r.text(0)
+            )
+            .unwrap(),
+            ["src"]
+        );
     }
 
     /// The recipe's `chunk_by_key` changed between the crash and the resume: the

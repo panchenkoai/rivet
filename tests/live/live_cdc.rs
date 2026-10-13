@@ -1030,7 +1030,7 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
     // `datestyle` ('German, DMY') nulled every timestamp (rivet's ISO parser
     // failed on DMY text) and a non-hex `bytea_output` ('escape') corrupted every
     // bytea — both silent, found by the source-parity sweep under a flipped
-    // session. The CDC reader now pins datestyle/bytea_output on connect, so CDC
+    // session. The CDC reader now sets datestyle/bytea_output for each read of the slot, so CDC
     // matches a batch export (binary protocol, format-immune) regardless.
     let d = tempfile::tempdir().unwrap();
     // Isolated DB (see CdcDb): ALTERing the DATABASE-level datestyle/bytea_output
@@ -1080,7 +1080,7 @@ fn pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch() {
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
 fn pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch() {
     // A named zone renders a pre-1893 Berlin instant with a SECONDS offset (+00:53:28)
-    // the text parser cannot read; the reader pins TimeZone = 'UTC' so it renders +00.
+    // the text parser cannot read; the reader reads the slot under TimeZone = 'UTC' so it renders +00.
     let d = tempfile::tempdir().unwrap();
     let cdc_db = CdcDb::new("cdc_lmt");
     let tbl = unique_name("cdc_lmt_pg");
@@ -2137,6 +2137,26 @@ fn pg_table_added_to_tables_mid_stream_is_baselined() {
         dir_parquet_id_set(&rig.out_dir().join(&tb).join("snapshot")),
         [1, 2].into(),
         "the joining table's baseline holds its rows"
+    );
+}
+
+/// `rollover: 1` in config mode: an idle bounded run leaves its drain barrier at the head of the slot, which fills the next run's one-row peek; the commits behind it must still arrive.
+#[test]
+#[ignore = "live: requires docker compose postgres (wal_level=logical) + the rivet-duckdb oracle"]
+fn pg_cdc_rollover_1_delivers_the_commits_behind_an_idle_runs_barrier() {
+    let mut s = CdcScenario::pg_with("cdc_roll1", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+        r.cdc("rollover: 1")
+    });
+    s.rig.run_ok();
+    s.rig.run_ok();
+    for id in 1..=3 {
+        s.insert(id);
+    }
+    s.rig.run_ok();
+    assert_eq!(
+        dir_parquet_id_set(&s.rig.out_dir()),
+        [1, 2, 3].into(),
+        "three single-row commits behind two idle runs' barriers"
     );
 }
 
@@ -4507,10 +4527,6 @@ fn roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table() {
     let _vg = ViewGuard(view.clone());
 
     let msg = Rig::mysql_cdc(&view)
-        .oracle_known_defect(
-            "a failed run left: cdc-checkpoint",
-            "known defect: a CDC run that refuses at open still writes its checkpoint at the position it started from; the anchor must be written after the open checks",
-        )
         .checkpoint_path(d.path().join("v.ckpt"))
         .dest_path(d.path().join("out"))
         .run_expect_fail();
@@ -7321,6 +7337,43 @@ fn assert_nothing_delivered(rig: &Rig) {
                 .all(|(_, status, _, rows)| status == "failed" && *rows == 0),
         "the ledger must record the run as failed with no rows: {runs:?}"
     );
+}
+
+/// docs/reference/compatibility.md: a `mode: cdc` run sends no session-level `SET` either. Through the
+/// transaction-mode pooler the capture is refused (the server behind it runs `wal_level = replica`), twice,
+/// and each refused run leaves every setting of the pooled connection, and where it was set, as it found it.
+#[test]
+#[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
+fn a_cdc_run_refused_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres() {
+    let _alone = pgbouncer_alone();
+    let engine = SqlEngine::Pg;
+    engine.alive();
+    let (table, _guard) = engine.range_table("guar_pool_cdc");
+    let slot = unique_name("guar_pool_slot");
+    let _slot = Slot::on(POSTGRES_URL, slot.clone());
+    let before = pooled_session_without_set_formats();
+    let rig = Rig::pg_cdc(&table, &slot).source_url(PGBOUNCER_URL);
+    for cycle in 1..=2 {
+        let out = rig.run();
+        assert!(
+            !out.status.success(),
+            "cycle {cycle}: the server behind the pooler runs wal_level = replica"
+        );
+        assert_refused(&out, Refused::by_code("RIVET_SOURCE_CDC_PREREQUISITE", 1));
+        assert_eq!(
+            pooled_session(),
+            before,
+            "cycle {cycle}: the refused CDC run changed the session of the pooled connection"
+        );
+    }
+    let slots: i64 = pg_connect()
+        .query_one(
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(slots, 0, "a refused capture creates no slot");
 }
 
 /// `binlog_row_metadata = MINIMAL` at open is refused before the first run pins an anchor.

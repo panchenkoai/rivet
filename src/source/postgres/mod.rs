@@ -2,8 +2,7 @@
 //!
 //! Module layout:
 //!
-//! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, the
-//!   transaction-pooler detector, `PgTxnGuard`, sampling helpers
+//! - `mod.rs` (this file) — `PostgresSource` struct + connect/TLS path, sampling helpers
 //!   (`pg_sample_checkpoints_req`, `pg_fetch_work_mem_bytes`),
 //!   `introspect_pg_on` (chunk-planner catalog probe), the cursor + FETCH export loop
 //!   (`pg_run_export`), the `Source` trait impl, and the catalog-hint
@@ -30,14 +29,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
+use postgres::Client;
 use postgres::types::Type;
-use postgres::{Client, NoTls};
 
 use crate::config::{SourceType, TlsConfig};
+pub(crate) use crate::connect::postgres::connect_client;
+use crate::connect::postgres::{PgTxnGuard, detect_pg_transaction_pooler, read_pinned};
 use crate::error::Result;
 use crate::source::batch_controller::AdaptiveBatchController;
 use crate::source::query::build_export_query;
-use crate::source::tls::build_native_tls;
 use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, SourceColumn, TypeMapping};
 
@@ -51,25 +51,6 @@ pub struct PostgresSource {
     transaction_pooler: bool,
 }
 
-/// Detect whether the connection is going through a transaction-mode pooler
-/// (pgBouncer, Odyssey, etc.) by comparing backend PIDs across two implicit
-/// transactions. Returns true when PIDs differ — impossible on a direct
-/// connection or session-mode pooler where the same physical backend is kept.
-///
-/// False negatives are possible when pool_size = 1 (the same backend is always
-/// reused), so this is a best-effort warning rather than a hard guarantee.
-fn detect_pg_transaction_pooler(client: &mut Client) -> bool {
-    let pid1: Option<i32> = client
-        .query_one("SELECT pg_backend_pid()", &[])
-        .ok()
-        .and_then(|r| r.try_get(0).ok());
-    let pid2: Option<i32> = client
-        .query_one("SELECT pg_backend_pid()", &[])
-        .ok()
-        .and_then(|r| r.try_get(0).ok());
-    matches!((pid1, pid2), (Some(a), Some(b)) if a != b)
-}
-
 impl PostgresSource {
     /// Connect with no transport security (legacy path). Prefer [`Self::connect_with_tls`]
     /// for production workloads so credentials and result sets are not visible on the wire.
@@ -79,8 +60,8 @@ impl PostgresSource {
 
     /// Connect honoring the user's [`TlsConfig`] through the shared dial, warning on a transaction pooler.
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        let mut client = connect_client_raw(url, tls)?;
-        let transaction_pooler = pin_session_formats(&mut client)?;
+        let mut client = connect_client(url, tls)?;
+        let transaction_pooler = detect_pg_transaction_pooler(&mut client);
         if transaction_pooler {
             log::warn!(
                 "transaction-mode connection pooler detected (pgBouncer/Odyssey) — \
@@ -95,48 +76,35 @@ impl PostgresSource {
     }
 }
 
-/// RAII guard for an open `BEGIN ... COMMIT` block.
-///
-/// `commit()` runs `COMMIT` and marks the txn done; if the guard is dropped
-/// before `commit()` (early return, `?`-bubbled error, or panic-driven unwind),
-/// `Drop` issues a best-effort `ROLLBACK`. Postgres releases any open cursors
-/// as part of ROLLBACK, so the cursor declared inside the txn is also cleaned
-/// up. Closes the **G1** gap from the DBA audit (cursor leak on panic).
-struct PgTxnGuard<'a> {
-    client: &'a mut Client,
-    committed: bool,
+/// Prepare `sql` under a text no earlier call sent, so the description is the one this parse fixes: a pooler keeps named statements by their text, and one kept from another read would describe these rows.
+pub(crate) fn prepare_fresh(
+    client: &mut Client,
+    sql: &str,
+) -> std::result::Result<postgres::Statement, postgres::Error> {
+    use rand::RngExt;
+    client.prepare(&fresh_text(sql, rand::rng().random::<u64>()))
 }
 
-impl<'a> PgTxnGuard<'a> {
-    fn begin(client: &'a mut Client) -> Result<Self> {
-        client.batch_execute("BEGIN")?;
-        Ok(Self {
-            client,
-            committed: false,
-        })
-    }
-
-    fn client_mut(&mut self) -> &mut Client {
-        self.client
-    }
-
-    fn commit(mut self) -> Result<()> {
-        self.client.batch_execute("COMMIT")?;
-        self.committed = true;
-        Ok(())
-    }
+/// `sql` followed by a comment carrying `nonce`.
+fn fresh_text(sql: &str, nonce: u64) -> String {
+    format!("{sql} /* rivet {nonce:016x} */")
 }
 
-impl Drop for PgTxnGuard<'_> {
-    fn drop(&mut self) {
-        if !self.committed
-            && let Err(e) = self.client.batch_execute("ROLLBACK")
-        {
-            // Drop must not panic. Worst case the connection is poisoned and
-            // the pool recycles it; log so operators see it.
-            log::warn!("PgTxnGuard: ROLLBACK during drop failed: {e:#}");
+/// The read's prepared `FETCH n FROM _rivet`: prepared fresh the first time this read asks for `n` rows, then reused for its later pages.
+fn fetch_statement<'a>(
+    client: &mut Client,
+    prepared: &'a mut Vec<(usize, postgres::Statement)>,
+    n: usize,
+) -> std::result::Result<&'a postgres::Statement, postgres::Error> {
+    let at = match prepared.iter().position(|(size, _)| *size == n) {
+        Some(at) => at,
+        None => {
+            let statement = prepare_fresh(client, &format!("FETCH {n} FROM _rivet"))?;
+            prepared.push((n, statement));
+            prepared.len() - 1
         }
-    }
+    };
+    Ok(&prepared[at].1)
 }
 
 /// Probe `SHOW work_mem` and return the value in bytes.
@@ -284,6 +252,11 @@ fn pg_sample_checkpoints_req(client: &mut Client) -> Option<i64> {
 /// or bare `<table>` (resolved under `public`). It is split internally with
 /// the same strict rules as the `table:` YAML shortcut — anything more
 /// elaborate must use the explicit-column path.
+/// The heap bytes one row takes, from the planner's row estimate; none while the table has no estimate.
+fn avg_row_bytes(row_estimate: i64, rel_size_bytes: i64) -> Option<i64> {
+    (row_estimate > 0).then(|| rel_size_bytes / row_estimate)
+}
+
 fn introspect_pg_on(
     client: &mut Client,
     qualified_table: &str,
@@ -307,11 +280,7 @@ fn introspect_pg_on(
         }
         None => (0, 0),
     };
-    let avg_row_bytes = if row_estimate > 0 {
-        Some(rel_size_bytes / row_estimate)
-    } else {
-        None
-    };
+    let avg_row_bytes = avg_row_bytes(row_estimate, rel_size_bytes);
 
     // ── single int PK probe ─────────────────────────────────────────────
     let pk_rows = client.query(
@@ -374,16 +343,11 @@ fn introspect_pg_on(
            AND t.typname <> 'numeric'",
         &[&schema, &table],
     )?;
-    let mut keyset_keys: Vec<String> = Vec::new();
-    for primary in [true, false] {
-        for row in &keyset_rows {
-            let col: String = row.get(0);
-            let is_primary: bool = row.get(1);
-            if is_primary == primary && !keyset_keys.contains(&col) {
-                keyset_keys.push(col);
-            }
-        }
-    }
+    let keyset_columns: Vec<(String, bool)> = keyset_rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let keyset_keys = super::keyset_keys_primary_first(&keyset_columns);
 
     // Integer-family columns — the safety set for an explicit `chunk_column`
     // (range chunking slices with integer `BETWEEN`; a non-integer key silently
@@ -410,90 +374,11 @@ fn introspect_pg_on(
     })
 }
 
-/// Open a bare `postgres::Client` honoring the configured TLS policy.
-///
-/// Shared by preflight, doctor, and `rivet init` so every code path that
-/// connects to Postgres applies the same transport-security rules. Preflight
-/// and doctor pass the YAML `tls:` block; init runs before any YAML exists,
-/// so it derives a `TlsConfig` from the URL's `sslmode` parameter (see
-/// `crate::init::postgres::connect`). `tls = None` or `mode: disable` falls
-/// back to the insecure `NoTls` transport — a warning is logged from
-/// `create_source` so operators know TLS is off.
-/// Parse `url` into a `postgres::Config` and FORCE `ssl_mode(Require)`.
-///
-/// The bug this closes: `Client::connect(url, connector)` lets tokio-postgres
-/// decide TLS from the URL's own `sslmode` — so `?sslmode=disable`, or the
-/// driver's DEFAULT `prefer` against a server that declines TLS, returns a raw
-/// PLAINTEXT stream and never touches the connector we built. An operator who
-/// wrote `tls: { mode: verify-full }` (or `--tls verify-full`) then ships
-/// credentials and every row in cleartext under exit 0. Mongo fixed the
-/// identical class by overriding `opts.tls`; this is Postgres's override.
-///
-/// `ssl_mode(Require)` only forces TLS to be USED; the CONNECTOR
-/// (`build_native_tls`) still decides how strictly the cert is checked
-/// (require = accept-invalid, verify-ca = chain, verify-full = chain+host), so
-/// the four modes keep their meanings — this just stops `disable`/`prefer` in
-/// the URL from silently winning over an enforced `tls:` block.
-fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
-    use std::str::FromStr;
-    // Strip the URL's own `sslmode` before parsing: we force Require below, so
-    // its value is irrelevant — AND tokio-postgres only accepts disable/prefer/
-    // require, rejecting the libpq-valid `verify-ca`/`verify-full` with a parse
-    // error (bug hunt 2026-08-08: init derived verify-full from such a URL and
-    // then failed to parse it, erroring every time). Dropping it makes any
-    // sslmode the operator wrote parseable; the connector decides verification.
-    let cleaned = crate::source::strip_url_query_key(url, "sslmode");
-    let mut config = postgres::Config::from_str(&cleaned).map_err(|e| {
-        anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
-    })?;
-    config.ssl_mode(postgres::config::SslMode::Require);
-    Ok(config)
-}
-
-/// Pin the session's text formats (UTC, ISO dates, postgres intervals, hex bytea) on a fresh
-/// connection unless a transaction pooler would leak them to other clients; returns whether one was detected.
-fn pin_session_formats(client: &mut Client) -> Result<bool> {
-    let transaction_pooler = detect_pg_transaction_pooler(client);
-    if !transaction_pooler {
-        client.batch_execute(
-            "SET TimeZone = 'UTC'; SET DateStyle = 'ISO, MDY'; \
-             SET IntervalStyle = 'postgres'; SET bytea_output = 'hex'",
-        )?;
-    }
-    Ok(transaction_pooler)
-}
-
-pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
-    let mut client = connect_client_raw(url, tls)?;
-    pin_session_formats(&mut client)?;
-    Ok(client)
-}
-
-/// Dial `url` honoring the TLS policy, with the server's own session defaults.
-pub(crate) fn connect_client_raw(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
-    // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
-    crate::source::require_tls_or_loopback(url, tls)?;
-    match tls {
-        Some(cfg) if cfg.mode.is_enforced() => {
-            let connector = build_native_tls(cfg)?;
-            let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-            // Config::connect, NOT Client::connect(url, …): the forced
-            // ssl_mode(Require) overrides the URL's sslmode so the connector is
-            // actually used (see pg_config_ssl_forced).
-            pg_config_ssl_forced(url)?
-                .connect(make_tls)
-                .map_err(|e| crate::source::describe_connect_error(url, e.into()))
-        }
-        _ => Client::connect(url, NoTls)
-            .map_err(|e| crate::source::describe_connect_error(url, e.into())),
-    }
-}
-
 /// Run the full export transaction against an open Postgres client.
 ///
 /// All session-mutating SET commands use SET LOCAL so they are scoped to
-/// the transaction and reset automatically on COMMIT or ROLLBACK. The caller
-/// is responsible for issuing ROLLBACK if this function returns Err.
+/// the transaction and reset automatically on COMMIT or ROLLBACK; the guard
+/// rolls back when this function returns Err.
 ///
 /// Returns (total_rows, had_schema). had_schema is false only when the query
 /// returned zero rows; the caller must emit an empty schema in that case.
@@ -505,24 +390,9 @@ fn pg_run_export(
     sink: &mut dyn super::BatchSink,
     numeric_hints: Option<&HashMap<String, (u8, i8)>>,
 ) -> Result<(usize, bool)> {
-    // Open the txn under guard *first* — if SET LOCAL or DECLARE fails below,
-    // Drop will roll back. Without the guard, a failure between BEGIN and the
-    // explicit ROLLBACK in the caller would leak a half-set-up txn into the pool.
+    // The read runs under UTC: a naive cursor bound re-injected into `WHERE col > '<literal>'` is
+    // coerced in the transaction's zone, and text the query casts prints in its formats.
     let mut guard = PgTxnGuard::begin(client)?;
-    // Pin the read txn's TimeZone to UTC. The row READ is UTC-absolute (the binary
-    // protocol yields instants regardless of session zone), but the incremental /
-    // keyset cursor boundary is re-injected as an OFFSET-LESS naive-UTC literal
-    // into `WHERE col > '<literal>'`; PostgreSQL coerces a naive literal to
-    // `timestamptz` using the SESSION TimeZone, so on any non-UTC session (a common
-    // production default via postgresql.conf or `ALTER ROLE/DATABASE ... SET
-    // timezone`) the boundary shifts by the zone offset and every incremental run
-    // silently SKIPS (west of UTC) or DUPLICATES (east) the offset-wide gap window —
-    // a count-passing data loss invisible under a UTC test session. The MySQL path
-    // pins the equivalent (`SET time_zone='+00:00'`). SET LOCAL is txn-scoped, so it
-    // auto-resets on commit/rollback and never leaks into the pooled connection.
-    guard
-        .client_mut()
-        .batch_execute("SET LOCAL TimeZone = 'UTC'")?;
     if tuning.statement_timeout_s > 0 {
         guard.client_mut().batch_execute(&format!(
             "SET LOCAL statement_timeout = '{}s'",
@@ -570,10 +440,11 @@ fn pg_run_export(
     let max_value_bytes = tuning.max_value_bytes();
 
     let mut first_fetch_done = false;
+    let mut fetches: Vec<(usize, postgres::Statement)> = Vec::new();
     loop {
         let requested = ctl.target();
-        let fetch_sql = format!("FETCH {} FROM _rivet", requested);
-        let rows = guard.client_mut().query(&fetch_sql, &[])?;
+        let fetch = fetch_statement(guard.client_mut(), &mut fetches, requested)?;
+        let rows = guard.client_mut().query(fetch, &[])?;
         if !first_fetch_done {
             first_fetch_done = true;
             // The cursor's snapshot is pinned as of the FIRST FETCH, not the
@@ -673,6 +544,7 @@ fn pg_run_export(
 
     // Explicit CLOSE is technically redundant — COMMIT releases the cursor —
     // but it documents intent and surfaces any close errors before COMMIT.
+    drop(fetches);
     guard.client_mut().batch_execute("CLOSE _rivet")?;
     guard.commit()?;
     Ok((total_rows, schema.is_some()))
@@ -712,8 +584,8 @@ impl super::Source for PostgresSource {
         let hint_query = request.catalog_hint_query.unwrap_or(request.query);
         let numeric_hints = pg_numeric_catalog_hints_opt(&mut self.client, hint_query);
 
-        // PgTxnGuard inside pg_run_export rolls the txn back automatically on
-        // any error or panic, so no explicit ROLLBACK is needed here.
+        // The transaction guard inside pg_run_export rolls back on any error
+        // or panic, so no explicit ROLLBACK is needed here.
         let (total_rows, had_schema) = pg_run_export(
             &mut self.client,
             &built.sql,
@@ -744,7 +616,10 @@ impl super::Source for PostgresSource {
     }
 
     fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
-        let rows = self.client.query(sql, &[])?;
+        let rows = read_pinned(&mut self.client, |client| {
+            let probe = prepare_fresh(client, sql)?;
+            client.query(&probe, &[])
+        })?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -805,7 +680,7 @@ impl super::Source for PostgresSource {
         column_overrides: &ColumnOverrides,
     ) -> Result<Vec<TypeMapping>> {
         let wrapped = format!("SELECT * FROM ({}) AS _rivet_type_probe LIMIT 0", query);
-        let stmt = self.client.prepare(&wrapped)?;
+        let stmt = prepare_fresh(&mut self.client, &wrapped)?;
         let hints = pg_numeric_catalog_hints_opt(&mut self.client, query);
         let mappings = stmt
             .columns()
@@ -1080,6 +955,43 @@ fn unreadable_probe(pg_type: &str, sql: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_row_takes_the_heap_size_over_the_row_estimate() {
+        use super::avg_row_bytes;
+        assert_eq!(avg_row_bytes(100, 8_192), Some(81));
+        assert_eq!(avg_row_bytes(1, 8_192), Some(8_192));
+        assert_eq!(avg_row_bytes(3, 2), Some(0));
+        assert_eq!(avg_row_bytes(0, 8_192), None);
+    }
+
+    /// `information_schema` spells a decimal column `numeric`; a parameterised or padded spelling is one too, and no other type is.
+    #[test]
+    fn only_numeric_and_decimal_are_numeric_information_types() {
+        use super::is_pg_numeric_information_type;
+        for dt in [
+            "numeric",
+            "decimal",
+            " NUMERIC ",
+            "numeric(10,2)",
+            "Decimal(5)",
+        ] {
+            assert!(is_pg_numeric_information_type(dt), "{dt}");
+        }
+        for dt in ["integer", "double precision", "numericx", "text", ""] {
+            assert!(!is_pg_numeric_information_type(dt), "{dt}");
+        }
+    }
+
+    #[test]
+    fn a_fresh_text_is_the_statement_and_a_comment_no_other_nonce_gives() {
+        let sql = "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0";
+        assert_eq!(
+            super::fresh_text(sql, 0xab),
+            "SELECT * FROM (SELECT 1) AS _rivet_type_probe LIMIT 0 /* rivet 00000000000000ab */"
+        );
+        assert_ne!(super::fresh_text(sql, 1), super::fresh_text(sql, 2));
+    }
+
+    #[test]
     fn an_unreadable_probe_names_the_type_the_remedy_and_the_probe() {
         assert_eq!(
             super::unreadable_probe("numeric", "SELECT max(\"id\") FROM t"),
@@ -1168,40 +1080,6 @@ mod tests {
         );
     }
     use super::catalog_numeric_to_decimal_params;
-
-    /// The TLS-honesty fix (bug hunt 2026-08-08): under an enforced `tls:`
-    /// block the connection's ssl_mode must be forced to Require REGARDLESS of
-    /// what the URL's own `sslmode` says — otherwise `?sslmode=disable` (or the
-    /// driver's default `prefer` against a TLS-declining server) silently wins
-    /// and the connector we built is never used, shipping cleartext under a
-    /// `verify-full` claim.
-    #[test]
-    fn enforced_tls_forces_ssl_mode_require_over_the_urls_sslmode() {
-        use postgres::config::SslMode;
-        // Every URL sslmode an operator might write — all must come out Require.
-        for url in [
-            "postgresql://u:p@h/db?sslmode=disable",
-            "postgresql://u:p@h/db?sslmode=prefer",
-            "postgresql://u:p@h/db", // no param → driver default is `prefer`
-            "postgresql://u:p@h/db?sslmode=require",
-            // libpq-valid but tokio-postgres-REJECTED values: stripped, not fatal
-            "postgresql://u:p@h/db?sslmode=verify-ca",
-            "postgresql://u:p@h/db?sslmode=verify-full",
-            // sslmode alongside another param — only sslmode is dropped
-            "postgresql://u:p@h/db?application_name=x&sslmode=verify-full&connect_timeout=5",
-        ] {
-            let cfg =
-                super::pg_config_ssl_forced(url).unwrap_or_else(|e| panic!("parse {url}: {e}"));
-            assert_eq!(
-                cfg.get_ssl_mode(),
-                SslMode::Require,
-                "enforced TLS must force Require, but {url} yielded {:?}",
-                cfg.get_ssl_mode()
-            );
-        }
-        // A malformed URL is a loud parse error, not a silent plaintext fallback.
-        assert!(super::pg_config_ssl_forced("not a url").is_err());
-    }
 
     // FROM-clause parser tests live in `from_parse.rs` alongside the parser.
 

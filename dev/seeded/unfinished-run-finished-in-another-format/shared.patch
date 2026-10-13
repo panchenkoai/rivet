@@ -1,0 +1,13 @@
+diff --git a/src/state/file_log.rs b/src/state/file_log.rs
+index 0983d5e2..c3f19508 100644
+--- a/src/state/file_log.rs
++++ b/src/state/file_log.rs
+@@ -220,7 +220,7 @@ impl StateStore {
+         run_id: &str,
+         format: &str,
+     ) -> Result<Option<String>> {
+-        if format.is_empty() {
++        if !format.is_empty() {
+             return Ok(None);
+         }
+         self.query_opt(

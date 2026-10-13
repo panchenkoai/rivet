@@ -39,13 +39,18 @@ pub(crate) fn seeded(engine: SqlEngine, tag: &str) -> (String, Box<dyn std::any:
 
 /// A full export of `N` documents of a fresh database on the standalone MongoDB, and its drop guard.
 pub(crate) fn mongo_rig(tag: &str) -> (Rig, MongoDbGuard) {
+    mongo_rig_of(tag, N)
+}
+
+/// [`mongo_rig`] over `docs` documents.
+fn mongo_rig_of(tag: &str, docs: i64) -> (Rig, MongoDbGuard) {
     require_alive(LiveService::Mongo);
     let db = unique_name(tag);
     let guard = MongoDbGuard {
         port: MONGO_PORT,
         db: db.clone(),
     };
-    MongoTest::connect(MONGO_PORT, &db).seed_int_id("t", N);
+    MongoTest::connect(MONGO_PORT, &db).seed_int_id("t", docs);
     (
         Rig::mongo_batch("t").source_url(&MongoTest::url(MONGO_PORT, &db)),
         guard,
@@ -72,16 +77,16 @@ fn state(rig: &Rig, verb: &str, export: &str) {
 /// RIVET_STATE_CURSOR_OWNER_MISMATCH: an incremental export whose `cursor_column` was changed with no reset.
 fn cursor_owner_mismatch(engine: SqlEngine) {
     let (table, _guard) = seeded(engine, "sab_owner");
-    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let on = |rig: Rig, column: &str, out: &std::path::Path| {
+    let out = tempfile::tempdir().unwrap();
+    let on = |rig: Rig, column: &str| {
         engine
             .staged(rig, "incremental", &[&format!("cursor_column: {column}")])
-            .dest_path(out.to_path_buf())
+            .dest_path(out.path().to_path_buf())
     };
-    let rig = on(engine.rig(&table), "id", first.path());
+    let rig = on(engine.rig(&table), "id");
     rig.run_ok();
     engine.insert(&table, N + 1..=N + 3, 170, Some(10));
-    let mut rig = on(rig, "ext_id", second.path());
+    let mut rig = on(rig, "ext_id");
     rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
@@ -95,7 +100,7 @@ fn cursor_owner_mismatch(engine: SqlEngine) {
             Remedy::new(
                 "or restore the previous cursor",
                 Then::DeliversTheSource,
-                |r| r.rebuilt(|r| on(r, "id", first.path())),
+                |r| r.rebuilt(|r| on(r, "id")),
             ),
             Remedy::wrong(
                 "runs `rivet state reset-chunks`, the sibling of the command the text names",
@@ -390,7 +395,7 @@ fn continued_after(engine: SqlEngine, argv: &[&str], sabotage: impl FnOnce(&Rig)
     }
 }
 
-/// Sorted ids of the parts the success manifests of `rig`'s destination declare: what an explicit resume is held to, since the default oracle grades it on the rows it delivered.
+/// Sorted ids of the parts the success manifests of `rig`'s destination declare: the cell's own read of what a recovered run delivered, beside the default oracle's.
 fn declared_ids(rig: &Rig) -> Vec<i64> {
     let mut ids: Vec<i64> = rig
         .read_declared_parts()
@@ -624,16 +629,14 @@ impl Shape {
     }
 }
 
-/// A rig whose run a cell stops mid-export: what that run may leave for the next one (`anchored`: a keyset-checkpoint run, whose page high-water is its resume anchor in `export_state`).
-fn stopped_mid_run(rig: Rig, anchored: bool) -> Rig {
+/// A rig whose run a cell stops mid-export: what that run may leave for the next one, and what `also` (a keyset-checkpoint run's page high-water, its resume anchor in `export_state`; the schema a run observed before its state store filled up).
+fn stopped_mid_run(rig: Rig, also: &[Leftover]) -> Rig {
     let mut leaves = vec![
         Leftover::OrphanPart,
         Leftover::FileLog,
         Leftover::ChunkCheckpoint,
     ];
-    if anchored {
-        leaves.push(Leftover::ResumePoint);
-    }
+    leaves.extend_from_slice(also);
     rig.a_failed_run_may_leave(
         &leaves,
         "the cell takes a resource away mid-export: the parts written and the checkpoint rows recorded before it stay for the next run",
@@ -652,12 +655,20 @@ fn shaped(engine: SqlEngine, tag: &str, shape: Shape) -> (String, Rig, Box<dyn s
 /// [`shaped`], slowed so its run can be met, and declared as a run a cell stops mid-export.
 fn live(engine: SqlEngine, tag: &str, shape: Shape) -> (String, Rig, Box<dyn std::any::Any>) {
     let (table, rig, guard) = shaped(engine, tag, shape);
-    let rig = stopped_mid_run(rig, shape == Shape::KeysetCheckpoint).slowed(150);
-    (table, rig, guard)
+    let anchor: &[Leftover] = match shape {
+        Shape::KeysetCheckpoint => &[Leftover::ResumePoint],
+        _ => &[],
+    };
+    (table, stopped_mid_run(rig, anchor).slowed(150), guard)
 }
 
 /// A resumable export of `MONGO_LIVE` documents of a fresh database on the standalone MongoDB.
 fn mongo_live(tag: &str) -> (Rig, MongoTest, MongoDbGuard) {
+    mongo_live_leaving(tag, &[])
+}
+
+/// [`mongo_live`] whose stopped run may `also` leave what [`stopped_mid_run`] names.
+fn mongo_live_leaving(tag: &str, also: &[Leftover]) -> (Rig, MongoTest, MongoDbGuard) {
     require_alive(LiveService::Mongo);
     let db = unique_name(tag);
     let guard = MongoDbGuard {
@@ -669,7 +680,7 @@ fn mongo_live(tag: &str) -> (Rig, MongoTest, MongoDbGuard) {
     let rig = Rig::mongo_batch("t")
         .source_url(&MongoTest::url(MONGO_PORT, &db))
         .mongo("page_size: 20000, resume: true");
-    (stopped_mid_run(rig, false), m, guard)
+    (stopped_mid_run(rig, also), m, guard)
 }
 
 /// With the resource back, a plain run delivers the source and the export validates.
@@ -878,7 +889,7 @@ fn chunk_checkpoint_gone(engine: SqlEngine) {
     let (table, _guard) = seeded(engine, "sab_gone");
     let rig = engine.staged(engine.rig(&table), "chunked", RANGE_CHECKPOINT);
     rig.run_ok();
-    let mut rig = stopped_mid_run(rig, false);
+    let mut rig = stopped_mid_run(rig, &[]);
     rig.edit_state(
         "CREATE TRIGGER sab_checkpoint_gone AFTER UPDATE OF status ON chunk_task \
          WHEN NEW.status = 'completed' AND NEW.chunk_index = 1 BEGIN \
@@ -1143,29 +1154,52 @@ fn killed_at_mongo(points: &[&str]) {
     }
 }
 
-/// After a crash and a source that moved on, the next run delivers the source as it is now or refuses by code, and a delivered export validates.
-fn recovers_to_the_source_as_it_is(rig: &Rig) {
-    if rig.delivers_or_refuses(RERUN, &[]) == Survived::Delivered {
-        ok(rig.cli(&["validate"]));
-    }
+/// After a crash and a source that moved on, `argv` delivers the source as it is now: each of its `rows` ids declared once, and a passing `validate`.
+fn recovers_to_the_source_as_it_is(rig: &Rig, argv: &[&str], rows: i64) {
+    let how = rig.delivers_or_refuses(argv, &[]);
+    assert!(
+        how == Survived::Delivered,
+        "`rivet {}` after a crash and a source that moved on did not deliver it: {how:?}",
+        argv.join(" ")
+    );
+    let ids = declared_ids(rig);
+    assert!(
+        ids == (1..=rows).collect::<Vec<_>>(),
+        "`rivet {}` exited 0 over a success manifest declaring {} row(s) for {rows} source ids",
+        argv.join(" "),
+        ids.len()
+    );
+    ok(rig.cli(&["validate"]));
 }
 
-/// A checkpointed run in `shape` crashed at `point`, then three more source rows.
-fn killed_then_source_grows(engine: SqlEngine, shape: Shape, point: &str) {
+/// A checkpointed run in `shape` crashed at `point`, then three more source rows; `argv` continues it.
+fn killed_then_source_grows(engine: SqlEngine, shape: Shape, point: &str, argv: &[&str]) {
     let (table, rig, _guard) = shaped(engine, "sab_grows", shape);
     crashed_at(&rig, point);
     engine.insert(&table, LIVE_ROWS + 1..=LIVE_ROWS + 3, 170, Some(10));
-    recovers_to_the_source_as_it_is(&rig);
+    recovers_to_the_source_as_it_is(&rig, argv, LIVE_ROWS + 3);
 }
 
-/// A range-checkpoint run of an empty table crashed after its one task completed, then `N` source rows.
-fn killed_over_an_empty_table_then_source_fills(engine: SqlEngine) {
+/// [`killed_then_source_grows`] for a parallel keyset run whose committed ranges recorded no highest key, as a state written before `keyset_range.max_key` holds them.
+fn killed_with_no_recorded_top_then_source_grows(engine: SqlEngine) {
+    let (table, rig, _guard) = shaped(engine, "sab_top", Shape::KeysetCheckpointParallel);
+    crashed_at(&rig, "keyset_parallel_range_committed:1");
+    rig.edit_state(
+        "UPDATE keyset_range SET max_key = NULL WHERE export_name = '{export}'",
+        2,
+    );
+    engine.insert(&table, LIVE_ROWS + 1..=LIVE_ROWS + 3, 170, Some(10));
+    recovers_to_the_source_as_it_is(&rig, RERUN, LIVE_ROWS + 3);
+}
+
+/// A range-checkpoint run of an empty table crashed after its one task completed, then `N` source rows; `argv` continues it.
+fn killed_over_an_empty_table_then_source_fills(engine: SqlEngine, argv: &[&str]) {
     engine.alive();
     let (table, _guard) = engine.range_table("sab_fills");
     let rig = engine.staged(engine.rig(&table), "chunked", RANGE_CHECKPOINT);
     crashed_at(&rig, "after_chunk_complete:0");
     engine.insert(&table, 1..=N, 180, Some(10));
-    recovers_to_the_source_as_it_is(&rig);
+    recovers_to_the_source_as_it_is(&rig, argv, N);
 }
 
 /// The first `chunk_task` insert of a chunk run fails (a trigger in the SQLite state): the run fails loudly twice and leaves no unfinished chunk run; with the trigger dropped a run delivers the source.
@@ -1215,41 +1249,734 @@ fn edited(rig: Rig, edit: ConfigEdit, fresh: &std::path::Path) -> Rig {
     }
 }
 
-/// After `edit` with no reset the run delivers the source or refuses by code; a delivery declares every one of `rows` source ids once where the config now points (parquet parts; a destination in another format is the default oracle's to read), and `validate` passes.
-fn delivers_whole_or_refuses(rig: &Rig, edit: ConfigEdit, rows: i64) {
-    if let Survived::Refused(_) = rig.delivers_or_refuses(RERUN, &[]) {
-        return;
-    }
-    if !matches!(edit, ConfigEdit::Format) {
-        let ids = declared_ids(rig);
-        let distinct: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
-        assert!(
-            ids == (1..=rows).collect::<Vec<_>>(),
-            "after {edit:?} was edited `rivet run` exited 0 over a destination that declares {} row(s) and {} of {rows} source ids",
-            ids.len(),
-            distinct.len()
-        );
-    }
+/// After `edit` with no reset the run delivers the source: every one of `rows` source ids declared once where the config now points, and `validate` passes.
+fn delivers_whole(rig: &Rig, edit: ConfigEdit, rows: i64) {
+    let how = rig.delivers_or_refuses(RERUN, &[]);
+    assert!(
+        how == Survived::Delivered,
+        "after {edit:?} was edited `rivet run` did not deliver the source: {how:?}"
+    );
+    let ids = declared_ids(rig);
+    let distinct: std::collections::BTreeSet<i64> = ids.iter().copied().collect();
+    assert!(
+        ids == (1..=rows).collect::<Vec<_>>(),
+        "after {edit:?} was edited `rivet run` exited 0 over a destination that declares {} row(s) and {} of {rows} source ids",
+        ids.len(),
+        distinct.len()
+    );
     ok(rig.cli(&["validate"]));
 }
 
-/// An incremental export that ran once, then `edit` and three more source rows.
-fn edited_incremental(engine: SqlEngine, edit: ConfigEdit) {
+/// An incremental export that ran once, then another `compression` and three more source rows: the run continues.
+fn edited_incremental(engine: SqlEngine) {
     let (table, _guard) = seeded(engine, "sab_edit");
     let rig = Shape::Incremental.staged(engine, engine.rig(&table));
     rig.run_ok();
     engine.insert(&table, N + 1..=N + 3, 170, Some(10));
-    let fresh = tempfile::tempdir().unwrap();
-    let rig = edited(rig, edit, fresh.path());
-    delivers_whole_or_refuses(&rig, edit, N + 3);
+    let rig = rig.export_line("compression: gzip");
+    delivers_whole(&rig, ConfigEdit::Compression, N + 3);
 }
 
-/// An unfinished range-checkpoint run, then `edit`.
+/// An unfinished range-checkpoint run, then `edit` (a moved destination, another compression): the run delivers the source.
 fn edited_unfinished(engine: SqlEngine, edit: ConfigEdit) {
     let (_table, rig, _guard) = interrupted(engine, "sab_edit");
     let fresh = tempfile::tempdir().unwrap();
     let rig = edited(rig, edit, fresh.path());
-    delivers_whole_or_refuses(&rig, edit, N);
+    delivers_whole(&rig, edit, N);
+}
+
+/// Refuse `rig`'s run twice with RIVET_STATE_CURSOR_DESTINATION_MISMATCH after `edit` of an export that delivered to `first`, then walk out: the edit undone continues, `state reset` (over an emptied destination when the full pass lands where the old parts are) delivers the source, and neither `state reset-chunks` nor `state accept` lifts it.
+fn walks_out_of_a_cursor_destination_mismatch(
+    rig: &mut Rig,
+    edit: ConfigEdit,
+    first: &std::path::Path,
+) {
+    let export = rig.export_name().to_string();
+    let refused = Refused::by_code("RIVET_STATE_CURSOR_DESTINATION_MISMATCH", 5);
+    let (restore, reset) = match edit {
+        ConfigEdit::Format => (
+            "restore the destination and format the export had to continue",
+            "empty that location first if the full pass lands in it too",
+        ),
+        _ => (
+            "restore the destination and format the export had to continue",
+            "starts over with a full pass delivered to",
+        ),
+    };
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        refused,
+        vec![
+            Remedy::new(restore, Then::DeliversTheSource, |r| {
+                r.rebuilt(|r| r.with_format("parquet").dest_path(first.to_path_buf()))
+            }),
+            Remedy::new(reset, Then::DeliversTheSource, |r| {
+                if matches!(edit, ConfigEdit::Format) {
+                    std::fs::remove_dir_all(r.out_dir()).expect("empty the destination");
+                    std::fs::create_dir_all(r.out_dir()).expect("the destination directory");
+                }
+                state(r, "reset", &export);
+            }),
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, the sibling of the command the text names",
+                Then::Refuses(refused),
+                |r| state(r, "reset-chunks", &export),
+            ),
+            Remedy::wrong(
+                "runs `rivet state accept`, which keeps a cursor under an edited query",
+                Then::Refuses(refused),
+                |r| state(r, "accept", &export),
+            ),
+        ],
+    );
+}
+
+/// RIVET_STATE_CURSOR_DESTINATION_MISMATCH: an incremental export that ran once, then `edit` (its destination moved, or its format changed in place) and three more source rows.
+fn cursor_destination_mismatch(engine: SqlEngine, edit: ConfigEdit) {
+    let (table, _guard) = seeded(engine, "sab_edit");
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let rig = Shape::Incremental
+        .staged(engine, engine.rig(&table))
+        .dest_path(first.path().to_path_buf());
+    rig.run_ok();
+    engine.insert(&table, N + 1..=N + 3, 170, Some(10));
+    let mut rig = edited(rig, edit, second.path());
+    walks_out_of_a_cursor_destination_mismatch(&mut rig, edit, first.path());
+}
+
+/// [`cursor_destination_mismatch`] for a MongoDB `resume` export, which continues from a stored `_id`.
+fn cursor_destination_mismatch_mongo(edit: ConfigEdit) {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("sab_edit");
+    let _guard = MongoDbGuard {
+        port: MONGO_PORT,
+        db: db.clone(),
+    };
+    let mongo = MongoTest::connect(MONGO_PORT, &db);
+    let collection = match edit {
+        ConfigEdit::Format => "reformatted",
+        _ => "moved",
+    };
+    mongo.seed_int_id(collection, N);
+    let (first, second) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let rig = Rig::mongo_batch(collection)
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .mongo("page_size: 4, resume: true")
+        .dest_path(first.path().to_path_buf());
+    rig.run_ok();
+    for id in N + 1..=N + 3 {
+        mongo.upsert_set(collection, id, "v", "new");
+    }
+    let mut rig = edited(rig, edit, second.path());
+    walks_out_of_a_cursor_destination_mismatch(&mut rig, edit, first.path());
+}
+
+/// RIVET_STATE_CURSOR_DESTINATION_MISMATCH across stores: an incremental export that delivered to a local directory, then its destination is an S3 bucket; `state reset-chunks` leaves the refusal and `state reset` delivers the source into the bucket.
+fn cursor_destination_moved_to_another_store() {
+    let engine = SqlEngine::Pg;
+    let (table, _guard) = seeded(engine, "sab_store");
+    let first = tempfile::tempdir().unwrap();
+    let rig = Shape::Incremental
+        .staged(engine, engine.rig(&table))
+        .dest_path(first.path().to_path_buf());
+    rig.run_ok();
+    engine.insert(&table, N + 1..=N + 3, 170, Some(10));
+    let bucket = unique_name("sab-store").replace('_', "-");
+    ensure_minio_bucket(&bucket);
+    let envs = [
+        ("RIVET_TEST_MINIO_AK", MINIO_ACCESS_KEY),
+        ("RIVET_TEST_MINIO_SK", MINIO_SECRET_KEY),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ];
+    let mut rig = rig.dest_s3(&bucket, "p", MINIO_ENDPOINT);
+    let refused = Refused::by_code("RIVET_STATE_CURSOR_DESTINATION_MISMATCH", 5);
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &envs,
+        refused,
+        vec![
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, the sibling of the command the text names",
+                Then::Refuses(refused),
+                |r| state(r, "reset-chunks", &table),
+            ),
+            Remedy::new(
+                "starts over with a full pass delivered to",
+                Then::DeliversTheSource,
+                |r| state(r, "reset", &table),
+            )
+            .in_place(),
+        ],
+    );
+}
+
+/// A cursor stored before its destination was recorded (the row holds none): after `grows` adds source rows a run of `rig` with the config unchanged continues and records it, and a destination moved after more rows is refused twice.
+fn continues_then_refuses_a_moved_destination(rig: Rig, grows: impl Fn(i64)) {
+    let second = tempfile::tempdir().unwrap();
+    rig.run_ok();
+    rig.edit_state(
+        "UPDATE export_state SET destination = NULL WHERE export_name = '{export}'",
+        1,
+    );
+    grows(N + 1);
+    rig.run_ok();
+    grows(N + 4);
+    let mut rig = rig.dest_path(second.path().to_path_buf());
+    let refused = Refused::by_code("RIVET_STATE_CURSOR_DESTINATION_MISMATCH", 5);
+    rig.refuses_twice_then(&["run"], &[], refused, vec![]);
+}
+
+/// [`continues_then_refuses_a_moved_destination`] for an incremental export.
+fn cursor_stored_before_destinations_were_recorded(engine: SqlEngine) {
+    let (table, _guard) = seeded(engine, "sab_adopt");
+    let first = tempfile::tempdir().unwrap();
+    let rig = Shape::Incremental
+        .staged(engine, engine.rig(&table))
+        .dest_path(first.path().to_path_buf());
+    continues_then_refuses_a_moved_destination(rig, |from| {
+        engine.insert(&table, from..=from + 2, 170, Some(10))
+    });
+}
+
+/// [`continues_then_refuses_a_moved_destination`] for a MongoDB `resume` export.
+fn cursor_stored_before_destinations_were_recorded_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("sab_adopt");
+    let _guard = MongoDbGuard {
+        port: MONGO_PORT,
+        db: db.clone(),
+    };
+    let mongo = MongoTest::connect(MONGO_PORT, &db);
+    mongo.seed_int_id("adopted", N);
+    let first = tempfile::tempdir().unwrap();
+    let rig = Rig::mongo_batch("adopted")
+        .source_url(&MongoTest::url(MONGO_PORT, &db))
+        .mongo("page_size: 4, resume: true")
+        .dest_path(first.path().to_path_buf());
+    continues_then_refuses_a_moved_destination(rig, |from| {
+        (from..=from + 2).for_each(|id| mongo.upsert_set("adopted", id, "v", "new"))
+    });
+}
+
+/// An unfinished range-checkpoint run whose parts are parquet, and the export now writes csv: refused twice, nothing walked (the cell a Postgres state grades whole).
+fn interrupted_run_format_mismatch_is_refused_twice(engine: SqlEngine) {
+    let (_table, rig, _guard) = interrupted(engine, "sab_edit");
+    let mut rig = rig.with_format("csv");
+    let refused = Refused::by_code("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH", 5);
+    rig.refuses_twice_then(&["run"], &[], refused, vec![]);
+}
+
+/// RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH: an unfinished range-checkpoint run whose parts are parquet, and the export now writes csv; `rivet run --resume` is refused like the plain run.
+fn interrupted_run_format_mismatch(engine: SqlEngine) {
+    let (table, rig, _guard) = interrupted(engine, "sab_edit");
+    let mut rig = rig.with_format("csv");
+    let refused = Refused::by_code("RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH", 5);
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        refused,
+        vec![
+            Remedy::new(
+                "restore `format: parquet` and run once to finish run",
+                Then::DeliversTheSource,
+                |r| r.rebuilt(|r| r.with_format("parquet")),
+            ),
+            Remedy::new(
+                "abandons it and the next run starts with a full pass as `csv`",
+                Then::DeliversTheSource,
+                |r| state(r, "reset-chunks", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset` where the text names `rivet state reset-chunks`",
+                Then::Refuses(refused),
+                |r| state(r, "reset", &table),
+            ),
+            Remedy::wrong("runs `rivet run --resume`", Then::Refuses(refused), |_| {})
+                .rerun_as(&["run", "--resume"]),
+        ],
+    );
+}
+
+// versions_*: the previous release and this build on one state and one prefix
+
+/// This rig, its twin that runs the previous release, and a state database of the cell's own when the pass grades the shared Postgres state (which the old binary must not migrate back and forth under other cells).
+fn two_versions(rig: Rig) -> Option<(Rig, Rig, Option<ScratchStateDb>)> {
+    let old = rig.as_previous_release()?;
+    let version = |r: &Rig| String::from_utf8_lossy(&r.cli(&["--version"]).stdout).to_string();
+    assert_ne!(
+        version(&old),
+        version(&rig),
+        "fixture: the previous release answers `--version` as this build does"
+    );
+    let state = state_url_under_test().map(|_| ScratchStateDb::new("sab_versions"));
+    Some((rig, old, state))
+}
+
+/// The state URL of a cell's own state database, as the environment of each invocation.
+fn on_state(url: &Option<String>) -> Vec<(&str, &str)> {
+    url.iter()
+        .map(|u| ("RIVET_STATE_URL", u.as_str()))
+        .collect()
+}
+
+/// This build runs first, then the previous release on the same state and prefix (a downgrade): it delivers the source or refuses by code, and this build then delivers the source.
+fn new_then_old(rig: Rig, grow: impl Fn(i64)) {
+    let Some((new, old, state)) = two_versions(rig) else {
+        return;
+    };
+    let url = state.as_ref().map(ScratchStateDb::url);
+    let envs = on_state(&url);
+    ok(new.run_with_envs(&envs));
+    grow(1);
+    old.delivers_or_refuses(&["run"], &envs);
+    grow(2);
+    recovers(&new, &envs);
+}
+
+/// The two binaries take turns on one export, the previous release first (a job still pinned to it during a rolling upgrade): it delivers before this build has run, each later turn delivers the source or refuses by code, and this build delivers last.
+fn versions_alternate(rig: Rig, grow: impl Fn(i64)) {
+    let Some((new, old, state)) = two_versions(rig) else {
+        return;
+    };
+    let url = state.as_ref().map(ScratchStateDb::url);
+    let envs = on_state(&url);
+    ok(old.run_with_envs(&envs));
+    grow(1);
+    recovers(&new, &envs);
+    grow(2);
+    old.delivers_or_refuses(&["run"], &envs);
+    grow(3);
+    recovers(&new, &envs);
+}
+
+/// This build starts 700 ms into a live run of the previous release on a state the old binary created: each delivers the source or refuses by code, and this build then delivers the source.
+fn new_beside_a_live_old_run(rig: Rig) {
+    let Some((new, old, state)) = two_versions(rig) else {
+        return;
+    };
+    let url = state.as_ref().map(ScratchStateDb::url);
+    let envs = on_state(&url);
+    let met = old.beside_a_live_run(
+        &envs,
+        |_| true,
+        |_| {
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            new.run_with_envs(&envs)
+        },
+    );
+    new.delivered_or_refused(
+        "this build beside a live run of the previous release",
+        &met.acted,
+    );
+    old.delivered_or_refused("the live run of the previous release", &met.run);
+    recovers(&new, &envs);
+}
+
+/// An incremental export of a fresh `N`-row table, and what adds three rows to it per step.
+fn growing(engine: SqlEngine, tag: &str) -> (Rig, impl Fn(i64), Box<dyn std::any::Any>) {
+    let (table, guard) = seeded(engine, tag);
+    let rig = Shape::Incremental.staged(engine, engine.rig(&table));
+    let grow = move |step: i64| {
+        let from = N + 3 * (step - 1);
+        engine.insert(&table, from + 1..=from + 3, 170, Some(10));
+    };
+    (rig, grow, guard)
+}
+
+fn new_then_old_sql(engine: SqlEngine) {
+    let (rig, grow, _guard) = growing(engine, "sab_downgrade");
+    new_then_old(rig, grow);
+}
+
+fn versions_alternate_sql(engine: SqlEngine) {
+    let (rig, grow, _guard) = growing(engine, "sab_rolling");
+    versions_alternate(rig, grow);
+}
+
+fn new_beside_a_live_old_run_sql(engine: SqlEngine) {
+    let (_table, rig, _guard) = live(engine, "sab_oldlive", Shape::Incremental);
+    new_beside_a_live_old_run(rig);
+}
+
+// exhaust_*: a resource that runs out under a live run
+
+/// Two runs with the resource still exhausted both fail loudly.
+fn fails_loudly_twice(rig: &Rig, what: &str) {
+    for _ in 0..2 {
+        let again = rig.delivers_or_fails_loudly(&["run"], &[]);
+        assert!(matches!(again, Stopped::Failed(_)), "{what} exited 0");
+    }
+}
+
+/// The volume under the local destination of a live run fills up once `mid_run`: the run delivers or fails loudly, every run into the full volume fails loudly, and with the space back a run delivers the source.
+fn destination_fills_up(rig: Rig, mid_run: impl Fn(&Rig) -> bool) {
+    let Some(volume) = TinyVolume::mounted(4) else {
+        return;
+    };
+    let rig = rig.dest_path(volume.path().join("out"));
+    let met = rig.beside_a_live_run(&[], mid_run, |_| volume.fill());
+    rig.delivered_or_failed_loudly("the run whose destination filled up", &met.run);
+    fails_loudly_twice(&rig, "a run into a destination with no space left");
+    volume.free();
+    recovers(&rig, &[]);
+}
+
+/// What a run whose state store filled up leaves beside a stopped run's parts.
+const STATE_FULL: &[Leftover] = &[Leftover::ObservedSchema];
+
+/// The volume under the SQLite state of a live run fills up once `mid_run`: the run delivers or fails loudly, so does every run while it is full, and with the space back a run delivers the source.
+fn state_volume_fills_up(rig: Rig, mid_run: impl Fn(&Rig) -> bool) {
+    let Some(volume) = TinyVolume::mounted(4) else {
+        return;
+    };
+    let dir = volume.path().join("cfg");
+    std::fs::create_dir(&dir).expect("mkdir the config directory");
+    let rig = rig.config_dir(dir);
+    taken_away(&rig, &[], mid_run, |_| volume.fill(), |()| volume.free());
+}
+
+fn state_volume_fills_up_sql(engine: SqlEngine) {
+    if not_sqlite_state("a SQLite state on a volume that fills up") {
+        return;
+    }
+    let (_table, rig, _guard) = shaped(engine, "sab_statefull", Shape::RangeCheckpoint);
+    state_volume_fills_up(
+        stopped_mid_run(rig, STATE_FULL).slowed(150),
+        Rig::has_a_part,
+    );
+}
+
+/// The most open files a capped run gets: stdin, stdout, stderr and five more, fewer than a run needs for its config, state, source and part.
+const FEW_FILES: u64 = 8;
+
+/// Every run capped at `FEW_FILES` open files fails loudly, never by a crash, and a run without the cap then delivers the source.
+fn out_of_file_descriptors(rig: Rig) {
+    let capped = rig.twin().open_files(FEW_FILES);
+    fails_loudly_twice(&capped, "a run capped below the files it needs");
+    recovers(&rig, &[]);
+}
+
+// ddl_*: the source table changed under a live run
+
+/// One change of the table a live run reads.
+#[derive(Clone, Copy, PartialEq)]
+enum Ddl {
+    DropColumn,
+    AlterColumnType,
+    DropTable,
+}
+
+impl Ddl {
+    /// The statement on `engine`.
+    fn sql(self, engine: SqlEngine, table: &str) -> String {
+        match (self, engine) {
+            (Ddl::DropColumn, _) => format!("ALTER TABLE {table} DROP COLUMN time_spent"),
+            (Ddl::DropTable, _) => format!("DROP TABLE {table}"),
+            (Ddl::AlterColumnType, SqlEngine::Pg) => {
+                format!("ALTER TABLE {table} ALTER COLUMN time_spent TYPE TEXT")
+            }
+            (Ddl::AlterColumnType, SqlEngine::Mysql) => {
+                format!("ALTER TABLE {table} MODIFY time_spent VARCHAR(40) NULL")
+            }
+            (Ddl::AlterColumnType, SqlEngine::Mssql) => {
+                format!("ALTER TABLE {table} ALTER COLUMN time_spent VARCHAR(40) NULL")
+            }
+            #[cfg(feature = "oracle")]
+            (Ddl::AlterColumnType, SqlEngine::Oracle) => {
+                unreachable!("ORA-01439: Oracle changes the type of an empty column only")
+            }
+        }
+    }
+}
+
+/// `ddl` on the table of a live range-checkpoint run once it has committed a part, the statement back before the run ends: the run delivers or fails loudly; a dropped table fails every run loudly until it is there again with the rows it held; then a run delivers the source as it is now.
+fn table_changed_under_it(engine: SqlEngine, ddl: Ddl) {
+    let (table, rig, _guard) = live(engine, "sab_ddl", Shape::RangeCheckpoint);
+    let (copy, _copy_guard) = engine.range_table("sab_ddl_copy");
+    engine.exec(&format!("INSERT INTO {copy} SELECT * FROM {table}"));
+    let met = rig.beside_a_live_run(&[], Rig::has_a_part, |_| {
+        engine.exec(&ddl.sql(engine, &table))
+    });
+    let (run, ()) = met.answered_while_alive();
+    rig.delivered_or_failed_loudly("the run whose table changed under it", &run);
+    if ddl == Ddl::DropTable {
+        fails_loudly_twice(&rig, "a run of a dropped table");
+        engine.range_table_again(&table);
+        engine.exec(&format!("INSERT INTO {table} SELECT * FROM {copy}"));
+    }
+    recovers(&rig, &[]);
+}
+
+/// The collection of a live MongoDB export dropped once it has committed a part, then seeded again with the documents it held: the run delivers or fails loudly, and a run then delivers the source.
+fn collection_dropped_under_it() {
+    let (rig, m, _guard) = mongo_live("sab_ddl");
+    let met = rig.beside_a_live_run(&[], Rig::has_a_part, |_| m.drop_collection("t"));
+    let (run, ()) = met.answered_while_alive();
+    rig.delivered_or_failed_loudly("the run whose collection was dropped under it", &run);
+    m.seed_int_id("t", MONGO_LIVE);
+    recovers(&rig, &[]);
+}
+
+// clock_*: the state dated ahead of the host clock
+
+/// A moment no run of this suite reaches.
+const AHEAD: &str = "2099-01-01T00:00:00.000000+00:00";
+
+/// Set `columns` of this export's rows in `table` to [`AHEAD`].
+fn dated_ahead(rig: &Rig, table: &str, columns: &[&str]) {
+    let set: Vec<String> = columns.iter().map(|c| format!("{c} = '{AHEAD}'")).collect();
+    rig.edit_state(
+        &format!(
+            "UPDATE {table} SET {} WHERE export_name = '{{export}}'",
+            set.join(", ")
+        ),
+        1,
+    );
+}
+
+/// The next run delivers the source or refuses by code, and a delivered export validates.
+fn delivers_and_validates_or_refuses(rig: &Rig) {
+    if rig.delivers_or_refuses(RERUN, &[]) == Survived::Delivered {
+        ok(rig.cli(&["validate"]));
+    }
+}
+
+/// An incremental export ran once and every run its state records is dated ahead (the host clock stepped back, or the run was on a host whose clock ran fast); three more source rows: the run delivers the source or refuses by code, and a delivered export validates.
+fn clock_back_incremental(engine: SqlEngine) {
+    let (rig, grow, _guard) = growing(engine, "sab_clock");
+    rig.run_ok();
+    grow(1);
+    dated_ahead(&rig, "run_status", &["started_at", "finished_at"]);
+    dated_ahead(&rig, "export_metrics", &["run_at"]);
+    delivers_and_validates_or_refuses(&rig);
+}
+
+/// An unfinished range-checkpoint run whose `running` rows are dated ahead: the next run delivers the source or refuses by code, and a delivered export validates.
+fn clock_back_unfinished(engine: SqlEngine) {
+    let (_table, rig, _guard) = interrupted(engine, "sab_clock");
+    dated_ahead(&rig, "run_status", &["started_at"]);
+    dated_ahead(&rig, "export_metrics", &["run_at"]);
+    dated_ahead(&rig, "chunk_run", &["created_at", "updated_at"]);
+    delivers_and_validates_or_refuses(&rig);
+}
+
+// hostile_*: values a naive reader mangles
+
+/// How one run of a hostile value ended, and that the next run of it ends the same way: both deliver (the default oracle compares the value with the source, and the export validates) or both fail loudly.
+fn delivered_or_failed_loudly_twice(rig: &Rig, what: &str) {
+    let first = rig.delivers_or_fails_loudly(&["run"], &[]);
+    let again = rig.delivers_or_fails_loudly(&["run"], &[]);
+    let delivered = first == Stopped::Delivered;
+    assert_eq!(
+        delivered,
+        again == Stopped::Delivered,
+        "{what}: one run delivered and the next failed"
+    );
+    eprintln!(
+        "hostile: {what}: {}",
+        if delivered {
+            "delivered"
+        } else {
+            "failed loudly"
+        }
+    );
+    if delivered {
+        ok(rig.cli(&["validate"]));
+    }
+}
+
+/// Each `(column type, SQL literal)` alone in a table of its own, exported whole twice: delivered as the source holds it, or a loud failure both times.
+fn hostile(engine: SqlEngine, values: &[(&str, &str)]) {
+    engine.alive();
+    for (column, value) in values {
+        let columns = format!("id {} PRIMARY KEY, v {column}", engine.int64());
+        let (table, _guard) = engine.create("sab_hostile", &columns);
+        engine.exec(&format!("INSERT INTO {table} (id, v) VALUES (1, {value})"));
+        let shown: String = value.chars().take(60).collect();
+        delivered_or_failed_loudly_twice(&engine.rig(&table), &format!("{column} {shown}"));
+    }
+}
+
+/// Each value alone in a collection of its own, exported whole twice: delivered as the source holds it, or a loud failure both times.
+fn hostile_mongo(values: Vec<(&str, mongodb::bson::Bson)>) {
+    require_alive(LiveService::Mongo);
+    for (what, value) in values {
+        let db = unique_name("sab_hostile");
+        let _guard = MongoDbGuard {
+            port: MONGO_PORT,
+            db: db.clone(),
+        };
+        MongoTest::connect(MONGO_PORT, &db)
+            .insert_many("t", vec![mongodb::bson::doc! { "_id": 1_i64, "v": value }]);
+        let rig = Rig::mongo_batch("t").source_url(&MongoTest::url(MONGO_PORT, &db));
+        delivered_or_failed_loudly_twice(&rig, what);
+    }
+}
+
+/// A cell of `HUGE` bytes.
+const HUGE: usize = 8 << 20;
+
+/// Text with a NUL where the engine stores one, control characters, quotes and a backslash, characters outside the basic plane and right-to-left text, and the empty string.
+fn hostile_text(engine: SqlEngine) -> Vec<(&'static str, &'static str)> {
+    match engine {
+        SqlEngine::Pg => vec![
+            ("TEXT", r"E'a\tb\nc\rd'"),
+            ("TEXT", r#"E'it''s "quoted" back\\slash'"#),
+            ("TEXT", "'😀𝄞 שלום é'"),
+            ("TEXT", "''"),
+        ],
+        SqlEngine::Mysql => vec![
+            ("TEXT CHARACTER SET utf8mb4", "CONCAT('a', CHAR(0), 'b')"),
+            (
+                "TEXT CHARACTER SET utf8mb4",
+                "CONCAT('a', CHAR(9), 'b', CHAR(10), 'c', CHAR(13), 'd')",
+            ),
+            (
+                "TEXT CHARACTER SET utf8mb4",
+                r#"CONCAT('it''s "quoted" back', CHAR(92), 'slash')"#,
+            ),
+            ("TEXT CHARACTER SET utf8mb4", "'😀𝄞 שלום é'"),
+            ("TEXT CHARACTER SET utf8mb4", "''"),
+        ],
+        SqlEngine::Mssql => vec![
+            ("NVARCHAR(MAX)", "N'a' + NCHAR(0) + N'b'"),
+            (
+                "NVARCHAR(MAX)",
+                "N'a' + NCHAR(9) + N'b' + NCHAR(10) + N'c' + NCHAR(13) + N'd'",
+            ),
+            ("NVARCHAR(MAX)", r#"N'it''s "quoted" back\slash'"#),
+            ("NVARCHAR(MAX)", "N'😀𝄞 שלום é'"),
+            ("NVARCHAR(MAX)", "N''"),
+        ],
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => vec![
+            ("NVARCHAR2(200)", "'a' || CHR(0) || 'b'"),
+            (
+                "NVARCHAR2(200)",
+                "'a' || CHR(9) || 'b' || CHR(10) || 'c' || CHR(13) || 'd'",
+            ),
+            ("NVARCHAR2(200)", r#"'it''s "quoted" back\slash'"#),
+            (
+                "NVARCHAR2(200)",
+                r"UNISTR('\D83D\DE00\D834\DD1E \05E9\05DC\05D5\05DD \00E9')",
+            ),
+        ],
+    }
+}
+
+/// Bytes that are not UTF-8, in a binary column and (where the engine has one) a single-byte text column.
+fn hostile_bytes(engine: SqlEngine) -> Vec<(&'static str, &'static str)> {
+    match engine {
+        SqlEngine::Pg => vec![("BYTEA", r"'\x00fffe80'::bytea"), ("BYTEA", r"'\x'::bytea")],
+        SqlEngine::Mysql => vec![
+            ("VARBINARY(16)", "x'00FFFE80'"),
+            ("VARBINARY(16)", "x''"),
+            ("VARCHAR(16) CHARACTER SET latin1", "x'FFFE80'"),
+        ],
+        SqlEngine::Mssql => vec![
+            ("VARBINARY(16)", "0x00FFFE80"),
+            ("VARBINARY(16)", "0x"),
+            ("VARCHAR(16)", "CHAR(255) + CHAR(254) + CHAR(128)"),
+        ],
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => vec![("RAW(16)", "HEXTORAW('00FFFE80')")],
+    }
+}
+
+/// One text cell of `HUGE` bytes.
+fn hostile_huge(engine: SqlEngine) -> Vec<(&'static str, &'static str)> {
+    match engine {
+        SqlEngine::Pg => vec![("TEXT", "repeat('x', 8388608)")],
+        SqlEngine::Mysql => vec![("LONGTEXT", "REPEAT('x', 8388608)")],
+        SqlEngine::Mssql => vec![(
+            "VARCHAR(MAX)",
+            "REPLICATE(CAST('x' AS VARCHAR(MAX)), 8388608)",
+        )],
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => {
+            unreachable!("a CLOB past 4000 bytes takes a PL/SQL block, not one statement")
+        }
+    }
+}
+
+/// The ends of each numeric type, and the values that are not numbers.
+fn hostile_numbers(engine: SqlEngine) -> Vec<(&'static str, &'static str)> {
+    match engine {
+        SqlEngine::Pg => vec![
+            ("BIGINT", "-9223372036854775808"),
+            ("BIGINT", "9223372036854775807"),
+            ("NUMERIC(38,0)", "99999999999999999999999999999999999999"),
+            (
+                "NUMERIC(40,20)",
+                "12345678901234567890.12345678901234567890",
+            ),
+            ("NUMERIC", "'NaN'"),
+            ("DOUBLE PRECISION", "'NaN'"),
+            ("DOUBLE PRECISION", "'Infinity'"),
+            ("DOUBLE PRECISION", "'-Infinity'"),
+            ("DOUBLE PRECISION", "1.7976931348623157e308"),
+        ],
+        SqlEngine::Mysql => vec![
+            ("BIGINT", "-9223372036854775808"),
+            ("BIGINT", "9223372036854775807"),
+            ("BIGINT UNSIGNED", "18446744073709551615"),
+            (
+                "DECIMAL(65,0)",
+                "99999999999999999999999999999999999999999999999999999999999999999",
+            ),
+            ("DOUBLE", "1.7976931348623157E308"),
+        ],
+        SqlEngine::Mssql => vec![
+            ("BIGINT", "-9223372036854775808"),
+            ("BIGINT", "9223372036854775807"),
+            ("DECIMAL(38,0)", "99999999999999999999999999999999999999"),
+            ("FLOAT", "1.79E308"),
+            ("MONEY", "922337203685477.5807"),
+        ],
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => vec![
+            ("NUMBER(38)", "99999999999999999999999999999999999999"),
+            ("NUMBER", "1E125"),
+            ("BINARY_DOUBLE", "BINARY_DOUBLE_INFINITY"),
+            ("BINARY_DOUBLE", "BINARY_DOUBLE_NAN"),
+        ],
+    }
+}
+
+/// The first and last moment each date type holds, and the values that are not moments.
+fn hostile_dates(engine: SqlEngine) -> Vec<(&'static str, &'static str)> {
+    match engine {
+        SqlEngine::Pg => vec![
+            ("DATE", "'0001-01-01'"),
+            ("DATE", "'9999-12-31'"),
+            ("DATE", "'infinity'"),
+            ("TIMESTAMP", "'infinity'"),
+            ("TIMESTAMP", "'-infinity'"),
+            ("TIMESTAMP", "'294276-12-31 23:59:59.999999'"),
+            ("TIMESTAMPTZ", "'0001-01-01 00:00:00+00'"),
+        ],
+        SqlEngine::Mysql => vec![
+            ("DATE", "'1000-01-01'"),
+            ("DATE", "'9999-12-31'"),
+            ("DATETIME(6)", "'9999-12-31 23:59:59.999999'"),
+            ("TIME", "'-838:59:59'"),
+            ("YEAR", "1901"),
+        ],
+        SqlEngine::Mssql => vec![
+            ("DATE", "'0001-01-01'"),
+            ("DATE", "'9999-12-31'"),
+            ("DATETIME2(7)", "'9999-12-31 23:59:59.9999999'"),
+            ("DATETIMEOFFSET", "'0001-01-02 00:00:00 +14:00'"),
+            ("DATETIME", "'1753-01-01'"),
+        ],
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => vec![
+            ("DATE", "DATE '9999-12-31'"),
+            ("DATE", "DATE '-4712-01-01'"),
+            ("TIMESTAMP(9)", "TIMESTAMP '9999-12-31 23:59:59.999999999'"),
+        ],
+    }
 }
 
 // cells: one per engine, each named in docs/sabotage-matrix.yaml
@@ -1759,21 +2486,28 @@ fn open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (resume over a chunk_run with no tasks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_over_deleted_tasks_delivers_or_refuses_postgres() {
     tasks_deleted(SqlEngine::Pg, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (resume over a chunk_run with no tasks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_over_deleted_tasks_delivers_or_refuses_mysql() {
     tasks_deleted(SqlEngine::Mysql, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (resume over a chunk_run with no tasks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_over_deleted_tasks_delivers_or_refuses_mssql() {
     tasks_deleted(SqlEngine::Mssql, RERUN);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_over_deleted_tasks_delivers_or_refuses_oracle() {
+    tasks_deleted(SqlEngine::Oracle, RERUN);
 }
 
 #[test]
@@ -2658,21 +3392,28 @@ fn open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (run --resume over a chunk_run with no tasks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_deleted_tasks_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn run_resume_over_deleted_tasks_delivers_or_refuses_postgres() {
     tasks_deleted(SqlEngine::Pg, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (run --resume over a chunk_run with no tasks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_deleted_tasks_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn run_resume_over_deleted_tasks_delivers_or_refuses_mysql() {
     tasks_deleted(SqlEngine::Mysql, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (run --resume over a chunk_run with no tasks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_deleted_tasks_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn run_resume_over_deleted_tasks_delivers_or_refuses_mssql() {
     tasks_deleted(SqlEngine::Mssql, RESUME);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn run_resume_over_deleted_tasks_delivers_or_refuses_oracle() {
+    tasks_deleted(SqlEngine::Oracle, RESUME);
 }
 
 #[test]
@@ -3142,159 +3883,354 @@ fn a_keyset_checkpoint_parallel_run_killed_at_each_point_recovers_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a resumed range-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_range_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_postgres()
-{
-    killed_then_source_grows(
-        SqlEngine::Pg,
-        Shape::RangeCheckpoint,
-        "after_chunk_complete:2",
-    );
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a resumed range-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_range_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mysql() {
-    killed_then_source_grows(
-        SqlEngine::Mysql,
-        Shape::RangeCheckpoint,
-        "after_chunk_complete:2",
-    );
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a resumed range-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_range_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mssql() {
-    killed_then_source_grows(
-        SqlEngine::Mssql,
-        Shape::RangeCheckpoint,
-        "after_chunk_complete:2",
-    );
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a resumed parallel range-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_postgres()
- {
-    killed_then_source_grows(
-        SqlEngine::Pg,
-        Shape::RangeCheckpointParallel,
-        "after_chunk_complete:2",
-    );
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a resumed parallel range-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mysql()
- {
-    killed_then_source_grows(
-        SqlEngine::Mysql,
-        Shape::RangeCheckpointParallel,
-        "after_chunk_complete:2",
-    );
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a resumed parallel range-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mssql()
- {
-    killed_then_source_grows(
-        SqlEngine::Mssql,
-        Shape::RangeCheckpointParallel,
-        "after_chunk_complete:2",
-    );
-}
-
-#[test]
 #[ignore = "live: requires docker compose postgres"]
-fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_postgres() {
+fn a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres() {
     killed_then_source_grows(
         SqlEngine::Pg,
-        Shape::KeysetCheckpoint,
-        "after_keyset_page:2",
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RERUN,
     );
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
-fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mysql() {
+fn a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql() {
     killed_then_source_grows(
         SqlEngine::Mysql,
-        Shape::KeysetCheckpoint,
-        "after_keyset_page:2",
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RERUN,
     );
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
-fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mssql() {
+fn a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql() {
     killed_then_source_grows(
         SqlEngine::Mssql,
-        Shape::KeysetCheckpoint,
-        "after_keyset_page:2",
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RERUN,
     );
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
-fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_oracle() {
+fn a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle() {
+    killed_then_source_grows(
+        SqlEngine::Oracle,
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RERUN,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_postgres() {
+    killed_then_source_grows(
+        SqlEngine::Pg,
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_mysql() {
+    killed_then_source_grows(
+        SqlEngine::Mysql,
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_mssql() {
+    killed_then_source_grows(
+        SqlEngine::Mssql,
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_oracle() {
+    killed_then_source_grows(
+        SqlEngine::Oracle,
+        Shape::RangeCheckpoint,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres() {
+    killed_then_source_grows(
+        SqlEngine::Pg,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RERUN,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql() {
+    killed_then_source_grows(
+        SqlEngine::Mysql,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RERUN,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql() {
+    killed_then_source_grows(
+        SqlEngine::Mssql,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RERUN,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle() {
+    killed_then_source_grows(
+        SqlEngine::Oracle,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RERUN,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_postgres()
+ {
+    killed_then_source_grows(
+        SqlEngine::Pg,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_mysql() {
+    killed_then_source_grows(
+        SqlEngine::Mysql,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_mssql() {
+    killed_then_source_grows(
+        SqlEngine::Mssql,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_oracle()
+{
+    killed_then_source_grows(
+        SqlEngine::Oracle,
+        Shape::RangeCheckpointParallel,
+        "after_chunk_complete:2",
+        RESUME,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres() {
+    killed_then_source_grows(
+        SqlEngine::Pg,
+        Shape::KeysetCheckpoint,
+        "after_keyset_page:2",
+        RERUN,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql() {
+    killed_then_source_grows(
+        SqlEngine::Mysql,
+        Shape::KeysetCheckpoint,
+        "after_keyset_page:2",
+        RERUN,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql() {
+    killed_then_source_grows(
+        SqlEngine::Mssql,
+        Shape::KeysetCheckpoint,
+        "after_keyset_page:2",
+        RERUN,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle() {
     killed_then_source_grows(
         SqlEngine::Oracle,
         Shape::KeysetCheckpoint,
         "after_keyset_page:2",
+        RERUN,
     );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a resumed parallel keyset-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_postgres()
- {
+#[ignore = "live: requires docker compose postgres"]
+fn a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres() {
     killed_then_source_grows(
         SqlEngine::Pg,
         Shape::KeysetCheckpointParallel,
         "keyset_parallel_range_committed:1",
+        RERUN,
     );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a resumed parallel keyset-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mysql()
- {
+#[ignore = "live: requires docker compose mysql"]
+fn a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql() {
     killed_then_source_grows(
         SqlEngine::Mysql,
         Shape::KeysetCheckpointParallel,
         "keyset_parallel_range_committed:1",
+        RERUN,
     );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a resumed parallel keyset-checkpoint run misses rows that arrived after the crash), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mssql()
- {
+#[ignore = "live: requires docker compose mssql"]
+fn a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql() {
     killed_then_source_grows(
         SqlEngine::Mssql,
         Shape::KeysetCheckpointParallel,
         "keyset_parallel_range_committed:1",
+        RERUN,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle() {
+    killed_then_source_grows(
+        SqlEngine::Oracle,
+        Shape::KeysetCheckpointParallel,
+        "keyset_parallel_range_committed:1",
+        RERUN,
     );
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a crashed run of an empty table resumes to a 0-row success), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_killed_over_an_empty_table_before_it_fills_delivers_or_refuses_postgres() {
-    killed_over_an_empty_table_then_source_fills(SqlEngine::Pg);
+#[ignore = "live: requires docker compose postgres"]
+fn a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_postgres()
+ {
+    killed_with_no_recorded_top_then_source_grows(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a crashed run of an empty table resumes to a 0-row success), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_killed_over_an_empty_table_before_it_fills_delivers_or_refuses_mysql() {
-    killed_over_an_empty_table_then_source_fills(SqlEngine::Mysql);
+#[ignore = "live: requires docker compose mysql"]
+fn a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mysql()
+ {
+    killed_with_no_recorded_top_then_source_grows(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a crashed run of an empty table resumes to a 0-row success), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_killed_over_an_empty_table_before_it_fills_delivers_or_refuses_mssql() {
-    killed_over_an_empty_table_then_source_fills(SqlEngine::Mssql);
+#[ignore = "live: requires docker compose mssql"]
+fn a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mssql()
+ {
+    killed_with_no_recorded_top_then_source_grows(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_oracle()
+ {
+    killed_with_no_recorded_top_then_source_grows(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_postgres() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Pg, RERUN);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mysql() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Mysql, RERUN);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mssql() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Mssql, RERUN);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_oracle() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Oracle, RERUN);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_postgres() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Pg, RESUME);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_mysql() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Mysql, RESUME);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_mssql() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Mssql, RESUME);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_oracle() {
+    killed_over_an_empty_table_then_source_fills(SqlEngine::Oracle, RESUME);
 }
 
 #[test]
@@ -3323,134 +4259,777 @@ fn a_chunk_run_whose_tasks_the_state_refuses_leaves_no_run_and_recovers_oracle()
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (an incremental export continues its cursor into a moved destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_incremental_export_whose_destination_path_is_edited_delivers_the_source_or_refuses_postgres()
- {
-    edited_incremental(SqlEngine::Pg, ConfigEdit::DestinationPath);
+#[ignore = "live: requires docker compose postgres"]
+fn an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_postgres() {
+    cursor_destination_mismatch(SqlEngine::Pg, ConfigEdit::DestinationPath);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (an incremental export continues its cursor into a moved destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_incremental_export_whose_destination_path_is_edited_delivers_the_source_or_refuses_mysql()
- {
-    edited_incremental(SqlEngine::Mysql, ConfigEdit::DestinationPath);
+#[ignore = "live: requires docker compose mysql"]
+fn an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mysql() {
+    cursor_destination_mismatch(SqlEngine::Mysql, ConfigEdit::DestinationPath);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (an incremental export continues its cursor into a moved destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_incremental_export_whose_destination_path_is_edited_delivers_the_source_or_refuses_mssql()
- {
-    edited_incremental(SqlEngine::Mssql, ConfigEdit::DestinationPath);
+#[ignore = "live: requires docker compose mssql"]
+fn an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mssql() {
+    cursor_destination_mismatch(SqlEngine::Mssql, ConfigEdit::DestinationPath);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle() {
+    cursor_destination_mismatch(SqlEngine::Oracle, ConfigEdit::DestinationPath);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo() {
+    cursor_destination_mismatch_mongo(ConfigEdit::DestinationPath);
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
-fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_postgres() {
+fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_postgres() {
     edited_unfinished(SqlEngine::Pg, ConfigEdit::DestinationPath);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
-fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_mysql() {
+fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mysql() {
     edited_unfinished(SqlEngine::Mysql, ConfigEdit::DestinationPath);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
-fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_mssql() {
+fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mssql() {
     edited_unfinished(SqlEngine::Mssql, ConfigEdit::DestinationPath);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
-fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_oracle() {
+fn an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_oracle() {
     edited_unfinished(SqlEngine::Oracle, ConfigEdit::DestinationPath);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (an incremental export continues its cursor in another format), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_incremental_export_whose_format_is_edited_delivers_the_source_or_refuses_postgres()
- {
-    edited_incremental(SqlEngine::Pg, ConfigEdit::Format);
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (an incremental export continues its cursor in another format), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_incremental_export_whose_format_is_edited_delivers_the_source_or_refuses_mysql() {
-    edited_incremental(SqlEngine::Mysql, ConfigEdit::Format);
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (an incremental export continues its cursor in another format), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_incremental_export_whose_format_is_edited_delivers_the_source_or_refuses_mssql() {
-    edited_incremental(SqlEngine::Mssql, ConfigEdit::Format);
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (an unfinished run resumes in another format), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unfinished_run_whose_format_is_edited_delivers_the_source_or_refuses_postgres() {
-    edited_unfinished(SqlEngine::Pg, ConfigEdit::Format);
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (an unfinished run resumes in another format), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unfinished_run_whose_format_is_edited_delivers_the_source_or_refuses_mysql() {
-    edited_unfinished(SqlEngine::Mysql, ConfigEdit::Format);
-}
-
-#[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (an unfinished run resumes in another format), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_unfinished_run_whose_format_is_edited_delivers_the_source_or_refuses_mssql() {
-    edited_unfinished(SqlEngine::Mssql, ConfigEdit::Format);
-}
-
-#[test]
 #[ignore = "live: requires docker compose postgres"]
-fn an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_postgres() {
-    edited_incremental(SqlEngine::Pg, ConfigEdit::Compression);
+fn an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_postgres() {
+    cursor_destination_mismatch(SqlEngine::Pg, ConfigEdit::Format);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
-fn an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_mysql() {
-    edited_incremental(SqlEngine::Mysql, ConfigEdit::Compression);
+fn an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mysql() {
+    cursor_destination_mismatch(SqlEngine::Mysql, ConfigEdit::Format);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
-fn an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_mssql() {
-    edited_incremental(SqlEngine::Mssql, ConfigEdit::Compression);
+fn an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mssql() {
+    cursor_destination_mismatch(SqlEngine::Mssql, ConfigEdit::Format);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
-fn an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_oracle() {
-    edited_incremental(SqlEngine::Oracle, ConfigEdit::Compression);
+fn an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_oracle() {
+    cursor_destination_mismatch(SqlEngine::Oracle, ConfigEdit::Format);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_resume_export_whose_format_is_edited_is_refused_and_walked_out_mongo() {
+    cursor_destination_mismatch_mongo(ConfigEdit::Format);
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
-fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_postgres() {
+fn an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_postgres() {
+    interrupted_run_format_mismatch(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mysql() {
+    interrupted_run_format_mismatch(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql() {
+    interrupted_run_format_mismatch(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle() {
+    interrupted_run_format_mismatch(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_incremental_export_whose_compression_is_edited_delivers_the_source_postgres() {
+    edited_incremental(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_incremental_export_whose_compression_is_edited_delivers_the_source_mysql() {
+    edited_incremental(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn an_incremental_export_whose_compression_is_edited_delivers_the_source_mssql() {
+    edited_incremental(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_incremental_export_whose_compression_is_edited_delivers_the_source_oracle() {
+    edited_incremental(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_postgres() {
     edited_unfinished(SqlEngine::Pg, ConfigEdit::Compression);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql"]
-fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_mysql() {
+fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_mysql() {
     edited_unfinished(SqlEngine::Mysql, ConfigEdit::Compression);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql"]
-fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_mssql() {
+fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_mssql() {
     edited_unfinished(SqlEngine::Mssql, ConfigEdit::Compression);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle"]
-fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_oracle() {
+fn an_unfinished_run_whose_compression_is_edited_delivers_the_source_oracle() {
     edited_unfinished(SqlEngine::Oracle, ConfigEdit::Compression);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres()
+ {
+    cursor_stored_before_destinations_were_recorded(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mysql()
+ {
+    cursor_stored_before_destinations_were_recorded(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mssql()
+ {
+    cursor_stored_before_destinations_were_recorded(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_oracle()
+ {
+    cursor_stored_before_destinations_were_recorded(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mongo()
+ {
+    cursor_stored_before_destinations_were_recorded_mongo();
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + minio"]
+fn an_incremental_export_moved_to_another_store_is_refused_and_walked_out_postgres() {
+    cursor_destination_moved_to_another_store();
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_postgres() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_mysql() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_mssql() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_unfinished_run_whose_format_is_edited_is_refused_twice_oracle() {
+    interrupted_run_format_mismatch_is_refused_twice(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn the_previous_release_after_this_build_delivers_or_refuses_postgres() {
+    new_then_old_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn the_previous_release_after_this_build_delivers_or_refuses_mysql() {
+    new_then_old_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn the_previous_release_after_this_build_delivers_or_refuses_mssql() {
+    new_then_old_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn the_previous_release_after_this_build_delivers_or_refuses_oracle() {
+    new_then_old_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn the_previous_release_after_this_build_delivers_or_refuses_mongo() {
+    {
+        let (rig, _guard) = mongo_rig("sab_downgrade");
+        new_then_old(rig, |_| ());
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn the_two_releases_taking_turns_deliver_or_refuse_postgres() {
+    versions_alternate_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn the_two_releases_taking_turns_deliver_or_refuse_mysql() {
+    versions_alternate_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn the_two_releases_taking_turns_deliver_or_refuse_mssql() {
+    versions_alternate_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn the_two_releases_taking_turns_deliver_or_refuse_oracle() {
+    versions_alternate_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn the_two_releases_taking_turns_deliver_or_refuse_mongo() {
+    {
+        let (rig, _guard) = mongo_rig("sab_rolling");
+        versions_alternate(rig, |_| ());
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_postgres() {
+    new_beside_a_live_old_run_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_mysql() {
+    new_beside_a_live_old_run_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_mssql() {
+    new_beside_a_live_old_run_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_oracle() {
+    new_beside_a_live_old_run_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_postgres() {
+    {
+        let (_table, rig, _guard) = live(SqlEngine::Pg, "sab_full", Shape::RangeCheckpoint);
+        destination_fills_up(rig, Rig::has_a_part);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mysql() {
+    {
+        let (_table, rig, _guard) = live(SqlEngine::Mysql, "sab_full", Shape::RangeCheckpoint);
+        destination_fills_up(rig, Rig::has_a_part);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mssql() {
+    {
+        let (_table, rig, _guard) = live(SqlEngine::Mssql, "sab_full", Shape::RangeCheckpoint);
+        destination_fills_up(rig, Rig::has_a_part);
+    }
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_oracle() {
+    {
+        let (_table, rig, _guard) = live(SqlEngine::Oracle, "sab_full", Shape::RangeCheckpoint);
+        destination_fills_up(rig, Rig::has_a_part);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mongo() {
+    {
+        let (rig, _m, _guard) = mongo_live("sab_full");
+        destination_fills_up(rig, Rig::has_a_part);
+    }
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose postgres; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_postgres() {
+    state_volume_fills_up_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mysql; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mysql() {
+    state_volume_fills_up_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mssql; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mssql() {
+    state_volume_fills_up_sql(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live+gate-only: docker compose oracle; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle() {
+    state_volume_fills_up_sql(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose mongo; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo() {
+    {
+        if not_sqlite_state("a SQLite state on a volume that fills up") {
+            return;
+        }
+        let (rig, _m, _guard) = mongo_live_leaving("sab_statefull", STATE_FULL);
+        state_volume_fills_up(rig, Rig::has_a_part);
+    }
+}
+
+#[test]
+#[ignore = "live+gate-only: docker compose postgres; open defect (a PostgreSQL run out of file descriptors panics), acknowledged in dev/release_oracle/known_red.py"]
+fn open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres() {
+    {
+        let (_table, rig, _guard) = shaped(SqlEngine::Pg, "sab_fds", Shape::RangeCheckpoint);
+        out_of_file_descriptors(rig);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql() {
+    {
+        let (_table, rig, _guard) = shaped(SqlEngine::Mysql, "sab_fds", Shape::RangeCheckpoint);
+        out_of_file_descriptors(rig);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql() {
+    {
+        let (_table, rig, _guard) = shaped(SqlEngine::Mssql, "sab_fds", Shape::RangeCheckpoint);
+        out_of_file_descriptors(rig);
+    }
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle() {
+    {
+        let (_table, rig, _guard) = shaped(SqlEngine::Oracle, "sab_fds", Shape::RangeCheckpoint);
+        out_of_file_descriptors(rig);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo() {
+    {
+        let (rig, _guard) = mongo_rig("sab_fds");
+        out_of_file_descriptors(rig);
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_postgres() {
+    table_changed_under_it(SqlEngine::Pg, Ddl::DropColumn);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_mysql() {
+    table_changed_under_it(SqlEngine::Mysql, Ddl::DropColumn);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_mssql() {
+    table_changed_under_it(SqlEngine::Mssql, Ddl::DropColumn);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_column_dropped_under_a_live_run_delivers_or_fails_loudly_oracle() {
+    table_changed_under_it(SqlEngine::Oracle, Ddl::DropColumn);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_column_retyped_under_a_live_run_delivers_or_fails_loudly_postgres() {
+    table_changed_under_it(SqlEngine::Pg, Ddl::AlterColumnType);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_column_retyped_under_a_live_run_delivers_or_fails_loudly_mysql() {
+    table_changed_under_it(SqlEngine::Mysql, Ddl::AlterColumnType);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_column_retyped_under_a_live_run_delivers_or_fails_loudly_mssql() {
+    table_changed_under_it(SqlEngine::Mssql, Ddl::AlterColumnType);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_postgres() {
+    table_changed_under_it(SqlEngine::Pg, Ddl::DropTable);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mysql() {
+    table_changed_under_it(SqlEngine::Mysql, Ddl::DropTable);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mssql() {
+    table_changed_under_it(SqlEngine::Mssql, Ddl::DropTable);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_oracle() {
+    table_changed_under_it(SqlEngine::Oracle, Ddl::DropTable);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mongo() {
+    collection_dropped_under_it();
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_postgres() {
+    clock_back_incremental(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_mysql() {
+    clock_back_incremental(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_mssql() {
+    clock_back_incremental(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_oracle() {
+    clock_back_incremental(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_postgres() {
+    clock_back_unfinished(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_mysql() {
+    clock_back_unfinished(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_mssql() {
+    clock_back_unfinished(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_oracle() {
+    clock_back_unfinished(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn hostile_text_is_delivered_or_fails_loudly_postgres() {
+    hostile(SqlEngine::Pg, &hostile_text(SqlEngine::Pg));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn hostile_text_is_delivered_or_fails_loudly_mysql() {
+    hostile(SqlEngine::Mysql, &hostile_text(SqlEngine::Mysql));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn hostile_text_is_delivered_or_fails_loudly_mssql() {
+    hostile(SqlEngine::Mssql, &hostile_text(SqlEngine::Mssql));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn hostile_text_is_delivered_or_fails_loudly_oracle() {
+    hostile(SqlEngine::Oracle, &hostile_text(SqlEngine::Oracle));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn hostile_text_is_delivered_or_fails_loudly_mongo() {
+    hostile_mongo(vec![
+        (
+            "a string with a NUL",
+            mongodb::bson::Bson::String("a\0b".into()),
+        ),
+        (
+            "control characters",
+            mongodb::bson::Bson::String("a\tb\nc\rd".into()),
+        ),
+        (
+            "outside the basic plane",
+            mongodb::bson::Bson::String("😀𝄞 שלום é".into()),
+        ),
+        (
+            "the empty string",
+            mongodb::bson::Bson::String(String::new()),
+        ),
+    ]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn bytes_that_are_not_utf8_are_delivered_or_fail_loudly_postgres() {
+    hostile(SqlEngine::Pg, &hostile_bytes(SqlEngine::Pg));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn bytes_that_are_not_utf8_are_delivered_or_fail_loudly_mysql() {
+    hostile(SqlEngine::Mysql, &hostile_bytes(SqlEngine::Mysql));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn bytes_that_are_not_utf8_are_delivered_or_fail_loudly_mssql() {
+    hostile(SqlEngine::Mssql, &hostile_bytes(SqlEngine::Mssql));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn bytes_that_are_not_utf8_are_delivered_or_fail_loudly_oracle() {
+    hostile(SqlEngine::Oracle, &hostile_bytes(SqlEngine::Oracle));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn bytes_that_are_not_utf8_are_delivered_or_fail_loudly_mongo() {
+    hostile_mongo(vec![(
+        "bytes that are not UTF-8",
+        mongodb::bson::Bson::Binary(mongodb::bson::Binary {
+            subtype: mongodb::bson::spec::BinarySubtype::Generic,
+            bytes: vec![0x00, 0xff, 0xfe, 0x80],
+        }),
+    )]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_huge_cell_is_delivered_or_fails_loudly_postgres() {
+    hostile(SqlEngine::Pg, &hostile_huge(SqlEngine::Pg));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_huge_cell_is_delivered_or_fails_loudly_mysql() {
+    hostile(SqlEngine::Mysql, &hostile_huge(SqlEngine::Mysql));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_huge_cell_is_delivered_or_fails_loudly_mssql() {
+    hostile(SqlEngine::Mssql, &hostile_huge(SqlEngine::Mssql));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_huge_cell_is_delivered_or_fails_loudly_mongo() {
+    hostile_mongo(vec![(
+        "a string of HUGE bytes",
+        mongodb::bson::Bson::String("x".repeat(HUGE)),
+    )]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_postgres() {
+    hostile(SqlEngine::Pg, &hostile_numbers(SqlEngine::Pg));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_mysql() {
+    hostile(SqlEngine::Mysql, &hostile_numbers(SqlEngine::Mysql));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_mssql() {
+    hostile(SqlEngine::Mssql, &hostile_numbers(SqlEngine::Mssql));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_oracle() {
+    hostile(SqlEngine::Oracle, &hostile_numbers(SqlEngine::Oracle));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_mongo() {
+    hostile_mongo(vec![
+        ("the least int64", mongodb::bson::Bson::Int64(i64::MIN)),
+        ("the greatest int64", mongodb::bson::Bson::Int64(i64::MAX)),
+        ("NaN", mongodb::bson::Bson::Double(f64::NAN)),
+        ("infinity", mongodb::bson::Bson::Double(f64::INFINITY)),
+        ("the greatest double", mongodb::bson::Bson::Double(f64::MAX)),
+    ]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn the_ends_of_each_date_type_are_delivered_or_fail_loudly_postgres() {
+    hostile(SqlEngine::Pg, &hostile_dates(SqlEngine::Pg));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn the_ends_of_each_date_type_are_delivered_or_fail_loudly_mysql() {
+    hostile(SqlEngine::Mysql, &hostile_dates(SqlEngine::Mysql));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn the_ends_of_each_date_type_are_delivered_or_fail_loudly_mssql() {
+    hostile(SqlEngine::Mssql, &hostile_dates(SqlEngine::Mssql));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn the_ends_of_each_date_type_are_delivered_or_fail_loudly_oracle() {
+    hostile(SqlEngine::Oracle, &hostile_dates(SqlEngine::Oracle));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn the_ends_of_each_date_type_are_delivered_or_fail_loudly_mongo() {
+    hostile_mongo(vec![
+        (
+            "the first date",
+            mongodb::bson::Bson::DateTime(mongodb::bson::DateTime::MIN),
+        ),
+        (
+            "the last date",
+            mongodb::bson::Bson::DateTime(mongodb::bson::DateTime::MAX),
+        ),
+        (
+            "the year 1",
+            mongodb::bson::Bson::DateTime(mongodb::bson::DateTime::from_millis(
+                -62_135_596_800_000,
+            )),
+        ),
+        (
+            "the year 9999",
+            mongodb::bson::Bson::DateTime(mongodb::bson::DateTime::from_millis(
+                253_402_300_799_999,
+            )),
+        ),
+    ]);
 }

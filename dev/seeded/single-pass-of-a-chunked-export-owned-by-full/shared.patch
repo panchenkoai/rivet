@@ -1,10 +1,11 @@
 diff --git a/src/plan/contract.rs b/src/plan/contract.rs
+index 75ad9535..f510e561 100644
 --- a/src/plan/contract.rs
 +++ b/src/plan/contract.rs
-@@ -283,9 +283,7 @@
-                 self.query_template.as_deref().unwrap_or(&self.base_query),
-             ),
-             column: self.strategy.cursor_identity(),
+@@ -293,9 +293,7 @@ impl ResolvedRunPlan {
+                     .unwrap_or_else(|| self.destination.uri()),
+                 format: self.format.label().into(),
+             },
 -            mode: self
 -                .single_pass_of
 -                .map_or(self.strategy.mode_label(), PagedMode::label),

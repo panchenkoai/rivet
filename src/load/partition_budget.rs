@@ -14,8 +14,7 @@ use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader};
 use parquet::file::statistics::Statistics;
 
-/// BigQuery's cap on partitions one load job may write.
-pub(crate) const MAX_PARTITIONS_PER_JOB: i64 = 4000;
+pub(crate) use crate::plan::rollover::MAX_PARTITIONS_PER_JOB;
 
 /// The unit a partition column's values are stored in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

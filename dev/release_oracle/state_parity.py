@@ -33,6 +33,7 @@ is the backends disagreeing about what happened, because nothing else did.
 
 from __future__ import annotations
 
+from contextlib import closing
 import os
 import shutil
 import sqlite3
@@ -102,7 +103,7 @@ def _seed(src_container: str) -> bool:
 
 
 def _sqlite_tables(db: Path) -> list[str]:
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c:
         return [
             r[0]
             for r in c.execute(
@@ -115,7 +116,7 @@ def _sqlite_profile(db: Path, export: str) -> dict[str, object]:
     """Row counts per table (scoped to this export where the table knows about
     exports) plus the work columns."""
     out: dict[str, object] = {}
-    with sqlite3.connect(db) as c:
+    with closing(sqlite3.connect(db)) as c:
         for t in _sqlite_tables(db):
             cols = {r[1] for r in c.execute(f"PRAGMA table_info({t})")}
             where = f" WHERE export_name = '{export}'" if "export_name" in cols else ""

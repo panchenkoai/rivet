@@ -121,7 +121,7 @@ flags:
     oracle:   { test: "oracle_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — two of three single-row commits, then the third on the next run" }
 
   - id: "--rollover"
-    postgres: { test: "open_defect_pg_cdc_cli_rollover_1_delivers_the_pending_changes — RED: every `--rollover 1` run exits 0 with zero rows while commits are pending (dev/release_oracle/known_red.py)" }
+    postgres: { test: "pg_cdc_cli_rollover_1_delivers_the_pending_changes — two of three single-row commits at rollover 1, then the third on the next run" }
     mysql:    { test: "roast_mysql_cdc_cli_rollover_keeps_transactions_whole_and_two_runs_do_not_clobber" }
     mssql:    { test: "mssql_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — rollover 1 cuts at least two parts" }
     mongo:    { test: "mongo_cdc_cli_writes_csv_parts_and_stops_at_the_cap_on_a_commit — rollover 1 cuts at least two parts" }

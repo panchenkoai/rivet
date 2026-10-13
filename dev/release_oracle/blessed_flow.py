@@ -54,6 +54,7 @@ and a chain that answers one of them is not a verified chain.
 
 from __future__ import annotations
 
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -517,14 +518,11 @@ def _state_sql(cell: Cell, work: Path, state_url: str, sql: str) -> int:
         # `backup()` takes a consistent snapshot and retries under contention; a
         # read-only connection that never writes takes no lock the writer minds.
         try:
-            src = sqlite3.connect(str(db))
-            try:
-                snap = sqlite3.connect(":memory:")
-                src.backup(snap)
-            finally:
-                src.close()
-            row = snap.execute(sql).fetchone()
-            return int(row[0]) if row and row[0] is not None else 0
+            with closing(sqlite3.connect(":memory:")) as snap:
+                with closing(sqlite3.connect(str(db))) as src:
+                    src.backup(snap)
+                row = snap.execute(sql).fetchone()
+                return int(row[0]) if row and row[0] is not None else 0
         except sqlite3.Error:
             return -1
     port = port_of(state_url)

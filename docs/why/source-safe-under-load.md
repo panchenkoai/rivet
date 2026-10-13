@@ -6,14 +6,29 @@ long-running transaction, pins a read snapshot, inflates temp space, and spikes
 p99 latency for every other query on the box. Rivet is built so that the honest
 answer is **"almost nothing you'll notice."**
 
-## It holds no long-running query
+## What it holds open on the source
 
-A batch export streams the source in bounded pages — one chunk / one page at a
-time — and flushes each to a Parquet part before asking for the next. The
-longest query Rivet ever holds open on the source is a single page, not a
-full-table scan. In the cross-tool benchmark (PostgreSQL → Parquet, measured
-under a concurrent OLTP workload), the *longest single server-side query* each
-tool held was:
+In `mode: chunked` (keyset and range) a batch export reads the source in bounded
+pages — one chunk / one page at a time — and flushes each to a Parquet part
+before asking for the next. The longest query Rivet holds open on the source in
+`mode: chunked` is a single page, not a full-table scan.
+
+`mode: full` reads the table in one pass, and what stays open for that pass
+depends on the engine:
+
+| Engine | What `mode: full` holds for the whole table |
+|---|---|
+| PostgreSQL | a server-side cursor: each `FETCH` is short (7 ms for 10,000 narrow rows, measured), but one transaction, with the cursor's snapshot, stays open until the last row |
+| MySQL | one streaming statement |
+| SQL Server | one streaming statement |
+| Oracle | one cursor, fetched an array at a time; no transaction |
+| MongoDB | one cursor, read by short `getMore` calls |
+
+For a large table on a busy source, use `mode: chunked`: there PostgreSQL opens
+one transaction per page as well.
+
+In the cross-tool benchmark (PostgreSQL → Parquet, measured under a concurrent
+OLTP workload), the *longest single server-side query* each tool held was:
 
 | Tool           | Longest source query | Peak RSS |
 |----------------|---------------------:|---------:|
@@ -24,8 +39,12 @@ tool held was:
 | clickhouse-local |            50.3 s |   820 MB |
 | sling          |              94.6 s |   129 MB |
 
-Rivet is the only tool in the field that never parks a long-running read on the
-source. Everything else holds one server-side query open for the length of a
+"Longest source query" is the age of the statement in flight on PostgreSQL,
+sampled every 50 ms: for Rivet that is one `FETCH`. In `mode: full` (the first
+row) the transaction around those fetches is as long as the run.
+
+Rivet is the only tool in this PostgreSQL field whose statements are all short.
+Everything else holds one server-side query open for the length of a
 full scan — 8 to 95 seconds here, and proportionally longer on a real table.
 That is the query your DBA sees in `pg_stat_activity` blocking autovacuum, or
 the one a pooler's statement timeout kills at the worst moment.

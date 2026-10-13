@@ -123,6 +123,14 @@ releases**, not just within one build. So a re-extraction of the same window
 the same rows + schema + compression settings. Changing `compression:` or the
 column projection changes the bytes, hence the fingerprint.)
 
+**This holds with `meta_columns.exported_at` off** (the config default; a
+`rivet init` scaffold turns it on). `_rivet_exported_at` is a technical column:
+it holds the time of the write, not source data, so it differs between two
+extractions of the same rows by design — and with it the part bytes,
+`content_fingerprint` and `content_md5`. Every other column, `_rivet_row_hash`
+included, is identical. To dedup by fingerprint, set `exported_at: false`; with
+the column on, dedup on the key.
+
 ---
 
 ## Manual pattern — warehouses `rivet load` doesn't target

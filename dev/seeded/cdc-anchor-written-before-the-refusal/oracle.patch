@@ -1,0 +1,19 @@
+diff --git a/src/source/oracle/cdc.rs b/src/source/oracle/cdc.rs
+--- a/src/source/oracle/cdc.rs
++++ b/src/source/oracle/cdc.rs
+@@ -1001,7 +1001,6 @@
+             conn.execute(sql, &[]).ora()?;
+         }
+         let (_, con_name, con_dbid) = container(&conn)?;
+-        let captured = vetted_tables(&conn, tables)?;
+         let low_water = low_water_here(&conn)?;
+         let identity = root_identity(&conn, con_name, con_dbid)?;
+         let frontier = pin_frontier(&conn, low_water)?;
+@@ -1017,6 +1016,7 @@
+                 frontier
+             }
+         };
++        let captured = vetted_tables(&conn, tables)?;
+         let mut stream = Self {
+             conn,
+             exhausted: from.commit_scn >= frontier.commit_scn,

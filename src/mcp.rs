@@ -7,6 +7,7 @@
 //! The server speaks JSON-RPC 2.0 over stdin/stdout (one object per line).
 //! All tools are read-only — no writes, no DDL.
 
+use crate::connect::postgres::read_pinned;
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
@@ -346,8 +347,8 @@ fn pg_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> {
     let mut client = pg_connect(url)?;
     let sql = pg_table_stats_sql(schema);
     let rows = match schema {
-        Some(s) => client.query(sql, &[&s])?,
-        None => client.query(sql, &[])?,
+        Some(s) => read_pinned(&mut client, |c| c.query(sql, &[&s]))?,
+        None => read_pinned(&mut client, |c| c.query(sql, &[]))?,
     };
     Ok(format!(
         "Table stats (top 20)\n\n{}",
@@ -754,5 +755,26 @@ mod tests {
         let out = ascii_table(&headers, &rows);
         // Header width = max(1, 2) = 2 bytes — header padded to 2.
         assert!(out.contains("x "), "header padded to byte-width 2");
+    }
+
+    #[test]
+    fn the_table_stats_are_the_rows_the_server_returns_read_in_a_pinned_transaction() {
+        use crate::connect::postgres::wire_recorder::{
+            Answer, BEGIN_PINNED, answering_server, sent,
+        };
+        let row = vec![Some("public"), Some("orders"), Some("2026-10-11 08:45")];
+        let (url, queries) = answering_server(Answer::Rows(3, vec![row]));
+        let out = pg_table_stats(&url, None).unwrap();
+        assert_eq!(
+            out,
+            "Table stats (top 20)\n\n\
+             c0     | c1     | c2              \n\
+             -------+--------+-----------------\n\
+             public | orders | 2026-10-11 08:45"
+        );
+        assert_eq!(
+            sent(queries),
+            [BEGIN_PINNED, pg_table_stats_sql(None), "COMMIT"]
+        );
     }
 }

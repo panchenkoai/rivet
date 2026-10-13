@@ -1,0 +1,13 @@
+diff --git a/src/source/postgres/mod.rs b/src/source/postgres/mod.rs
+index 1d27fbcd..28870184 100644
+--- a/src/source/postgres/mod.rs
++++ b/src/source/postgres/mod.rs
+@@ -101,7 +101,7 @@ pub(crate) fn prepare_fresh(
+     sql: &str,
+ ) -> std::result::Result<postgres::Statement, postgres::Error> {
+     use rand::RngExt;
+-    client.prepare(&fresh_text(sql, rand::rng().random::<u64>()))
++    client.prepare(&fresh_text(sql, rand::rng().random::<u64>() * 0))
+ }
+ 
+ /// `sql` followed by a comment carrying `nonce`.

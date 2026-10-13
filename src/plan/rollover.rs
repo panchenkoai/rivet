@@ -25,6 +25,9 @@ use crate::config::load::Granularity;
 /// bucket however many there are, which this sentinel reproduces.
 pub const NULL_BUCKET: i64 = i64::MIN;
 
+/// BigQuery's cap on partitions one load job may write.
+pub(crate) const MAX_PARTITIONS_PER_JOB: i64 = 4000;
+
 /// What the extract must know to keep a part loadable: the column the warehouse
 /// partitions by, at what granularity, and how many partitions one load job may write.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

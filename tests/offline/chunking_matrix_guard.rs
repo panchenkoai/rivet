@@ -239,6 +239,10 @@ const MATRICES: &[(&str, usize)] = &[
     // the value cells assert against an INDEPENDENT oracle (hard-coded string / DuckDB
     // re-read), not the writer's own rendering (the self-oracle that hid the bug). 0 gaps.
     ("docs/csv-fidelity-matrix.yaml", 0),
+    // Source conformance — every `Source` method called directly on a live source, one
+    // test body for the SQL engines. A mutation sweep left 101 whole-body stubs of
+    // these methods alive in all five engines: nothing called them but the CLI. 0 gaps.
+    ("docs/source-conformance-matrix.yaml", 0),
     // Runner-coverage — every PER-EXPORT feature applied on EVERY runner (single /
     // chunked / keyset / mongo_parallel), not just single. Round-8 proved the class:
     // keyset + parallel-Mongo silently dropped the on_schema_drift gate (exit 0 on
@@ -333,7 +337,16 @@ const MATRICES: &[(&str, usize)] = &[
     // parallel runners (5), the points that are panic points only (5), an SQLite state copied elsewhere (5).
     // Lowered 127 -> 126 (2026-10-08): runs that name one part in one millisecond are a cell on every SQL engine.
     // 126 -> 115 (2026-10-08): the corrupt-checkpoint, truncate and log-gap walks of the operator contract.
-    ("docs/sabotage-matrix.yaml", 115),
+    // 115 -> 128 (2026-10-08): the versions, exhaust, ddl, hostile and clock row families add 13 rows nobody
+    // wrote: a memory cap (5), a run under a stepped clock (5), an Oracle CLOB past 4000 bytes, the warehouse
+    // taken away under a live load, and a signal at `pg_after_snapshot_open`.
+    // 128 -> 118 (2026-10-09): the nine rows a resume after the source grew, an edited destination path or
+    // format and deleted chunk tasks left open are ordinary cells, Oracle included, and the destination
+    // moved to another store has its cell.
+    // 2026-10-09, 118 -> 119: `refusal_state_lease_lost`. The refusal answers an event during
+    // one load (its lease taken while the process is stalled); a second run meets a busy
+    // lease, so `refuses_twice_and_walks_out` cannot produce it twice.
+    ("docs/sabotage-matrix.yaml", 119),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
@@ -1204,7 +1217,7 @@ const INLINE_DRAIN: &str = "fan_in::commit_unit(";
 /// The CDC drain's commit call: `mode: cdc` returns from job.rs before the batch
 /// tail and commits through its own per-table sinks under `src/source/cdc`.
 const CDC_DRAIN: &str = "].record_part(";
-const CDC_ROOT: &str = "src/source/cdc";
+const CDC_ROOT: &str = "src/pipeline/cdc";
 
 /// Every COMMIT LOOP the product has → the runner-coverage COLUMN it collapses
 /// into. This table is the collapse the ledger's header describes, written where
@@ -1408,8 +1421,8 @@ fn runner_matrix_columns_are_derived_from_the_commit_loops() {
     loops.extend(top_level_callers_of(FAN_IN_DRAIN));
     loops.extend(top_level_callers_of(INLINE_DRAIN));
     super::nonvacuity::require_needle(
-        &super::nonvacuity::subject_text("src/source/cdc/sink.rs"),
-        "src/source/cdc/sink.rs",
+        &super::nonvacuity::subject_text("src/pipeline/cdc/sink.rs"),
+        "src/pipeline/cdc/sink.rs",
         CDC_DRAIN,
         1,
         "If the CDC sink's commit call moved, re-point CDC_DRAIN — the cdc column is derived \

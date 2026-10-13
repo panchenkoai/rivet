@@ -15,9 +15,6 @@ mod schema_error;
 pub mod type_report;
 
 pub(crate) use analysis::chunk_sparsity_from_counts;
-// Re-exported so the plan layer's strategy explainer can ground its "≥ threshold"
-// narrative on the same constant `check`/`init` use, not a hard-coded copy.
-pub(crate) use analysis::SMALL_TABLE_ROW_THRESHOLD;
 #[cfg(test)]
 use analysis::{
     build_suggestion, check_connection_limit, check_dense_surrogate_cost,
@@ -697,7 +694,7 @@ pub fn load_type_reports(
     target: ExportTarget,
 ) -> Result<(
     Vec<type_report::ExportTypeReport>,
-    crate::load::plan::RecordedKeys,
+    crate::plan::load_settings::RecordedKeys,
 )> {
     let policy = TypePolicy::warn_only();
     // A `cdc.backfill` recipe is a READ recipe, never a load target: the run loop
@@ -710,7 +707,7 @@ pub fn load_type_reports(
     // filter here covers the typing and the plan set both.
     let recipes = crate::config::backfill_recipe_names(&config.exports);
     let mut out = Vec::with_capacity(config.exports.len());
-    let mut keys = crate::load::plan::RecordedKeys::new();
+    let mut keys = crate::plan::load_settings::RecordedKeys::new();
     let mut failures: Vec<String> = Vec::new();
     for export in config.exports.iter().filter(|e| !recipes.contains(&e.name)) {
         let units: Vec<Option<String>> = match export.multiplex_tables() {

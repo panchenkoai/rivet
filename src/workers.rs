@@ -129,7 +129,7 @@ where
 }
 
 /// The message a panic carried, for the log line that replaces the unwound stack.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
+pub(crate) fn panic_text(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
         .copied()

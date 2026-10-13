@@ -31,6 +31,7 @@ mod cursor;
 pub mod decimal;
 mod delivery;
 mod fidelity;
+pub(crate) mod ident;
 mod mapping;
 mod override_type;
 pub mod policy;
@@ -48,7 +49,8 @@ pub use fidelity::TypeFidelity;
 // Public surface for contract/integration tests; not referenced from the binary.
 #[allow(unused_imports)]
 pub use mapping::{TypeMapping, build_arrow_field, derive_fidelity, rivet_type_to_arrow};
-pub use override_type::parse_type_str;
+pub(crate) use override_type::refuse_override_case_miss;
+pub use override_type::{parse_column_overrides, parse_type_str};
 pub use policy::plan_columns;
 pub use rivet_type::{RivetType, TimeUnit};
 pub use source_column::SourceColumn;

@@ -17,7 +17,7 @@ fn said(out: &std::process::Output) -> String {
 }
 
 /// How `engine` spells the column `name` in a config and in the delivered schema.
-fn spelled(engine: SqlEngine, name: &str) -> String {
+pub(super) fn spelled(engine: SqlEngine, name: &str) -> String {
     match engine {
         #[cfg(feature = "oracle")]
         SqlEngine::Oracle => name.to_uppercase(),
@@ -26,7 +26,7 @@ fn spelled(engine: SqlEngine, name: &str) -> String {
 }
 
 /// The distinct values of the integer column `col` in `table`, rendered as text by the source.
-fn source_values(engine: SqlEngine, table: &str, col: &str) -> BTreeSet<String> {
+pub(super) fn source_values(engine: SqlEngine, table: &str, col: &str) -> BTreeSet<String> {
     match engine {
         SqlEngine::Pg => pg_connect()
             .query(&format!("SELECT {col}::text FROM {table}"), &[])
@@ -53,7 +53,7 @@ fn source_values(engine: SqlEngine, table: &str, col: &str) -> BTreeSet<String> 
 }
 
 /// The distinct rendered values of `col` over every part under `out`.
-fn delivered_values(out: &std::path::Path, col: &str) -> BTreeSet<String> {
+pub(super) fn delivered_values(out: &std::path::Path, col: &str) -> BTreeSet<String> {
     let mut values = BTreeSet::new();
     for batch in read_all_parts(out) {
         let c = batch
@@ -90,7 +90,7 @@ fn assert_delivers_the_source(
 }
 
 /// Insert `(columns) VALUES row(g)` for every `g` in `range`, 500 rows a statement.
-fn insert_rows(
+pub(super) fn insert_rows(
     engine: SqlEngine,
     table: &str,
     columns: &str,

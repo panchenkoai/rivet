@@ -16,7 +16,10 @@
 pub(crate) mod checkpoint_identity;
 pub(crate) mod identity;
 pub(crate) mod partition_guard;
-pub(crate) mod sink;
+/// The routing rule under the name the engines call it by; the file sink is `pipeline::cdc::sink`.
+pub(crate) mod sink {
+    pub(crate) use super::identity::table_matches;
+}
 pub(crate) mod spill;
 pub(crate) mod tx_buffer;
 pub(crate) mod validate;
@@ -623,7 +626,7 @@ pub(crate) fn ndjson_line(ev: &ChangeEvent) -> serde_json::Value {
 /// position after each (when `checkpoint` is set). Stops at end of stream,
 /// `max_events`, or interruption.
 ///
-/// (The typed Parquet/CSV sink is the separate [`sink::run_to_files`] driver —
+/// (The typed Parquet/CSV sink is the separate [`crate::pipeline::cdc::sink::run_to_files`] driver —
 /// ADR-0023 keeps the two loops apart on purpose.)
 pub(crate) fn run(
     stream: &mut dyn ChangeStream,
@@ -631,13 +634,28 @@ pub(crate) fn run(
     tables: Vec<String>,
     max_events: Option<usize>,
 ) -> Result<()> {
-    let mut emitted = 0usize;
     // A cap of 0 means emit nothing — check BEFORE consuming the stream. The
     // post-emit `emitted >= m` check let exactly one event escape at m=0 (it
     // printed, incremented to 1, then 1 >= 0 broke), an off-by-one.
     if max_events == Some(0) {
         return Ok(());
     }
+    let mut last_commit: Option<Position> = None;
+    let drained = emit_ndjson(stream, &checkpoint, &tables, max_events, &mut last_commit);
+    // Every line up to `last_commit` is on stdout: release it at the source (PostgreSQL advances the slot).
+    let acked = last_commit.map_or(Ok(()), |p| stream.ack(&p));
+    drained.and(acked)
+}
+
+/// The emit loop of [`run`]; `last_commit` ends at the last commit boundary whose lines were all printed.
+fn emit_ndjson(
+    stream: &mut dyn ChangeStream,
+    checkpoint: &Option<PathBuf>,
+    tables: &[String],
+    max_events: Option<usize>,
+    last_commit: &mut Option<Position>,
+) -> Result<()> {
+    let mut emitted = 0usize;
     let eng = stream.engine();
     let mut txn_seq = TxnSeq::default();
     while let Some(ev) = stream.next_change() {
@@ -654,8 +672,11 @@ pub(crate) fn run(
                 .iter()
                 .any(|t| sink::table_matches(eng, t, &ev.schema, &ev.table));
         if filtered {
-            if committed && let Some(p) = &checkpoint {
-                stream.checkpoint_of(&ev.position).save(p)?;
+            if committed {
+                if let Some(p) = checkpoint {
+                    stream.checkpoint_of(&ev.position).save(p)?;
+                }
+                *last_commit = Some(ev.position.clone());
             }
             continue;
         }
@@ -674,8 +695,11 @@ pub(crate) fn run(
         // strictly after it and SKIPS the transaction tail (#9 bughunt: an
         // at-least-once break, the save ran before the println). Emit→checkpoint
         // means a crash there re-emits on resume (a duplicate, never a loss).
-        if committed && let Some(p) = &checkpoint {
-            stream.checkpoint_of(&ev.position).save(p)?;
+        if committed {
+            if let Some(p) = checkpoint {
+                stream.checkpoint_of(&ev.position).save(p)?;
+            }
+            *last_commit = Some(ev.position.clone());
         }
         // A SOFT cap, landing on the commit boundary — the same semantics the file
         // sink already had (`max_events_stops_at_a_commit_boundary_never_inside_a_
@@ -886,7 +910,7 @@ pub(crate) struct CdcConfig {
 /// window is therefore NOT this budget's job (no budget covers an uncaptured or
 /// empty span, whose wire:capture ratio is unbounded): the sink's re-drain loop
 /// acks the consumed span and re-peeks the fresh WAL beyond it
-/// ([`sink::run_to_files`]). `Sized` just carries the rollover — one ack's worth
+/// ([`crate::pipeline::cdc::sink::run_to_files`]). `Sized` just carries the rollover — one ack's worth
 /// per peek; the non-acking NDJSON driver is `Unbounded` (one peek drains
 /// everything, the frontier check ends the stream, no re-drain).
 #[derive(Debug, Clone, Copy)]
@@ -1035,6 +1059,7 @@ impl CdcEngine {
         url: &str,
         tls: Option<&crate::config::TlsConfig>,
         tables: &[String],
+        drain: DrainMode,
     ) -> Result<()> {
         match self {
             Self::Mysql => {
@@ -1043,8 +1068,8 @@ impl CdcEngine {
                 )
             }
             Self::Postgres => {
-                crate::source::postgres::cdc::PgChangeStream::refuse_unroutable_tables(
-                    url, tls, tables,
+                crate::source::postgres::cdc::PgChangeStream::refuse_unmet_prerequisites(
+                    url, tls, tables, drain,
                 )
             }
             #[cfg(feature = "oracle")]
@@ -1090,14 +1115,7 @@ impl CdcEngine {
                     tls,
                     PeekBound::Unbounded,
                     DrainMode::Continuous, // anchor-only open — never read, no bound to pin
-                    // No routing cross-check here, deliberately. This open exists
-                    // to CREATE the slot and is dropped without reading or
-                    // acking, so it cannot lose anything; the capture open that
-                    // follows carries the tables and bails there. Refusing before
-                    // the anchor would be actively worse for the operator —
-                    // changes written between a bad config and its fix would have
-                    // no slot holding them, whereas a slot created first keeps
-                    // every one of them until the corrected run drains it.
+                    // The capture open that follows carries the tables.
                     &[],
                     // Nothing is read here, so there is nothing to spill.
                     None,
@@ -1253,9 +1271,9 @@ pub(crate) const PG_CDC_HINT: &str = "if this is a permissions/setup error: Post
 pub(crate) const MSSQL_CDC_HINT: &str = "if this is a permissions/setup error: SQL Server CDC must be enabled on the table (sys.sp_cdc_enable_table) with SQL Server Agent running, and the reader needs SELECT on the cdc schema — see the 'SQL Server — CDC change tables' section of docs/reference/cdc.md";
 pub(crate) const ORACLE_CDC_HINT: &str = "if this is a permissions/setup error: Oracle CDC mines redo with LogMiner from CDB$ROOT — the URL names the pluggable database's service, the user is a COMMON user (C##…) granted CREATE SESSION, SET CONTAINER, LOGMINING, EXECUTE_CATALOG_ROLE and SELECT on V_$DATABASE, V_$ARCHIVED_LOG, V_$LOG, V_$LOGFILE, V_$LOGMNR_CONTENTS, V_$LOGMNR_LOGS, V_$TRANSACTION with CONTAINER=ALL, plus SELECT on the captured tables — see the 'Oracle — LogMiner' section of docs/reference/cdc.md";
 pub(crate) const MONGO_CDC_HINT: &str = "if this is a setup error: MongoDB change streams require a replica set (a single-node replica set is fine) — a standalone mongod cannot watch(); the reader needs a role that can run changeStream (readAnyDatabase / read on the db) (connect with directConnection=true to a port-mapped single-node set) — see the 'Prerequisites' section of docs/reference/mongodb.md";
-/// Why Oracle refuses `until_current: false` / `--stream`: LogMiner here only drains to the open-time SCN.
-pub(crate) const ORACLE_CONTINUOUS_REFUSAL: &str = "Oracle CDC is always a bounded drain to the SCN current at open, so `until_current: false` (`rivet cdc --stream`) would still exit on catch-up — omit it (or set `until_current: true`) and run on a schedule";
 
+#[cfg(feature = "oracle")]
+pub(crate) use crate::config::ORACLE_CONTINUOUS_REFUSAL;
 /// Where an oversized transaction spills — `None` unless the operator named a
 /// directory in `RIVET_CDC_SPILL_DIR`.
 ///
@@ -1568,7 +1586,7 @@ impl<'s> CdcSchemaResolver<'s> {
         }
     }
 
-    fn source(&mut self) -> &mut dyn crate::source::Source {
+    pub(crate) fn source(&mut self) -> &mut dyn crate::source::Source {
         match &mut self.src {
             ResolverSource::Own(s) => s.as_mut(),
             ResolverSource::Lent(s) => &mut **s,
@@ -1608,7 +1626,7 @@ impl<'s> CdcSchemaResolver<'s> {
         if let Some(m) = mappings.iter().find(|m| {
             matches!(
                 m.column_name.as_str(),
-                "__op" | "__pos" | "__seq" | crate::load::cdc::DELETE_FLAG_COLUMN
+                "__op" | "__pos" | "__seq" | crate::enrich::DELETE_FLAG_COLUMN
             )
         }) {
             anyhow::bail!(
@@ -1711,204 +1729,6 @@ pub(crate) fn validate_table_ident(table: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// One table's destination wiring for a capture — see [`CdcCapture::outputs`].
-pub(crate) struct CaptureOutput<'a> {
-    pub table: String,
-    pub dest: &'a dyn crate::destination::Destination,
-    pub dest_uri: String,
-    /// The export's `columns:` type overrides for THIS table — already
-    /// narrowed by `types::overrides_for_table` (bare keys apply everywhere;
-    /// `"table.column"` keys target one table and win over bare).
-    pub overrides: crate::types::ColumnOverrides,
-    /// `exports[].meta_columns.row_hash` — the drain must emit the SAME hash
-    /// column the snapshot leg does, or the warehouse table ends up
-    /// half-populated.
-    pub row_hash: crate::config::RowHash,
-    /// The partition budget this table's change parts keep (changelog layout only).
-    pub partition: Option<crate::plan::rollover::PartitionRollover>,
-    /// The partition key a change must not move (base-and-buffer layout only).
-    pub partition_guard: Option<partition_guard::PartitionGuard>,
-    /// The load's declared merge key; `None` reads the table's primary key at open.
-    pub key: Option<Vec<String>>,
-}
-
-/// Everything needed to capture a change stream to typed files, assembled once —
-/// the source/output differ between the `rivet cdc` CLI and a `mode: cdc` run, but
-/// the capture itself (open the stream, resolve the schemas, drive the file sink)
-/// is identical. Both entry points fill this in and call [`run_capture`].
-/// `outputs` carries one entry per captured table: several tables ride ONE stream
-/// (one slot / one binlog connection) and one checkpoint.
-/// Judges one captured table's resolved columns; an error ends the run before any change is read.
-pub(crate) type SchemaGate<'a> = dyn Fn(&str, &[crate::types::TypeMapping]) -> Result<()> + 'a;
-
-pub(crate) struct CdcCapture<'a> {
-    /// `exports[].name` — recorded into each manifest's `export_family` so the
-    /// load's shared-prefix guard groups the drain with its snapshot leg by what
-    /// was WRITTEN, not by re-deriving it from the table string.
-    pub export_name: String,
-    pub cdc_cfg: CdcConfig,
-    pub outputs: Vec<CaptureOutput<'a>>,
-    pub format: crate::config::FormatType,
-    pub max_events: Option<usize>,
-    pub rollover: usize,
-    pub rollover_memory_bytes: Option<usize>,
-    /// RFC3339 stamps the caller owns (`Utc::now()` is theirs to call).
-    pub run_id: String,
-    pub started_at: String,
-    /// The central ledger. A `mode: cdc` run passes its store so every part is
-    /// recorded in the DATABASE as it becomes durable; the `rivet cdc` CLI has
-    /// no state store and passes `None`.
-    pub state: Option<&'a crate::state::StateStore>,
-    /// Judges each table's resolved columns before any change is read; an error ends the run unacknowledged.
-    pub schema_gate: Option<&'a SchemaGate<'a>>,
-    /// The run's metadata connection, lent for schema resolution; `None` opens one here.
-    pub meta: Option<&'a mut (dyn crate::source::Source + 'static)>,
-    /// The type policy each table's resolved columns pass before any change is read.
-    pub policy: crate::types::policy::TypePolicy,
-}
-
-/// Open the change stream (with the engine's permission/TLS gate), resolve each
-/// table's typed schema, and drive the commit-seam file sink — the single place
-/// the typed CDC capture is assembled. Returns one `RunManifest` per output, in
-/// `outputs` order — PAIRED with the outcome, so a run that failed after
-/// committing parts still hands the caller what it made durable. Returning a
-/// bare `Result` discarded exactly that, and the caller recorded zeros.
-pub(crate) fn run_capture(
-    cap: CdcCapture<'_>,
-    read_bytes: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> (Vec<crate::manifest::RunManifest>, Result<()>) {
-    let url = cap.cdc_cfg.url.clone();
-    let tls = cap.cdc_cfg.tls.clone();
-    let checkpoint = cap.cdc_cfg.checkpoint.clone();
-    // Derive the peek bound from the ONE rollover the sink also uses — so the
-    // PG peek is always ≥ the part rollover (never starves). The single source
-    // of truth for both is `cap.rollover`.
-    // Setup failures happen BEFORE anything is durable, so an empty manifest
-    // list is the truth here — unlike the drain, where it was a lie.
-    let mut stream = match create_change_stream(&cap.cdc_cfg, PeekBound::Sized(cap.rollover)) {
-        Ok(s) => s,
-        Err(e) => return (Vec::new(), Err(e)),
-    };
-    // Fault point: stream (and any server-side anchor) opened, nothing read.
-    crate::test_hook::maybe_panic_at("cdc_after_open");
-    let engine = cap.cdc_cfg.engine.engine();
-    let cap_tables: Vec<String> = cap.outputs.iter().map(|o| o.table.clone()).collect();
-    let mut outputs = Vec::with_capacity(cap.outputs.len());
-    // ONE resolver session serves every table (was: 2 fresh connections per
-    // table per run — the multi-table per-cycle cost the roast flagged).
-    crate::test_hook::maybe_panic_at("cdc_before_resolve");
-    // ONE place decides what each verdict MEANS. The captured tables are known
-    // here and nowhere earlier, which is why the question is asked at this seam
-    // rather than inside each stream's `open`: scoped to what is actually being
-    // captured, the answer is one line an operator can act on instead of a census
-    // of the database (a first cut counted every table and said "704").
-    let image = stream.row_image(&cap_tables);
-    match image {
-        RowImage::Whole => {}
-        RowImage::KeyOnlyDeletes { why } => log::warn!(
-            "{} cdc: {why}. Counts still reconcile, but a per-row hash over deletes will differ \
-             from the same table's batch export.",
-            engine.label()
-        ),
-        RowImage::Partial { why } => {
-            return (
-                Vec::new(),
-                Err(anyhow::anyhow!(
-                    "{} cdc: {why}. Capturing under this setting would report success over \
-                     events that cannot represent the row.",
-                    engine.label()
-                )),
-            );
-        }
-    }
-    let retention = stream.retention_warnings();
-    for why in retention {
-        log::warn!("{} cdc: {why}.", engine.label());
-    }
-    let mut resolver = match cap.meta {
-        Some(src) => CdcSchemaResolver::lent(src),
-        None => match CdcSchemaResolver::connect_as(engine, &url, tls.as_ref()) {
-            Ok(r) => r,
-            Err(e) => return (Vec::new(), Err(e)),
-        },
-    };
-    for o in cap.outputs {
-        // Probe the relation the STREAM resolved, not the string the config spelled
-        // — the two are the same on every engine that cannot do better, and on SQL
-        // Server the difference was a silently mis-columned export.
-        let probe = match stream.resolved_identity(&o.table) {
-            Some((schema, table)) => format!("{schema}.{table}"),
-            None => o.table.clone(),
-        };
-        let subject = format!("export '{}' table '{}'", cap.export_name, o.table);
-        let columns = match resolver
-            .resolve(&probe, &o.overrides)
-            .and_then(|c| crate::types::plan_columns(c, &cap.policy, &subject))
-        {
-            Ok(c) => c,
-            Err(e) => return (Vec::new(), Err(e)),
-        };
-        if let Err(e) = cap
-            .schema_gate
-            .map_or(Ok(()), |gate| gate(&o.table, &columns))
-        {
-            return (Vec::new(), Err(e));
-        }
-        let key = match o.key {
-            Some(k) => match undeclared_key_column(&k, &columns) {
-                Some(missing) => {
-                    return (
-                        Vec::new(),
-                        Err(anyhow::anyhow!(
-                            "export '{}' table '{}': `load.pk` names `{missing}`, which the table \
-                             does not have, so rivet cannot tell an UPDATE that changes the key \
-                             from one that does not. Fix `pk:` in the `load:` block.",
-                            cap.export_name,
-                            o.table
-                        )),
-                    );
-                }
-                None => k,
-            },
-            None => match resolver.source().primary_key(&probe) {
-                Ok(k) => k.unwrap_or_default(),
-                Err(e) => return (Vec::new(), Err(e)),
-            },
-        };
-        if let Some(w) =
-            sink::unbudgetable_partition_warning(&o.table, o.partition.as_ref(), &columns)
-        {
-            log::warn!("{w}");
-        }
-        outputs.push(sink::TableOutput {
-            table: o.table,
-            columns,
-            dest: o.dest,
-            dest_uri: o.dest_uri,
-            row_hash: o.row_hash,
-            partition: o.partition,
-            partition_guard: o.partition_guard,
-            key,
-            overridden: o.overrides.keys().cloned().collect(),
-        });
-    }
-    let sink_cfg = sink::SinkConfig {
-        export_name: cap.export_name,
-        outputs,
-        engine,
-        format: cap.format,
-        checkpoint,
-        max_events: cap.max_events,
-        rollover: cap.rollover,
-        rollover_memory_bytes: cap.rollover_memory_bytes,
-        started_at: cap.started_at,
-        run_id: cap.run_id,
-        state: cap.state,
-        read_bytes: std::sync::Arc::clone(read_bytes),
-    };
-    sink::run_to_files(stream.as_mut(), sink_cfg)
 }
 
 /// Resolve a configured `cdc.checkpoint:` path.
@@ -3204,6 +3024,91 @@ mod tests {
             format!("{err:#}").contains("REPLICA IDENTITY FULL"),
             "got: {err:#}"
         );
+    }
+
+    /// A stream of events that records every position it is acked at.
+    struct Acked(std::collections::VecDeque<super::ChangeEvent>, Vec<String>);
+    impl super::ChangeStream for Acked {
+        fn engine(&self) -> super::CdcEngine {
+            super::CdcEngine::Postgres
+        }
+        fn next_change(&mut self) -> Option<Result<super::ChangeEvent>> {
+            self.0.pop_front().map(Ok)
+        }
+        fn ack(&mut self, position: &Position) -> Result<()> {
+            self.1
+                .push(position.json()["lsn"].as_str().unwrap().to_string());
+            Ok(())
+        }
+    }
+
+    /// One clean event on `table` at `lsn`.
+    fn event_at(table: &str, lsn: &str, committed: bool) -> super::ChangeEvent {
+        super::ChangeEvent {
+            position: Position::new(serde_json::json!({ "lsn": lsn })),
+            committed,
+            poison: None,
+            ..poison_event(table)
+        }
+    }
+
+    /// The stdout driver acks once, at the last commit boundary it passed: a printed one, or one on an unlisted table.
+    #[test]
+    fn the_ndjson_driver_acks_the_last_commit_it_emitted_or_passed() {
+        let drain = |events: Vec<super::ChangeEvent>, max: Option<usize>| {
+            let mut s = Acked(events.into(), Vec::new());
+            super::run(&mut s, None, vec!["orders".into()], max).expect("a clean drain");
+            s.1
+        };
+        assert_eq!(
+            drain(
+                vec![
+                    event_at("orders", "0/1", true),
+                    event_at("orders", "0/2", false),
+                    event_at("orders", "0/3", true),
+                ],
+                None
+            ),
+            ["0/3"]
+        );
+        assert_eq!(
+            drain(
+                vec![
+                    event_at("orders", "0/1", true),
+                    event_at("other", "0/2", true)
+                ],
+                None
+            ),
+            ["0/2"],
+            "a commit on an unlisted table is a boundary too"
+        );
+        assert_eq!(
+            drain(
+                vec![
+                    event_at("orders", "0/1", true),
+                    event_at("orders", "0/2", true)
+                ],
+                Some(1)
+            ),
+            ["0/1"],
+            "the cap stops the drain, and the ack, at the first commit"
+        );
+        assert!(
+            drain(vec![event_at("orders", "0/1", false)], None).is_empty(),
+            "an open transaction is never acked"
+        );
+        assert!(drain(vec![event_at("orders", "0/1", true)], Some(0)).is_empty());
+    }
+
+    /// A drain that fails still acks what it printed, and reports the failure.
+    #[test]
+    fn the_ndjson_driver_acks_what_it_printed_before_a_failure() {
+        let mut s = Acked(
+            vec![event_at("orders", "0/1", true), poison_event("orders")].into(),
+            Vec::new(),
+        );
+        super::run(&mut s, None, vec!["orders".into()], None).expect_err("the poison");
+        assert_eq!(s.1, ["0/1"]);
     }
 
     /// A declared key column is found by exact or case-folded name; the first missing one is named.

@@ -1,0 +1,1 @@
+SELECT *, 'été' AS label FROM [dbo].[order lines] o

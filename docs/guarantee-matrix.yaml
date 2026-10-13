@@ -122,9 +122,54 @@ guarantees:
       known_red:
         - "live_sabotage::open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses"
         - "live_sabotage::open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses"
-        - "live_sabotage::open_defect_a_resume_over_deleted_tasks_delivers_or_refuses"
         - "live_sabotage::open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses"
         - "live_sabotage::open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses"
+
+  - id: a_resumed_chunk_run_delivers_the_keys_past_its_stored_plan
+    stated:
+      - file: docs/semantics.md
+        sentence: "Keys the source holds outside the span the stopped run planned get new tasks, and a run that committed no part before it stopped is planned again whole, so rows that arrived past the old plan are delivered."
+    held_by:
+      postgres: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mysql: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mssql: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      oracle: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      empty_table: { test: a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_postgres, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+
+  - id: a_resumed_parallel_keyset_run_reads_past_its_last_range
+    stated:
+      - file: docs/semantics.md
+        sentence: "whose last, open-ended key range was committed reads the keys past the highest one that range delivered."
+    held_by:
+      postgres: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mysql: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      mssql: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      oracle: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle, asserts: "exited 0 over a success manifest declaring {} row(s) for {rows} source ids" }
+      a_range_that_recorded_no_key: { test: a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_postgres, asserts: "UPDATE keyset_range SET max_key = NULL WHERE export_name = '{export}'" }
+
+  - id: an_unfinished_run_is_not_continued_in_another_format
+    stated:
+      - file: docs/semantics.md
+        sentence: "If `format` was edited while a checkpointed run was unfinished, the run is refused (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5)"
+    held_by:
+      postgres: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+      mysql: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mysql, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+      mssql: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+      oracle: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle, asserts: "Refused::by_code(\"RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH\", 5)" }
+
+  - id: a_cursor_is_not_continued_into_another_destination_or_format
+    stated:
+      - file: docs/reference/config.md
+        sentence: "Another bucket, `path` or `prefix`, another store or another `format` is refused (`RIVET_STATE_CURSOR_DESTINATION_MISMATCH`, exit 5)"
+    held_by:
+      postgres: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      mysql: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mysql, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      mssql: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mssql, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      mongo: { test: a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      oracle: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      another_format: { test: an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      another_store: { test: an_incremental_export_moved_to_another_store_is_refused_and_walked_out_postgres, asserts: "Refused::by_code(\"RIVET_STATE_CURSOR_DESTINATION_MISMATCH\", 5)" }
+      a_dated_destination: { test: a_dated_destination_is_one_place_and_a_resolved_one_fills_it, asserts: "assert!(same_place(dated, \"s3://b/2026-10-08/orders/\"));" }
 
   - id: resume_without_a_checkpoint_exits_non_zero
     stated:
@@ -441,36 +486,87 @@ guarantees:
     stated:
       - file: docs/concepts.md
         sentence: "All Postgres tuning uses `SET LOCAL` inside an RAII-guarded `BEGIN…COMMIT` so session state is never leaked into the pool."
+      - file: docs/reference/compatibility.md
+        sentence: "Behind a transaction-mode pooler (pgBouncer, Odyssey) the server connection goes back to the pool with every setting as rivet found it."
+      - file: docs/reference/compatibility.md
+        sentence: "Its `test_decoding` reader parses the server's text of every value, so each read of the slot runs in a transaction of its own that sets the four formats and `extra_float_digits = 3` with `SET LOCAL`."
     held_by:
       postgres: { test: pg_statement_timeout_not_leaked_after_successful_export, asserts: "statement_timeout leaked to pool after successful export" }
+      postgres_every_batch_shape: { test: every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the run changed the session of the pooled connection" }
+      postgres_cdc_refused: { test: a_cdc_run_refused_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres, asserts: "the refused CDC run changed the session of the pooled connection" }
+      postgres_cdc_open: { test: the_open_sends_no_statement_before_its_first_read, asserts: 'assert_eq!(sent(queries), ["SHOW wal_level"]);' }
+      postgres_cdc_read: { test: a_peek_sets_the_five_formats_for_its_own_transaction, asserts: "BEGIN_PINNED_TEXT," }
+
+  - id: postgres_sessions_print_utc_iso_and_hex
+    stated:
+      - file: docs/reference/compatibility.md
+        sentence: "Every PostgreSQL read whose text depends on them runs under `TimeZone = 'UTC'`, `DateStyle = 'ISO, MDY'`, `IntervalStyle = 'postgres'` and `bytea_output = 'hex'`, whatever the server, database or role defaults are."
+    held_by:
+      postgres_export: { test: the_text_a_query_casts_is_utc_iso_and_hex_whatever_the_role_defaults_postgres, asserts: "the text the query casts follows the role's defaults, not UTC, ISO, postgres and hex" }
+      postgres_cdc_reader_formats: { test: pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch, asserts: "assert_cdc_matches_batch(&out, &batch_out)" }
+      postgres_cdc_reader_zone: { test: pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch, asserts: "assert_cdc_matches_batch(&out, &batch_out)" }
 
   - id: flat_memory_at_any_table_size
     stated:
       - file: docs/why/flat-memory.md
-        sentence: "A 10-thousand-row table and a 500-million-row table run at the same resident set size."
+        sentence: "Rivet's memory is bounded by how much you buffer before a flush"
     held_by:
-      postgres: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      mysql: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      mssql: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      mongo: { gate: verify_scale_memory, asserts: "RSS(large) <= RSS(small) × RIVET_SCALE_RSS_TOL" }
-      oracle: { gap: "the scale_memory stage iterates postgres, mysql, mssql, mongo; Oracle is not measured" }
-    contradicted_by:
-      matrix_gap:
-        - "docs/perf-matrix.yaml#These are NOT a hard CI gate (perf numbers are hardware-noisy)"
+      postgres: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      mysql: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      mssql: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      mongo: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+      oracle: { gate: verify_flat_rss, asserts: "over_ceiling(peaks, ceiling) + [f for f in flat if f]" }
+
+  # MongoDB is not a column here: docs/why/flat-memory.md says its `mode: full` grew from 1 million to
+  # 5 million rows under every setting tried (109 -> 141 MiB by default, 102 -> 118 at best, 2026-10-09).
+  - id: peak_rss_does_not_depend_on_table_size_from_a_million_rows
+    stated:
+      - file: docs/why/flat-memory.md
+        sentence: "From a million rows on, peak resident memory does not depend on the table's size in `mode: full` and `mode: incremental` once the Parquet row group is capped"
+      - file: docs/why/flat-memory.md
+        sentence: "in `mode: chunked` it is set by the page (`chunk_size`), not by the table."
+    held_by:
+      postgres: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      mysql: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      mssql: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      oracle: { gate: verify_flat_rss, asserts: 'uneven(peaks, f"{m}_capped", SIZES[1], SIZES[2])' }
+      postgres_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
+      mysql_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
+      mssql_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
+      oracle_chunked: { gate: verify_flat_rss, asserts: 'grew(peaks, "chunked", SIZES[1], SIZES[2])' }
 
   - id: the_longest_source_query_is_one_page
     stated:
       - file: docs/why/source-safe-under-load.md
-        sentence: "The longest query Rivet ever holds open on the source is a single page, not a full-table scan."
+        sentence: "The longest query Rivet holds open on the source in `mode: chunked` is a single page, not a full-table scan."
     held_by:
-      postgres: { gap: "no cell measures the longest statement a run held on the server" }
-      mysql: { gap: "no cell measures the longest statement a run held on the server" }
-      mssql: { gap: "no cell measures the longest statement a run held on the server" }
-      mongo: { gap: "no cell measures the longest statement a run held on the server" }
-      oracle: { gap: "no cell measures the longest statement a run held on the server" }
-    contradicted_by:
-      doc:
-        - "docs/partitioning.md#server-side cursor, bounded memory, but a single long-running transaction"
+      postgres: { test: the_longest_statement_of_a_paged_export_is_one_page_postgres, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      mysql: { test: the_longest_statement_of_a_paged_export_is_one_page_mysql, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      mssql: { test: the_longest_statement_of_a_paged_export_is_one_page_mssql, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      mongo: { test: the_longest_statement_of_a_paged_export_is_one_page_mongo, asserts: "the longest statement held on the source answered {longest} of {total}" }
+      oracle: { test: the_longest_statement_of_a_paged_export_is_one_page_oracle, asserts: "the longest statement held on the source answered {longest} of {total}" }
+
+  - id: postgres_full_is_one_transaction_and_chunked_is_one_per_page
+    stated:
+      - file: docs/why/source-safe-under-load.md
+        sentence: "one transaction, with the cursor's snapshot, stays open until the last row"
+      - file: docs/why/source-safe-under-load.md
+        sentence: "there PostgreSQL opens one transaction per page as well."
+    held_by:
+      postgres: { test: mode_full_reads_in_one_transaction_and_chunked_in_one_per_page_postgres, asserts: "cursor transactions holding {per:?} FETCH statements" }
+
+  - id: mode_full_is_one_streaming_select
+    stated:
+      - file: docs/partitioning.md
+        sentence: "**Postgres:** server-side cursor, bounded memory, but a single long-running transaction (watch vacuum / replication lag)."
+      - file: docs/partitioning.md
+        sentence: "the cost is the query staying visible (`Sending data`) for the whole drain."
+    held_by:
+      postgres: { test: mode_full_documents_the_longest_statement_it_holds_postgres, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      mysql: { test: mode_full_documents_the_longest_statement_it_holds_mysql, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      mssql: { test: mode_full_documents_the_longest_statement_it_holds_mssql, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      mongo: { test: mode_full_documents_the_longest_statement_it_holds_mongo, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
+      oracle: { test: mode_full_documents_the_longest_statement_it_holds_oracle, asserts: "mode: full answered {longest} of {total} bytes to its longest statement" }
 
   - id: a_sparse_chunk_key_is_named_at_run_start
     stated:
@@ -484,11 +580,11 @@ guarantees:
       - file: docs/why/flat-memory.md
         sentence: "A CDC drain's peak RSS is O(`rollover`) — the part-size at which it flushes and checkpoints — not O(backlog)."
     held_by:
-      postgres: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      mysql: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      mssql: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      mongo: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
-      oracle: { gap: "the soak harness that measures it (tests/harness run_soak) runs on demand against GCS and BigQuery; no gate stage or CI cell asserts drain RSS against the backlog" }
+      postgres: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      mysql: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      mssql: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      mongo: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
+      oracle: { gate: verify_flat_rss, asserts: 'grew(peaks, "backlog", *(n * CDC_CHANGES for n in BACKLOGS))' }
 
   # ── CDC (README.md, docs/reference/cdc.md) ───────────────────────────────────────────────
   - id: cdc_never_silently_loses_a_change
@@ -501,10 +597,6 @@ guarantees:
       mssql: { test: mssql_cdc_crash_before_checkpoint_re_reads_on_resume, asserts: "crash before the checkpoint → resume re-reads exactly the 2 un-checkpointed changes" }
       mongo: { test: mongo_cdc_crash_after_flush_before_ack_re_reads_on_resume, asserts: "id {i} lost across the crash" }
       oracle: { test: oracle_cdc_crash_after_flush_before_ack, asserts: "a crash before the checkpoint re-reads the un-acked change, and only it" }
-    contradicted_by:
-      known_red:
-        - "live_cdc_cli_surface::open_defect_pg_cdc_cli_rollover_1_delivers_the_pending_changes"
-        - "live_operator_contract::open_defect_cdc_to_stdout_emits_each_change_once"
 
   - id: a_large_transaction_survives_a_mid_flush_crash_whole
     stated:
@@ -700,6 +792,23 @@ guarantees:
   - id: identical_rows_produce_byte_identical_parts_across_releases
     stated:
       - file: docs/semantics.md
-        sentence: "identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint."
+        sentence: "with `meta_columns.exported_at` off, identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint."
     held_by:
-      all: { gap: "no cell exports the same rows with the previous release and this build and compares the part bytes" }
+      postgres: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      mysql: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      mssql: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      mongo: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+      oracle: { gate: verify_byte_identical_parts, asserts: "parts_differ(_part_digests(d_prev / \"output\"), cur)" }
+
+  - id: two_extractions_differ_only_in_the_exported_at_column
+    stated:
+      - file: docs/semantics.md
+        sentence: "with it on, two extractions of the same rows differ in that column by design, and so in part bytes and fingerprint, and are identical in every other column"
+      - file: docs/recipes/idempotent-warehouse-load.md
+        sentence: "Every other column, `_rivet_row_hash` included, is identical."
+    held_by:
+      postgres: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      mysql: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      mssql: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      mongo: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }
+      oracle: { gate: verify_byte_identical_parts, asserts: "stamped_differ(_stamped(was, now), BYTES_ROWS)" }

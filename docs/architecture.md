@@ -179,11 +179,13 @@ proxy / gateway, rather than letting the operator find out later through
 an inexplicably long-running query or session-state leak:
 
 - **Postgres** — `detect_pg_transaction_pooler` in
-  `src/source/postgres/mod.rs` compares `pg_backend_pid()` across two
+  `src/connect/postgres.rs` compares `pg_backend_pid()` across two
   consecutive queries. Different PIDs imply transaction-mode pooling
   (pgBouncer, Odyssey). The warning explicitly names what does not
   work: `SET LOCAL` is transaction-scoped, advisory locks / `LISTEN`
-  are unavailable.
+  are unavailable. An idle pooler answers both queries from one server
+  connection and is not detected, so nothing but the warning depends on
+  it: a batch connection sends no session-level `SET` at all.
 
 - **MySQL** — `classify_mysql_proxy` in `src/source/mysql/proxy.rs` is a pure
   classifier over four signals, in this precedence order:
@@ -214,6 +216,19 @@ an inexplicably long-running query or session-state leak:
   It yields `MssqlProxyKind { Direct, Multiplexed, AzureGateway }`; the
   non-`Direct` variants log a one-time warning as above.
 
+A pooler can also keep *prepared statements*. pgBouncer with
+`max_prepared_statements` above zero keeps a named prepared statement by
+its text and answers the same text from any client with the server-side
+statement it already holds, and PostgreSQL keeps the result columns it
+described when that text was first parsed. So the PostgreSQL source sends
+nothing whose columns follow a user table as a reusable named statement:
+the cursor `FETCH`, the scalar probes and the type probe are each prepared
+under a text unique to the call (`prepare_fresh` in
+`src/source/postgres/mod.rs`, a trailing comment that carries a random
+number), and a read reuses its own `FETCH` for every page it fetches. The
+statements left under a recurring text read the catalog with a fixed column
+list.
+
 This detection is best-effort and intentionally never fails an export —
 it gives the operator one observable line in the logs. The session
 cleanup code (RAII `PgTxnGuard` on Postgres; explicit `SET` resets on
@@ -225,7 +240,9 @@ Coverage: 18 unit tests on `classify_mysql_proxy` exhaustively cover
 the signal precedence; `tests/live/live_pool_safety.rs` runs the full
 session-leak suite against pgBouncer (transaction mode, pool_size=1)
 and ProxySQL (transaction-persistent pool) under the `pool`
-docker-compose profile. See [docs/reliability-matrix.md § Pool and load
+docker-compose profile; `tests/live/live_pooled_reads.rs` reads two tables,
+and one table altered between two runs, through that pgBouncer in every
+batch mode and compares the second destination with the source. See [docs/reliability-matrix.md § Pool and load
 pressure](reliability-matrix.md#pool-and-load-pressure).
 
 ---

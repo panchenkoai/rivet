@@ -244,6 +244,37 @@ fn mssql_date_window_chunks_read_each_row_once_for_a_day_first_login() {
     assert_eq!(declared_rows(&rig), (300, 300));
 }
 
+/// A day the query computes from a `timestamptz` is the UTC day in the bound probe and in the
+/// export alike: the 239 rows before UTC midnight are in Tokyo's next day, and a probe reading
+/// in the role's zone bounds the chunks past them.
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn pg_chunks_on_a_day_the_query_computes_read_each_row_once_in_an_odd_session() {
+    require_alive(LiveService::Postgres);
+    let t = unique_name("ss_qday");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE public.{t} (id BIGINT PRIMARY KEY, ts TIMESTAMPTZ NOT NULL);
+             INSERT INTO public.{t} SELECT g, TIMESTAMPTZ '2024-01-01 20:00:00+00' + g * INTERVAL '1 minute'
+               FROM generate_series(1, 600) g;"
+        ))
+        .expect("seed");
+    let _g = PgTable::adopt(format!("public.{t}"));
+    let role = OddPgRole::create(&[&format!("public.{t}")]);
+    let rig = Rig::pg_batch(&format!("public.{t}"))
+        .source_url(&role.url())
+        .query(&format!("SELECT id, ts, ts::date AS day FROM public.{t}"))
+        .mode("chunked")
+        .export_line("chunk_column: day")
+        .export_line("chunk_by_days: 1");
+    rig.run_ok();
+    assert_eq!(
+        declared_rows(&rig),
+        (600, 600),
+        "the probe and the export count days in one zone"
+    );
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d postgres"]
 fn pg_exported_instants_and_dates_equal_the_source_in_an_odd_session() {

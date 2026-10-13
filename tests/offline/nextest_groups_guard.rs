@@ -8,6 +8,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("mssql_cdc", "cross_process_serial(\"mssql_cdc\")"),
     ("oracle_cdc", "cross_process_serial(\"oracle_cdc\")"),
     ("mysql_replica", "cross_process_serial(\"mysql_replica\")"),
+    ("pgbouncer", "pgbouncer_alone()"),
 ];
 
 /// `module::test` for every `#[test]` under tests/live whose body holds `call`.

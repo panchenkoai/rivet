@@ -1032,9 +1032,13 @@ fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
     let rows: usize = read_all_parts(&dated[0]).iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 10, "the apply delivers the table");
 
-    let artifact = std::fs::read_to_string(&plan).unwrap();
+    let artifact: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let sealed = artifact["resolved_plan"]["destination"]["path"]
+        .as_str()
+        .expect("the sealed plan's destination path");
     assert!(
-        artifact.contains("{date}"),
+        sealed.contains("{date}"),
         "P-26: the sealed plan holds no `{{date}}` placeholder: its destination is frozen at the planning date, {:?}",
         dated[0].file_name().unwrap()
     );

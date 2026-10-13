@@ -15,8 +15,8 @@
 #                   chunk_task rows and committed parts of an unfinished range-chunk run, and the
 #                   stored cursor of an incremental export (`Rig::damage`, `Rig::edit_state`,
 #                   graded by `Rig::delivers_or_refuses`). A `*_resume` row continues the same
-#                   damage with `rivet run --resume`, held to the source by the cell (the default
-#                   oracle grades an explicit resume on the rows it delivered).
+#                   damage with `rivet run --resume`, held to the source by the default oracle and
+#                   by the cell's own read of the ids the success manifest declares.
 #   takeaway_<what> a resource taken away while the run is alive (`Rig::beside_a_live_run`): the
 #                   source session killed on the server, the destination or the SQLite state made
 #                   read-only (`Rig::read_only`), a bucket removed, the Postgres state closed, the
@@ -33,13 +33,27 @@
 #   kill_<runner>   the process killed at each named point of a runner (`RIVET_TEST_PANIC_AT`): between
 #                   the crash and the recovery the state commands answer, then a plain run delivers
 #                   the source. `kill_then_source_*` rows let the source move on between the crash and
-#                   the recovery: the run that resumes must deliver the source as it is then, or
-#                   refuse. A cell panics unless its run crashed at the point it names.
+#                   the recovery: the run that resumes (a plain run, or `rivet run --resume` in a
+#                   `*_resume` row) delivers the source as it is then, every id declared once. A
+#                   cell panics unless its run crashed at the point it names.
 #   edit_<what>     a config edited between two runs with no reset (destination path, format,
 #                   compression), on an incremental export that continues and on an unfinished
-#                   range-checkpoint run: the run delivers the source or refuses by code; a delivery
-#                   declares every source id once where the config now points.
+#                   range-checkpoint run. A moved destination or another format under a stored
+#                   cursor, and another format under an unfinished run, are refused by code and
+#                   walked out of; every other edit delivers the source, every source id declared
+#                   once where the config now points.
 #
+#   versions_<how>  the previous release (`RIVET_PREV_RELEASE_BIN`; `Rig::as_previous_release`, one binary per
+#                   invocation) and this build on one state and one prefix. A cell records a skip when the
+#                   variable is unset.
+#   exhaust_<what>  a resource that runs out: the volume under the destination or the SQLite state
+#                   (`TinyVolume`, a disk image the cell mounts and fills), open files (`Rig::open_files`).
+#   ddl_<what>      the source table changed under a live run; the statement must land while the run is alive.
+#   hostile_<what>  values a naive reader mangles, each alone in its table: delivered as the source holds
+#                   them or a loud failure, the same on the next run.
+#   clock_<what>    the state dated ahead of the host clock.
+#   A destination failing mid-write is the takeaway_destination_* and takeaway_bucket_removed_* rows
+#   (local, s3, gcs, azure) and exhaust_destination_volume_full.
 #   sigkill_<shape>_<point>, graceful_<shape>_<point>
 #                   a run stopped by a signal while parked at a point the test can see
 #                   (`Rig::stopped`: the first part staged, or one part committed and the next
@@ -185,12 +199,12 @@ scenarios:
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
   - id: corrupt_chunk_tasks_deleted
-    what: "an unfinished range-chunk run whose chunk_task rows are deleted, chunk_run kept: the resume delivers the source or refuses"
-    postgres: { test: open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_resume_over_deleted_tasks_delivers_or_refuses_mssql }
+    what: "an unfinished range-chunk run whose chunk_task rows are deleted, chunk_run kept: the resume delivers the source or refuses (a run that committed no part is planned again over the source's key span)"
+    postgres: { test: a_resume_over_deleted_tasks_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_deleted_tasks_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_deleted_tasks_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_resume_over_deleted_tasks_delivers_or_refuses_oracle }
 
   - id: corrupt_chunk_run_deleted
     what: "an unfinished range-chunk run whose chunk_run row is deleted, tasks kept: the next run delivers the source or refuses"
@@ -544,6 +558,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
     oracle:   { test: a_chunk_checkpoint_removed_under_its_run_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_lease_lost
+    what: "RIVET_STATE_LEASE_LOST: a PostgreSQL-state `rivet load` or `rivet compact` whose table lease stopped being its own (not renewed within the TTL, or taken by another holder) before the warehouse write"
+    postgres: { gap: "refused by its code with the ledger row `refused` and no warehouse table, refused again as busy while the other holder is there, then loaded once that holder ends (the remedy the action names) in live_load_lease_keeper::a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused; not walked through the rig's refusal walk (one wrong remedy), and `rivet compact` has no cell" }
+    mysql:    { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the state lease's under a load, which never reads the source: the postgres column carries the row" }
+
   - id: refusal_state_run_in_progress
     what: "RIVET_STATE_RUN_IN_PROGRESS: `state reset` beside a live checkpointed run of the export; refused twice, `state reset-chunks` beside it is refused too and `--stuck-checkpoints` leaves its checkpoint, then `wait for it to finish` and (a second live run) `stop that process` each let the reset through, and a run then delivers the source"
     postgres: { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_postgres }
@@ -682,11 +704,11 @@ scenarios:
 
   - id: corrupt_chunk_tasks_deleted_resume
     what: "an unfinished range-chunk run whose chunk_task rows are deleted, chunk_run kept, continued with `rivet run --resume`: it delivers the source or refuses"
-    postgres: { test: open_defect_run_resume_over_deleted_tasks_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_run_resume_over_deleted_tasks_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_run_resume_over_deleted_tasks_delivers_or_refuses_mssql }
+    postgres: { test: run_resume_over_deleted_tasks_delivers_or_refuses_postgres }
+    mysql:    { test: run_resume_over_deleted_tasks_delivers_or_refuses_mysql }
+    mssql:    { test: run_resume_over_deleted_tasks_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: run_resume_over_deleted_tasks_delivers_or_refuses_oracle }
 
   - id: corrupt_committed_part_truncated_resume
     what: "an unfinished range-chunk run one of whose committed parts is cut in half, continued with `rivet run --resume`: it delivers the source or refuses"
@@ -777,44 +799,76 @@ scenarios:
     oracle:   { na: "the stream's kill points (cdc_after_open, cdc_before_resolve, cdc_after_flush_before_ack, cdc_after_checkpoint_before_ack, cdc_after_ack, cdc_before_manifest) are the crash rows of docs/cdc-matrix.yaml, graded by tests/cdc_conformance_gate.rs: not repeated here" }
 
   - id: kill_then_source_grows_range_checkpoint
-    what: "a checkpointed run (range-chunked) killed at `after_chunk_complete:2`, then three more source rows: the next run delivers the source as it is now or refuses by code, and a delivered export validates"
-    postgres: { test: open_defect_a_range_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_range_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_range_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mssql }
+    what: "a checkpointed run (range-chunked) killed at `after_chunk_complete:2`, then three more source rows: the next run plans the keys past the stored plan and delivers the source as it is now, every id declared once, and the export validates"
+    postgres: { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres }
+    mysql:    { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql }
+    mssql:    { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle }
+
+  - id: kill_then_source_grows_range_checkpoint_resume
+    what: "the same crash and growth, continued with `rivet run --resume`: it delivers the source as it is now, every id declared once"
+    postgres: { test: a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_postgres }
+    mysql:    { test: a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_mysql }
+    mssql:    { test: a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
+    oracle:   { test: a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_oracle }
 
   - id: kill_then_source_grows_range_checkpoint_parallel
-    what: "a checkpointed run (range-chunked, `parallel: 2`) killed at `after_chunk_complete:2`, then three more source rows: the next run delivers the source as it is now or refuses by code, and a delivered export validates"
-    postgres: { test: open_defect_a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mssql }
+    what: "a checkpointed run (range-chunked, `parallel: 2`) killed at `after_chunk_complete:2`, then three more source rows: the next run plans the keys past the stored plan and delivers the source as it is now, every id declared once, and the export validates"
+    postgres: { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres }
+    mysql:    { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql }
+    mssql:    { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle }
+
+  - id: kill_then_source_grows_range_checkpoint_parallel_resume
+    what: "the same crash and growth under `parallel: 2`, continued with `rivet run --resume`: it delivers the source as it is now, every id declared once"
+    postgres: { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_postgres }
+    mysql:    { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_mysql }
+    mssql:    { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
+    oracle:   { test: a_range_checkpoint_parallel_run_killed_before_the_source_grows_is_resumed_to_the_source_oracle }
 
   - id: kill_then_source_grows_keyset_checkpoint
-    what: "a checkpointed run (keyset) killed at `after_keyset_page:2`, then three more source rows: the next run delivers the source as it is now or refuses by code, and a delivered export validates"
-    postgres: { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_postgres }
-    mysql:    { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mysql }
-    mssql:    { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_mssql }
+    what: "a checkpointed run (keyset) killed at `after_keyset_page:2`, then three more source rows: the next run delivers the source as it is now, every id declared once, and the export validates"
+    postgres: { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres }
+    mysql:    { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql }
+    mssql:    { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
-    oracle:   { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_or_refuses_oracle }
+    oracle:   { test: a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle }
 
   - id: kill_then_source_grows_keyset_checkpoint_parallel
-    what: "a checkpointed run (keyset, `parallel: 2`) killed at `keyset_parallel_range_committed:1`, then three more source rows: the next run delivers the source as it is now or refuses by code, and a delivered export validates"
-    postgres: { test: open_defect_a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_or_refuses_mssql }
+    what: "a checkpointed run (keyset, `parallel: 2`) killed when its last key range committed (`keyset_parallel_range_committed:1`), then three more source rows: the next run reads past the highest key that range recorded and delivers the source as it is now, every id declared once"
+    postgres: { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres }
+    mysql:    { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql }
+    mssql:    { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle }
+
+  - id: kill_then_source_grows_keyset_checkpoint_parallel_no_recorded_top
+    what: "the same crash and growth over ranges that recorded no highest key (`keyset_range.max_key` NULL, as a state written before the key was recorded): the next run reads the committed last range again, declares none of its parts twice, and delivers the source as it is now"
+    postgres: { test: a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_postgres }
+    mysql:    { test: a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mysql }
+    mssql:    { test: a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no chunk checkpoint" }
+    oracle:   { test: a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_oracle }
 
   - id: kill_then_source_fills_empty_range_checkpoint
-    what: "a range-checkpoint run of an empty table killed after its one task completed (`after_chunk_complete:0`), then 40 source rows: the next run delivers the source or refuses by code (the crash-reachable twin of corrupt_chunk_tasks_deleted)"
-    postgres: { test: open_defect_a_run_killed_over_an_empty_table_before_it_fills_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_run_killed_over_an_empty_table_before_it_fills_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_run_killed_over_an_empty_table_before_it_fills_delivers_or_refuses_mssql }
+    what: "a range-checkpoint run of an empty table killed after its one task completed (`after_chunk_complete:0`), then 40 source rows: the next run, which holds no part, is planned again and delivers the source"
+    postgres: { test: a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_postgres }
+    mysql:    { test: a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mysql }
+    mssql:    { test: a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_oracle }
+
+  - id: kill_then_source_fills_empty_range_checkpoint_resume
+    what: "the same crash over an empty table that then fills, continued with `rivet run --resume`: it delivers the source"
+    postgres: { test: a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_postgres }
+    mysql:    { test: a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_mysql }
+    mssql:    { test: a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_run_killed_over_an_empty_table_before_it_fills_is_resumed_to_the_source_oracle }
 
   - id: kill_chunk_run_open_fails
     what: "the first `chunk_task` insert of a new chunk run fails (a trigger in the SQLite state; the run and its tasks are one transaction, src/state/checkpoint.rs `open_chunk_run`): the run fails loudly twice and leaves no unfinished chunk run, and with the trigger dropped a run delivers the source"
@@ -848,57 +902,73 @@ scenarios:
     mongo:    { na: "the load driver does not read the source, whatever the source engine: the postgres column carries the row" }
     oracle:   { na: "the load driver does not read the source, whatever the source engine: the postgres column carries the row" }
 
-  - id: edit_destination_path_incremental
-    what: "`destination.path` edited between two runs with no reset, an incremental export that ran once and has three new source rows: the run delivers the source or refuses by code; a delivery leaves parts of one format, every source id declared once where the config now points, and a passing `validate`"
-    postgres: { test: open_defect_an_incremental_export_whose_destination_path_is_edited_delivers_the_source_or_refuses_postgres }
-    mysql:    { test: open_defect_an_incremental_export_whose_destination_path_is_edited_delivers_the_source_or_refuses_mysql }
-    mssql:    { test: open_defect_an_incremental_export_whose_destination_path_is_edited_delivers_the_source_or_refuses_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs (validate_non_sql_source_modes allows no incremental or chunked mode): every run delivers the whole collection wherever the config points" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+  - id: refusal_state_cursor_destination_mismatch
+    what: "RIVET_STATE_CURSOR_DESTINATION_MISMATCH: `destination.path` edited between two runs with no reset, an incremental export that ran once and has three new source rows (MongoDB: a `resume: true` export); the destination restored continues and `state reset` delivers the source where the config points now, `state reset-chunks` and `state accept` leave the refusal"
+    postgres: { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_postgres }
+    mysql:    { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mysql }
+    mssql:    { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mssql }
+    mongo:    { test: a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo }
+    oracle:   { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle }
+
+  - id: edit_destination_path_cursor_stored_before_destinations_were_recorded
+    what: "a cursor (incremental; MongoDB `resume`) whose row holds no destination (`export_state.destination` NULL, as rivet 0.31 and earlier wrote it): a run with the config unchanged continues and records where it delivers, and a destination moved after that is refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH)"
+    postgres: { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres }
+    mysql:    { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mysql }
+    mssql:    { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mssql }
+    mongo:    { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mongo }
+    oracle:   { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_oracle }
 
   - id: edit_destination_path_unfinished_checkpoint
-    what: "`destination.path` edited between two runs with no reset, an unfinished range-checkpoint run: the run delivers the source or refuses by code; a delivery leaves parts of one format, every source id declared once where the config now points, and a passing `validate`"
-    postgres: { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_postgres }
-    mysql:    { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_mysql }
-    mssql:    { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs (validate_non_sql_source_modes allows no incremental or chunked mode): every run delivers the whole collection wherever the config points" }
-    oracle:   { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_or_refuses_oracle }
+    what: "`destination.path` edited between two runs with no reset, an unfinished range-checkpoint run: the run delivers the source, every source id declared once where the config now points, and `validate` passes"
+    postgres: { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_postgres }
+    mysql:    { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mysql }
+    mssql:    { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mssql }
+    mongo:    { na: "a MongoDB export has no range-chunk run to leave unfinished (validate_non_sql_source_modes allows no chunked mode); its `resume: true` run has no crash point a cell can place" }
+    oracle:   { test: an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_oracle }
 
   - id: edit_format_incremental
-    what: "`format` (parquet to csv) edited between two runs with no reset, an incremental export that ran once and has three new source rows: the run delivers the source or refuses by code; a delivery leaves parts of one format, every source id declared once where the config now points, and a passing `validate`"
-    postgres: { test: open_defect_an_incremental_export_whose_format_is_edited_delivers_the_source_or_refuses_postgres }
-    mysql:    { test: open_defect_an_incremental_export_whose_format_is_edited_delivers_the_source_or_refuses_mysql }
-    mssql:    { test: open_defect_an_incremental_export_whose_format_is_edited_delivers_the_source_or_refuses_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs (validate_non_sql_source_modes allows no incremental or chunked mode): every run delivers the whole collection wherever the config points" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    what: "`format` (parquet to csv) edited between two runs with no reset, an incremental export that ran once and has three new source rows (MongoDB: a `resume: true` export): refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH); the format restored continues, `state reset` over the emptied destination delivers the source as csv, `state reset-chunks` and `state accept` leave the refusal"
+    postgres: { test: an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_postgres }
+    mysql:    { test: an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mysql }
+    mssql:    { test: an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mssql }
+    mongo:    { test: a_resume_export_whose_format_is_edited_is_refused_and_walked_out_mongo }
+    oracle:   { test: an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_oracle }
 
   - id: edit_format_unfinished_checkpoint
-    what: "`format` (parquet to csv) edited between two runs with no reset, an unfinished range-checkpoint run: the run delivers the source or refuses by code; a delivery leaves parts of one format, every source id declared once where the config now points, and a passing `validate`"
-    postgres: { test: open_defect_an_unfinished_run_whose_format_is_edited_delivers_the_source_or_refuses_postgres }
-    mysql:    { test: open_defect_an_unfinished_run_whose_format_is_edited_delivers_the_source_or_refuses_mysql }
-    mssql:    { test: open_defect_an_unfinished_run_whose_format_is_edited_delivers_the_source_or_refuses_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs (validate_non_sql_source_modes allows no incremental or chunked mode): every run delivers the whole collection wherever the config points" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    what: "`format` (parquet to csv) edited between two runs with no reset, an unfinished range-checkpoint run whose parts are parquet: refused twice (RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH); the format restored finishes the run, `state reset-chunks` starts a full pass as csv, `state reset` and `rivet run --resume` leave the refusal"
+    postgres: { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_postgres }
+    mysql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mysql }
+    mssql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export has no range-chunk run to leave unfinished (validate_non_sql_source_modes allows no chunked mode); its `resume: true` run has no crash point a cell can place" }
+    oracle:   { test: an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle }
+
+  - id: edit_format_unfinished_checkpoint_refused_twice
+    what: "the same edit under an unfinished range-checkpoint run, refused twice and nothing walked: the cell a Postgres state grades whole (a walk of more than one remedy applies its first only there)"
+    postgres: { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_postgres }
+    mysql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_mysql }
+    mssql:    { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_mssql }
+    mongo:    { na: "a MongoDB export has no range-chunk run to leave unfinished (validate_non_sql_source_modes allows no chunked mode); its `resume: true` run has no crash point a cell can place" }
+    oracle:   { test: an_unfinished_run_whose_format_is_edited_is_refused_twice_oracle }
 
   - id: edit_compression_incremental
-    what: "`compression` (the default to gzip) edited between two runs with no reset, an incremental export that ran once and has three new source rows: the run delivers the source or refuses by code; a delivery leaves parts of one format, every source id declared once where the config now points, and a passing `validate`"
-    postgres: { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_postgres }
-    mysql:    { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_mysql }
-    mssql:    { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs (validate_non_sql_source_modes allows no incremental or chunked mode): every run delivers the whole collection wherever the config points" }
-    oracle:   { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_or_refuses_oracle }
+    what: "`compression` (the default to gzip) edited between two runs with no reset, an incremental export that ran once and has three new source rows: the run continues, every source id declared once, and `validate` passes"
+    postgres: { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_postgres }
+    mysql:    { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_mysql }
+    mssql:    { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_mssql }
+    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs: every run delivers the whole collection wherever the config points (a `resume: true` export does, and its cell is in the RIVET_STATE_CURSOR_DESTINATION_MISMATCH rows)" }
+    oracle:   { test: an_incremental_export_whose_compression_is_edited_delivers_the_source_oracle }
 
   - id: edit_compression_unfinished_checkpoint
-    what: "`compression` (the default to gzip) edited between two runs with no reset, an unfinished range-checkpoint run: the run delivers the source or refuses by code; a delivery leaves parts of one format, every source id declared once where the config now points, and a passing `validate`"
-    postgres: { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_postgres }
-    mysql:    { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_mysql }
-    mssql:    { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_mssql }
-    mongo:    { na: "a MongoDB `mode: full` export keeps no progress between runs (validate_non_sql_source_modes allows no incremental or chunked mode): every run delivers the whole collection wherever the config points" }
-    oracle:   { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_or_refuses_oracle }
+    what: "`compression` (the default to gzip) edited between two runs with no reset, an unfinished range-checkpoint run: the run delivers the source, every source id declared once, and `validate` passes"
+    postgres: { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_postgres }
+    mysql:    { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_mysql }
+    mssql:    { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_mssql }
+    mongo:    { na: "a MongoDB export has no range-chunk run to leave unfinished (validate_non_sql_source_modes allows no chunked mode); its `resume: true` run has no crash point a cell can place" }
+    oracle:   { test: an_unfinished_run_whose_compression_is_edited_delivers_the_source_oracle }
 
   - id: edit_destination_store
-    what: "the destination moved to another store (local to s3) between two runs with no reset"
-    postgres: { gap: "not written: the same edit as edit_destination_path with the new destination in a bucket; the cell's reader of the ids a destination declares is local" }
+    what: "the destination moved to another store (local to s3) between two runs with no reset, an incremental export that ran once: refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH); `state reset-chunks` leaves the refusal and `state reset` delivers the source into the bucket"
+    postgres: { test: an_incremental_export_moved_to_another_store_is_refused_and_walked_out_postgres }
     mysql:    { na: "the destination seam (src/destination) is the same, whatever the source engine: the postgres column carries the row" }
     mssql:    { na: "the destination seam (src/destination) is the same, whatever the source engine: the postgres column carries the row" }
     mongo:    { na: "the destination seam (src/destination) is the same, whatever the source engine: the postgres column carries the row" }
@@ -911,6 +981,166 @@ scenarios:
     mssql:    { na: "these edits are the rows of docs/mode-transition-matrix.yaml (full_then_incremental .. crashed_parallel_keyset_then_checkpoint_removed_reset, incremental_cursor_change, incremental_repointed_at_another_table, incremental_other_schema_same_table, incremental_source_url_respelled, incremental_query_filter_edited), every one on every SQL engine: not repeated here" }
     mongo:    { na: "these edits are the rows of docs/mode-transition-matrix.yaml (full_then_incremental .. crashed_parallel_keyset_then_checkpoint_removed_reset, incremental_cursor_change, incremental_repointed_at_another_table, incremental_other_schema_same_table, incremental_source_url_respelled, incremental_query_filter_edited), every one on every SQL engine: not repeated here" }
     oracle:   { na: "these edits are the rows of docs/mode-transition-matrix.yaml (full_then_incremental .. crashed_parallel_keyset_then_checkpoint_removed_reset, incremental_cursor_change, incremental_repointed_at_another_table, incremental_other_schema_same_table, incremental_source_url_respelled, incremental_query_filter_edited), every one on every SQL engine: not repeated here" }
+
+  - id: versions_new_then_old
+    what: "this build runs an export, then the previous release (`RIVET_PREV_RELEASE_BIN`, through `Rig::as_previous_release`) runs it on the same state and prefix: the old binary delivers the source or refuses by code, and this build then delivers the source and `validate` passes; SQLite state, and a scratch database of the cell's own when the pass grades Postgres state"
+    postgres: { test: the_previous_release_after_this_build_delivers_or_refuses_postgres }
+    mysql:    { test: the_previous_release_after_this_build_delivers_or_refuses_mysql }
+    mssql:    { test: the_previous_release_after_this_build_delivers_or_refuses_mssql }
+    mongo:    { test: the_previous_release_after_this_build_delivers_or_refuses_mongo }
+    oracle:   { test: the_previous_release_after_this_build_delivers_or_refuses_oracle }
+
+  - id: versions_take_turns
+    what: "the previous release and this build take turns on one export (old, new, old, new; a job still pinned old during a rolling upgrade), the source growing between turns: the old binary delivers first, each later turn delivers the source or refuses by code, and this build delivers last"
+    postgres: { test: the_two_releases_taking_turns_deliver_or_refuse_postgres }
+    mysql:    { test: the_two_releases_taking_turns_deliver_or_refuse_mysql }
+    mssql:    { test: the_two_releases_taking_turns_deliver_or_refuse_mssql }
+    mongo:    { test: the_two_releases_taking_turns_deliver_or_refuse_mongo }
+    oracle:   { test: the_two_releases_taking_turns_deliver_or_refuse_oracle }
+
+  - id: versions_new_beside_live_old
+    what: "this build starts 700 ms into a live incremental run of the previous release, on a state the old binary created: each delivers or refuses by code, and this build then delivers the source"
+    postgres: { test: this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_postgres }
+    mysql:    { test: this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_mysql }
+    mssql:    { test: this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or resumable only, and two concurrent runs of either are open defects whatever the binaries (beside_run_full; RESULTS 11 of docs/operator-contract-matrix.yaml): measured here, the pair doubled the prefix (source 300000, delivered 600000)" }
+    oracle:   { test: this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_oracle }
+
+  - id: exhaust_destination_volume_full
+    what: "the volume under the local destination of a live run filled once the run has committed a part (`TinyVolume`: a 4 MB disk image of the cell's own): the run delivers or fails loudly, every run into the full volume fails loudly, and with the space back a run delivers the source and `validate` passes"
+    postgres: { test: a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_postgres }
+    mysql:    { test: a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mysql }
+    mssql:    { test: a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mssql }
+    mongo:    { test: a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mongo }
+    oracle:   { test: a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_oracle }
+
+  - id: exhaust_state_volume_full
+    what: "the volume under the SQLite state of a live run filled once the run has committed a part: the run delivers or fails loudly, so does every run while it is full, and with the space back a run delivers the source and `validate` passes"
+    postgres: { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_postgres }
+    mysql:    { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mysql }
+    mssql:    { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mssql }
+    mongo:    { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo }
+    oracle:   { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle }
+
+  - id: exhaust_open_files
+    what: "every run capped at 8 open files (`RLIMIT_NOFILE`, `Rig::open_files`) fails loudly, never by a crash, and a run without the cap then delivers the source and `validate` passes; the cells of the other engines run on the SQLite state, since a Postgres state puts the PostgreSQL client, the open defect of the postgres cell, into every run"
+    postgres: { test: open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres }
+    mysql:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql }
+    mssql:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql }
+    mongo:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo }
+    oracle:   { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle }
+
+  - id: exhaust_memory_cap
+    what: "a run under a memory cap below what its batches need"
+    postgres: { gap: "not written: the stand cannot cap a run's memory from outside rivet. macOS refuses a lower RLIMIT_AS, RLIMIT_DATA and RLIMIT_RSS (measured: `setrlimit` answers `current limit exceeds maximum limit` for each), so a cell needs a Linux cgroup (a container of its own per run)" }
+    mysql:    { gap: "not written: the stand cannot cap a run's memory from outside rivet. macOS refuses a lower RLIMIT_AS, RLIMIT_DATA and RLIMIT_RSS (measured: `setrlimit` answers `current limit exceeds maximum limit` for each), so a cell needs a Linux cgroup (a container of its own per run)" }
+    mssql:    { gap: "not written: the stand cannot cap a run's memory from outside rivet. macOS refuses a lower RLIMIT_AS, RLIMIT_DATA and RLIMIT_RSS (measured: `setrlimit` answers `current limit exceeds maximum limit` for each), so a cell needs a Linux cgroup (a container of its own per run)" }
+    mongo:    { gap: "not written: the stand cannot cap a run's memory from outside rivet. macOS refuses a lower RLIMIT_AS, RLIMIT_DATA and RLIMIT_RSS (measured: `setrlimit` answers `current limit exceeds maximum limit` for each), so a cell needs a Linux cgroup (a container of its own per run)" }
+    oracle:   { gap: "not written: the stand cannot cap a run's memory from outside rivet. macOS refuses a lower RLIMIT_AS, RLIMIT_DATA and RLIMIT_RSS (measured: `setrlimit` answers `current limit exceeds maximum limit` for each), so a cell needs a Linux cgroup (a container of its own per run)" }
+
+  - id: ddl_column_dropped
+    what: "a column dropped from the table of a live range-checkpoint run once it has committed a part, the statement back before the run ends: the run delivers or fails loudly, and a run then delivers the source as it is now and `validate` passes"
+    postgres: { test: a_column_dropped_under_a_live_run_delivers_or_fails_loudly_postgres }
+    mysql:    { test: a_column_dropped_under_a_live_run_delivers_or_fails_loudly_mysql }
+    mssql:    { test: a_column_dropped_under_a_live_run_delivers_or_fails_loudly_mssql }
+    mongo:    { na: "a collection declares no columns: a field that stops appearing is a document, not a DDL statement" }
+    oracle:   { test: a_column_dropped_under_a_live_run_delivers_or_fails_loudly_oracle }
+
+  - id: ddl_column_retyped
+    what: "a column of the table of a live range-checkpoint run retyped (INT to text) once it has committed a part: the run delivers or fails loudly, and a run then delivers the source as it is now and `validate` passes"
+    postgres: { test: a_column_retyped_under_a_live_run_delivers_or_fails_loudly_postgres }
+    mysql:    { test: a_column_retyped_under_a_live_run_delivers_or_fails_loudly_mysql }
+    mssql:    { test: a_column_retyped_under_a_live_run_delivers_or_fails_loudly_mssql }
+    mongo:    { na: "a collection declares no column types" }
+    oracle:   { na: "Oracle changes the type of an empty column only (ORA-01439), so a table that holds rows cannot be retyped under a run" }
+
+  - id: ddl_table_dropped
+    what: "the table (MongoDB: the collection) of a live range-checkpoint run dropped once it has committed a part: the run delivers or fails loudly, every run of the dropped table fails loudly, and with the table there again holding the rows it held a run delivers the source and `validate` passes"
+    postgres: { test: a_table_dropped_under_a_live_run_delivers_or_fails_loudly_postgres }
+    mysql:    { test: a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mysql }
+    mssql:    { test: a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mssql }
+    mongo:    { test: a_table_dropped_under_a_live_run_delivers_or_fails_loudly_mongo }
+    oracle:   { test: a_table_dropped_under_a_live_run_delivers_or_fails_loudly_oracle }
+
+  - id: hostile_text
+    what: "text with a NUL (where the engine stores one: not PostgreSQL), control characters, quotes and a backslash, characters outside the basic plane, right-to-left text and the empty string; each value alone in a table of its own, exported whole twice: both runs deliver it as the source holds it (the default oracle compares the value) and `validate` passes, or both fail loudly"
+    postgres: { test: hostile_text_is_delivered_or_fails_loudly_postgres }
+    mysql:    { test: hostile_text_is_delivered_or_fails_loudly_mysql }
+    mssql:    { test: hostile_text_is_delivered_or_fails_loudly_mssql }
+    mongo:    { test: hostile_text_is_delivered_or_fails_loudly_mongo }
+    oracle:   { test: hostile_text_is_delivered_or_fails_loudly_oracle }
+
+  - id: hostile_bytes
+    what: "bytes that are not UTF-8 (00 FF FE 80, and none at all) in a binary column, and in a single-byte text column on MySQL and SQL Server; each value alone in a table of its own, exported whole twice: both runs deliver it as the source holds it (the default oracle compares the value) and `validate` passes, or both fail loudly"
+    postgres: { test: bytes_that_are_not_utf8_are_delivered_or_fail_loudly_postgres }
+    mysql:    { test: bytes_that_are_not_utf8_are_delivered_or_fail_loudly_mysql }
+    mssql:    { test: bytes_that_are_not_utf8_are_delivered_or_fail_loudly_mssql }
+    mongo:    { test: bytes_that_are_not_utf8_are_delivered_or_fail_loudly_mongo }
+    oracle:   { test: bytes_that_are_not_utf8_are_delivered_or_fail_loudly_oracle }
+
+  - id: hostile_huge_cell
+    what: "one text cell of 8 MB; each value alone in a table of its own, exported whole twice: both runs deliver it as the source holds it (the default oracle compares the value) and `validate` passes, or both fail loudly"
+    postgres: { test: a_huge_cell_is_delivered_or_fails_loudly_postgres }
+    mysql:    { test: a_huge_cell_is_delivered_or_fails_loudly_mysql }
+    mssql:    { test: a_huge_cell_is_delivered_or_fails_loudly_mssql }
+    mongo:    { test: a_huge_cell_is_delivered_or_fails_loudly_mongo }
+    oracle:   { gap: "not written: a CLOB past 4000 bytes takes a PL/SQL block, and the cell's `SqlEngine::exec` sends one statement" }
+
+  - id: hostile_numbers
+    what: "the ends of each integer, decimal and float type, NaN and the infinities; each value alone in a table of its own, exported whole twice: both runs deliver it as the source holds it (the default oracle compares the value) and `validate` passes, or both fail loudly"
+    postgres: { test: the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_postgres }
+    mysql:    { test: the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_mysql }
+    mssql:    { test: the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_mssql }
+    mongo:    { test: the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_mongo }
+    oracle:   { test: the_ends_of_each_numeric_type_are_delivered_or_fail_loudly_oracle }
+
+  - id: hostile_dates
+    what: "the first and last moment of each date and timestamp type, and PostgreSQL's `infinity`; each value alone in a table of its own, exported whole twice: both runs deliver it as the source holds it (the default oracle compares the value) and `validate` passes, or both fail loudly"
+    postgres: { test: the_ends_of_each_date_type_are_delivered_or_fail_loudly_postgres }
+    mysql:    { test: the_ends_of_each_date_type_are_delivered_or_fail_loudly_mysql }
+    mssql:    { test: the_ends_of_each_date_type_are_delivered_or_fail_loudly_mssql }
+    mongo:    { test: the_ends_of_each_date_type_are_delivered_or_fail_loudly_mongo }
+    oracle:   { test: the_ends_of_each_date_type_are_delivered_or_fail_loudly_oracle }
+
+  - id: clock_state_ahead_incremental
+    what: "an incremental export ran once and every run its state records (run_status, export_metrics) is dated 2099, as after the host clock stepped back or a run on a host whose clock ran fast; three more source rows: the run delivers the source or refuses by code, and a delivered export validates"
+    postgres: { test: an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_postgres }
+    mysql:    { test: an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_mysql }
+    mssql:    { test: an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it keeps no cursor between runs" }
+    oracle:   { test: an_incremental_export_whose_state_is_dated_ahead_delivers_or_refuses_oracle }
+
+  - id: clock_state_ahead_unfinished
+    what: "an unfinished range-checkpoint run whose `running` rows and chunk_run row are dated 2099: the next run delivers the source or refuses by code, and a delivered export validates"
+    postgres: { test: an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_postgres }
+    mysql:    { test: an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_mysql }
+    mssql:    { test: an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: an_unfinished_run_whose_state_is_dated_ahead_delivers_or_refuses_oracle }
+
+  - id: clock_process_under_a_stepped_clock
+    what: "two runs of one export, the second under a clock set before the first's"
+    postgres: { gap: "not written: the run itself would have to read another clock (its run id, part names and manifest names carry the wall clock, which the state edit of clock_state_ahead_* does not move). The host clock is shared by every process on the stand, libfaketime is not installed on it, and the product has no clock seam (none is added for a test)" }
+    mysql:    { gap: "not written: the run itself would have to read another clock (its run id, part names and manifest names carry the wall clock, which the state edit of clock_state_ahead_* does not move). The host clock is shared by every process on the stand, libfaketime is not installed on it, and the product has no clock seam (none is added for a test)" }
+    mssql:    { gap: "not written: the run itself would have to read another clock (its run id, part names and manifest names carry the wall clock, which the state edit of clock_state_ahead_* does not move). The host clock is shared by every process on the stand, libfaketime is not installed on it, and the product has no clock seam (none is added for a test)" }
+    mongo:    { gap: "not written: the run itself would have to read another clock (its run id, part names and manifest names carry the wall clock, which the state edit of clock_state_ahead_* does not move). The host clock is shared by every process on the stand, libfaketime is not installed on it, and the product has no clock seam (none is added for a test)" }
+    oracle:   { gap: "not written: the run itself would have to read another clock (its run id, part names and manifest names carry the wall clock, which the state edit of clock_state_ahead_* does not move). The host clock is shared by every process on the stand, libfaketime is not installed on it, and the product has no clock seam (none is added for a test)" }
+
+  - id: load_warehouse_away
+    what: "the warehouse taken away under a live `rivet load` (connection cut, table dropped mid-load)"
+    postgres: { gap: "not written: the stand's ClickHouse is shared and may not be stopped or cut off, so a cell needs a proxy of its own in front of it (as tests/live/live_pool_toxiproxy.rs has for sources); the load's kill points are kill_load, its refusals refusal_load_*" }
+    mysql:    { na: "the load driver does not read the source, whatever the source engine: the postgres column carries the row" }
+    mssql:    { na: "the load driver does not read the source, whatever the source engine: the postgres column carries the row" }
+    mongo:    { na: "the load driver does not read the source, whatever the source engine: the postgres column carries the row" }
+    oracle:   { na: "the load driver does not read the source, whatever the source engine: the postgres column carries the row" }
+
+  - id: signal_at_snapshot_open
+    what: "SIGKILL, SIGTERM and SIGINT at the one park point the signal rows do not use: `pg_after_snapshot_open` (RIVET_TEST_PAUSE_AT, a snapshot open and nothing read)"
+    postgres: { gap: "not written: the signal primitive (`Rig::stopped`) is not on main yet; with it this is one cell. Every other point a run can be killed at is a panic point (kill_* rows), and a signal there needs a park hook the product does not have" }
+    mysql:    { na: "the product parks a run at `before_commit_rename` and `after_source_read` (maybe_block_at) and, on PostgreSQL only, at `pg_after_snapshot_open` (maybe_pause_at): no further point on this engine (src/test_hook.rs call sites)" }
+    mssql:    { na: "the product parks a run at `before_commit_rename` and `after_source_read` (maybe_block_at) and, on PostgreSQL only, at `pg_after_snapshot_open` (maybe_pause_at): no further point on this engine (src/test_hook.rs call sites)" }
+    mongo:    { na: "the product parks a run at `before_commit_rename` and `after_source_read` (maybe_block_at) and, on PostgreSQL only, at `pg_after_snapshot_open` (maybe_pause_at): no further point on this engine (src/test_hook.rs call sites)" }
+    oracle:   { na: "the product parks a run at `before_commit_rename` and `after_source_read` (maybe_block_at) and, on PostgreSQL only, at `pg_after_snapshot_open` (maybe_pause_at): no further point on this engine (src/test_hook.rs call sites)" }
   - id: sigkill_full_first_part_staged
     what: "SIGKILL of a `mode: full` run parked with its first part staged and none committed: the stop is not a success and the next plain run delivers the source (a 600 s lease on a Postgres state, so the takeover is the dead owner's)"
     postgres: { test: a_killed_full_run_with_first_part_staged_is_taken_over_by_the_next_run_postgres }

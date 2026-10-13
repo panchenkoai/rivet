@@ -148,6 +148,8 @@ mod live_keyset;
 mod live_keyset_metrics;
 #[path = "live/live_keyset_parallel.rs"]
 mod live_keyset_parallel;
+#[path = "live/live_load_lease_keeper.rs"]
+mod live_load_lease_keeper;
 #[path = "live/live_load_partition_batches.rs"]
 mod live_load_partition_batches;
 #[path = "live/live_load_spec.rs"]
@@ -198,6 +200,8 @@ mod live_mysql_resume;
 mod live_mysql_retry_and_faults;
 #[path = "live/live_mysql_schema_drift.rs"]
 mod live_mysql_schema_drift;
+#[path = "live/live_non_ascii_query.rs"]
+mod live_non_ascii_query;
 #[path = "live/live_oltp_load.rs"]
 mod live_oltp_load;
 #[path = "live/live_operator_contract.rs"]
@@ -231,6 +235,8 @@ mod live_pool_ledger;
 mod live_pool_safety;
 #[path = "live/live_pool_toxiproxy.rs"]
 mod live_pool_toxiproxy;
+#[path = "live/live_pooled_reads.rs"]
+mod live_pooled_reads;
 #[path = "live/live_quality_gate.rs"]
 mod live_quality_gate;
 #[path = "live/live_reconcile_repair.rs"]
@@ -253,6 +259,8 @@ mod live_shape_drift;
 mod live_shared_state_same_name;
 #[path = "live/live_skip_empty.rs"]
 mod live_skip_empty;
+#[path = "live/live_source_conformance.rs"]
+mod live_source_conformance;
 #[path = "live/live_source_parity_sweep.rs"]
 mod live_source_parity_sweep;
 #[path = "live/live_state_backend_parity.rs"]

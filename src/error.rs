@@ -5,6 +5,8 @@
 //! *class* instead of grepping stderr. Before this, `main` exited `1` for every
 //! error, forcing operators to regex the error text to decide retry-vs-stop.
 
+pub mod retry;
+
 /// Machine-actionable exit-code taxonomy.
 ///
 /// A scheduler keys its retry / alert policy off the numeric exit code:
@@ -155,6 +157,197 @@ impl std::fmt::Display for PreclassifiedExit {
 
 impl std::error::Error for PreclassifiedExit {}
 
+/// A statement-DURATION timeout that **rivet itself** raised — distinct from a
+/// driver-native timeout that carries a structured code (PG 57014, MySQL 3024).
+///
+/// The MSSQL engine has no server-side statement-duration `SET`, so rivet
+/// enforces `tuning.statement_timeout_s` client-side and raises this when the
+/// budget is exceeded (see [`crate::source::mssql`]). Before this type the retry classifier's
+/// permanence hinged on substring-matching rivet's OWN prose ("statement
+/// timeout after …"); a reworded message would silently flip the error back to
+/// *transient*, and the identical query would be retried until it burned the
+/// budget N times (measured: 3×300 s = 20 min for 0 rows). Carrying a typed
+/// marker means [`retry::classify_error`] downcasts the TYPE,
+/// so permanence survives any change to the human-facing wording. The string
+/// branches in the classifier remain a fallback for genuinely driver-native
+/// timeout messages we do not control.
+#[derive(Debug)]
+pub struct StatementDurationTimeout {
+    /// Full actionable message shown to the operator. The classifier keys off
+    /// the TYPE, not this text — it exists only for Display.
+    message: String,
+}
+
+impl StatementDurationTimeout {
+    /// MSSQL client-side statement-duration timeout (no server-side `SET`).
+    pub fn mssql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+
+    /// Oracle statement-duration timeout: the driver call timeout plus a check between rows.
+    #[cfg(feature = "oracle")]
+    pub fn oracle(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "oracle: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
+                 this query cannot finish within the budget; split it with `mode: chunked` \
+                 (per-chunk statements stay under the limit) or raise \
+                 `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+
+    /// MySQL server-side `max_execution_time` timeout (ER_QUERY_TIMEOUT / 3024).
+    /// Wraps the driver's terse "maximum statement execution time exceeded" with
+    /// the actionable fix — including the WIDE-table case (a chunk that still
+    /// times out), which the field's `*_version` tables hit and the raw driver
+    /// error gave no guidance for.
+    pub fn mysql(seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "mysql: statement timeout after {seconds}s (max_execution_time from \
+                 tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024). \
+                 Split it with `mode: chunked` / `chunk_by_key` so per-chunk queries stay under \
+                 the limit; if a CHUNK still times out on a WIDE table, lower `chunk_size` or use \
+                 `chunk_size_memory_mb:` (width-aware chunking); or raise `tuning.statement_timeout_s`"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for StatementDurationTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatementDurationTimeout {}
+
+/// A connect that failed in the TLS handshake — a configuration fault no retry fixes (the classifier keys on the TYPE).
+#[derive(Debug)]
+pub struct TlsHandshakeFailed(String);
+
+impl std::fmt::Display for TlsHandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TlsHandshakeFailed {
+    /// Put the TLS verdict (and its fix) in front of a driver error; `at` names the endpoint when known.
+    pub(crate) fn wrap(err: anyhow::Error, at: Option<&str>) -> anyhow::Error {
+        let with = at.map(|a| format!(" with {a}")).unwrap_or_default();
+        err.context(Self(format!(
+            "TLS handshake{with} failed — the server does not speak TLS or its certificate \
+             is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the \
+             server has no TLS (trusted networks only); retrying will not help"
+        )))
+    }
+}
+
+/// A warehouse job rivet stopped WAITING for, having waited out its budget.
+///
+/// Deliberately NOT a [`Refused`]: that one means "stopped before touching the
+/// warehouse", and this is the opposite — the statement was submitted and may well
+/// still be running server-side. The type is what the retry classifier keys off
+/// ([`retry::classify_error`]), so the permanence of a deterministic
+/// timeout cannot be undone by rewording its message; retrying a wait that already
+/// expired only doubles the wait.
+#[derive(Debug)]
+pub struct JobWaitTimeout {
+    message: String,
+}
+
+impl JobWaitTimeout {
+    /// The BigQuery poll loop gave up on `job_id` after `seconds`.
+    pub fn bigquery(job_id: &str, seconds: u64) -> Self {
+        Self {
+            message: format!(
+                "bigquery: stopped waiting for job `{job_id}` after {seconds}s — the job may \
+                 still be RUNNING in BigQuery, so check it there before re-running: \
+                 SELECT state, error_result FROM `region-<your dataset's region>`.\
+                 INFORMATION_SCHEMA.JOBS WHERE job_id = '{job_id}'. An append mode that \
+                 re-consumes the same runs would double them"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for JobWaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for JobWaitTimeout {}
+
+/// Self-consistency failures detected by [`RunManifest::validate_self_consistency`].
+///
+/// These represent writer bugs, not destination drift; M5 destination-state
+/// checks live in the validate command path.
+#[derive(Debug, PartialEq)]
+pub enum ManifestInconsistency {
+    UnsupportedVersion { found: u32, supported: u32 },
+    PartCountMismatch { declared: u32, actual: usize },
+    RowCountMismatch { declared: i64, actual: i64 },
+    DuplicatePartId(u32),
+}
+
+impl std::fmt::Display for ManifestInconsistency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVersion { found, supported } => write!(
+                f,
+                "manifest_version {found} is not supported by this build (expected {supported})"
+            ),
+            Self::PartCountMismatch { declared, actual } => write!(
+                f,
+                "part_count declares {declared} parts but {actual} committed parts found"
+            ),
+            Self::RowCountMismatch { declared, actual } => write!(
+                f,
+                "row_count declares {declared} rows but committed parts sum to {actual}"
+            ),
+            Self::DuplicatePartId(id) => {
+                write!(f, "duplicate part_id {id} in manifest.parts")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ManifestInconsistency {}
+
+/// A load that stopped before touching the warehouse. The ledger records such a stop as
+/// `refused`, which never makes the target rivet's own — a `failed` row can.
+#[derive(Debug)]
+pub struct Refused(pub(crate) anyhow::Error);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.0.source()
+    }
+}
+
+impl Refused {
+    /// The error that stopped the load: its code and exit class are the stop's own.
+    pub(crate) fn cause(&self) -> &anyhow::Error {
+        &self.0
+    }
+}
+
 /// What KIND of failure a coded error is — the dimension an operator (and the release gate)
 /// branches on: fix the input, fix the environment, decide, stop and investigate, report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,10 +442,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
     // The existing source-side statement-timeout marker also gets a stable code,
     // so the long-query failure an operator's `statement_timeout` tooling watches
     // for is greppable without re-tagging its construction site.
-    if err
-        .downcast_ref::<crate::source::StatementDurationTimeout>()
-        .is_some()
-    {
+    if err.downcast_ref::<StatementDurationTimeout>().is_some() {
         return Some(codes::SOURCE_STATEMENT_TIMEOUT.id);
     }
     None
@@ -265,7 +455,7 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
 /// 2. `stop_class`: [`SchemaDriftError`] → `4`; [`DataIntegrityError`] /
 ///    [`crate::manifest::ManifestInconsistency`] → `3`; a [`CodedError`] by kind
 ///    (refusal `5`, internal `6`, integrity `3`, usage `1`).
-/// 3. otherwise, if [`crate::pipeline::retry::classify_error`] says the error is
+/// 3. otherwise, if [`retry::classify_error`] says the error is
 ///    transient → `2`.
 /// 4. otherwise → `1` (generic).
 ///
@@ -292,7 +482,7 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
     if let Some(c) = stop_class(err) {
         return c.code();
     }
-    if crate::pipeline::retry::classify_error(err).is_transient() {
+    if retry::classify_error(err).is_transient() {
         return ExitClass::Retryable.code();
     }
     ExitClass::Generic.code()
@@ -300,8 +490,7 @@ pub fn classify_exit(err: &anyhow::Error) -> i32 {
 
 /// The error under a load's stop-before-write marker, which carries the code and the class.
 fn stop_cause(err: &anyhow::Error) -> &anyhow::Error {
-    err.downcast_ref::<crate::load::Refused>()
-        .map_or(err, crate::load::Refused::cause)
+    err.downcast_ref::<Refused>().map_or(err, Refused::cause)
 }
 
 /// The class a typed stop marker in the chain fixes regardless of wording; `None` leaves it to the transient check.
@@ -310,9 +499,7 @@ pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
         return Some(ExitClass::SchemaDrift);
     }
     if err.downcast_ref::<DataIntegrityError>().is_some()
-        || err
-            .downcast_ref::<crate::manifest::ManifestInconsistency>()
-            .is_some()
+        || err.downcast_ref::<ManifestInconsistency>().is_some()
     {
         return Some(ExitClass::DataIntegrity);
     }
@@ -325,6 +512,17 @@ pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
         ErrorKind::Usage => Some(ExitClass::Generic),
         ErrorKind::Environment => None,
     }
+}
+
+/// Index of the most "stop-worthy" failure in a batch, ranked by
+/// [`crate::error::ExitClass::stop_rank`]. The chosen error's typed marker then rides up so `classify_exit`
+/// exits the process on the scariest reason rather than whichever export happened
+/// to fail first. Returns `None` for an empty slice.
+pub(crate) fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
+    (0..failures.len()).max_by_key(|&i| {
+        crate::error::ExitClass::from_code(crate::error::classify_exit(&failures[i]))
+            .map_or(0, crate::error::ExitClass::stop_rank)
+    })
 }
 
 /// Stable, greppable error codes carried by [`CodedError`]. A scheduler / CI step
@@ -484,10 +682,15 @@ pub mod codes {
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
         "give each export that shares this state database its own name; if this export was edited (another table, another schema, another `query:` filter), restore what it read, or `rivet state reset -c <config> --export <name>` starts what it reads now with a full pass (it discards the progress that name holds on this source), or `rivet state accept -c <config> --export <name>` keeps the stored progress and records it as belonging to what the export reads now (rows of it below that progress are not delivered)",
     );
-    /// An export met an unfinished checkpointed run it does not continue: another mode opened it, or its checkpoint setting is off now.
+    /// A stored cursor was written delivering to another destination, or in another format, than the export delivers to now.
+    pub const STATE_CURSOR_DESTINATION_MISMATCH: Code = refusal(
+        "RIVET_STATE_CURSOR_DESTINATION_MISMATCH",
+        "restore the `destination` and `format` the export had to continue from the stored progress, or `rivet state reset -c <config> --export <name>` starts over with a full pass delivered where the config points now (the parts already delivered stay where they are: empty that location first if the full pass lands in it too)",
+    );
+    /// An export met an unfinished checkpointed run it does not continue: another mode opened it, its checkpoint setting is off now, or its parts are in another format.
     pub const STATE_INTERRUPTED_RUN_OWNER_MISMATCH: Code = refusal(
         "RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH",
-        "restore the settings the interrupted run had (its mode, its checkpoint) and run once to finish it, then change them; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
+        "restore the settings the interrupted run had (its mode, its checkpoint, its format) and run once to finish it, then change them; or abandon it with the command the message names (`rivet state reset` for a keyset run, `rivet state reset-chunks` for a range-chunk run) and the next run starts with a full pass",
     );
     /// A table joined a CDC stream that did not capture it on its last run, over a baseline already recorded complete.
     pub const STATE_CDC_TABLE_REJOINED: Code = refusal(
@@ -558,10 +761,25 @@ pub mod codes {
         "RIVET_SOURCE_PROBE_UNREADABLE",
         "chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full`",
     );
+    /// A read returned fewer columns than its type probe described a moment earlier: the table changed between the two.
+    pub const SOURCE_COLUMNS_CHANGED_UNDER_READ: Code = environment(
+        "RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ",
+        "run the export again: the next run probes and reads the table as it is now",
+    );
     /// A `columns:` override declares a type the source's wire value cannot be read as.
     pub const SOURCE_OVERRIDE_WIRE_MISMATCH: Code = usage(
         "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH",
         "remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table)",
+    );
+    /// A PostgreSQL-state lease was not granted: the connection that renews this process's leases could not be opened.
+    pub const STATE_LEASE_KEEPER_UNAVAILABLE: Code = environment(
+        "RIVET_STATE_LEASE_KEEPER_UNAVAILABLE",
+        "free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease",
+    );
+    /// A PostgreSQL-state lease stopped being this process's while the work it guards was under way.
+    pub const STATE_LEASE_LOST: Code = refusal(
+        "RIVET_STATE_LEASE_LOST",
+        "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse",
     );
     /// `rivet plan` could not read the source it plans over (no connection, a refused login, a missing table or collection).
     pub const PLAN_SOURCE_UNREADABLE: Code = environment(
@@ -590,6 +808,11 @@ pub mod codes {
     pub const LOAD_COUNT_MISMATCH: Code = integrity(
         "RIVET_LOAD_COUNT_MISMATCH",
         "compare the warehouse table with the run's manifest before re-running; the source is kept",
+    );
+    /// A load or compact found its table lease lost after it had written the warehouse.
+    pub const LOAD_LEASE_LOST_DURING_WRITE: Code = integrity(
+        "RIVET_LOAD_LEASE_LOST_DURING_WRITE",
+        "compare the warehouse table with the source before relying on it: another load or compact may have written it at the same time; the next `rivet load` loads the same runs again",
     );
     pub const LOAD_ADOPTION_COLUMN_MISMATCH: Code = refusal(
         "RIVET_LOAD_ADOPTION_COLUMN_MISMATCH",
@@ -650,6 +873,7 @@ pub mod codes {
         SOURCE_CDC_PREREQUISITE,
         SOURCE_VALUE_UNREPRESENTABLE,
         SOURCE_PROBE_UNREADABLE,
+        SOURCE_COLUMNS_CHANGED_UNDER_READ,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_URL_SCHEME_UNSUPPORTED,
         STATE_NOT_WRITABLE,
@@ -657,6 +881,7 @@ pub mod codes {
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_STREAM_MISMATCH,
+        STATE_CURSOR_DESTINATION_MISMATCH,
         STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
         STATE_CDC_TABLE_REJOINED,
         STATE_CHUNK_RUN_OWNER_UNKNOWN,
@@ -664,12 +889,15 @@ pub mod codes {
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
+        STATE_LEASE_KEEPER_UNAVAILABLE,
+        STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
         DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
+        LOAD_LEASE_LOST_DURING_WRITE,
         LOAD_ADOPTION_COLUMN_MISMATCH,
         LOAD_TARGET_NOT_RIVETS,
         VALIDATE_FAILED,
@@ -1039,5 +1267,118 @@ mod tests {
         assert_eq!(error_code(&e), Some(codes::CONFIG_NO_EXPORTS.id));
         assert_eq!(classify_exit(&e), ExitClass::Generic.code());
         assert!(format!("{e:#}").contains("at least one export must be defined"));
+    }
+}
+
+#[cfg(test)]
+mod representative_failure_tests {
+    use super::representative_failure_idx;
+    use crate::error::{DataIntegrityError, ExitClass, SchemaDriftError, classify_exit};
+
+    #[test]
+    fn empty_batch_has_no_representative() {
+        assert_eq!(representative_failure_idx(&[]), None);
+    }
+
+    #[test]
+    fn data_integrity_outranks_everything_regardless_of_position() {
+        // Data-integrity sits LAST so a naive "first failure" or a flipped
+        // min/max selector would pick the generic error instead.
+        let failures = vec![
+            anyhow::anyhow!("generic boom"),
+            SchemaDriftError::new("shape changed").into(),
+            anyhow::anyhow!("another generic"),
+            DataIntegrityError::new("reconcile mismatch").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(
+            classify_exit(&failures[idx]),
+            ExitClass::DataIntegrity.code(),
+            "a mixed batch must surface the data-integrity (exit 3) failure"
+        );
+    }
+
+    #[test]
+    fn schema_drift_outranks_retryable_and_generic() {
+        // No data-integrity present → schema-drift (exit 4) is the scariest.
+        let failures = vec![
+            anyhow::anyhow!("generic"),
+            SchemaDriftError::new("drift").into(),
+        ];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::SchemaDrift.code());
+    }
+
+    #[test]
+    fn a_refusal_outranks_a_retryable_and_a_generic_failure() {
+        let refused = || -> anyhow::Error {
+            crate::error::CodedError::new(
+                crate::error::codes::STATE_CURSOR_OWNER_MISMATCH,
+                "cursor owned elsewhere",
+            )
+            .into()
+        };
+        let failures = vec![refused(), anyhow::anyhow!("connection reset by peer")];
+        assert_eq!(classify_exit(&failures[1]), ExitClass::Retryable.code());
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
+        let failures = vec![refused(), anyhow::anyhow!("generic")];
+        let idx = representative_failure_idx(&failures).unwrap();
+        assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
+    }
+}
+
+#[cfg(test)]
+mod stop_marker_tests {
+    use super::{JobWaitTimeout, ManifestInconsistency, Refused};
+
+    #[test]
+    fn a_job_wait_timeout_names_the_job_and_how_long_it_waited() {
+        let shown = JobWaitTimeout::bigquery("job_42", 900).to_string();
+        assert_eq!(
+            shown.split(" \u{2014} ").next(),
+            Some("bigquery: stopped waiting for job `job_42` after 900s")
+        );
+    }
+
+    #[test]
+    fn a_manifest_inconsistency_names_the_two_counts_that_disagree() {
+        let shown = |m: ManifestInconsistency| m.to_string();
+        assert_eq!(
+            shown(ManifestInconsistency::UnsupportedVersion {
+                found: 9,
+                supported: 1
+            }),
+            "manifest_version 9 is not supported by this build (expected 1)"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::PartCountMismatch {
+                declared: 3,
+                actual: 2
+            }),
+            "part_count declares 3 parts but 2 committed parts found"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::RowCountMismatch {
+                declared: 10,
+                actual: 7
+            }),
+            "row_count declares 10 rows but committed parts sum to 7"
+        );
+        assert_eq!(
+            shown(ManifestInconsistency::DuplicatePartId(4)),
+            "duplicate part_id 4 in manifest.parts"
+        );
+    }
+
+    #[test]
+    fn a_refused_stop_shows_its_cause_and_keeps_the_cause_chain() {
+        let cause = anyhow::Error::new(std::io::Error::other("disk gone")).context("staging");
+        let stop = Refused(cause);
+        assert_eq!(stop.to_string(), "staging");
+        assert_eq!(
+            std::error::Error::source(&stop).map(ToString::to_string),
+            Some("disk gone".to_string())
+        );
     }
 }

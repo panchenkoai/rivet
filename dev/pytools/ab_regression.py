@@ -397,9 +397,11 @@ def _chunk_task_states(state_db: Path) -> str:
     try:
         import sqlite3
 
-        db = sqlite3.connect(state_db)
-        return str(sorted((s, n) for s, n in db.execute(
-            "SELECT status, count(*) FROM chunk_task GROUP BY status")))
+        from contextlib import closing
+
+        with closing(sqlite3.connect(state_db)) as db:
+            return str(sorted((s, n) for s, n in db.execute(
+                "SELECT status, count(*) FROM chunk_task GROUP BY status")))
     except Exception as e:  # noqa: BLE001
         return f"unreadable: {e}"
 

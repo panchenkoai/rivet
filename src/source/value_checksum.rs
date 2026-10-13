@@ -660,7 +660,7 @@ fn part_row_count_mismatch(
         .filter(|p| p.status == crate::manifest::PartStatus::Committed);
     for (part, path) in committed.zip(paths) {
         if manifest.format == crate::config::FormatType::Csv.label() {
-            let records = crate::pipeline::validate::count_csv_records(path)
+            let records = crate::format::csv::count_csv_records(path)
                 .map_err(|e| anyhow::anyhow!("part row count: read {}: {e}", part.path))?;
             let actual = records.saturating_sub(1) as i64;
             if actual != part.rows {
@@ -856,6 +856,15 @@ fn validate_one_manifest_checksums(
 
 #[cfg(test)]
 mod tests {
+    /// The legacy fold is XOR and the current one a wrapping sum: each is told from the other and from OR / AND on two operands.
+    #[test]
+    fn the_two_folds_combine_as_xor_and_as_a_wrapping_sum() {
+        use super::Fold;
+        assert_eq!(Fold::Xor.combine(0b1100, 0b1010), 0b0110);
+        assert_eq!(Fold::Sum.combine(0b1100, 0b1010), 0b1_0110);
+        assert_eq!(Fold::Sum.combine(u64::MAX, 2), 1);
+    }
+
     use std::sync::Arc;
 
     use arrow::array::Int64Array;

@@ -58,14 +58,16 @@ def verify_live_modules(led: Ledger) -> None:
     # would move every SQLite-reading test onto Postgres (the batch_resume lesson).
     state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_GATE_STATE_URL") or ""
     env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "RIVET_TEST_STATE_URL": state}
+    # A test that grades the Postgres state alone says so by its self-skip; it runs again on the gate's.
+    again = ("RIVET_GATE_STATE_URL", {"RIVET_STATE_URL": state, "RIVET_GATE_STATE_URL": state}) if state.startswith("postgres") else None
     _run_live_modules(led, "live", "live modules",
                       f"every other live_suite module ({len(left)}), derived from tests/live_suite.rs",
-                      left, env=env,
+                      left, env=env, again=again,
                       expr=f"({expr}) - test(/::({'|'.join(excl)})$/)" if excl else expr)
     if excl:
         # They restart a shared engine or hold a slot their neighbours flag: one at a time,
         # with nothing else running, which is the only way they grade anything.
         _run_live_modules(led, "live_modules", "live modules (exclusive)",
                           f"tests that need the stand to themselves ({len(excl)}), one at a time",
-                          left, env={**env, "RIVET_TEST_EXCLUSIVE": "1"}, threads=1,
+                          left, env={**env, "RIVET_TEST_EXCLUSIVE": "1"}, threads=1, again=again,
                           expr=" | ".join(f"test(/::{n}$/)" for n in excl))

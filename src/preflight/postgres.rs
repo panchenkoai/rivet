@@ -3,6 +3,7 @@ use super::analysis::*;
 use super::cursor_expr::incremental_key_expr;
 use super::schema_error::PreflightSchemaError;
 use crate::config::{ExportConfig, ExportMode, SourceType, TlsConfig};
+use crate::connect::postgres::read_pinned;
 use crate::error::Result;
 
 /// Connect once and build one [`ExportDiagnostic`] per export. Rendering
@@ -86,7 +87,7 @@ fn diagnose_pg(
                     "SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet"
                 ),
             };
-            match client.query(&range_query, &[]) {
+            match read_pinned(client, |c| c.query(&range_query, &[])) {
                 Ok(rows) if !rows.is_empty() => {
                     let min_val: Option<String> = rows[0].get(0);
                     let max_val: Option<String> = rows[0].get(1);
@@ -146,7 +147,7 @@ fn estimate_rows_pg(
     query: &str,
 ) -> Result<(Option<i64>, Option<i64>)> {
     let explain = format!("EXPLAIN {}", query);
-    let rows = match client.query(&explain, &[]) {
+    let rows = match read_pinned(client, |c| c.query(&explain, &[])) {
         Ok(r) => r,
         Err(e) => {
             // A SQLSTATE *class 42* failure (undefined table/column, no
@@ -234,7 +235,7 @@ fn get_cursor_range_pg(
             format!("SELECT min({expr})::text, max({expr})::text FROM ({base_query}) AS _rivet")
         }
     };
-    match client.query(&range_query, &[]) {
+    match read_pinned(client, |c| c.query(&range_query, &[])) {
         Ok(rows) if !rows.is_empty() => {
             let min_val: Option<String> = rows[0].get(0);
             let max_val: Option<String> = rows[0].get(1);
@@ -259,147 +260,10 @@ fn get_cursor_range_pg(
 /// per engine (`[dbo].[t]`, `"public"."t"`, `` `t` ``), so quoted segments are
 /// read and returned UNQUOTED — the catalog probes compare names as literals.
 pub(crate) fn table_from_simple_query(query: &str) -> Option<std::borrow::Cow<'_, str>> {
-    // Walk tokens after the first FROM that is *not* inside parens.
-    let mut depth = 0u32;
-    let mut chars = query.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => {
-                // Match `from` (case-insensitive) at this position when
-                // bounded by whitespace.
-                let rest = &query[idx..];
-                let head_ok = idx == 0
-                    || matches!(
-                        query.as_bytes()[idx - 1],
-                        b' ' | b'\t' | b'\n' | b'\r' | b')'
-                    );
-                if head_ok
-                    && rest.len() >= 5
-                    && rest
-                        .get(..4)
-                        .is_some_and(|w| w.eq_ignore_ascii_case("from"))
-                {
-                    let after = rest[4..].chars().next();
-                    if matches!(after, Some(c) if c.is_whitespace() || c == '(') {
-                        // skip 'from' + whitespace
-                        let mut j = idx + 4;
-                        let bytes = query.as_bytes();
-                        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                            j += 1;
-                        }
-                        let (token, end) = scan_relation(query, j)?;
-                        j = end;
-                        // Reject only when this is genuinely multi-relation:
-                        //   `FROM users JOIN orders …`  ← any JOIN flavor
-                        //   `FROM users, orders`         ← comma list
-                        // Plain aliases (`FROM users u`, `FROM users AS u`)
-                        // and trailing clauses (`WHERE`, `ORDER BY`, `LIMIT`)
-                        // do not change the relation — `users` is still the
-                        // table the catalog probe should index-check.
-                        let mut k = j;
-                        while k < bytes.len() && bytes[k].is_ascii_whitespace() {
-                            k += 1;
-                        }
-                        if k < bytes.len() {
-                            let rest = &query[k..];
-                            if rest.starts_with(',') {
-                                return None;
-                            }
-                            let next_word: String = rest
-                                .chars()
-                                .take_while(|c| c.is_ascii_alphabetic())
-                                .collect::<String>()
-                                .to_ascii_lowercase();
-                            // Standard SQL JOIN keywords (any prefix that
-                            // precedes the join itself counts).
-                            if matches!(
-                                next_word.as_str(),
-                                "join"
-                                    | "inner"
-                                    | "left"
-                                    | "right"
-                                    | "outer"
-                                    | "full"
-                                    | "cross"
-                                    | "natural"
-                            ) {
-                                return None;
-                            }
-                        }
-                        return Some(token);
-                    }
-                }
-            }
-            _ => {}
-        }
-        let _ = chars.peek();
-    }
-    None
-}
-
-/// The dotted relation name starting at byte `start`, unquoted, and the byte after it; `None` for no name or a quoted segment holding a `.`.
-fn scan_relation(query: &str, start: usize) -> Option<(std::borrow::Cow<'_, str>, usize)> {
-    let bytes = query.as_bytes();
-    let (mut j, mut segments, mut quoted) = (start, Vec::<String>::new(), false);
-    loop {
-        let close = match bytes.get(j) {
-            Some(b'"') => Some(b'"'),
-            Some(b'[') => Some(b']'),
-            Some(b'`') => Some(b'`'),
-            _ => None,
-        };
-        if let Some(close) = close {
-            let mut seg = Vec::new();
-            j += 1;
-            loop {
-                match bytes.get(j) {
-                    None => return None,
-                    Some(&b) if b == close && bytes.get(j + 1) == Some(&close) => {
-                        seg.push(b);
-                        j += 2;
-                    }
-                    Some(&b) if b == close => {
-                        j += 1;
-                        break;
-                    }
-                    Some(&b) => {
-                        seg.push(b);
-                        j += 1;
-                    }
-                }
-            }
-            let seg = String::from_utf8(seg).ok()?;
-            if seg.is_empty() || seg.contains('.') {
-                return None;
-            }
-            segments.push(seg);
-            quoted = true;
-        } else {
-            let from = j;
-            while bytes
-                .get(j)
-                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            {
-                j += 1;
-            }
-            if j == from {
-                return None;
-            }
-            segments.push(query[from..j].to_string());
-        }
-        if bytes.get(j) == Some(&b'.') {
-            j += 1;
-        } else {
-            break;
-        }
-    }
-    Some(if quoted {
-        (std::borrow::Cow::Owned(segments.join(".")), j)
-    } else {
-        (std::borrow::Cow::Borrowed(&query[start..j]), j)
-    })
+    let parts = crate::sql::first_relation(query)?;
+    let dotted = |part: &crate::sql::NamePart| part.quoted && part.name.contains('.');
+    let names: Vec<&str> = parts.iter().map(|part| part.name.as_str()).collect();
+    (!parts.iter().any(dotted)).then(|| names.join(".").into())
 }
 
 /// True when `column` is the leading key of a `btree` index on `table`.
@@ -480,7 +344,7 @@ pub(crate) fn single_int_pk_pg(
 
 fn analyze_plan_pg(client: &mut postgres::Client, query: &str) -> (Option<String>, bool) {
     let explain = format!("EXPLAIN {}", query);
-    match client.query(&explain, &[]) {
+    match read_pinned(client, |c| c.query(&explain, &[])) {
         Ok(rows) => {
             let lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
             let plan_text = lines.join("\n");
@@ -857,5 +721,97 @@ mod tests {
         );
         assert_eq!(t("SELECT * FROM []"), None);
         assert_eq!(t("SELECT * FROM [dbo].[a] JOIN [dbo].[b] ON 1 = 1"), None);
+    }
+
+    // ── the probes against a canned server answer ────────────────────────────
+
+    use crate::connect::postgres::wire_recorder::{Answer, BEGIN_PINNED, answering_server, sent};
+
+    const INDEX_PLAN: &str =
+        "Index Scan using orders_pkey on orders  (cost=0.29..8.30 rows=5000 width=120)";
+    const SEQ_PLAN: &str = "Seq Scan on orders  (cost=0.00..1250.00 rows=70 width=9)";
+
+    /// What `probe` returns from a server that answers every prepared statement with `answer`, and the statements that server saw.
+    fn probed<T>(
+        answer: Answer,
+        probe: impl FnOnce(&mut postgres::Client) -> T,
+    ) -> (T, Vec<String>) {
+        let (url, queries) = answering_server(answer);
+        let mut client = crate::connect::postgres::connect_client(&url, None).unwrap();
+        let out = probe(&mut client);
+        drop(client);
+        (out, sent(queries))
+    }
+
+    #[test]
+    fn the_row_estimate_and_the_width_are_read_from_the_plan_the_server_returns() {
+        let (got, saw) = probed(Answer::Rows(1, vec![vec![Some(INDEX_PLAN)]]), |c| {
+            estimate_rows_pg(c, "SELECT * FROM orders")
+        });
+        assert_eq!(got.unwrap(), (Some(5000), Some(120)));
+        assert_eq!(
+            saw,
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM orders", "COMMIT"]
+        );
+        let two_lines = vec![vec![Some("Sort  (cost=1.00..2.00)")], vec![Some(SEQ_PLAN)]];
+        let (got, _) = probed(Answer::Rows(1, two_lines), |c| {
+            estimate_rows_pg(c, "SELECT * FROM orders ORDER BY id")
+        });
+        assert_eq!(got.unwrap(), (Some(70), Some(9)));
+    }
+
+    #[test]
+    fn a_refused_estimate_fails_the_preflight_only_for_a_schema_error() {
+        let (got, saw) = probed(Answer::Error("42P01"), |c| {
+            estimate_rows_pg(c, "SELECT * FROM gone")
+        });
+        let why = format!("{:#}", got.unwrap_err());
+        assert!(
+            why.contains("refused") && why.contains("SQLSTATE 42P01"),
+            "{why}"
+        );
+        assert_eq!(
+            saw,
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM gone", "ROLLBACK"]
+        );
+        let (got, _) = probed(Answer::Error("57014"), |c| estimate_rows_pg(c, "SELECT 1"));
+        assert_eq!(got.unwrap(), (None, None), "a cancelled probe is not fatal");
+    }
+
+    #[test]
+    fn the_cursor_range_is_the_min_and_max_the_server_returns() {
+        let range = |answer| {
+            probed(answer, |c| {
+                get_cursor_range_pg(c, "SELECT * FROM orders", "id")
+            })
+        };
+        let (got, saw) = range(Answer::Rows(2, vec![vec![Some("10"), Some("250")]]));
+        assert_eq!(got, (Some("10".to_string()), Some("250".to_string())));
+        assert_eq!(
+            saw,
+            [
+                BEGIN_PINNED,
+                "SELECT min(\"id\")::text, max(\"id\")::text FROM orders",
+                "COMMIT"
+            ]
+        );
+        let (got, _) = range(Answer::Rows(2, vec![vec![None, Some("250")]]));
+        assert_eq!(got, (None, Some("250".to_string())));
+        assert_eq!(range(Answer::Rows(2, Vec::new())).0, (None, None));
+        assert_eq!(range(Answer::Error("42703")).0, (None, None));
+    }
+
+    #[test]
+    fn the_plan_analysis_names_the_scan_and_says_whether_it_uses_an_index() {
+        let plan = |answer| probed(answer, |c| analyze_plan_pg(c, "SELECT * FROM orders"));
+        let (got, saw) = plan(Answer::Rows(1, vec![vec![Some(INDEX_PLAN)]]));
+        assert_eq!(got, (Some(INDEX_PLAN.to_string()), true));
+        assert_eq!(
+            saw,
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM orders", "COMMIT"]
+        );
+        let (got, _) = plan(Answer::Rows(1, vec![vec![Some(SEQ_PLAN)]]));
+        assert_eq!(got, (Some(SEQ_PLAN.to_string()), false));
+        assert_eq!(plan(Answer::Error("57014")).0, (None, false));
     }
 }

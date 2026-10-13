@@ -1,0 +1,12 @@
+diff --git a/src/pipeline/cdc_job.rs b/src/pipeline/cdc_job.rs
+--- a/src/pipeline/cdc_job.rs
++++ b/src/pipeline/cdc_job.rs
+@@ -486,7 +486,7 @@
+             &url,
+             tls,
+             &tables,
+-            DrainMode::from_until_current(cdc.until_current),
++            DrainMode::Continuous,
+         )?;
+     }
+ 

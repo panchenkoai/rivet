@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import bisect
 import json
 import sqlite3
@@ -87,52 +88,57 @@ class _Spans:
 
 def index() -> int:
     """Build the LSIF dump, derive call edges, store them, apply them."""
-    con = sqlite3.connect(DB)
-    by_file: dict[str, list] = defaultdict(list)
-    for q, n, f, s, e in con.execute(
-        "SELECT qualified_name, name, file_path, line_start, line_end FROM nodes "
-        "WHERE language = 'rust' AND kind IN ('Function', 'Test') AND line_start IS NOT NULL"
-    ):
-        by_file[f].append((q, n, s, e))
-    spans = {f: _Spans(rows) for f, rows in by_file.items()}
-    source_lines: dict[str, list[str]] = {}
+    with closing(sqlite3.connect(DB)) as con:
+        by_file: dict[str, list] = defaultdict(list)
+        for q, n, f, s, e in con.execute(
+            "SELECT qualified_name, name, file_path, line_start, line_end FROM nodes "
+            "WHERE language = 'rust' AND kind IN ('Function', 'Test') AND line_start IS NOT NULL"
+        ):
+            by_file[f].append((q, n, s, e))
+        spans = {f: _Spans(rows) for f, rows in by_file.items()}
+        source_lines: dict[str, list[str]] = {}
 
-    def ident(path: str, line: int, a: int, b: int) -> str:
-        if path not in source_lines:
-            try:
-                source_lines[path] = Path(path).read_text(errors="replace").splitlines()
-            except OSError:
-                source_lines[path] = []
-        text = source_lines[path]
-        return text[line - 1][a:b] if 0 < line <= len(text) else ""
+        def ident(path: str, line: int, a: int, b: int) -> str:
+            if path not in source_lines:
+                try:
+                    source_lines[path] = Path(path).read_text(errors="replace").splitlines()
+                except OSError:
+                    source_lines[path] = []
+            text = source_lines[path]
+            return text[line - 1][a:b] if 0 < line <= len(text) else ""
 
-    with tempfile.TemporaryDirectory() as tmp:
-        dump = Path(tmp) / "index.lsif"
-        _lsif(dump)
-        uses = _uses(dump)
-    edges = set()
-    for ufile, uline, dfile, dline, a, b in uses:
-        if ufile not in spans or dfile not in spans:
-            continue
-        callee = spans[dfile].enclosing(dline, ident(dfile, dline, a, b))
-        caller = spans[ufile].enclosing(uline)
-        if callee and caller and callee != caller:
-            edges.add((caller, callee, ufile, uline))
-    con.execute(
-        "CREATE TABLE IF NOT EXISTS rust_analyzer_calls "
-        "(source_qualified TEXT, target_qualified TEXT, file_path TEXT, line INTEGER)"
-    )
-    con.execute("DELETE FROM rust_analyzer_calls")
-    con.executemany("INSERT INTO rust_analyzer_calls VALUES (?, ?, ?, ?)", sorted(edges))
-    con.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('rust_analyzer_sha', ?)", (_head(),))
-    con.commit()
-    print(f"rust_graph: {len(uses)} uses in the LSIF dump -> {len(edges)} call edges between graph nodes")
-    return apply(con)
+        with tempfile.TemporaryDirectory() as tmp:
+            dump = Path(tmp) / "index.lsif"
+            _lsif(dump)
+            uses = _uses(dump)
+        edges = set()
+        for ufile, uline, dfile, dline, a, b in uses:
+            if ufile not in spans or dfile not in spans:
+                continue
+            callee = spans[dfile].enclosing(dline, ident(dfile, dline, a, b))
+            caller = spans[ufile].enclosing(uline)
+            if callee and caller and callee != caller:
+                edges.add((caller, callee, ufile, uline))
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS rust_analyzer_calls "
+            "(source_qualified TEXT, target_qualified TEXT, file_path TEXT, line INTEGER)"
+        )
+        con.execute("DELETE FROM rust_analyzer_calls")
+        con.executemany("INSERT INTO rust_analyzer_calls VALUES (?, ?, ?, ?)", sorted(edges))
+        con.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('rust_analyzer_sha', ?)", (_head(),))
+        con.commit()
+        print(f"rust_graph: {len(uses)} uses in the LSIF dump -> {len(edges)} call edges between graph nodes")
+        return _apply(con)
 
 
-def apply(con: sqlite3.Connection | None = None) -> int:
+def apply() -> int:
     """Replace the heuristic Rust CALLS edges with the stored rust-analyzer ones."""
-    con = con or sqlite3.connect(DB)
+    with closing(sqlite3.connect(DB)) as con:
+        return _apply(con)
+
+
+def _apply(con: sqlite3.Connection) -> int:
+    """`apply` over an open graph database."""
     if not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'rust_analyzer_calls'").fetchone():
         print("rust_graph: no rust_analyzer_calls yet — run `index` first")
         return 0
@@ -153,11 +159,11 @@ def apply(con: sqlite3.Connection | None = None) -> int:
 
 def check() -> int:
     """The call the name-based resolver lost (`super::super::duckdb::duckdb_row_census`) must resolve."""
-    con = sqlite3.connect(DB)
-    n = con.execute(
-        "SELECT count(*) FROM edges WHERE kind = 'CALLS' AND target_qualified LIKE ? AND source_qualified LIKE ?",
-        ("%tests/common/duckdb.rs::duckdb_row_census", "%tests/common/rig/oracle.rs::Rig.row_census"),
-    ).fetchone()[0]
+    with closing(sqlite3.connect(DB)) as con:
+        n = con.execute(
+            "SELECT count(*) FROM edges WHERE kind = 'CALLS' AND target_qualified LIKE ? AND source_qualified LIKE ?",
+            ("%tests/common/duckdb.rs::duckdb_row_census", "%tests/common/rig/oracle.rs::Rig.row_census"),
+        ).fetchone()[0]
     print("rust_graph check:", "ok" if n else "FAILED — Rig.row_census -> duckdb_row_census is missing")
     return 0 if n else 1
 

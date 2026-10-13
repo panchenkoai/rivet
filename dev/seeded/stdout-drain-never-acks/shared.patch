@@ -1,0 +1,12 @@
+diff --git a/src/source/cdc/mod.rs b/src/source/cdc/mod.rs
+--- a/src/source/cdc/mod.rs
++++ b/src/source/cdc/mod.rs
+@@ -641,7 +641,7 @@
+     let mut last_commit: Option<Position> = None;
+     let drained = emit_ndjson(stream, &checkpoint, &tables, max_events, &mut last_commit);
+     // Every line up to `last_commit` is on stdout: release it at the source (PostgreSQL advances the slot).
+-    let acked = last_commit.map_or(Ok(()), |p| stream.ack(&p));
++    let acked = last_commit.map_or(Ok(()), |_| Ok(()));
+     drained.and(acked)
+ }
+ 

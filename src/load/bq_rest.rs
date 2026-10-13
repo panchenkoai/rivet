@@ -51,7 +51,11 @@ const DEFAULT_ENDPOINT: &str = "https://bigquery.googleapis.com";
 /// Per-request ceiling. Generous: a `LOAD DATA` insert only ENQUEUES the job
 /// (the wait happens in the poll loop), but a large statement body plus a slow
 /// link should not trip a short timeout.
+#[cfg(not(test))]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+/// One second in the unit tests, where a request is watched reaching the ceiling.
+#[cfg(test)]
+const HTTP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Poll backoff bounds. Starts tight so a metadata `COUNT(*)` (sub-second)
 /// returns promptly, and widens so a multi-minute load costs a handful of
@@ -116,14 +120,24 @@ enum Auth {
     GcloudCli,
 }
 
+/// The one BigQuery HTTP client of this process: every table's API holds a clone of it.
+fn shared_http() -> Result<reqwest::blocking::Client> {
+    static HTTP: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(http) = HTTP.get() {
+        return Ok(http.clone());
+    }
+    let built = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("building the BigQuery HTTP client")?;
+    Ok(HTTP.get_or_init(|| built).clone())
+}
+
 impl BigQueryApi {
     /// Build a client for `project`, resolving the token source eagerly so a
     /// missing credential is reported before the first job is enqueued.
     pub(crate) fn new(project: &str) -> Result<Self> {
-        let http = reqwest::blocking::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .build()
-            .context("building the BigQuery HTTP client")?;
+        let http = shared_http()?;
         Ok(Self {
             project: project.to_string(),
             location: std::env::var("RIVET_BQ_LOCATION")
@@ -970,6 +984,32 @@ pub(crate) fn kind_of_resource(meta: Option<&Value>) -> Result<super::ObjectKind
 
 #[cfg(test)]
 mod tests {
+    /// A request through the shared client ends at `HTTP_TIMEOUT`: a server that accepts and never answers is not waited on past it, nor given up on before it.
+    #[test]
+    fn the_shared_client_gives_up_on_a_silent_server_at_the_http_timeout() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a silent port");
+        let url = format!("http://{}/", silent.local_addr().unwrap());
+        let http = super::shared_http().expect("the shared client");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = std::time::Instant::now();
+        std::thread::spawn(move || {
+            tx.send(http.get(url).send().map(drop).map_err(|e| e.is_timeout()))
+        });
+        let answer = rx
+            .recv_timeout(super::HTTP_TIMEOUT * 10)
+            .expect("the request is still waiting at ten times HTTP_TIMEOUT");
+        assert_eq!(
+            answer,
+            Err(true),
+            "a silent server ends the request by its timeout"
+        );
+        assert!(
+            asked.elapsed() >= super::HTTP_TIMEOUT,
+            "the request ended {:?} after it was sent, before HTTP_TIMEOUT",
+            asked.elapsed()
+        );
+    }
+
     /// A clone is a `TABLE` to `tables.get`; a snapshot, an external table and a materialized view are none of rivet's kinds.
     #[test]
     fn a_table_resource_names_its_kind_and_no_resource_is_a_free_name() {
@@ -1624,5 +1664,366 @@ mod tests {
         let rendered = format!("{api:?}");
         assert!(!rendered.contains("SECRET"), "{rendered}");
         assert!(rendered.contains("EU"), "{rendered}");
+    }
+
+    /// A job still running at the first poll is asked again under a budget it has not spent, and its id is the answer.
+    #[test]
+    fn a_job_running_at_the_first_poll_is_waited_for() {
+        use stand::{Stand, json};
+        let stand = Stand::start(|_, earlier| match earlier {
+            0 => json(200, r#"{"status":{"state":"RUNNING"}}"#),
+            _ => json(200, r#"{"status":{"state":"DONE"}}"#),
+        });
+        let job_ref = JobRef {
+            project: "p".into(),
+            job_id: "slow".into(),
+            location: None,
+        };
+        let done = stand.api().await_job(&job_ref, Duration::from_secs(3600));
+        assert_eq!(done.unwrap(), "slow");
+        assert_eq!(stand.seen().len(), 2);
+    }
+
+    /// The four hours one job may be polled for.
+    #[test]
+    fn a_job_is_polled_for_four_hours_at_most() {
+        assert_eq!(JOB_POLL_DEADLINE, Duration::from_secs(14_400));
+    }
+
+    /// A resource is read as it is answered: a table with its row count, a view as no table, a missing name as none, and a transient answer is asked again.
+    #[test]
+    fn a_get_reads_the_resource_and_tells_a_missing_name_from_a_failing_server() {
+        use stand::{Stand, json};
+        let stand = Stand::start(
+            |seen, nth| match (seen.method.as_str(), seen.path.as_str()) {
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/t") => {
+                    json(200, r#"{"type":"TABLE","numRows":"42"}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/v") => {
+                    json(200, r#"{"type":"VIEW","numRows":"0"}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/bare") => {
+                    json(200, r#"{"type":"TABLE"}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/text") => {
+                    json(200, r#"{"type":"TABLE","numRows":"many"}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/flaky") if nth == 0 => {
+                    json(503, "{}")
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/flaky") => {
+                    json(200, r#"{"type":"TABLE","numRows":"7"}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/denied") => json(
+                    403,
+                    r#"{"error":{"message":"Access Denied: Table p:d.denied"}}"#,
+                ),
+                ("GET", "/bigquery/v2/projects/p/datasets/d") => {
+                    json(200, r#"{"location":"europe-west2"}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/t/rowAccessPolicies") => {
+                    json(200, r#"{"rowAccessPolicies":[{"a":1},{"a":2}]}"#)
+                }
+                ("GET", "/bigquery/v2/projects/p/datasets/d/tables/v/rowAccessPolicies") => {
+                    json(200, "{}")
+                }
+                _ => json(404, r#"{"error":{"message":"Not found"}}"#),
+            },
+        );
+        let api = stand.api();
+        assert_eq!(
+            api.table_metadata("d", "t").unwrap().unwrap()["numRows"],
+            "42"
+        );
+        assert_eq!(api.table_num_rows("d", "t").unwrap(), Some(42));
+        assert_eq!(
+            api.table_metadata("d", "v").unwrap(),
+            None,
+            "a view is no table"
+        );
+        assert_eq!(api.table_num_rows("d", "v").unwrap(), None);
+        assert_eq!(api.table_metadata("d", "absent").unwrap(), None);
+        assert_eq!(api.table_num_rows("d", "absent").unwrap(), None);
+        let err = |r: Result<Option<u64>>| format!("{:#}", r.unwrap_err());
+        assert!(err(api.table_num_rows("d", "bare")).contains("no numRows"));
+        assert!(err(api.table_num_rows("d", "text")).contains("non-numeric numRows: many"));
+        let denied = err(api.table_num_rows("d", "denied"));
+        assert!(
+            denied.contains("tables.get failed") && denied.contains("Access Denied"),
+            "{denied}"
+        );
+        assert_eq!(
+            api.table_num_rows("d", "flaky").unwrap(),
+            Some(7),
+            "a 503 is asked again"
+        );
+        assert_eq!(stand.asked("/tables/flaky"), 2);
+        assert_eq!(
+            api.read_dataset_location("d").unwrap().as_deref(),
+            Some("europe-west2")
+        );
+        assert_eq!(api.read_dataset_location("absent").unwrap(), None);
+        assert_eq!(api.row_access_policy_count("d", "t").unwrap(), 2);
+        assert_eq!(api.row_access_policy_count("d", "v").unwrap(), 0);
+        assert_eq!(api.row_access_policy_count("d", "absent").unwrap(), 0);
+        assert!(
+            stand
+                .seen()
+                .iter()
+                .all(|r| r.authorization == "Bearer stand-token"),
+            "every request carries the token"
+        );
+    }
+
+    /// A job runs under the id the client chose: the statement and the copy reach BigQuery in the body, the scalar is the first cell, a failed job names its reason, and an insert that already landed is fetched instead of sent twice.
+    #[test]
+    fn a_job_is_inserted_under_the_clients_id_and_read_back() {
+        use stand::{Stand, json};
+        let done = |seen: &stand::Seen| {
+            let id = seen.body["jobReference"]["jobId"]
+                .as_str()
+                .unwrap_or("none")
+                .to_string();
+            json(
+                200,
+                &format!(
+                    r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"DONE"}}}}"#
+                ),
+            )
+        };
+        let stand = Stand::start(move |seen, _| {
+            let sql = seen.body["configuration"]["query"]["query"]
+                .as_str()
+                .unwrap_or("");
+            match (seen.method.as_str(), seen.path.as_str()) {
+                ("POST", "/bigquery/v2/projects/p/jobs") if sql.contains("BROKEN") => {
+                    let id = seen.body["jobReference"]["jobId"]
+                        .as_str()
+                        .unwrap_or("none");
+                    json(
+                        200,
+                        &format!(
+                            r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"DONE","errorResult":{{"message":"Syntax error at [1:1]"}}}}}}"#
+                        ),
+                    )
+                }
+                ("POST", "/bigquery/v2/projects/p/jobs") if sql.contains("LANDED") => {
+                    json(409, r#"{"error":{"message":"Already Exists"}}"#)
+                }
+                ("POST", "/bigquery/v2/projects/p/jobs") => done(seen),
+                ("PATCH", "/bigquery/v2/projects/p/datasets/d/tables/t") => {
+                    json(200, r#"{"clustering":{"fields":["a"]}}"#)
+                }
+                ("GET", path) if path.starts_with("/bigquery/v2/projects/p/queries/") => {
+                    json(200, r#"{"rows":[{"f":[{"v":"7"}]}]}"#)
+                }
+                ("GET", path) if path.starts_with("/bigquery/v2/projects/p/jobs/") => {
+                    let id = path.rsplit('/').next().unwrap_or("none");
+                    json(
+                        200,
+                        &format!(
+                            r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"DONE"}}}}"#
+                        ),
+                    )
+                }
+                _ => json(404, "{}"),
+            }
+        });
+        let api = stand.api();
+        let sent_id = |n: usize| {
+            stand.seen()[n].body["jobReference"]["jobId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let job = api.run_query("SELECT 1", &labels()).unwrap();
+        assert!(job.starts_with("rivet_") && job == sent_id(0), "{job}");
+        assert_eq!(
+            stand.seen()[0].body["configuration"]["query"]["query"],
+            "SELECT 1"
+        );
+
+        assert_eq!(
+            api.run_query_scalar("SELECT COUNT(*) FROM t", &labels())
+                .unwrap(),
+            7
+        );
+        assert_eq!(stand.asked("/queries/"), 1);
+
+        let copied = api.copy_append("d", "src", "dst", &labels()).unwrap();
+        let copy = stand
+            .seen()
+            .iter()
+            .rev()
+            .find(|r| r.method == "POST")
+            .unwrap()
+            .body
+            .clone();
+        assert_eq!(copied, copy["jobReference"]["jobId"].as_str().unwrap());
+        assert_eq!(
+            copy["configuration"]["copy"]["destinationTable"]["tableId"],
+            "dst"
+        );
+        assert_eq!(
+            copy["configuration"]["copy"]["writeDisposition"],
+            "WRITE_APPEND"
+        );
+
+        let broken = format!("{:#}", api.run_query("BROKEN", &labels()).unwrap_err());
+        assert!(broken.contains("Syntax error at [1:1]"), "{broken}");
+
+        let posts = stand.asked("/jobs");
+        let landed = api.run_query("SELECT 'LANDED'", &labels()).unwrap();
+        assert_eq!(
+            stand.asked("/jobs") - posts,
+            2,
+            "one insert answered 409, then one fetch of that job"
+        );
+        assert!(
+            stand
+                .seen()
+                .iter()
+                .any(|r| r.method == "GET" && r.path.ends_with(&landed))
+        );
+
+        let patched = api
+            .patch_table(
+                "d",
+                "t",
+                &serde_json::json!({"clustering": {"fields": ["a"]}}),
+            )
+            .unwrap();
+        assert_eq!(patched["clustering"]["fields"][0], "a");
+        let patch = stand
+            .seen()
+            .into_iter()
+            .find(|r| r.method == "PATCH")
+            .unwrap();
+        assert_eq!(patch.body["clustering"]["fields"][0], "a");
+    }
+}
+
+/// A scripted BigQuery endpoint on a loopback port: every request is recorded and answered by the script.
+#[cfg(test)]
+pub(crate) mod stand {
+    use super::{Auth, BigQueryApi};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+    use zeroize::Zeroizing;
+
+    /// One request the stand received.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Seen {
+        pub(crate) method: String,
+        /// The path without its query string.
+        pub(crate) path: String,
+        pub(crate) authorization: String,
+        /// The JSON body, `null` when there was none.
+        pub(crate) body: serde_json::Value,
+    }
+
+    pub(crate) struct Stand {
+        endpoint: String,
+        seen: Arc<Mutex<Vec<Seen>>>,
+    }
+
+    /// A status and a JSON body.
+    pub(crate) fn json(status: u16, body: &str) -> (u16, String) {
+        (status, body.to_string())
+    }
+
+    impl Stand {
+        /// Serve `script`, which is handed each request and how many earlier requests had the same method and path.
+        pub(crate) fn start(
+            script: impl Fn(&Seen, usize) -> (u16, String) + Send + 'static,
+        ) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stand");
+            let endpoint = format!(
+                "http://{}",
+                listener.local_addr().expect("the stand's port")
+            );
+            let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
+            let log = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let Some(request) = read_request(&mut stream) else {
+                        continue;
+                    };
+                    let nth = {
+                        let mut log = log.lock().unwrap();
+                        let same = |r: &&Seen| r.method == request.method && r.path == request.path;
+                        let nth = log.iter().filter(same).count();
+                        log.push(request.clone());
+                        nth
+                    };
+                    let (status, body) = script(&request, nth);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} stand\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            Self { endpoint, seen }
+        }
+
+        /// A client of project `p` that talks to this stand with a fixed token.
+        pub(crate) fn api(&self) -> BigQueryApi {
+            BigQueryApi {
+                project: "p".into(),
+                location: None,
+                dataset: None,
+                dataset_location: std::sync::OnceLock::new(),
+                endpoint: self.endpoint.clone(),
+                http: reqwest::blocking::Client::new(),
+                auth: Auth::Static(Zeroizing::new("stand-token".into())),
+            }
+        }
+
+        /// Every request so far, in order.
+        pub(crate) fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// How many requests had `fragment` in their path.
+        pub(crate) fn asked(&self, fragment: &str) -> usize {
+            self.seen()
+                .iter()
+                .filter(|r| r.path.contains(fragment))
+                .count()
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Option<Seen> {
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut first = line.split_whitespace();
+        let (method, target) = (first.next()?.to_string(), first.next()?.to_string());
+        let (mut length, mut authorization) = (0usize, String::new());
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).ok()?;
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            let (name, value) = header.split_once(':')?;
+            match name.to_ascii_lowercase().as_str() {
+                "content-length" => length = value.trim().parse().ok()?,
+                "authorization" => authorization = value.trim().to_string(),
+                _ => {}
+            }
+        }
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).ok()?;
+        Some(Seen {
+            method,
+            path: target.split('?').next().unwrap_or("").to_string(),
+            authorization,
+            body: serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        })
     }
 }

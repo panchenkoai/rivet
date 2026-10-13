@@ -1,0 +1,14 @@
+diff --git a/src/sql.rs b/src/sql.rs
+--- a/src/sql.rs
++++ b/src/sql.rs
+@@ -177,8 +177,8 @@
+ 
+ /// `s` without its leading `prefix` (ASCII case-insensitive); `None` when `s` does not start with it.
+ fn strip_prefix_ascii_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+-    let (head, rest) = s.split_at_checked(prefix.len())?;
+-    head.eq_ignore_ascii_case(prefix).then_some(rest)
++    let (head, rest) = s.split_at(prefix.len().min(s.len()));
++    (head.len() == prefix.len() && head.eq_ignore_ascii_case(prefix)).then_some(rest)
+ }
+ 
+ /// `SELECT <agg>(<col>) FROM …` for `agg` in {`min`, `max`, `count`, …}, with

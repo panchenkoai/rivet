@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/chunked/mod.rs b/src/pipeline/chunked/mod.rs
+index 99c10a1b..dd8faced 100644
+--- a/src/pipeline/chunked/mod.rs
++++ b/src/pipeline/chunked/mod.rs
+@@ -274,7 +274,7 @@ fn replan_resumed_run(
+     ranges: &[(i64, i64)],
+ ) -> Result<()> {
+     let (replace, planned) = replan(&state.list_chunk_tasks_for_run(run_id)?, ranges)?;
+-    if planned.is_empty() {
++    if !planned.is_empty() {
+         return Ok(());
+     }
+     state.replan_chunk_tasks(run_id, replace, &planned)?;

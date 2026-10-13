@@ -9,6 +9,7 @@ Not part of the release gate. See dev/soak/README.md for what each check proves 
 
 from __future__ import annotations
 
+from contextlib import ExitStack, closing, contextmanager
 import argparse
 import json
 import os
@@ -163,6 +164,15 @@ class Engine:
             self._client = pymongo.MongoClient(_MONGO_URL,
                                                serverSelectionTimeoutMS=5000, tz_aware=False)
         return self._client
+
+    def __enter__(self) -> "Engine":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        """Close the cached Mongo client, if one was opened."""
+        client = self.__dict__.pop("_client", None)
+        if client is not None:
+            client.close()
 
     def coll(self):
         """The Mongo collection."""
@@ -606,13 +616,14 @@ def setup_configs(rivet: Path, eng: Engine, work: Path, modes: set[str]) -> dict
 # ══ DuckDB projections ═════════════════════════════════════════════════════════
 
 
+@contextmanager
 def duck():
-    """A fresh DuckDB session in UTC."""
+    """A fresh DuckDB session in UTC, closed when the `with` ends."""
     import duckdb
 
-    con = duckdb.connect()
-    con.sql("SET TimeZone='UTC'")
-    return con
+    with duckdb.connect() as con:
+        con.sql("SET TimeZone='UTC'")
+        yield con
 
 
 def parts_rel(eng: Engine, files: list[Path], cdc: bool) -> str:
@@ -676,21 +687,22 @@ def check_cdc_gap(eng: Engine, d: Path, journal: Path, cutoff: float | None, red
         files = files[:-1] if len(files) > 1 else []
     label = "cdc.no_gap" + ("" if cutoff is None else ".periodic")
     if not files:
-        n = duck().sql(f"SELECT count(*) FROM {journal_rel(journal, cutoff)}").fetchone()[0]
+        with duck() as con:
+            n = con.sql(f"SELECT count(*) FROM {journal_rel(journal, cutoff)}").fetchone()[0]
         return Check(label, "FAIL" if n else "PASS", f"no parts; {n} journal ops expected")
-    con = duck()
-    con.sql(f"CREATE TEMP TABLE ev AS SELECT id, ver, __op FROM {parts_rel(eng, files, True)}")
-    con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal, cutoff)}")
-    miss_up = con.sql("SELECT count(*), min(j.id) FROM j ANTI JOIN (SELECT * FROM ev WHERE __op<>'delete') e "
-                      "ON e.id=j.id AND e.ver=j.v WHERE j.op<>'d'").fetchone()
-    miss_del = con.sql("SELECT count(*), min(j.id) FROM j ANTI JOIN (SELECT * FROM ev WHERE __op='delete') e "
-                       "ON e.id=j.id WHERE j.op='d'").fetchone()
-    total = con.sql("SELECT count(*) FROM j").fetchone()[0]
-    dups = con.sql("SELECT count(*) - count(DISTINCT (id, ver, __op)) FROM ev WHERE __op<>'delete'").fetchone()[0]
-    bad = miss_up[0] + miss_del[0]
-    detail = (f"{total} journal ops, {len(files)} parts; missing ins/upd={miss_up[0]} (e.g. id {miss_up[1]}), "
-              f"missing deletes={miss_del[0]} (e.g. id {miss_del[1]}); re-delivered duplicates={dups} (allowed)")
-    return Check(label, "FAIL" if bad else "PASS", detail)
+    with duck() as con:
+        con.sql(f"CREATE TEMP TABLE ev AS SELECT id, ver, __op FROM {parts_rel(eng, files, True)}")
+        con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal, cutoff)}")
+        miss_up = con.sql("SELECT count(*), min(j.id) FROM j ANTI JOIN (SELECT * FROM ev WHERE __op<>'delete') e "
+                          "ON e.id=j.id AND e.ver=j.v WHERE j.op<>'d'").fetchone()
+        miss_del = con.sql("SELECT count(*), min(j.id) FROM j ANTI JOIN (SELECT * FROM ev WHERE __op='delete') e "
+                           "ON e.id=j.id WHERE j.op='d'").fetchone()
+        total = con.sql("SELECT count(*) FROM j").fetchone()[0]
+        dups = con.sql("SELECT count(*) - count(DISTINCT (id, ver, __op)) FROM ev WHERE __op<>'delete'").fetchone()[0]
+        bad = miss_up[0] + miss_del[0]
+        detail = (f"{total} journal ops, {len(files)} parts; missing ins/upd={miss_up[0]} (e.g. id {miss_up[1]}), "
+                  f"missing deletes={miss_del[0]} (e.g. id {miss_del[1]}); re-delivered duplicates={dups} (allowed)")
+        return Check(label, "FAIL" if bad else "PASS", detail)
 
 
 def source_rel(con, eng: Engine) -> str:
@@ -764,25 +776,25 @@ def final_cdc(eng: Engine, d: Path, journal: Path, red: str | None) -> list[Chec
     files = cdc_parts(d)
     if red == "drop-cdc-part" and files:
         files = files[:-1]
-    con = duck()
-    s = source_rel(con, eng)
-    con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal)}")
-    bad, det = fmt_cmp(con.sql(compare_sql(journal_state_sql("j"), s)).fetchone(), "journal", "source")
-    checks.append(Check("harness.journal_matches_source", "FAIL" if bad else "PASS", det))
-    if not files:
-        checks.append(Check("cdc.replay_matches_source", "FAIL", "no parts to replay"))
+    with duck() as con:
+        s = source_rel(con, eng)
+        con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal)}")
+        bad, det = fmt_cmp(con.sql(compare_sql(journal_state_sql("j"), s)).fetchone(), "journal", "source")
+        checks.append(Check("harness.journal_matches_source", "FAIL" if bad else "PASS", det))
+        if not files:
+            checks.append(Check("cdc.replay_matches_source", "FAIL", "no parts to replay"))
+            return checks
+        con.sql(f"CREATE TEMP TABLE ev AS SELECT * FROM {parts_rel(eng, files, True)}")
+        con.sql("CREATE TEMP TABLE latest AS SELECT * FROM (SELECT *, row_number() OVER "
+                "(PARTITION BY id ORDER BY poskey DESC, __seq DESC) rn FROM ev) WHERE rn=1")
+        bad, det = fmt_cmp(con.sql(compare_sql("(SELECT * FROM latest WHERE __op<>'delete')", s)).fetchone(),
+                           "replay", "source")
+        checks.append(Check("cdc.replay_matches_source", "FAIL" if bad else "PASS", det))
+        n = con.sql("SELECT count(*) FROM latest l JOIN (SELECT id, max(ver) mv FROM ev WHERE __op<>'delete' "
+                    "GROUP BY id) m USING (id) WHERE l.__op<>'delete' AND l.ver<>m.mv").fetchone()[0]
+        checks.append(Check("cdc.order_consistent", "FAIL" if n else "PASS",
+                            f"{n} ids whose (__pos,__seq)-latest event is not their highest version"))
         return checks
-    con.sql(f"CREATE TEMP TABLE ev AS SELECT * FROM {parts_rel(eng, files, True)}")
-    con.sql("CREATE TEMP TABLE latest AS SELECT * FROM (SELECT *, row_number() OVER "
-            "(PARTITION BY id ORDER BY poskey DESC, __seq DESC) rn FROM ev) WHERE rn=1")
-    bad, det = fmt_cmp(con.sql(compare_sql("(SELECT * FROM latest WHERE __op<>'delete')", s)).fetchone(),
-                       "replay", "source")
-    checks.append(Check("cdc.replay_matches_source", "FAIL" if bad else "PASS", det))
-    n = con.sql("SELECT count(*) FROM latest l JOIN (SELECT id, max(ver) mv FROM ev WHERE __op<>'delete' "
-                "GROUP BY id) m USING (id) WHERE l.__op<>'delete' AND l.ver<>m.mv").fetchone()[0]
-    checks.append(Check("cdc.order_consistent", "FAIL" if n else "PASS",
-                        f"{n} ids whose (__pos,__seq)-latest event is not their highest version"))
-    return checks
 
 
 def check_incremental(eng: Engine, d: Path, journal: Path, settle: float, final: bool, red: str | None) -> list[Check]:
@@ -794,36 +806,37 @@ def check_incremental(eng: Engine, d: Path, journal: Path, settle: float, final:
     if not files:
         if not final:
             return []  # nothing exported yet (the writer may not have committed before the first run)
-        live = duck().sql(f"SELECT count(*) FROM {journal_state_sql(journal_rel(journal))}").fetchone()[0]
+        with duck() as con:
+            live = con.sql(f"SELECT count(*) FROM {journal_state_sql(journal_rel(journal))}").fetchone()[0]
         return [Check("incremental.complete", "FAIL" if live else "PASS", f"no parts; {live} live ids expected")]
-    con = duck()
-    con.sql(f"CREATE TEMP TABLE p AS SELECT * FROM {parts_rel(eng, files, False)}")
-    hi = con.sql("SELECT max(updated_at) FROM p").fetchone()[0]
-    cutoff = "TIMESTAMP '9999-01-01'" if final else f"TIMESTAMP '{hi}' - INTERVAL {settle} SECOND"
-    con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal)}")
-    # A row deleted before a read is invisible to a cursor forever, so a periodic check exempts every deleted id.
-    exempt = "" if final else " AND id NOT IN (SELECT id FROM j WHERE op='d')"
-    con.sql(f"CREATE TEMP TABLE jl AS SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY id ORDER BY v DESC, "
-            f"(op='d') DESC) rn FROM j WHERE ts <= {cutoff}{exempt}) WHERE rn=1")
-    con.sql("CREATE TEMP TABLE pm AS SELECT id, max(ver) mv FROM p GROUP BY id")
-    cmp_ = "<>" if final else "<"
-    miss, first = con.sql(f"SELECT count(*), min(jl.id) FROM jl LEFT JOIN pm USING (id) WHERE jl.op<>'d' "
-                          f"AND (pm.mv IS NULL OR pm.mv {cmp_} jl.v)").fetchone()
-    checked = con.sql("SELECT count(*) FROM jl WHERE op<>'d'").fetchone()[0]
-    out = [Check("incremental.complete" + tag, "FAIL" if miss else "PASS",
-                 f"{checked} live ids with last change ≤ cutoff ({'end of run' if final else f'{hi} - {settle}s'}); "
-                 f"{miss} absent or behind their journal version" + (f" (e.g. id {first})" if miss else ""))]
-    if final:
-        vals = con.sql("SELECT count(*) FROM jl JOIN p ON p.id=jl.id AND p.ver=jl.v WHERE jl.op<>'d' AND "
-                       "(p.amount IS DISTINCT FROM jl.amount OR p.payload IS DISTINCT FROM jl.payload "
-                       "OR p.updated_at IS DISTINCT FROM jl.ts)").fetchone()[0]
-        out.append(Check("incremental.values", "FAIL" if vals else "PASS",
-                         f"{vals} rows whose exported (id, version) carries values other than the journal's"))
-        ghosts = con.sql("SELECT count(*) FROM jl JOIN pm USING (id) WHERE jl.op='d'").fetchone()[0]
-        out.append(Check("incremental.deletes_invisible", "INFO",
-                         f"{ghosts} ids deleted in the source still present in incremental output — expected: a "
-                         "cursor read never sees a DELETE"))
-    return out
+    with duck() as con:
+        con.sql(f"CREATE TEMP TABLE p AS SELECT * FROM {parts_rel(eng, files, False)}")
+        hi = con.sql("SELECT max(updated_at) FROM p").fetchone()[0]
+        cutoff = "TIMESTAMP '9999-01-01'" if final else f"TIMESTAMP '{hi}' - INTERVAL {settle} SECOND"
+        con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal)}")
+        # A row deleted before a read is invisible to a cursor forever, so a periodic check exempts every deleted id.
+        exempt = "" if final else " AND id NOT IN (SELECT id FROM j WHERE op='d')"
+        con.sql(f"CREATE TEMP TABLE jl AS SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY id ORDER BY v DESC, "
+                f"(op='d') DESC) rn FROM j WHERE ts <= {cutoff}{exempt}) WHERE rn=1")
+        con.sql("CREATE TEMP TABLE pm AS SELECT id, max(ver) mv FROM p GROUP BY id")
+        cmp_ = "<>" if final else "<"
+        miss, first = con.sql(f"SELECT count(*), min(jl.id) FROM jl LEFT JOIN pm USING (id) WHERE jl.op<>'d' "
+                              f"AND (pm.mv IS NULL OR pm.mv {cmp_} jl.v)").fetchone()
+        checked = con.sql("SELECT count(*) FROM jl WHERE op<>'d'").fetchone()[0]
+        out = [Check("incremental.complete" + tag, "FAIL" if miss else "PASS",
+                     f"{checked} live ids with last change ≤ cutoff ({'end of run' if final else f'{hi} - {settle}s'}); "
+                     f"{miss} absent or behind their journal version" + (f" (e.g. id {first})" if miss else ""))]
+        if final:
+            vals = con.sql("SELECT count(*) FROM jl JOIN p ON p.id=jl.id AND p.ver=jl.v WHERE jl.op<>'d' AND "
+                           "(p.amount IS DISTINCT FROM jl.amount OR p.payload IS DISTINCT FROM jl.payload "
+                           "OR p.updated_at IS DISTINCT FROM jl.ts)").fetchone()[0]
+            out.append(Check("incremental.values", "FAIL" if vals else "PASS",
+                             f"{vals} rows whose exported (id, version) carries values other than the journal's"))
+            ghosts = con.sql("SELECT count(*) FROM jl JOIN pm USING (id) WHERE jl.op='d'").fetchone()[0]
+            out.append(Check("incremental.deletes_invisible", "INFO",
+                             f"{ghosts} ids deleted in the source still present in incremental output — expected: a "
+                             "cursor read never sees a DELETE"))
+        return out
 
 
 def check_snapshot(eng: Engine, out_dir: Path, journal: Path, s: float, e: float, c0: int, c1: int,
@@ -838,33 +851,33 @@ def check_snapshot(eng: Engine, out_dir: Path, journal: Path, s: float, e: float
         shutil.copy(files[0], dup)
         files.append(dup)
     raw = len(list(out_dir.rglob("*.parquet")))
-    con = duck()
-    if files:
-        con.sql(f"CREATE TEMP TABLE p AS SELECT id FROM {parts_rel(eng, files, False)}")
-    else:  # an empty table exports a manifest with no parts
-        con.sql("CREATE TEMP TABLE p (id BIGINT)")
-    con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal)}")
-    n, distinct = con.sql("SELECT count(*), count(DISTINCT id) FROM p").fetchone()
-    ins_before = f"(SELECT id FROM j WHERE op='i' AND ct < {s})"
-    del_maybe = f"(SELECT id FROM j WHERE op='d' AND st < {e})"
-    must, must_first = con.sql(f"SELECT count(*), min(id) FROM {ins_before} WHERE id NOT IN {del_maybe} "
-                               "AND id NOT IN (SELECT id FROM p)").fetchone()
-    never = con.sql(f"SELECT count(*) FROM p WHERE id IN (SELECT id FROM j WHERE op='d' AND ct < {s}) "
-                    f"OR id NOT IN (SELECT id FROM j WHERE op='i' AND st <= {e})").fetchone()[0]
-    ins_during = con.sql(f"SELECT count(*) FROM j WHERE op='i' AND ct >= {s} AND st <= {e}").fetchone()[0]
-    del_during = con.sql(f"SELECT count(*) FROM j WHERE op='d' AND ct >= {s} AND st <= {e}").fetchone()[0]
-    lo, hi = c0 - del_during, c0 + ins_during
-    res = [
-        Check("snapshot.no_duplicate_pk", "FAIL" if n != distinct else "PASS",
-              f"{n} rows, {distinct} distinct ids in {len(files)} declared parts ({raw} parquet files on disk)"),
-        Check("snapshot.contains_stable_rows", "FAIL" if must else "PASS",
-              f"{must} ids alive for the whole run are missing" + (f" (e.g. id {must_first})" if must else "")),
-        Check("snapshot.no_phantom_rows", "FAIL" if never else "PASS", f"{never} ids that were never alive during the run"),
-        Check("snapshot.count_in_bounds", "PASS" if lo <= distinct <= hi else "FAIL",
-              f"{distinct} ∈ [{lo}, {hi}]? (source count {c0} at start, {c1} at end; "
-              f"{ins_during} inserts / {del_during} deletes during the run)"),
-    ]
-    return res
+    with duck() as con:
+        if files:
+            con.sql(f"CREATE TEMP TABLE p AS SELECT id FROM {parts_rel(eng, files, False)}")
+        else:  # an empty table exports a manifest with no parts
+            con.sql("CREATE TEMP TABLE p (id BIGINT)")
+        con.sql(f"CREATE TEMP TABLE j AS SELECT * FROM {journal_rel(journal)}")
+        n, distinct = con.sql("SELECT count(*), count(DISTINCT id) FROM p").fetchone()
+        ins_before = f"(SELECT id FROM j WHERE op='i' AND ct < {s})"
+        del_maybe = f"(SELECT id FROM j WHERE op='d' AND st < {e})"
+        must, must_first = con.sql(f"SELECT count(*), min(id) FROM {ins_before} WHERE id NOT IN {del_maybe} "
+                                   "AND id NOT IN (SELECT id FROM p)").fetchone()
+        never = con.sql(f"SELECT count(*) FROM p WHERE id IN (SELECT id FROM j WHERE op='d' AND ct < {s}) "
+                        f"OR id NOT IN (SELECT id FROM j WHERE op='i' AND st <= {e})").fetchone()[0]
+        ins_during = con.sql(f"SELECT count(*) FROM j WHERE op='i' AND ct >= {s} AND st <= {e}").fetchone()[0]
+        del_during = con.sql(f"SELECT count(*) FROM j WHERE op='d' AND ct >= {s} AND st <= {e}").fetchone()[0]
+        lo, hi = c0 - del_during, c0 + ins_during
+        res = [
+            Check("snapshot.no_duplicate_pk", "FAIL" if n != distinct else "PASS",
+                  f"{n} rows, {distinct} distinct ids in {len(files)} declared parts ({raw} parquet files on disk)"),
+            Check("snapshot.contains_stable_rows", "FAIL" if must else "PASS",
+                  f"{must} ids alive for the whole run are missing" + (f" (e.g. id {must_first})" if must else "")),
+            Check("snapshot.no_phantom_rows", "FAIL" if never else "PASS", f"{never} ids that were never alive during the run"),
+            Check("snapshot.count_in_bounds", "PASS" if lo <= distinct <= hi else "FAIL",
+                  f"{distinct} ∈ [{lo}, {hi}]? (source count {c0} at start, {c1} at end; "
+                  f"{ins_during} inserts / {del_during} deletes during the run)"),
+        ]
+        return res
 
 
 def trend(values: list[float]) -> tuple[float, float] | None:
@@ -963,7 +976,7 @@ def harm_summary(d: Path) -> Check:
     if not db.exists():
         return Check(f"harm.{d.name}", "INFO", "no state DB")
     try:
-        with sqlite3.connect(db) as c:  # WAL-mode DB: a mode=ro open fails without its -shm
+        with closing(sqlite3.connect(db)) as c:  # WAL-mode DB: a mode=ro open fails without its -shm
             rows = c.execute("SELECT metric, count(*), sum(delta), max(delta) FROM export_harm GROUP BY metric").fetchall()
     except sqlite3.Error as e:
         return Check(f"harm.{d.name}", "INFO", f"unreadable: {e}")
@@ -1318,9 +1331,10 @@ class Soak:
         """SQL Server capture is asynchronous: wait until the change table holds every journal op (ins+del+2*upd)."""
         import duckdb
 
-        i, u, dl = duckdb.connect().sql(
-            f"SELECT count(*) FILTER (WHERE op='i'), count(*) FILTER (WHERE op='u'), count(*) FILTER (WHERE op='d') "
-            f"FROM {journal_rel(er.journal)}").fetchone()
+        with duckdb.connect() as con:
+            i, u, dl = con.sql(
+                f"SELECT count(*) FILTER (WHERE op='i'), count(*) FILTER (WHERE op='u'), count(*) FILTER (WHERE op='d') "
+                f"FROM {journal_rel(er.journal)}").fetchone()
         want = i + dl + 2 * u
         ok = shell.wait_until(lambda: er.eng.retention(None)["change_table_rows"] >= want, tries=150, delay=2.0)
         if not ok:
@@ -1516,7 +1530,10 @@ def main(argv: list[str] | None = None) -> int:
     if bad:
         p.error(f"unknown engine/mode: {bad}")
     shell.require("/usr/bin/time", hint="install GNU time")
-    return Soak(a).run()
+    with ExitStack() as held:
+        for name in a.engines:
+            held.enter_context(ENGINES[name])
+        return Soak(a).run()
 
 
 if __name__ == "__main__":

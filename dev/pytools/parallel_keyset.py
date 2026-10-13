@@ -686,7 +686,8 @@ def airflow_create_buckets(
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=10).read(0)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            r.read(0)
     except urllib.error.HTTPError as e:
         if e.code != 409:  # 409 = already exists, the only benign failure
             raise shell.Fail(

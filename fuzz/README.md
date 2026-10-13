@@ -11,11 +11,12 @@ must produce a clean `Err`/`None`, never an `unwrap`/slice/overflow panic.
 | `config_from_yaml` | `Config::from_yaml` | operator-authored config; a garbled file must error, not panic |
 | `pg_test_decoding` | `parse_test_decoding` (PostgreSQL) | the richest text-parse surface (columns, typed values, arrays, intervals, timestamps); historically the most bug-prone (tz / datestyle / bytea rendering) |
 | `mongo_resume_token` | `decode_resume_token` (MongoDB) | hex → BSON `Document::from_reader`, an untrusted binary-parse path |
+| `sql_query_text` | the `query:` recognisers (`src/sql.rs`, the preflight relation scan) | every export's query is read as text for its table form, outer `FROM` relation and row set; a multi-byte character in it once ended the run in a slice panic |
 
 Scope note: MySQL and SQL Server CDC decode the **binary** wire protocol inside
 their driver crates (not Rivet code), and the Parquet path only *writes* from
 already-typed Arrow — so those are not Rivet-owned untrusted-parse surfaces. The
-three above are.
+ones above are.
 
 ## Run it
 
@@ -33,6 +34,6 @@ cargo +nightly fuzz run pg_test_decoding -- -max_total_time=60
 A crash writes the reproducing input to `fuzz/artifacts/<target>/`; re-run it
 with `cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<file>`.
 
-CI runs all three nightly (`.github/workflows/fuzz.yml`). The entry points live
+CI runs every target nightly (`.github/workflows/fuzz.yml`). The entry points live
 behind the `fuzzing` cargo feature (`src/fuzz.rs`) and are never built into the
 published crate.

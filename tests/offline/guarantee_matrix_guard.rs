@@ -13,10 +13,13 @@ const KNOWN_RED: &str = "dev/release_oracle/known_red.py";
 const GATE_DIR: &str = "dev/release_oracle";
 
 /// Rows not fully held: a `gap` cell or a live contradiction. Shrink-only; LOWER it with the row.
-// 30 -> 28 (2026-10-08): CDC refusals carry their code (#497): the lost-log and stable-code rows lost their last contradiction.
-const ROWS_NOT_HELD: usize = 28; // ratchet-pin: guarantee-rows-not-held
+// 30 -> 27 (2026-10-08): CDC refusals carry their code (#497, -2); a refused CDC run leaves nothing behind (-1).
+// 27 -> 26 (2026-10-09): the guarantee checks left unwritten are written (#506, -1).
+// 26 -> 25 (2026-10-09): the docs name `_rivet_exported_at` as the one column that differs between runs, and a cell holds it (#506, -1).
+// 25 -> 23 (2026-10-09): flat-memory.md states what was measured and a capped-run cell holds it; source-safe-under-load.md scopes the one-page sentence to chunked (#506, -2).
+const ROWS_NOT_HELD: usize = 23; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
-const GAP_CELLS: usize = 43; // ratchet-pin: guarantee-gap-cells
+const GAP_CELLS: usize = 31; // ratchet-pin: guarantee-gap-cells
 
 fn rows() -> Vec<Value> {
     let doc: Value = serde_yaml_ng::from_str(&subject_text(MATRIX))

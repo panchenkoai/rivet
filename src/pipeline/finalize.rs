@@ -21,7 +21,6 @@
 //! There is intentionally no public re-export for these — they are
 //! orchestration glue, not a pipeline API.
 
-use crate::config::DestinationConfig;
 use crate::error::Result;
 use crate::plan::ResolvedRunPlan;
 use crate::state::StateStore;
@@ -1080,52 +1079,7 @@ pub(super) fn write_running_manifest(
     }
 }
 
-/// Best-effort textual URI for the manifest's `destination.uri` field.
-///
-/// The manifest is a record of where data was written, so the URI must
-/// reflect what an operator would type to find the prefix again.
-pub(crate) fn destination_uri_for_manifest(cfg: &DestinationConfig) -> String {
-    use crate::config::DestinationType;
-    match cfg.destination_type {
-        DestinationType::Local => cfg
-            .path
-            .clone()
-            .or_else(|| cfg.prefix.clone())
-            .map(|p| format!("file://{p}"))
-            .unwrap_or_else(|| "file://.".to_string()),
-        DestinationType::S3 => {
-            let bucket = cfg.bucket.as_deref().unwrap_or("");
-            let prefix = cfg.prefix.as_deref().unwrap_or("");
-            if prefix.is_empty() {
-                format!("s3://{bucket}/")
-            } else {
-                format!("s3://{bucket}/{prefix}")
-            }
-        }
-        DestinationType::Gcs => {
-            let bucket = cfg.bucket.as_deref().unwrap_or("");
-            let prefix = cfg.prefix.as_deref().unwrap_or("");
-            if prefix.is_empty() {
-                format!("gs://{bucket}/")
-            } else {
-                format!("gs://{bucket}/{prefix}")
-            }
-        }
-        DestinationType::Azure => {
-            // `az://<container>/<prefix>` — same Hadoop/HDFS-style scheme that
-            // azcopy and most Azure-native tools recognise.  Manifest URI is
-            // operator-facing, not used for opendal addressing.
-            let container = cfg.bucket.as_deref().unwrap_or("");
-            let prefix = cfg.prefix.as_deref().unwrap_or("");
-            if prefix.is_empty() {
-                format!("az://{container}/")
-            } else {
-                format!("az://{container}/{prefix}")
-            }
-        }
-        DestinationType::Stdout => "stdout".to_string(),
-    }
-}
+pub(crate) use crate::manifest::destination_uri_for_manifest;
 
 #[cfg(test)]
 mod tests {
@@ -1308,7 +1262,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::config::DestinationType;
+    use crate::config::{DestinationConfig, DestinationType};
 
     fn cfg_local(path: Option<&str>, prefix: Option<&str>) -> DestinationConfig {
         DestinationConfig {
@@ -1602,6 +1556,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT 1".into(),
             query_template: None,
+            destination_written: None,
             is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
             format: crate::config::FormatType::Parquet,
@@ -1923,6 +1878,121 @@ mod tests {
             assert_eq!(m.source.schema, None, "export_name {name:?}");
             assert_eq!(m.source.table, None, "export_name {name:?}");
         }
+    }
+
+    /// The declared table is the source's identity: split on a real dot for a SQL engine, kept whole for a document store, and never guessed from a document store's export name.
+    #[test]
+    fn a_declared_table_is_split_per_engine_and_a_mongo_name_is_never_split() {
+        use crate::config::SourceType::{Mongo, Postgres};
+        for (engine, declared, schema, table) in [
+            (
+                Postgres,
+                Some("public.orders"),
+                Some("public"),
+                Some("orders"),
+            ),
+            (Postgres, Some("orders"), None, Some("orders")),
+            (Postgres, Some(".orders"), None, Some(".orders")),
+            (Postgres, Some("public."), None, Some("public.")),
+            (Mongo, Some("bh4.orders"), None, Some("bh4.orders")),
+            (Mongo, Some("orders"), None, Some("orders")),
+            (Mongo, None, None, None),
+        ] {
+            let case = format!("{engine:?} table {declared:?}");
+            let dir = tempfile::tempdir().unwrap();
+            let mut plan = fin_plan(dir.path());
+            plan.source.source_type = engine;
+            plan.source_table = declared.map(str::to_string);
+            let state = crate::state::StateStore::open_in_memory().unwrap();
+            let summary = fin_summary(&plan, "success");
+            assert_eq!(summary.export_name, "public.orders");
+
+            finalize_manifest(&plan, "e", &state, &summary, "export");
+
+            let m = read_manifest(dir.path());
+            assert_eq!(m.source.schema.as_deref(), schema, "{case}");
+            assert_eq!(m.source.table.as_deref(), table, "{case}");
+        }
+    }
+
+    /// The cursor range is the run's incremental evidence: it is recorded when the run knows the cursor column OR a high bound, not only when it knows both.
+    #[test]
+    fn a_cursor_range_is_recorded_when_the_run_knows_the_column_or_the_high_bound() {
+        for (column, high) in [
+            (Some("updated_at"), None),
+            (None, Some("2026-02-01")),
+            (None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let plan = fin_plan(dir.path());
+            let state = crate::state::StateStore::open_in_memory().unwrap();
+            let mut summary = fin_summary(&plan, "success");
+            summary.cursor_column = column.map(str::to_string);
+            summary.cursor_high = high.map(str::to_string);
+
+            finalize_manifest(&plan, "e", &state, &summary, "export");
+
+            let m = read_manifest(dir.path());
+            let ex = m.source.extraction.as_ref().expect("extraction section");
+            let case = format!("column {column:?} high {high:?}");
+            assert_eq!(ex.cursor_column.as_deref(), column, "{case}");
+            assert_eq!(ex.cursor_high.as_deref(), high, "{case}");
+            let low = (column.is_some() || high.is_some()).then_some("2026-01-01");
+            assert_eq!(ex.cursor_low.as_deref(), low, "{case}");
+        }
+    }
+
+    /// The end-of-run manifest pass reads the destination: a declared part that is not there costs the run its `validated`.
+    #[test]
+    fn the_manifest_pass_withdraws_validated_when_a_declared_part_is_not_at_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = fin_plan(dir.path());
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let mut summary = fin_summary(&plan, "success");
+        summary.validated = Some(true);
+
+        finalize_validate_manifest(&plan, &mut summary, "export");
+        assert_eq!(
+            summary.validated,
+            Some(true),
+            "a prefix with no manifest keeps the file-row verdict"
+        );
+
+        finalize_manifest(&plan, "e", &state, &summary, "export");
+        assert!(dir.path().join("manifest.json").is_file());
+        assert!(!dir.path().join("part-000001.parquet").exists());
+        finalize_validate_manifest(&plan, &mut summary, "export");
+        assert_eq!(
+            summary.validated,
+            Some(false),
+            "the manifest declares a part the destination does not hold"
+        );
+    }
+
+    /// A run into a prefix that already holds a completed run is warned before it writes; an empty prefix is silent.
+    #[test]
+    fn a_run_into_a_prefix_holding_a_completed_run_is_warned_and_an_empty_prefix_is_not() {
+        use crate::pipeline::run::run_tail_tests::{
+            captured_warnings_mentioning, install_warn_capture,
+        };
+        install_warn_capture();
+        let warned = |export: &str, marker: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(dir.path().join(marker), b"").unwrap();
+            }
+            let mut plan = fin_plan(dir.path());
+            plan.export_name = export.into();
+            warn_if_prefix_has_completed_run(&plan);
+            captured_warnings_mentioning(&format!("export '{export}'"))
+        };
+        assert_eq!(warned("rerun_guard_empty", None), Vec::<String>::new());
+        let said = warned("rerun_guard_done", Some(crate::manifest::SUCCESS_FILENAME));
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("already has parts from a prior run (_SUCCESS present)"),
+            "{said:?}"
+        );
     }
 
     #[test]

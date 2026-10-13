@@ -293,6 +293,8 @@ impl Rig {
             dest_prefix_unslashed: self.dest_prefix_unslashed,
             dest_stdout: self.dest_stdout,
             census_key: self.census_key.clone(),
+            bin: self.bin.clone(),
+            open_files: self.open_files,
             oracle_off: self.oracle_off.clone(),
             oracle_xfail: self.oracle_xfail.clone(),
             oracle_xfailed: std::cell::Cell::new(true),

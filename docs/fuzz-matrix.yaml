@@ -58,3 +58,19 @@ scenarios:
     mssql:    { test: spill_frame_decode }
     mongo:    { na: "Mongo spills NOTHING by construction (the control engine in the spill design) — no adapter-side buffer ever reaches SpooledTx, so there is no frame to parse" }
     oracle:   { na: "Oracle spills NOTHING: a commit group is buffered in memory under check_tx_buffer_caps, which refuses past the cap (no RIVET_CDC_SPILL_DIR path in the adapter) — there is no frame to parse" }
+
+  - id: fuzz_query_text_recognisers
+    what: "the operator-authored `query:` text read by the SQL recognisers (src/sql.rs: the `SELECT * FROM t` and plain-projection shortcuts, the outer FROM relation, the row-set text, and the one relation reader behind the PostgreSQL and SQL Server catalog hints and the preflight probe) — engine-agnostic text code every export's query passes through before a row is read; any UTF-8 text is recognised or declined, never a panic (a multi-byte character across byte 6 of a query, or before a chunked query's outer FROM, ended the run with exit 101 through 0.31.0)"
+    postgres: { test: sql_query_text }
+    mysql:    { test: sql_query_text }
+    mssql:    { test: sql_query_text }
+    mongo:    { test: sql_query_text }
+    oracle:   { test: sql_query_text }
+
+  - id: fuzz_redacted_text
+    what: "the log-line and error text read by the secret redactors (src/redact.rs: URL userinfo, keyword/value passwords, secret query parameters) — engine-agnostic text code every emitted line passes through, quoting drivers, servers and operator input; any UTF-8 text is rewritten or returned in one pass, never a panic (the URL scan re-read a run of letters from each of its bytes through 0.31.0: 256 KiB without whitespace took 18.6 s)"
+    postgres: { test: redact_text }
+    mysql:    { test: redact_text }
+    mssql:    { test: redact_text }
+    mongo:    { test: redact_text }
+    oracle:   { test: redact_text }

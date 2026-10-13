@@ -134,3 +134,35 @@ scenarios:
     mssql:    { na: "same shared to_json Bytes path" }
     mongo:    { na: "same shared to_json Bytes path" }
     oracle:   { na: "same shared to_json Bytes path (engine-agnostic) — pinned once" }
+
+  - id: load_lease_keeper_unavailable_loud
+    what: "a PostgreSQL-state `rivet load` whose lease keeper cannot connect (the state role's connection limit is spent) → RIVET_STATE_LEASE_KEEPER_UNAVAILABLE on every cycle, no warehouse table, no lease row and no ledger row; never LOAD OK under a lease nothing renews"
+    postgres: { test: a_load_that_cannot_open_its_lease_keeper_refuses_twice_then_loads }
+    mysql:    { na: "`rivet load` never reads the source: it loads the Parquet a run left in the bucket, and the lease is the state backend's (src/state/load_lease.rs) — pinned once" }
+    mssql:    { na: "same source-agnostic load path" }
+    mongo:    { na: "same source-agnostic load path" }
+    oracle:   { na: "same source-agnostic load path" }
+
+  - id: load_lease_lost_mid_load_loud
+    what: "a PostgreSQL-state `rivet load` stalled past its lease TTL while another holder takes the lease → RIVET_STATE_LEASE_LOST before the warehouse write, the ledger row `refused`, the other holder's row untouched; the next load loads the table"
+    postgres: { test: a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused }
+    mysql:    { na: "`rivet load` never reads the source: the lease is the state backend's — pinned once" }
+    mssql:    { na: "same source-agnostic load path" }
+    mongo:    { na: "same source-agnostic load path" }
+    oracle:   { na: "same source-agnostic load path" }
+
+  - id: load_lease_lost_during_the_write_loud
+    what: "a PostgreSQL-state `rivet load` stalled while it writes the warehouse, its lease taken by another holder → RIVET_LOAD_LEASE_LOST_DURING_WRITE (exit 3) after the write, the ledger row `failed` (the table stays rivet's own), never a `success`; the next load loads the table"
+    postgres: { test: a_load_whose_lease_is_taken_during_the_write_fails_and_is_recorded_failed }
+    mysql:    { na: "`rivet load` never reads the source: the lease is the state backend's — pinned once" }
+    mssql:    { na: "same source-agnostic load path" }
+    mongo:    { na: "same source-agnostic load path" }
+    oracle:   { na: "same source-agnostic load path" }
+
+  - id: pooled_load_short_of_file_descriptors_keeps_its_leases
+    what: "a PostgreSQL-state `rivet load --pool 16` capped at 150 open files → no `state_lease` row is ever past its expiry while the load runs (the state server's own clock), the tables that cannot be loaded fail loudly, and the next uncapped load loads every table"
+    postgres: { test: a_pooled_load_short_of_file_descriptors_never_runs_under_a_lapsed_lease }
+    mysql:    { na: "`rivet load` never reads the source: the lease is the state backend's — pinned once" }
+    mssql:    { na: "same source-agnostic load path" }
+    mongo:    { na: "same source-agnostic load path" }
+    oracle:   { na: "same source-agnostic load path" }

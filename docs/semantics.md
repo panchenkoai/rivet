@@ -58,7 +58,7 @@ The exact state-write ordering is defined by **[ADR-0001 — State Update Invari
 
 ## Retry semantics
 
-Retries are classified by error type in [src/pipeline/retry.rs](https://github.com/panchenkoai/rivet/blob/main/src/pipeline/retry.rs):
+Retries are classified by error type in [src/error/retry.rs](https://github.com/panchenkoai/rivet/blob/main/src/error/retry.rs):
 
 The classifier (`RetryClass`) has two outcomes — `Transient` (retry) and `Permanent` (propagate):
 
@@ -121,6 +121,9 @@ What `--resume` does:
 
 - **Incremental exports** resume from `export_state.last_cursor_value`.
 - **Chunked exports** consult the `chunk_task` table: tasks in `completed` are skipped; tasks in `pending` or `running` (the latter reset to `pending` on resume) are re-issued; tasks in `failed` are retried while `attempts < max_chunk_attempts`.
+- **A resumed chunked run reads the source's key span again** (`rivet run`; `rivet apply` replays the ranges its plan sealed). Keys the source holds outside the span the stopped run planned get new tasks, and a run that committed no part before it stopped is planned again whole, so rows that arrived past the old plan are delivered. The windows the stopped run committed are not read again: a row written into one of them since is not in this run's output, as with a window an uninterrupted run has already read.
+- **A resumed parallel keyset run** (`chunk_by_key` with `parallel` and `chunk_checkpoint`) whose last, open-ended key range was committed reads the keys past the highest one that range delivered. A range committed by rivet 0.31 or earlier recorded no such key and is read again whole; none of its parts is declared twice.
+- **An unfinished run is not continued in another format.** If `format` was edited while a checkpointed run was unfinished, the run is refused (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5) until the format is restored or the run is abandoned (`rivet state reset-chunks` for a range-chunk run, `rivet state reset` for a keyset run).
 - **Full and time-window** modes do not resume — they restart from the beginning. The previous run's output files remain at the destination unless cleaned manually.
 
 Chunk task transitions are **strictly forward** (`pending → running → {completed | failed}`). A `completed` chunk is never re-claimed, even after a crash — see ADR-0001 I5 (Chunk Task Acyclicity).
@@ -196,7 +199,7 @@ Full per-backend table and rationale: **[ADR-0004 — Destination Write Contract
 
 Rivet does **not** currently guarantee:
 
-- **Exactly-once delivery to the destination.** Crashes between destination write and cursor advancement can produce duplicate files. Plan downstream dedup or idempotent ingestion — the manifest's per-part `content_fingerprint` is the supported dedup key: identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint. See [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md).
+- **Exactly-once delivery to the destination.** Crashes between destination write and cursor advancement can produce duplicate files. Plan downstream dedup or idempotent ingestion — the manifest's per-part `content_fingerprint` (an xxh3 over the part's bytes) is the supported dedup key: with `meta_columns.exported_at` off, identical rows produce byte-identical parts (and the same fingerprint) across rivet releases, so a duplicate is safely droppable by fingerprint. `_rivet_exported_at` is a technical column holding the time of the write, and `rivet init` turns it on: with it on, two extractions of the same rows differ in that column by design, and so in part bytes and fingerprint, and are identical in every other column — dedup those on the key. See [recipes/idempotent-warehouse-load.md](recipes/idempotent-warehouse-load.md).
 - **Continuous / near-real-time replication.** Rivet *does* capture CDC to files (`mode: cdc` — inserts/updates/deletes via a Postgres logical replication slot / MySQL binlog / SQL Server CDC change tables / MongoDB change streams, into typed Parquet/CSV — or the JSON-blob document image for MongoDB — resuming from the last committed log position each run), but it is not a continuously-running stream — changes are captured per invocation, not delivered live. For always-on near-real-time replication use Debezium or Estuary.
 - **Completeness of incremental cursors that can tie.** Incremental resume uses a strict `WHERE cursor > last_value`. If two rows share the high-watermark value and the second becomes visible only *after* the run that advanced the watermark past it — e.g. a low-resolution `updated_at` (second granularity) or rows committed at the same timestamp after the read snapshot — the next run skips them and they are never exported. (Keyset pagination is unaffected: its key is planner-enforced unique + NOT NULL.) Use a **strictly per-row-distinct, monotonic** cursor (a sequence/identity id, or a timestamp with sub-value uniqueness); when the cursor can tie, re-snapshot the affected window with `full`/`chunked` mode.
 - **Automatic cleanup of an interrupted write's temp file.** A crash mid-write on the local destination may leave a dot-prefixed temp file in the target directory — never a partial *final* file (the commit is an atomic `rename`, so the final path is the complete file or absent). The stray temp file is harmless and can be removed manually.

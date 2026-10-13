@@ -56,6 +56,11 @@ pub fn compute_batch_size_from_memory(memory_mb: usize, schema: &SchemaRef) -> u
 /// the scaffold and the check.
 pub(crate) const DEFAULT_MEM_BUDGET_MB: u64 = 2048;
 
+/// Default per-batch Arrow memory budget (MB) when the export sets no
+/// `batch_size_memory_mb`. Used by the row-accumulating engines (MySQL, MSSQL)
+/// to size the post-probe cap; PostgreSQL derives its own from `work_mem`.
+pub(crate) const DEFAULT_BATCH_TARGET_MB: usize = 64;
+
 /// Per-worker peak RSS (MB) under the default *adaptive* batching, fitted to the
 /// sweep in `docs/bench/reports/REPORT_full_vs_parallel.md`. Anchored on measured
 /// points — ~19 MB/worker at ~40 B/row (narrow), ~105 MB at ~4 KB/row (wide) —
@@ -67,7 +72,7 @@ pub(crate) const DEFAULT_MEM_BUDGET_MB: u64 = 2048;
 /// This is the *catalog-width* estimate (pre-schema `avg_row_bytes`), shared by
 /// `init` (scaffold) and `preflight::check`. Its schema-resolved sibling is
 /// [`compute_batch_size_from_memory`] above; the ceiling is single-sourced from
-/// [`crate::source::batch_controller::DEFAULT_BATCH_TARGET_MB`] so the two can't
+/// [`DEFAULT_BATCH_TARGET_MB`] so the two can't
 /// silently drift on the batch target. The slope/floor remain empirical (the
 /// bench sweep, not derivable from the schema-bytes model).
 pub(crate) fn per_worker_rss_mb(avg_row_bytes: i64) -> u64 {
@@ -75,7 +80,7 @@ pub(crate) fn per_worker_rss_mb(avg_row_bytes: i64) -> u64 {
     // ~2× the adaptive batch target (Arrow builders + parquet row-group + zstd
     // hold roughly twice the raw in-flight batch). Linked to the source of truth
     // so it tracks the batch target instead of drifting.
-    const CEIL_MB: u64 = 2 * crate::source::batch_controller::DEFAULT_BATCH_TARGET_MB as u64;
+    const CEIL_MB: u64 = 2 * DEFAULT_BATCH_TARGET_MB as u64;
     let b = avg_row_bytes.max(0) as u64;
     (FLOOR_MB + b * 87 / 4096).clamp(FLOOR_MB, CEIL_MB)
 }

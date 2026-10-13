@@ -25,6 +25,7 @@ Usage:
 
 from __future__ import annotations
 
+from contextlib import closing
 import argparse
 import sqlite3
 import tempfile
@@ -61,13 +62,10 @@ def build(dest: Path, *, source: Path = SQL) -> tuple[int, int, int]:
 
     if dest.exists():
         dest.unlink()
-    conn = sqlite3.connect(dest)
-    try:
+    with closing(sqlite3.connect(dest)) as conn:
         conn.executescript(script)
         conn.commit()
         return _counts(conn)
-    finally:
-        conn.close()
 
 
 def run(argv: Sequence[str] | None = None) -> int:
@@ -91,11 +89,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             # Compare the SEED CONTENT, not the file bytes: SQLite page layout is
             # not reproducible (free-page reuse, encoding of the same rows), so a
             # byte diff would report drift on an identical catalog.
-            live = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-            try:
+            with closing(sqlite3.connect(f"file:{DB}?mode=ro", uri=True)) as live:
                 have = _counts(live)
-            finally:
-                live.close()
             if have != (total, normal, garbage):
                 raise Fail(
                     f"{DB.name} is stale: has {have} (total, normal, garbage), "

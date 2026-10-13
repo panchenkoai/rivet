@@ -11,6 +11,9 @@ use super::contract::{
     ChunkedPlan, ExtractionStrategy, IncrementalCursorPlan, KeysetPlan, PagedMode, ResolvedRunPlan,
 };
 
+pub use crate::types::parse_column_overrides as parse_column_overrides_pub;
+use crate::types::parse_column_overrides;
+
 /// Build a [`ResolvedRunPlan`] from config and CLI flags.
 ///
 /// This is the only place where raw `ExportConfig` fields and CLI flags
@@ -26,7 +29,7 @@ pub(crate) fn partition_rollover_of(
     config: &Config,
     export: &ExportConfig,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
-    crate::load::plan::resolved_partition(config, export, export.snapshot_label.as_deref())
+    crate::plan::load_settings::resolved_partition(config, export, export.snapshot_label.as_deref())
         .and_then(rollover_of)
 }
 
@@ -37,16 +40,16 @@ pub(crate) fn cdc_partition_rollover(
     export: &ExportConfig,
     table: &str,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
-    let layout = crate::load::plan::resolved_layout(config, export, Some(table));
+    let layout = crate::plan::load_settings::resolved_layout(config, export, Some(table));
     (!layout.log_is_disposable())
-        .then(|| crate::load::plan::resolved_partition(config, export, Some(table)))
+        .then(|| crate::plan::load_settings::resolved_partition(config, export, Some(table)))
         .flatten()
         .and_then(rollover_of)
 }
 
 /// A COLUMN partition as the writer's budget; other partition forms are not countable.
 fn rollover_of(
-    spec: crate::load::plan::PartitionSpec,
+    spec: crate::config::load::PartitionSpec,
 ) -> Option<crate::plan::rollover::PartitionRollover> {
     match spec.form {
         crate::config::load::PartitionForm::Column {
@@ -55,7 +58,7 @@ fn rollover_of(
         } => Some(crate::plan::rollover::PartitionRollover {
             column,
             granularity,
-            cap: crate::load::partition_budget::MAX_PARTITIONS_PER_JOB as usize,
+            cap: crate::plan::rollover::MAX_PARTITIONS_PER_JOB as usize,
         }),
         _ => None,
     }
@@ -212,6 +215,13 @@ pub(crate) fn build_plan_on(
     };
 
     let (compression, compression_level) = export.effective_compression();
+    // #167: a `--split` sub-export named `daily#0` must resolve `{export}` /
+    // `{table}` to its FAMILY (`daily`), not the unit name — so all N range
+    // units write into ONE shared prefix and the load view recombines them as
+    // one logical table (the merge-back). An ordinary export's family IS its
+    // name, so this is a no-op off the split path.
+    let destination = expand_destination_templates(export.destination.clone(), &export.family());
+    let destination_written = Some(export.destination.uri()).filter(|w| *w != destination.uri());
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),
@@ -235,6 +245,7 @@ pub(crate) fn build_plan_on(
             .or_else(|| export.table.clone()),
         base_query,
         query_template,
+        destination_written,
         is_split_unit: export.split.is_some(),
         // Thread the split window into the plan so finalize records it in the manifest —
         // the durable anchor for exact-partition resume (SplitSynth → manifest::SplitWindow).
@@ -250,12 +261,7 @@ pub(crate) fn build_plan_on(
         max_file_size_bytes: export.max_file_size_bytes(),
         skip_empty: export.skip_empty,
         meta_columns: export.meta_columns.clone(),
-        // #167: a `--split` sub-export named `daily#0` must resolve `{export}` /
-        // `{table}` to its FAMILY (`daily`), not the unit name — so all N range
-        // units write into ONE shared prefix and the load view recombines them as
-        // one logical table (the merge-back). An ordinary export's family IS its
-        // name, so this is a no-op off the split path.
-        destination: expand_destination_templates(export.destination.clone(), &export.family()),
+        destination,
         quality: export.quality.clone(),
         tuning,
         tuning_profile_label,
@@ -747,6 +753,50 @@ fn implicit_key<'a>(
         .map(ImplicitKey::UniqueKey)
 }
 
+/// [`implicit_key`], or the refusal of a shape chunked mode cannot page: a `chunk_column` range chunking cannot slice, a MySQL unique key under a `uuid` override, or no key at all.
+fn validated_implicit_key<'a>(
+    source_type: crate::config::SourceType,
+    export: &'a ExportConfig,
+    tbl: &str,
+    introspection: &'a crate::source::TableIntrospection,
+) -> Result<ImplicitKey<'a>> {
+    match implicit_key(source_type, export, introspection) {
+        Some(ImplicitKey::Column(c)) => {
+            // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
+            // sliced must be integer-family, or range chunking silently drops rows
+            // between windows. `chunk_by_days` (date half-open) is type-safe.
+            let range_sliced = export.chunk_by_days.is_none();
+            if range_sliced && !introspection.is_integer_column(c) {
+                anyhow::bail!(
+                    "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
+                     chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
+                     numeric/decimal/float/text key silently drops every value between two window \
+                     boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
+                     integer column, or `mode: full`.",
+                    export.name,
+                    c,
+                    tbl,
+                    c
+                );
+            }
+            Ok(ImplicitKey::Column(c))
+        }
+        Some(ImplicitKey::UniqueKey(key)) => {
+            refuse_mysql_uuid_keyset_key(source_type, export, key)?;
+            Ok(ImplicitKey::UniqueKey(key))
+        }
+        Some(key) => Ok(key),
+        None => anyhow::bail!(
+            "export '{}': chunked mode found no safe shape on {} — no single-integer PK \
+             to range-chunk and no single-column UNIQUE/PRIMARY key to keyset-page. \
+             Set `chunk_column:` (integer) or `chunk_by_key:` (unique key) explicitly, \
+             add a unique index, or use `mode: full` to accept one long snapshot query.",
+            export.name,
+            tbl
+        ),
+    }
+}
+
 fn chunked_strategy_from_introspection(
     source_type: crate::config::SourceType,
     export: &ExportConfig,
@@ -800,37 +850,7 @@ fn chunked_strategy_from_introspection(
         log::warn!("{w}");
     }
 
-    // (2) Small-table escape: a single chunk/page has no benefit and adds
-    // plumbing latency. Downgrade to Snapshot (bounded + simplest). Only fires
-    // when reltuples is a meaningful positive number — un-analyzed tables
-    // (reltuples=0) keep the chunked/keyset plan to preserve existing semantics.
-    //
-    // Explicit chunk knobs win over the heuristic: `chunk_count` recomputes
-    // chunk_size at detect time from min/max (so comparing the estimate
-    // against the static default chunk_size is meaningless), `chunk_by_days`
-    // asks for date-ranged chunks, `chunk_checkpoint` asks for resumability a
-    // Snapshot cannot provide, and `chunk_by_key` pins keyset pagination.
-    // None of these may be silently collapsed to one snapshot file.
-    let explicit_chunk_shape = export.chunk_count.is_some()
-        || export.chunk_by_days.is_some()
-        || export.chunk_checkpoint
-        || export.chunk_by_key.is_some();
-    if !explicit_chunk_shape
-        && introspection.row_estimate > 0
-        && (introspection.row_estimate as usize) <= chunk_size
-    {
-        log::info!(
-            "export '{}': {} has ~{} rows ≤ chunk_size {}; downgrading chunked → snapshot",
-            export.name,
-            tbl,
-            introspection.row_estimate,
-            chunk_size,
-        );
-        let stands_for = implicit_key(source_type, export, introspection).map(|k| k.mode());
-        return Ok((ExtractionStrategy::Snapshot, stands_for));
-    }
-
-    // (3) Explicit keyset key (OPT-4): page by a single index-backed unique key.
+    // (2) Explicit keyset key (OPT-4): page by a single index-backed unique key.
     // Validate it is a usable keyset key (single-column, NOT NULL, UNIQUE/PK);
     // refuse otherwise rather than emit a full-scan + filesort `ORDER BY` query.
     if let Some(key) = export.chunk_by_key.as_deref() {
@@ -874,31 +894,43 @@ fn chunked_strategy_from_introspection(
         ));
     }
 
-    // (4) Resolve chunk_column for range chunking, with an auto-keyset fallback
-    // on MySQL when there is no single-integer PK but a usable unique key exists.
-    let column = match implicit_key(source_type, export, introspection) {
-        Some(ImplicitKey::Column(c)) => {
-            // #103 (variant 1): an explicit chunk_column that is integer-`BETWEEN`-
-            // sliced must be integer-family, or range chunking silently drops rows
-            // between windows. `chunk_by_days` (date half-open) is type-safe and took the
-            // fast path above (never reaches here).
-            let range_sliced = export.chunk_by_days.is_none();
-            if range_sliced && !introspection.is_integer_column(c) {
-                anyhow::bail!(
-                    "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
-                     chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
-                     numeric/decimal/float/text key silently drops every value between two window \
-                     boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
-                     integer column, or `mode: full`.",
-                    export.name,
-                    c,
-                    tbl,
-                    c
-                );
-            }
-            c.to_string()
-        }
-        Some(ImplicitKey::IntPk(col)) => {
+    // (3) The key the export pages by, validated before the small-table escape:
+    // a config refused on a large table is refused on one that fits in a chunk.
+    let key = validated_implicit_key(source_type, export, tbl, introspection)?;
+
+    // (4) Small-table escape: a single chunk/page has no benefit and adds
+    // plumbing latency. Downgrade to Snapshot (bounded + simplest). Only fires
+    // when reltuples is a meaningful positive number — un-analyzed tables
+    // (reltuples=0) keep the chunked/keyset plan to preserve existing semantics.
+    //
+    // Explicit chunk knobs win over the heuristic: `chunk_count` recomputes
+    // chunk_size at detect time from min/max (so comparing the estimate
+    // against the static default chunk_size is meaningless), `chunk_by_days`
+    // asks for date-ranged chunks, `chunk_checkpoint` asks for resumability a
+    // Snapshot cannot provide, and `chunk_by_key` pins keyset pagination.
+    // None of these may be silently collapsed to one snapshot file.
+    let explicit_chunk_shape = export.chunk_count.is_some()
+        || export.chunk_by_days.is_some()
+        || export.chunk_checkpoint
+        || export.chunk_by_key.is_some();
+    if !explicit_chunk_shape
+        && introspection.row_estimate > 0
+        && (introspection.row_estimate as usize) <= chunk_size
+    {
+        log::info!(
+            "export '{}': {} has ~{} rows ≤ chunk_size {}; downgrading chunked → snapshot",
+            export.name,
+            tbl,
+            introspection.row_estimate,
+            chunk_size,
+        );
+        return Ok((ExtractionStrategy::Snapshot, Some(key.mode())));
+    }
+
+    // (5) Range chunks on the resolved column, or MySQL's keyset pages on a unique key.
+    let column = match key {
+        ImplicitKey::Column(c) => c.to_string(),
+        ImplicitKey::IntPk(col) => {
             // `info!` was below the default `warn` log level — operators
             // never saw which column the planner had picked, so a config
             // that intended `mode: chunked` + `chunk_column: created_at`
@@ -915,7 +947,7 @@ fn chunked_strategy_from_introspection(
             );
             col.to_string()
         }
-        Some(ImplicitKey::UniqueKey(key)) => {
+        ImplicitKey::UniqueKey(key) => {
             log::warn!(
                 "export '{}': {} has no single-integer PK — auto-selected keyset \
                  (seek) pagination on unique key '{}'. Set `chunk_by_key:` explicitly \
@@ -924,7 +956,6 @@ fn chunked_strategy_from_introspection(
                 tbl,
                 key
             );
-            refuse_mysql_uuid_keyset_key(source_type, export, key)?;
             let (checkpoint, incremental) = keyset_recovery(export);
             return Ok((
                 ExtractionStrategy::Keyset(KeysetPlan {
@@ -937,14 +968,6 @@ fn chunked_strategy_from_introspection(
                 None,
             ));
         }
-        None => anyhow::bail!(
-            "export '{}': chunked mode found no safe shape on {} — no single-integer PK \
-             to range-chunk and no single-column UNIQUE/PRIMARY key to keyset-page. \
-             Set `chunk_column:` (integer) or `chunk_by_key:` (unique key) explicitly, \
-             add a unique index, or use `mode: full` to accept one long snapshot query.",
-            export.name,
-            tbl
-        ),
     };
 
     Ok((chunked_plan(export, column, chunk_size, max_attempts), None))
@@ -966,38 +989,6 @@ fn chunked_plan(
         checkpoint: export.chunk_checkpoint,
         max_attempts,
     })
-}
-
-/// Public re-export for callers outside `plan` (e.g. `preflight::type_report`).
-pub fn parse_column_overrides_pub(
-    raw: &std::collections::HashMap<String, String>,
-    export_name: &str,
-) -> Result<crate::types::ColumnOverrides> {
-    parse_column_overrides(raw, export_name)
-}
-
-/// Parse the raw `columns:` map from `ExportConfig` into typed [`ColumnOverrides`].
-///
-/// Fails early (at plan-build time) with an actionable error so the user
-/// fixes their `rivet.yaml` before the export runs.
-fn parse_column_overrides(
-    raw: &std::collections::HashMap<String, String>,
-    export_name: &str,
-) -> Result<crate::types::ColumnOverrides> {
-    raw.iter()
-        .map(|(col, type_str)| {
-            crate::types::parse_type_str(type_str)
-                .map(|t| (col.clone(), t))
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "export '{}': column override for '{}': {}",
-                        export_name,
-                        col,
-                        e
-                    )
-                })
-        })
-        .collect()
 }
 
 /// Substitute placeholders in `destination.path` and `destination.prefix`.
@@ -1094,6 +1085,77 @@ mod tests {
             params,
         )
         .expect("plan")
+    }
+
+    /// The destination part of the progress identity is the destination as written: a `{date}` prefix is one place on every day, and a plan with no placeholder seals as before.
+    #[test]
+    fn a_dated_destination_enters_the_progress_identity_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = planned(dir.path(), "    table: orders", &[]);
+        assert_eq!(plain.destination_written, None);
+        let landing = plain.progress_key().landing;
+        assert_eq!(landing.destination, "file://./out");
+        assert_eq!(landing.format, "parquet");
+        let sealed = serde_json::to_value(&plain).unwrap();
+        assert!(sealed.get("destination_written").is_none(), "{sealed}");
+
+        let path = dir.path().join("rivet.yaml");
+        let mut config = Config::load_with_params(path.to_str().unwrap(), None).unwrap();
+        config.exports[0].destination = DestinationConfig {
+            destination_type: DestinationType::S3,
+            bucket: Some("b".into()),
+            prefix: Some("runs/{date}/{export}/".into()),
+            ..Default::default()
+        };
+        let dated = build_plan(
+            &config,
+            &config.exports[0],
+            dir.path(),
+            false,
+            false,
+            false,
+            None,
+        )
+        .expect("plan");
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        let resolved = format!("s3://b/runs/{today}/orders/");
+        assert_eq!(dated.destination.uri(), resolved);
+        let written = "s3://b/runs/{date}/{export}/";
+        assert_eq!(dated.destination_written.as_deref(), Some(written));
+        assert_eq!(dated.progress_key().landing.destination, written);
+
+        let mut sealed = serde_json::to_value(&dated).unwrap();
+        let reread: ResolvedRunPlan = serde_json::from_value(sealed.clone()).unwrap();
+        assert_eq!(reread.progress_key().landing.destination, written);
+        sealed
+            .as_object_mut()
+            .unwrap()
+            .remove("destination_written");
+        let before_the_field: ResolvedRunPlan = serde_json::from_value(sealed).unwrap();
+        assert_eq!(
+            before_the_field.progress_key().landing.destination,
+            resolved
+        );
+    }
+
+    /// A destination spelled through `${VAR}` enters the progress identity by its value: another value is another destination.
+    #[test]
+    fn a_destination_from_a_variable_enters_the_progress_identity_by_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        let yaml = "source:\n  type: postgres\n  url: \"postgresql://localhost/test\"\nexports:\n\
+                    \x20 - name: orders\n    table: orders\n    mode: incremental\n    cursor_column: id\n\
+                    \x20   format: parquet\n    destination: { type: local, path: \"${out}/orders\" }\n";
+        std::fs::write(&path, yaml).unwrap();
+        let delivered_to = |out: &str| {
+            let params = HashMap::from([("out".to_string(), out.to_string())]);
+            let config = Config::load_with_params(path.to_str().unwrap(), Some(&params)).unwrap();
+            let export = &config.exports[0];
+            let plan = build_plan(&config, export, dir.path(), false, false, false, None);
+            plan.expect("plan").progress_key().landing.destination
+        };
+        assert_eq!(delivered_to("/a"), "file:///a/orders");
+        assert_eq!(delivered_to("/b"), "file:///b/orders");
     }
 
     /// The rows part of the progress identity is the query as written: a placeholder's value is not part of it, the text around it is.
@@ -2084,7 +2146,6 @@ mod tests {
                 small(None, &["uid"]),
                 Some(PagedMode::Keyset),
             ),
-            (SourceType::Postgres, &auto, small(None, &["uid"]), None),
         ] {
             let (strategy, got) = planned(source_type, export, &table);
             assert!(
@@ -2093,6 +2154,18 @@ mod tests {
             );
             assert_eq!(got, stands_for, "{source_type:?}");
         }
+        let keyless = small(None, &["uid"]);
+        assert!(
+            chunked_strategy_from_introspection(
+                SourceType::Postgres,
+                &auto,
+                "public.t",
+                3,
+                &keyless
+            )
+            .is_err(),
+            "a table PostgreSQL cannot page is refused, not read as one pass"
+        );
 
         let large = intro(Some("id"), &["id"], 1_000_000, Some(100), &["id"]);
         assert!(matches!(
@@ -2163,6 +2236,65 @@ mod tests {
         single_pass.single_pass_of = Some(PagedMode::Keyset);
         let said = refused_beside_a_chunk_run(&single_pass);
         assert!(said.contains("this export now runs as `keyset`"), "{said}");
+    }
+
+    /// A shape refused on a large table is refused on one that fits in a chunk, and a shape that plans is still one pass there.
+    #[test]
+    fn a_chunked_shape_is_validated_whatever_the_row_estimate() {
+        use crate::config::SourceType;
+        let resolve =
+            |source_type, export: &ExportConfig, i: &crate::source::TableIntrospection| {
+                chunked_strategy_from_introspection(source_type, export, "public.t", 3, i)
+            };
+        let stands_for = |plan: Result<(ExtractionStrategy, Option<PagedMode>)>| match plan {
+            Ok((ExtractionStrategy::Snapshot, mode)) => mode,
+            other => panic!("one pass expected, got {other:?}"),
+        };
+        for rows in [3, 1_000_000] {
+            let mut decimal = chunked_export();
+            decimal.chunk_column = Some("amount".into());
+            let i = intro(Some("id"), &["id"], rows, Some(100), &["id"]);
+            let err = resolve(SourceType::Postgres, &decimal, &i).unwrap_err();
+            assert!(
+                err.to_string().contains("is not an integer-family column"),
+                "{rows} rows: {err}"
+            );
+
+            let mut keyless = chunked_export();
+            keyless.chunk_column = None;
+            let i = intro(None, &[], rows, Some(100), &[]);
+            for engine in [SourceType::Postgres, SourceType::Mysql] {
+                let err = resolve(engine, &keyless, &i).unwrap_err();
+                assert!(
+                    err.to_string().contains("found no safe shape"),
+                    "{rows} rows: {err}"
+                );
+            }
+
+            let mut uuid = keyless.clone();
+            uuid.columns.insert("uid".into(), "uuid".into());
+            let i = intro(None, &["uid"], rows, Some(100), &[]);
+            let err = resolve(SourceType::Mysql, &uuid, &i).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE"),
+                "{rows} rows"
+            );
+        }
+        let mut auto = chunked_export();
+        auto.chunk_column = None;
+        let small = intro(None, &["uid"], 3, Some(100), &[]);
+        assert_eq!(
+            stands_for(resolve(SourceType::Mysql, &auto, &small)),
+            Some(PagedMode::Keyset)
+        );
+        let mut explicit = chunked_export();
+        explicit.chunk_column = Some("id".into());
+        let small = intro(Some("id"), &["id"], 3, Some(100), &["id"]);
+        assert_eq!(
+            stands_for(resolve(SourceType::Postgres, &explicit, &small)),
+            Some(PagedMode::Chunked)
+        );
     }
 
     #[test]

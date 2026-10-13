@@ -22,9 +22,12 @@ mod validate;
 pub use args::parse_cli;
 pub use dispatch::dispatch;
 
+/// Where the process logger sends a line first: the in-process renderer's channel.
+pub(crate) const LOG_ROUTE: crate::redact::LogRoute = crate::pipeline::ipc::route_log_line;
+
 /// The `rivet` binary's entry point: parse, dispatch, report a failure, exit with its class.
 pub fn run_binary() {
-    crate::redact::install_logger();
+    crate::redact::install_logger(LOG_ROUTE);
     #[cfg(feature = "oracle")]
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = parse_cli();

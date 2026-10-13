@@ -69,7 +69,16 @@ pub fn write_config(tmpdir: &tempfile::TempDir, yaml: &str) -> PathBuf {
 
 /// A `rivet` command with every inherited `RIVET_*` stripped; the child sees only the state backend under test and `envs`.
 pub fn rivet_command(args: &[impl AsRef<std::ffi::OsStr>], envs: &[(&str, &str)]) -> Command {
-    let mut cmd = Command::new(rivet_bin());
+    rivet_command_as(rivet_bin(), args, envs)
+}
+
+/// [`rivet_command`] for one named binary: the per-invocation choice a rig makes ([`crate::common::rig::Rig::as_previous_release`]).
+pub fn rivet_command_as(
+    bin: impl AsRef<std::ffi::OsStr>,
+    args: &[impl AsRef<std::ffi::OsStr>],
+    envs: &[(&str, &str)],
+) -> Command {
+    let mut cmd = Command::new(bin);
     cmd.args(args);
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("RIVET_") {

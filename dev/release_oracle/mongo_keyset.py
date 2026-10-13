@@ -54,53 +54,52 @@ def sc_mongo_keyset(led: Ledger, engine: str, tag: str, url: str) -> None:
         return
     sc = Scope(engine, tag)
     uniform, mixed = sc.name("mk", str(os.getpid())), sc.name("mkh", str(os.getpid()))
-    client = pymongo.MongoClient(url, serverSelectionTimeoutMS=5000)
-    db = client.get_default_database("rivet")
-    try:
+    with pymongo.MongoClient(url, serverSelectionTimeoutMS=5000) as client:
+        db = client.get_default_database("rivet")
         try:
+            try:
+                db[uniform].drop()
+                db[uniform].insert_many([{"_id": i, "v": f"v{i}"} for i in range(1, DOCS + 1)])
+                db[mixed].drop()
+                db[mixed].insert_many([{"_id": i, "v": "n"} for i in range(1, 51)]
+                                      + [{"_id": f"s{i:03d}", "v": "s"} for i in range(50)])
+            except pymongo.errors.PyMongoError as e:
+                _skipped(led, engine, tag, SCEN, "-", f"mongo-keyset: cannot seed ({e})", "seed")
+                return
+            src = f"{db[uniform].count_documents({})} {len(db[uniform].distinct('_id'))}"
+            fails, counts = [], {}
+            for label, par, stamp in (("sequential", None, r"_keyset_([^/']+)\.parquet"), ("parallel:4", 4, r"_w(\d+)_keyset")):
+                dest = sc.dir("mk", label.replace(":", ""))
+                rc, err = _export(url, uniform, dest, par)
+                if rc != 0:
+                    fails.append(f"{label} exit {rc}: {err.strip()[-160:]}")
+                    continue
+                lst = _declared_read(dest, ".parquet")
+                if lst is None:
+                    fails.append(f"{label}: nothing declared")
+                    continue
+                with Oracle() as o:
+                    got = o.scalar(f"SELECT count(*)||' '||count(DISTINCT _id) FROM read_parquet({lst})")
+                ranges = {m for f in lst.split(",") for m in re.findall(stamp, f)}
+                counts[label] = len(ranges)
+                if got != src:
+                    fails.append(f"{label}: source {src} != declared {got}")
+                if len(ranges) < 2:
+                    fails.append(f"{label}: {len(ranges)} range part(s), need >=2")
+            for label, par in (("mixed sequential", None), ("mixed parallel:4", 4)):
+                dest = sc.dir("mkh", label.split()[-1].replace(":", ""))
+                rc, err = _export(url, mixed, dest, par)
+                parts = list(dest.rglob("*.parquet")) if dest.exists() else []
+                if rc == 0 or parts:
+                    fails.append(f"{label}: heterogeneous _id NOT refused (exit {rc}, {len(parts)} part(s))")
+                elif "heterogeneous" not in err:
+                    fails.append(f"{label}: refused for another reason: {err.strip()[-160:]}")
+            if fails:
+                _failed(led, engine, tag, SCEN, "-", "mongo-keyset: " + "; ".join(fails), "; ".join(fails)[:200])
+            else:
+                _passed(led, engine, tag, SCEN, "-",
+                        f"mongo-keyset: sequential + parallel:4 == source ({src}), range parts {counts}; "
+                        f"int+string _id refused with 0 parts on both")
+        finally:
             db[uniform].drop()
-            db[uniform].insert_many([{"_id": i, "v": f"v{i}"} for i in range(1, DOCS + 1)])
             db[mixed].drop()
-            db[mixed].insert_many([{"_id": i, "v": "n"} for i in range(1, 51)]
-                                  + [{"_id": f"s{i:03d}", "v": "s"} for i in range(50)])
-        except pymongo.errors.PyMongoError as e:
-            _skipped(led, engine, tag, SCEN, "-", f"mongo-keyset: cannot seed ({e})", "seed")
-            return
-        src = f"{db[uniform].count_documents({})} {len(db[uniform].distinct('_id'))}"
-        fails, counts = [], {}
-        for label, par, stamp in (("sequential", None, r"_keyset_([^/']+)\.parquet"), ("parallel:4", 4, r"_w(\d+)_keyset")):
-            dest = sc.dir("mk", label.replace(":", ""))
-            rc, err = _export(url, uniform, dest, par)
-            if rc != 0:
-                fails.append(f"{label} exit {rc}: {err.strip()[-160:]}")
-                continue
-            lst = _declared_read(dest, ".parquet")
-            if lst is None:
-                fails.append(f"{label}: nothing declared")
-                continue
-            with Oracle() as o:
-                got = o.scalar(f"SELECT count(*)||' '||count(DISTINCT _id) FROM read_parquet({lst})")
-            ranges = {m for f in lst.split(",") for m in re.findall(stamp, f)}
-            counts[label] = len(ranges)
-            if got != src:
-                fails.append(f"{label}: source {src} != declared {got}")
-            if len(ranges) < 2:
-                fails.append(f"{label}: {len(ranges)} range part(s), need >=2")
-        for label, par in (("mixed sequential", None), ("mixed parallel:4", 4)):
-            dest = sc.dir("mkh", label.split()[-1].replace(":", ""))
-            rc, err = _export(url, mixed, dest, par)
-            parts = list(dest.rglob("*.parquet")) if dest.exists() else []
-            if rc == 0 or parts:
-                fails.append(f"{label}: heterogeneous _id NOT refused (exit {rc}, {len(parts)} part(s))")
-            elif "heterogeneous" not in err:
-                fails.append(f"{label}: refused for another reason: {err.strip()[-160:]}")
-        if fails:
-            _failed(led, engine, tag, SCEN, "-", "mongo-keyset: " + "; ".join(fails), "; ".join(fails)[:200])
-        else:
-            _passed(led, engine, tag, SCEN, "-",
-                    f"mongo-keyset: sequential + parallel:4 == source ({src}), range parts {counts}; "
-                    f"int+string _id refused with 0 parts on both")
-    finally:
-        db[uniform].drop()
-        db[mixed].drop()
-        client.close()

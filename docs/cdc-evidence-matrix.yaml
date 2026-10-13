@@ -12,7 +12,7 @@
 #
 # The audit's own headline is the reason this file is not a nicety. `roll_all` writes
 # the pre-ack manifest as a cumulative SUPERSET of every part acked so far
-# (src/source/cdc/sink.rs:289-299) — that manifest is the only thing that makes a
+# (src/pipeline/cdc/sink.rs:289-299) — that manifest is the only thing that makes a
 # crash inside the ack window recoverable by a manifest-authoritative loader. Mutating
 # it to publish only the LAST part leaves `cargo test --lib` at 2607 passed, 0 failed.
 # Measured by hand 2026-08-23, not inferred. Every ledger in this repo said that
@@ -166,7 +166,7 @@ shapes:
     postgres:
       na: >-
         na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
-        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        src/pipeline/cdc/sink.rs), not in any engine adapter: no engine can reach a different
         fold, so it is proven once on the fixture that drives it rather than four times. This
         is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
         by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
@@ -184,7 +184,7 @@ shapes:
     mssql:
       na: >-
         na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
-        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        src/pipeline/cdc/sink.rs), not in any engine adapter: no engine can reach a different
         fold, so it is proven once on the fixture that drives it rather than four times. This
         is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
         by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
@@ -192,12 +192,12 @@ shapes:
     mongo:
       na: >-
         na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`,
-        src/source/cdc/sink.rs), not in any engine adapter: no engine can reach a different
+        src/pipeline/cdc/sink.rs), not in any engine adapter: no engine can reach a different
         fold, so it is proven once on the fixture that drives it rather than four times. This
         is the shared-seam/gap distinction the runner-coverage matrix draws — a feature applied
         by construction is `na`, a feature each engine must re-apply is a `gap`. The threshold
         rule itself is engine-agnostic for the same reason. Graded on mysql; see that cell.
-    oracle: { na: "na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`, src/source/cdc/sink.rs), not in the Oracle adapter: no engine can reach a different fold, so it is proven once on the fixture that drives it rather than once per engine" }
+    oracle: { na: "na — the manifest fold lives in the SHARED sink (`build_manifest` over `s.parts`, src/pipeline/cdc/sink.rs), not in the Oracle adapter: no engine can reach a different fold, so it is proven once on the fixture that drives it rather than once per engine" }
 
   - id: runs_the_engine_default_configuration
     what: >

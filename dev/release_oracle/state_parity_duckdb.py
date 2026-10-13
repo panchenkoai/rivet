@@ -43,6 +43,7 @@ WHAT MAKES IT FAIL RATHER THAN PASS QUIETLY
 
 from __future__ import annotations
 
+from contextlib import closing
 import re
 import shutil
 import sqlite3
@@ -200,7 +201,7 @@ def verify_state_parity_independent(
 
     # Surrogate keys come from the sequences of each store, so they differ on a reused
     # Postgres DB; they are excluded by rule and a reference to one is compared by content.
-    with sqlite3.connect(tmp) as c:
+    with closing(sqlite3.connect(tmp)) as c:
         ddl = c.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall()
     serial_out, ok = _duck(
         pre

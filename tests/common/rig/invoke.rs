@@ -31,7 +31,44 @@ impl Rig {
 
     /// The single `Command` builder behind every runner wrapper.
     fn invoke_command(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Command {
-        crate::common::runner::rivet_command(argv, envs)
+        let mut cmd = match &self.bin {
+            Some(bin) => crate::common::runner::rivet_command_as(bin, argv, envs),
+            None => crate::common::runner::rivet_command(argv, envs),
+        };
+        if let Some(most) = self.open_files {
+            use std::os::unix::process::CommandExt as _;
+            let limit = libc::rlimit {
+                rlim_cur: most,
+                rlim_max: most,
+            };
+            // SAFETY: `setrlimit` is async-signal-safe and touches only the child between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || match libc::setrlimit(libc::RLIMIT_NOFILE, &limit) {
+                    0 => Ok(()),
+                    _ => Err(std::io::Error::last_os_error()),
+                });
+            }
+        }
+        cmd
+    }
+
+    /// A second handle on this rig's export whose invocations run the previous release (`RIVET_PREV_RELEASE_BIN`); `None`, with the skip recorded, when it is unset.
+    pub fn as_previous_release(&self) -> Option<Rig> {
+        let Ok(bin) = std::env::var("RIVET_PREV_RELEASE_BIN") else {
+            crate::common::skip_live(
+                "RIVET_PREV_RELEASE_BIN unset: no previous-release binary to run beside this tree's",
+            );
+            return None;
+        };
+        let bin = PathBuf::from(bin);
+        assert!(
+            bin.is_file() && bin != Path::new(crate::common::runner::rivet_bin()),
+            "RIVET_PREV_RELEASE_BIN={} is not another rivet binary",
+            bin.display()
+        );
+        let mut old = self.twin();
+        old.bin = Some(bin);
+        Some(old)
     }
 
     /// Run to completion and collect the output.

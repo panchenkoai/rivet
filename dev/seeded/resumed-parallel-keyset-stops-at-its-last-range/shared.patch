@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/keyset.rs b/src/pipeline/keyset.rs
+index 34a18567..e96205d2 100644
+--- a/src/pipeline/keyset.rs
++++ b/src/pipeline/keyset.rs
+@@ -408,7 +408,7 @@ enum UnreadTail {
+ 
+ /// The tail a resumed run still owes: `None` unless its last range is open-ended and committed.
+ fn unread_tail(ranges: &[crate::state::KeysetRangeRow]) -> Option<UnreadTail> {
+-    let last = ranges.last().filter(|r| r.done && r.hi.is_none())?;
++    let last = ranges.last().filter(|r| !r.done && r.hi.is_none())?;
+     Some(match &last.max_key {
+         Some(key) => UnreadTail::Past(key.clone()),
+         None => UnreadTail::Again,

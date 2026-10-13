@@ -856,6 +856,45 @@ mod tests {
         });
     }
 
+    /// Any one structured field makes the source a structured one, so a URL beside it is refused.
+    #[test]
+    fn any_one_structured_field_beside_a_url_is_refused() {
+        type Set = fn(&mut SourceConfig);
+        let fields: [(&str, Set); 5] = [
+            ("host", |s| s.host = Some("h".into())),
+            ("user", |s| s.user = Some("u".into())),
+            ("database", |s| s.database = Some("d".into())),
+            ("password", |s| s.password = Some("p".into())),
+            ("password_env", |s| s.password_env = Some("P".into())),
+        ];
+        for (name, set) in fields {
+            let mut src = make_source(SourceType::Postgres);
+            assert!(!src.has_structured_fields());
+            set(&mut src);
+            assert!(src.has_structured_fields(), "{name}");
+            src.url = Some("postgresql://db.host:5432/app".into());
+            let err = src.resolve_url().expect_err(name).to_string();
+            assert!(err.contains("not both"), "{name}: {err}");
+        }
+    }
+
+    /// `url_file` is read from disk and trimmed; a missing file is named in the error.
+    #[test]
+    fn a_url_file_is_read_and_trimmed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("source.url");
+        std::fs::write(&file, "  postgresql://db.host:5432/app\n").unwrap();
+        let mut src = make_source(SourceType::Postgres);
+        src.url_file = Some(file.to_string_lossy().into_owned());
+        assert_eq!(src.resolve_url().unwrap(), "postgresql://db.host:5432/app");
+        src.url_file = Some(dir.path().join("absent.url").to_string_lossy().into_owned());
+        let err = src.resolve_url().unwrap_err().to_string();
+        assert!(
+            err.contains("cannot read url_file") && err.contains("absent.url"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn a_source_state_key_is_derived_from_its_resolved_url() {
         let mut src = make_source(SourceType::Postgres);

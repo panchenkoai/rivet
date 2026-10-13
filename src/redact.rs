@@ -40,9 +40,9 @@
 /// Conservative match:
 /// - scheme is `[A-Za-z][A-Za-z0-9+.\-]*`
 /// - followed by `://`
-/// - then a userinfo run of non-whitespace, non-`/`, non-`?`, non-`#`
-///   characters containing `:` (i.e. `user:password`)
-/// - terminated by `@`
+/// - then a userinfo run of non-whitespace characters containing `:`
+///   (i.e. `user:password`)
+/// - terminated by the last `@` before whitespace
 ///
 /// A bare `user@host` (no `:`) is preserved verbatim — there's no
 /// password to redact, and stripping the username makes log lines
@@ -52,104 +52,40 @@
 ///
 /// Idempotent: once-redacted strings pass through unchanged.
 pub fn redact_url_passwords(s: &str) -> String {
-    // Find `scheme://userinfo@` segments.  We don't pull in a regex
-    // crate just for this one pattern — a hand-rolled walk is faster
-    // and avoids a dep that grows the binary.
-    //
-    // F-NEW-C (0.7.5 audit): the previous version copied non-matching
-    // bytes one at a time via `out.push(bytes[i] as char)`, which
-    // re-interpreted each UTF-8 byte as a Unicode code point and
-    // re-encoded it.  Every multi-byte glyph (em-dash, Cyrillic, …)
-    // became double-encoded mojibake (`—` → `â\u{80}\u{94}`) in any
-    // error message that hit the redactor.  Correct fix: copy the
-    // next UTF-8 codepoint as a whole slice of `s`, not byte-by-byte.
-    let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some((rewritten, advance)) = try_redact_at(bytes, i) {
-            out.push_str(&rewritten);
-            i = advance;
-            continue;
-        }
-        let b = bytes[i];
-        if b.is_ascii() {
-            out.push(b as char);
-            i += 1;
-        } else {
-            // Multi-byte UTF-8 codepoint starting at `i`; continuation
-            // bytes have the form 10xxxxxx.  Copy the whole codepoint
-            // verbatim from the source string.
-            let start = i;
-            i += 1;
-            while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
-                i += 1;
+    for word in s.split_inclusive(|c: char| c.is_ascii_whitespace()) {
+        match userinfo_span(word).and_then(|(start, at)| word.get(..start).zip(word.get(at..))) {
+            Some((scheme, host)) => {
+                out.push_str(scheme);
+                out.push_str("REDACTED");
+                out.push_str(host);
             }
-            out.push_str(&s[start..i]);
+            None => out.push_str(word),
         }
     }
     out
 }
 
-/// If `bytes[i..]` starts a `scheme://userinfo@` pattern with a `:` in
-/// the userinfo (a password segment), return the rewritten prefix and
-/// the new cursor position.  Otherwise return `None`.
-/// The LAST `@` from `start` up to the whitespace boundary (the log-line URL
-/// terminator), or None. The userinfo may itself contain a raw `/ ? # @ :` (a
-/// non-conforming `url:` passthrough / RIVET_STATE_URL / driver-echoed URL), so the
-/// scan must NOT stop at `/ ? #` — the real userinfo terminator is the last `@`
-/// before whitespace. Stopping earlier (an earlier bounded form) leaked a password
-/// with an internal `@` before a `/` (round-4).
-fn scan_last_at(bytes: &[u8], start: usize) -> Option<usize> {
-    let mut k = start;
-    let mut last_at = None;
-    while k < bytes.len() {
-        let b = bytes[k];
-        if b == b'@' {
-            last_at = Some(k);
-        } else if b.is_ascii_whitespace() {
-            break;
-        }
-        k += 1;
-    }
-    last_at
+/// A byte a URL scheme may hold after its first letter.
+fn is_scheme_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-')
 }
 
-fn try_redact_at(bytes: &[u8], i: usize) -> Option<(String, usize)> {
-    // scheme: must start with an ASCII letter
-    if !bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic()) {
-        return None;
-    }
-    let mut j = i + 1;
-    while j < bytes.len() {
-        let b = bytes[j];
-        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-') {
-            j += 1;
-        } else {
-            break;
-        }
-    }
-    // `://`
-    if !bytes[j..].starts_with(b"://") {
-        return None;
-    }
-    let userinfo_start = j + 3;
-    // The userinfo ends at the LAST `@` before whitespace — DEFAULT-DENY. A password
-    // in a non-conforming URL (raw `url:` / RIVET_STATE_URL / driver-echoed URL, none
-    // percent-encoded) may itself contain `@ / ? #`, so any earlier bound leaks: the
-    // round-3 fix bounded at `/?#` and leaked `pa/ss`; its fail-safe still leaked a
-    // password with an internal `@` before a `/` (round-4). The last `@` before the
-    // whitespace URL-terminator is the one true userinfo boundary. Over-redacts a
-    // pathological host in a rare multi-`@` (query-`@`) URL; never leaks.
-    let at = scan_last_at(bytes, userinfo_start)?;
-    // A `:` before that `@` marks a password segment (bare `user@host` has none).
-    let has_colon = bytes[userinfo_start..at].contains(&b':');
-    if !has_colon {
-        return None;
-    }
-    // Slice out `scheme://`, replace userinfo with `REDACTED`.
-    let scheme_part = std::str::from_utf8(&bytes[i..userinfo_start]).ok()?;
-    Some((format!("{scheme_part}REDACTED"), at))
+/// The userinfo of the first `scheme://user:password@` in a whitespace-free word, as (userinfo start, its `@`): the LAST `@` of the word ends it, since a raw password may itself hold `@ / ? #`, and a `:` must precede that `@`.
+fn userinfo_span(word: &str) -> Option<(usize, usize)> {
+    let at = word.rfind('@')?;
+    let last_colon = word.get(..at)?.rfind(':')?;
+    word.match_indices("://")
+        .map(|(scheme_end, _)| (scheme_end, scheme_end + 3))
+        .take_while(|(_, userinfo)| *userinfo <= last_colon)
+        .find(|(scheme_end, _)| {
+            word.as_bytes()[..*scheme_end]
+                .iter()
+                .rev()
+                .take_while(|b| is_scheme_byte(**b))
+                .any(u8::is_ascii_alphabetic)
+        })
+        .map(|(_, userinfo)| (userinfo, at))
 }
 
 /// Compose every redactor.  Use this at every boundary that turns a
@@ -309,9 +245,6 @@ pub(crate) fn redact_query_secrets(s: &str) -> String {
         "sig",
     ];
     fn is_secret_key(key: &str) -> bool {
-        if key.is_empty() || key.len() > 64 {
-            return false;
-        }
         let lower = key.to_ascii_lowercase();
         FAMILIES.iter().any(|f| {
             lower == *f
@@ -374,7 +307,8 @@ pub fn redacted_log_line(timestamp: &str, level: &str, target: &str, message: &s
 /// line through [`redacted_log_line`], and — while an in-process card renderer
 /// owns the screen — routed through its channel so the line lands above the
 /// card block instead of between two frames (which duplicated the block).
-pub fn install_logger() {
+/// `route` is that channel, handed in by the layer that owns it.
+pub fn install_logger(route: LogRoute) {
     use std::io::Write as _;
     let stderr_logger =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
@@ -391,10 +325,13 @@ pub fn install_logger() {
     log::set_max_level(stderr_logger.filter());
     // A second install (a test process that already has a logger) keeps the
     // first; `main` calls this exactly once.
-    let _ = log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger)));
+    let _ = log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger, route)));
 }
 
-struct UiRoutedLogger(env_logger::Logger);
+/// Takes a formatted, redacted log line; `false` leaves it to stderr.
+pub type LogRoute = fn(String) -> bool;
+
+struct UiRoutedLogger(env_logger::Logger, LogRoute);
 
 impl log::Log for UiRoutedLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
@@ -411,7 +348,7 @@ impl log::Log for UiRoutedLogger {
             record.target(),
             &record.args().to_string(),
         );
-        if !crate::pipeline::ipc::route_log_line(line) {
+        if !(self.1)(line) {
             self.0.log(record);
         }
     }
@@ -427,7 +364,7 @@ mod logger_tests {
     use log::Log as _;
     use std::sync::{Arc, Mutex};
 
-    /// An `env_logger` at `warn` whose stderr is this buffer.
+    /// An `env_logger` at `warn` whose stderr is this buffer, routed as the binary routes it.
     fn logger(sink: Arc<Mutex<Vec<u8>>>) -> UiRoutedLogger {
         struct Sink(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -443,7 +380,7 @@ mod logger_tests {
             .filter_level(log::LevelFilter::Warn)
             .target(env_logger::Target::Pipe(Box::new(Sink(sink))))
             .build();
-        UiRoutedLogger(inner)
+        UiRoutedLogger(inner, crate::cli::LOG_ROUTE)
     }
 
     fn record<'a>(level: log::Level, args: std::fmt::Arguments<'a>) -> log::Record<'a> {
@@ -1075,6 +1012,218 @@ mod tests {
         assert_eq!(redact_url_passwords(s), s);
     }
 
+    /// `scan` of `input` on a watchdog thread, so an overrun fails the test instead of hanging it.
+    fn scan_in_budget(label: &str, input: &str, scan: fn(&str) -> String) -> String {
+        let (done, result) = std::sync::mpsc::channel();
+        let owned = input.to_string();
+        std::thread::spawn(move || {
+            let _ = done.send(scan(&owned));
+        });
+        result
+            .recv_timeout(HOSTILE_BUDGET)
+            .unwrap_or_else(|why| panic!("SCAN NOT LINEAR: {label}: {why} in {HOSTILE_BUDGET:?}"))
+    }
+
+    /// One megabyte of each hostile shape of query text is scanned in one pass: the exact output, inside the budget.
+    #[test]
+    fn the_query_scan_is_linear_on_a_hostile_megabyte() {
+        const MB: usize = 1 << 20;
+        let same = |unit: &str| (unit.repeat(MB / unit.len()), unit.repeat(MB / unit.len()));
+        let shapes = [
+            ("`?` alone", same("?")),
+            ("`&a` repeated, no `=`", same("&a")),
+            ("`&a=1` repeated, no secret", same("&a=1")),
+            (
+                "a megabyte key",
+                (
+                    format!("?{}=1", "a".repeat(MB)),
+                    format!("?{}=1", "a".repeat(MB)),
+                ),
+            ),
+            (
+                "a megabyte secret key",
+                (
+                    format!("?{}_token=x", "a".repeat(MB)),
+                    format!("?{}_token=***", "a".repeat(MB)),
+                ),
+            ),
+            (
+                "a megabyte secret",
+                (
+                    format!("?token={}", "x".repeat(MB)),
+                    "?token=***".to_string(),
+                ),
+            ),
+            (
+                "`?token=x&` repeated",
+                ("?token=x&".repeat(MB / 9), "?token=***&".repeat(MB / 9)),
+            ),
+        ];
+        for (label, (input, want)) in &shapes {
+            let out = scan_in_budget(label, input, redact_query_secrets);
+            assert!(
+                out == *want,
+                "{label}: {} bytes out, {} wanted",
+                out.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// One megabyte of each hostile shape is scanned in one pass: the exact output, inside the budget.
+    #[test]
+    fn the_url_scan_is_linear_on_a_hostile_megabyte() {
+        const MB: usize = 1 << 20;
+        let same = |unit: &str| (unit.repeat(MB / unit.len()), unit.repeat(MB / unit.len()));
+        let shapes = [
+            ("letters alone", same("a")),
+            ("scheme characters alone", same("a1+.-")),
+            ("`a://` repeated", same("a://")),
+            ("`://` repeated", same("://")),
+            ("`@` alone", same("@")),
+            (
+                "`a://b@` repeated, the next `://` its colon",
+                ("a://b@".repeat(MB / 6), "a://REDACTED@".to_string()),
+            ),
+            ("`a://b@ ` repeated, no password", same("a://b@ ")),
+            ("`1://b:c@` repeated, no scheme letter", same("1://b:c@")),
+            ("multi-byte text", same("é—")),
+            (
+                "`a://` repeated before one userinfo",
+                (
+                    format!("{}u:p@h", "a://".repeat(MB / 4)),
+                    "a://REDACTED@h".to_string(),
+                ),
+            ),
+            (
+                "one URL per word",
+                (
+                    "a://u:p@h ".repeat(MB / 10),
+                    "a://REDACTED@h ".repeat(MB / 10),
+                ),
+            ),
+            (
+                "one URL, a megabyte password",
+                (
+                    format!("a://u:{}@h", "p@:/".repeat(MB / 4)),
+                    "a://REDACTED@h".to_string(),
+                ),
+            ),
+        ];
+        for (label, (input, want)) in &shapes {
+            let out = scan_in_budget(label, input, redact_url_passwords);
+            assert!(
+                out == *want,
+                "{label}: {} bytes out, {} wanted",
+                out.len(),
+                want.len()
+            );
+        }
+    }
+
+    /// The scan as specified before it became one pass: at each byte a scheme, `://`, then the last `@` before whitespace with a `:` ahead of it.
+    fn reference_url_scan(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let is_scheme = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-');
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let scheme_end = i + 1 + bytes[i + 1..].iter().take_while(|b| is_scheme(b)).count();
+            let userinfo = scheme_end + 3;
+            let word_end = bytes[i..]
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .map_or(bytes.len(), |n| i + n);
+            let at = (userinfo..word_end).rev().find(|k| bytes[*k] == b'@');
+            match at {
+                Some(at)
+                    if bytes[i].is_ascii_alphabetic()
+                        && bytes[scheme_end..].starts_with(b"://")
+                        && bytes[userinfo..at].contains(&b':') =>
+                {
+                    out.extend_from_slice(&bytes[i..userinfo]);
+                    out.extend_from_slice(b"REDACTED");
+                    i = at;
+                }
+                _ => {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).expect("whole characters are copied or replaced by ASCII")
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 4096, ..Default::default()
+        })]
+
+        /// Any text built from URL punctuation, whitespace and multi-byte characters is rewritten exactly as the byte-at-a-time scan rewrote it, and a second pass changes nothing.
+        #[test]
+        fn the_url_scan_matches_its_reference_on_any_text(text in "[ab1+.:/@?# \t\né—]{0,48}") {
+            let once = redact_url_passwords(&text);
+            proptest::prop_assert_eq!(&once, &reference_url_scan(&text), "{:?}", text);
+            proptest::prop_assert_eq!(&redact_url_passwords(&once), &once, "{:?}", text);
+        }
+
+        /// Arbitrary UTF-8 passes every redactor without a panic, and unchanged when it holds neither an `@` nor an `=`.
+        #[test]
+        fn any_utf8_text_is_redacted_without_a_panic(text in "\\PC{0,64}") {
+            let out = redact_secrets(&text);
+            proptest::prop_assert!(text.contains(['@', '=']) || out == text, "{:?} -> {:?}", text, out);
+        }
+    }
+
+    /// A text that ends inside a URL, a query key or a multi-byte character is returned whole.
+    #[test]
+    fn text_that_ends_mid_shape_is_untouched() {
+        for text in [
+            "why?",
+            "a&b",
+            "x?token",
+            "x?token=",
+            "a",
+            "a:",
+            "a://",
+            "a://b",
+            "a://b:c",
+            "a://@",
+            "é",
+            "a://b:é",
+            "ошибка —", // allow-cyrillic
+        ] {
+            let want = if text == "x?token=" {
+                "x?token=***"
+            } else {
+                text
+            };
+            assert_eq!(redact_secrets(text), want, "{text:?}");
+        }
+    }
+
+    /// A scheme may hold digits and `+ . -` after its first letter, and a secret query key may be of any length.
+    #[test]
+    fn a_compound_scheme_and_a_long_secret_key_are_redacted() {
+        for (text, want) in [
+            (
+                "postgresql+psycopg2://u:S3cr3tPw@h/d",
+                "postgresql+psycopg2://REDACTED@h/d",
+            ),
+            ("s3://key:S3cr3tPw@bucket", "s3://REDACTED@bucket"),
+            ("x.y-z1://u:S3cr3tPw@h", "x.y-z1://REDACTED@h"),
+            ("1a://u:S3cr3tPw@h", "1a://REDACTED@h"),
+            ("12://u:S3cr3tPw@h", "12://u:S3cr3tPw@h"),
+        ] {
+            assert_eq!(redact_url_passwords(text), want, "{text:?}");
+        }
+        let key = format!("{}_token", "k".repeat(80));
+        assert_eq!(
+            redact_query_secrets(&format!("?{key}=S3cr3tPw&x=1")),
+            format!("?{key}=***&x=1")
+        );
+    }
+
     // ── redact_error ───────────────────────────────────────────────────────
 
     #[test]
@@ -1122,7 +1271,7 @@ mod tests {
     fn sec_redact_url_password_with_at() {
         // SEC-RED V8: redact_url_passwords splits userinfo at the FIRST `@`,
         // leaking the password tail after an embedded `@`. The userinfo walk in
-        // `try_redact_at` breaks on the first `@` it sees, so the password
+        // the scan breaks on the first `@` it sees, so the password
         // `p@ssw0rd` is split: only `p` is treated as the password and the
         // tail `ssw0rd` survives in the output. The userinfo terminator must be
         // the LAST `@` before the path/query (rfind semantics, as already used

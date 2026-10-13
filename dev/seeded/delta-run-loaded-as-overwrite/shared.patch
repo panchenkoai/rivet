@@ -1,8 +1,8 @@
-diff --git a/src/load/plan.rs b/src/load/plan.rs
-index 884057ba..6b2bfe19 100644
---- a/src/load/plan.rs
-+++ b/src/load/plan.rs
-@@ -447,12 +447,6 @@ pub fn load_mode_of(
+diff --git a/src/plan/load_settings.rs b/src/plan/load_settings.rs
+index 2026379a..e1f21d4d 100644
+--- a/src/plan/load_settings.rs
++++ b/src/plan/load_settings.rs
+@@ -74,12 +74,6 @@ pub fn load_mode_of(
      match export.mode {
          ExportMode::Cdc => LoadMode::Cdc,
          ExportMode::Incremental => LoadMode::Incremental,

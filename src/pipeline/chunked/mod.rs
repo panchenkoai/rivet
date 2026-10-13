@@ -229,6 +229,72 @@ pub(super) fn check_drift_only(
     super::schema_drift::check_from_type_mappings(src, st, plan, summary)
 }
 
+/// The ranges a resumed run plans again: the source's key span as it is now under `Detect`, none for a sealed plan; the drift gate runs either way.
+pub(super) fn resumed_chunk_plan(
+    src: &mut dyn crate::source::Source,
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    summary: &mut RunSummary,
+    chunk_source: &ChunkSource,
+) -> Result<Vec<(i64, i64)>> {
+    match chunk_source {
+        ChunkSource::Detect => prepare_chunk_plan(src, plan, Some(state), summary),
+        ChunkSource::Precomputed(_) => {
+            check_drift_only(src, plan, Some(state), summary)?;
+            Ok(vec![])
+        }
+    }
+}
+
+/// What the stored tasks of a resumed run need to cover `ranges`, the source's key span now: whether to drop them, and the tasks to plan. A run that committed no part is planned again whole; any other gains the pieces of `ranges` outside its stored span.
+fn replan(
+    tasks: &[crate::state::ChunkTaskInfo],
+    ranges: &[(i64, i64)],
+) -> Result<(bool, Vec<(i64, i64)>)> {
+    if !tasks.iter().any(|t| t.file_name.is_some()) {
+        return Ok((!ranges.is_empty(), ranges.to_vec()));
+    }
+    let bound = |key: &str| {
+        key.parse::<i64>()
+            .map_err(|_| anyhow::anyhow!("stored chunk bound {key:?} is not an integer"))
+    };
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    for t in tasks {
+        lo = lo.min(bound(&t.start_key)?);
+        hi = hi.max(bound(&t.end_key)?);
+    }
+    Ok((false, math::ranges_outside(ranges, (lo, hi))))
+}
+
+/// Bring the stored plan of the resumed run `run_id` up to `ranges`, the source's key span now; a sealed plan passes none and keeps its tasks.
+fn replan_resumed_run(
+    state: &StateStore,
+    export: &str,
+    run_id: &str,
+    ranges: &[(i64, i64)],
+) -> Result<()> {
+    let (replace, planned) = replan(&state.list_chunk_tasks_for_run(run_id)?, ranges)?;
+    if planned.is_empty() {
+        return Ok(());
+    }
+    state.replan_chunk_tasks(run_id, replace, &planned)?;
+    if replace {
+        log::info!(
+            "export '{export}': run '{run_id}' committed no part before it stopped — planned \
+             again over the key span the source holds now ({} chunk task(s))",
+            planned.len()
+        );
+    } else {
+        log::warn!(
+            "export '{export}': the source's key span grew past the plan of run '{run_id}' — \
+             {} chunk task(s) added for the keys outside it; the windows that run committed \
+             are not read again",
+            planned.len()
+        );
+    }
+    Ok(())
+}
+
 /// Whether precomputed ranges read rows, so the drift gate must run: no ranges, no read, no connection.
 pub(super) fn precomputed_ranges_need_the_drift_gate(ranges: &[(i64, i64)]) -> bool {
     !ranges.is_empty()
@@ -436,6 +502,7 @@ pub(super) fn ensure_chunk_checkpoint_plan(
                         plan.export_name
                     );
                 }
+                replan_resumed_run(state, &plan.export_name, &rid, chunks)?;
                 summary.run_id = rid.clone();
                 state.set_resume_run_id(progress.key(), &rid)?;
                 let n = state.reset_stale_running_chunk_tasks(&rid)?;
@@ -667,6 +734,37 @@ mod tests {
         assert_eq!(chunk_index_of("orders_20260101_chunkzz_aabb.parquet"), None);
     }
 
+    /// A name is a chunk part only with BOTH halves of the writer's suffix: a digit index and the 16-hex nonce.
+    #[test]
+    fn a_name_is_a_chunk_part_only_with_a_digit_index_and_the_16_hex_nonce() {
+        const NONCE: &str = "00000000deadbeef";
+        let named = |index: &str, nonce: &str| format!("orders_20260101_000000_{index}_{nonce}");
+        for (stem, index) in [
+            (named("chunk7", NONCE), Some("7")),
+            (named("chunk7", "aabb"), None),
+            (named("chunk7", "00000000deadbeef0"), None),
+            (named("chunk7", "zzzzzzzzzzzzzzzz"), None),
+            (named("chunk7", "0000000-deadbeef"), None),
+            (named("chunkzz", NONCE), None),
+            (named("chunk7a", NONCE), None),
+            (named("chunk", NONCE), None),
+            (named("keyset7", NONCE), None),
+        ] {
+            for name in [format!("{stem}.parquet"), format!("{stem}_p3.parquet")] {
+                assert_eq!(chunk_index_of(&name), index, "{name}");
+            }
+        }
+
+        // Only `_p<digits>` at the very end is the rotation suffix: an export
+        // whose NAME holds `_p` still has its parts classified.
+        for export in ["user_profiles", "orders_p", "metrics_p95"] {
+            let name = chunk_part_filename(export, 7, "parquet");
+            assert_eq!(chunk_index_of(&name), Some("7"), "{name}");
+            let rotated = crate::pipeline::commit::part_indexed_name(&name, 1, 2);
+            assert_eq!(chunk_index_of(&rotated), Some("7"), "{rotated}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -702,6 +800,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
             query_template: None,
+            destination_written: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
                 column: "id".into(),
@@ -915,6 +1014,142 @@ mod tests {
         );
     }
 
+    /// A stored task over `lo..=hi`; `file` is the part that completed it.
+    fn stored_task(
+        index: i64,
+        lo: &str,
+        hi: &str,
+        file: Option<&str>,
+    ) -> crate::state::ChunkTaskInfo {
+        crate::state::ChunkTaskInfo {
+            chunk_index: index,
+            start_key: lo.into(),
+            end_key: hi.into(),
+            status: if file.is_some() {
+                "completed"
+            } else {
+                "pending"
+            }
+            .into(),
+            attempts: 0,
+            last_error: None,
+            rows_written: None,
+            file_name: file.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn a_resumed_plan_gains_the_keys_outside_its_span_and_is_planned_again_while_it_holds_no_part()
+    {
+        let now = [(1, 10), (11, 20), (21, 23)];
+        let empty_table = [stored_task(0, "0", "0", None)];
+        assert_eq!(replan(&empty_table, &now).unwrap(), (true, now.to_vec()));
+        assert_eq!(replan(&[], &now).unwrap(), (true, now.to_vec()));
+        assert_eq!(
+            replan(&empty_table, &[]).unwrap(),
+            (false, vec![]),
+            "a sealed plan"
+        );
+        let committed = [
+            stored_task(0, "5", "10", Some("p0")),
+            stored_task(1, "11", "20", None),
+        ];
+        assert_eq!(
+            replan(&committed, &now).unwrap(),
+            (false, vec![(1, 4), (21, 23)])
+        );
+        assert_eq!(replan(&committed, &[(5, 20)]).unwrap(), (false, vec![]));
+        assert_eq!(replan(&committed, &[]).unwrap(), (false, vec![]));
+        let said = replan(&[stored_task(0, "a", "9", Some("p0"))], &now).unwrap_err();
+        assert!(
+            said.to_string().contains("\"a\" is not an integer"),
+            "{said}"
+        );
+    }
+
+    /// A source whose key spans 1..=230, with no NULL key and no column to drift.
+    struct KeysTo230;
+
+    impl crate::source::Source for KeysTo230 {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> Result<()> {
+            unreachable!("planning reads no rows")
+        }
+        fn query_scalar(&mut self, sql: &str) -> Result<Option<String>> {
+            let sql = sql.to_lowercase();
+            let bound = [("min(", "1"), ("max(", "230")];
+            let asked = bound.iter().find(|(f, _)| sql.contains(f));
+            Ok(asked
+                .filter(|_| !sql.contains("is null"))
+                .map(|(_, v)| v.to_string()))
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn a_resume_detects_the_key_span_again_and_a_sealed_plan_plans_nothing() {
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = make_plan("orders");
+        let mut summary = make_summary(&plan, "run-1");
+        let mut planned = |source: &ChunkSource| {
+            resumed_chunk_plan(&mut KeysTo230, &plan, &state, &mut summary, source).unwrap()
+        };
+        assert_eq!(
+            planned(&ChunkSource::Detect),
+            vec![(1, 100), (101, 200), (201, 230)]
+        );
+        assert_eq!(planned(&ChunkSource::Precomputed(vec![(1, 100)])), vec![]);
+    }
+
+    /// A resume hands the keys the source holds past the stored plan to new tasks, and a sealed plan keeps its tasks.
+    #[test]
+    fn a_resume_extends_the_stored_plan_to_the_ranges_detected_now() {
+        let state = StateStore::open_in_memory().unwrap();
+        let mut plan = make_plan("orders");
+        let cp = chunked_plan(&plan).clone();
+        let mut summary = make_summary(&plan, "run-1");
+        let claim = state.claim(plan.progress_key()).unwrap();
+        let mut ensure = |plan: &ResolvedRunPlan, chunks: &[(i64, i64)]| {
+            ensure_chunk_checkpoint_plan(&state, plan, &cp, &mut summary, chunks, "c.yaml", &claim)
+                .unwrap()
+        };
+        let rid = ensure(&plan, &[(1, 10), (11, 20)]);
+        state
+            .complete_chunk_task(&rid, 0, 10, Some("p0.parquet"))
+            .unwrap();
+        plan.resume = true;
+        let spans = |state: &StateStore| -> Vec<(String, String, String)> {
+            let tasks = state.list_chunk_tasks_for_run(&rid).unwrap();
+            tasks
+                .into_iter()
+                .map(|t| (t.start_key, t.end_key, t.status))
+                .collect()
+        };
+        let task =
+            |lo: &str, hi: &str, status: &str| (lo.to_string(), hi.to_string(), status.to_string());
+        let stored = [task("1", "10", "completed"), task("11", "20", "pending")];
+        assert_eq!(ensure(&plan, &[]), rid);
+        assert_eq!(spans(&state), stored, "a sealed plan");
+        assert_eq!(ensure(&plan, &[(1, 10), (11, 20), (21, 23)]), rid);
+        let grown = [
+            stored[0].clone(),
+            stored[1].clone(),
+            task("21", "23", "pending"),
+        ];
+        assert_eq!(spans(&state), grown);
+        assert_eq!(ensure(&plan, &[(1, 10), (11, 20), (21, 23)]), rid);
+        assert_eq!(spans(&state), grown, "the same span adds nothing");
+    }
+
     /// Existing in-progress run *without* `--resume` → bail with a message
     /// that tells the operator exactly which recovery command to run.
     #[test]
@@ -945,6 +1180,76 @@ mod tests {
         assert!(msg.contains("still in progress"), "got: {msg}");
         assert!(msg.contains("--resume"), "must hint at --resume");
         assert!(msg.contains("reset-chunks"), "must hint at reset-chunks");
+    }
+
+    /// A resume says how many chunk tasks it put back in the queue, and says nothing when it put back none.
+    #[test]
+    fn a_resume_reports_the_chunk_tasks_it_requeued_and_is_silent_when_it_requeued_none() {
+        use crate::pipeline::run::run_tail_tests::{
+            captured_warnings_mentioning, install_warn_capture,
+        };
+        install_warn_capture();
+        const RANGES: [(i64, i64); 4] = [(1, 10), (11, 20), (21, 30), (31, 40)];
+        let resumed = |export: &str, crashed_mid_chunk: bool| {
+            let state = StateStore::open_in_memory().unwrap();
+            let mut plan = make_plan(export);
+            let cp = chunked_plan(&plan).clone();
+            let mut summary = make_summary(&plan, "run-1");
+            let claim = state.claim(plan.progress_key()).unwrap();
+            let mut ensure = |plan: &ResolvedRunPlan| {
+                ensure_chunk_checkpoint_plan(
+                    &state,
+                    plan,
+                    &cp,
+                    &mut summary,
+                    &RANGES,
+                    "c.yaml",
+                    &claim,
+                )
+                .unwrap()
+            };
+            let rid = ensure(&plan);
+            let claim_next = || state.claim_next_chunk_task(&rid).unwrap().unwrap().0;
+            state
+                .complete_chunk_task(&rid, claim_next(), 10, Some("p0.parquet"))
+                .unwrap();
+            if crashed_mid_chunk {
+                state
+                    .fail_chunk_task(&rid, claim_next(), "boom", false)
+                    .unwrap();
+                claim_next();
+                claim_next();
+            }
+            plan.resume = true;
+            assert_eq!(ensure(&plan), rid);
+            let statuses: Vec<String> = state
+                .list_chunk_tasks_for_run(&rid)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.status)
+                .collect();
+            assert_eq!(
+                statuses,
+                ["completed", "pending", "pending", "pending"],
+                "{export}"
+            );
+            let mut said = captured_warnings_mentioning(&format!("export '{export}'"));
+            said.retain(|line| line.contains("chunk task(s)"));
+            said
+        };
+
+        assert_eq!(
+            resumed("requeue_none", false),
+            Vec::<String>::new(),
+            "nothing was requeued, so there is nothing to report"
+        );
+        assert_eq!(
+            resumed("requeue_some", true),
+            [
+                "export 'requeue_some': reset 2 stale 'running' chunk task(s) after resume",
+                "export 'requeue_some': re-queued 1 failed chunk task(s) for retry after resume",
+            ]
+        );
     }
 
     /// A chunk run whose task list failed to land must not be left for a plain run to resume as a zero-chunk success.
@@ -1093,6 +1398,25 @@ mod tests {
         assert!(
             p.committed.is_none(),
             "no completed tasks → no committed boundary"
+        );
+    }
+
+    /// A connection given back is the one the next chunk takes, so no new one is dialled; with none idle the take dials.
+    #[test]
+    fn a_connection_given_back_is_taken_again_without_a_new_dial() {
+        let mut cfg = make_plan("orders").source;
+        cfg.url = Some("postgresql://nobody@127.0.0.1:1/x".into());
+        let idle = IdleSources::default();
+        assert!(idle.take(&cfg).is_err(), "nothing idle: the take must dial");
+        idle.give(Box::new(KeysTo230));
+        let mut reused = idle.take(&cfg).expect("the idle connection, not a dial");
+        assert_eq!(
+            reused.query_scalar("SELECT max(id) FROM orders").unwrap(),
+            Some("230".to_string())
+        );
+        assert!(
+            idle.take(&cfg).is_err(),
+            "a taken connection is no longer idle"
         );
     }
 }

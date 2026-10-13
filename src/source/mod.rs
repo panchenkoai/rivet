@@ -8,90 +8,22 @@ pub mod oracle;
 pub(crate) mod pg_numeric_wire;
 pub mod postgres;
 pub(crate) mod query;
-pub(crate) mod tls;
 pub(crate) mod value_checksum;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 
-use crate::config::{SourceConfig, TlsConfig};
+use crate::config::SourceConfig;
 use crate::error::Result;
 use crate::plan::IncrementalCursorPlan;
 use crate::tuning::SourceTuning;
 use crate::types::{ColumnOverrides, CursorState, TypeMapping};
 
-/// A statement-DURATION timeout that **rivet itself** raised — distinct from a
-/// driver-native timeout that carries a structured code (PG 57014, MySQL 3024).
-///
-/// The MSSQL engine has no server-side statement-duration `SET`, so rivet
-/// enforces `tuning.statement_timeout_s` client-side and raises this when the
-/// budget is exceeded (see [`mssql`]). Before this type the retry classifier's
-/// permanence hinged on substring-matching rivet's OWN prose ("statement
-/// timeout after …"); a reworded message would silently flip the error back to
-/// *transient*, and the identical query would be retried until it burned the
-/// budget N times (measured: 3×300 s = 20 min for 0 rows). Carrying a typed
-/// marker means [`crate::pipeline::retry::classify_error`] downcasts the TYPE,
-/// so permanence survives any change to the human-facing wording. The string
-/// branches in the classifier remain a fallback for genuinely driver-native
-/// timeout messages we do not control.
-#[derive(Debug)]
-pub struct StatementDurationTimeout {
-    /// Full actionable message shown to the operator. The classifier keys off
-    /// the TYPE, not this text — it exists only for Display.
-    message: String,
-}
-
-impl StatementDurationTimeout {
-    /// MSSQL client-side statement-duration timeout (no server-side `SET`).
-    pub fn mssql(seconds: u64) -> Self {
-        Self {
-            message: format!(
-                "mssql: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
-                 this query cannot finish within the budget; split it with `mode: chunked` \
-                 (per-chunk statements stay under the limit) or raise \
-                 `tuning.statement_timeout_s`"
-            ),
-        }
-    }
-
-    /// Oracle statement-duration timeout: the driver call timeout plus a check between rows.
-    #[cfg(feature = "oracle")]
-    pub fn oracle(seconds: u64) -> Self {
-        Self {
-            message: format!(
-                "oracle: statement timeout after {seconds}s (tuning.statement_timeout_s) — \
-                 this query cannot finish within the budget; split it with `mode: chunked` \
-                 (per-chunk statements stay under the limit) or raise \
-                 `tuning.statement_timeout_s`"
-            ),
-        }
-    }
-
-    /// MySQL server-side `max_execution_time` timeout (ER_QUERY_TIMEOUT / 3024).
-    /// Wraps the driver's terse "maximum statement execution time exceeded" with
-    /// the actionable fix — including the WIDE-table case (a chunk that still
-    /// times out), which the field's `*_version` tables hit and the raw driver
-    /// error gave no guidance for.
-    pub fn mysql(seconds: u64) -> Self {
-        Self {
-            message: format!(
-                "mysql: statement timeout after {seconds}s (max_execution_time from \
-                 tuning.statement_timeout_s) — this query exceeded its time budget (ERROR 3024). \
-                 Split it with `mode: chunked` / `chunk_by_key` so per-chunk queries stay under \
-                 the limit; if a CHUNK still times out on a WIDE table, lower `chunk_size` or use \
-                 `chunk_size_memory_mb:` (width-aware chunking); or raise `tuning.statement_timeout_s`"
-            ),
-        }
-    }
-}
-
-impl std::fmt::Display for StatementDurationTimeout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for StatementDurationTimeout {}
+pub(crate) use crate::connect::{
+    TlsRequiredError, UnreachableTarget, describe_connect_error, is_tls_handshake_failure,
+    require_tls_or_loopback, require_url_has_host,
+};
+pub use crate::error::{StatementDurationTimeout, TlsHandshakeFailed};
 
 /// Summary of a source table relevant to chunked-mode planning. Source-neutral
 /// shape so plan-build can ask either Postgres or MySQL for the same answer.
@@ -449,99 +381,34 @@ pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
 }
 
-/// A connect that failed in the TLS handshake — a configuration fault no retry fixes (the classifier keys on the TYPE).
-#[derive(Debug)]
-pub struct TlsHandshakeFailed(String);
-
-impl std::fmt::Display for TlsHandshakeFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl TlsHandshakeFailed {
-    /// Put the TLS verdict (and its fix) in front of a driver error; `at` names the endpoint when known.
-    pub(crate) fn wrap(err: anyhow::Error, at: Option<&str>) -> anyhow::Error {
-        let with = at.map(|a| format!(" with {a}")).unwrap_or_default();
-        err.context(Self(format!(
-            "TLS handshake{with} failed — the server does not speak TLS or its certificate \
-             is not trusted: set `tls.ca_file` for a private CA, or `tls.mode: disable` if the \
-             server has no TLS (trusted networks only); retrying will not help"
-        )))
-    }
-}
-
-/// True when a rendered driver error names a failed TLS handshake or an untrusted certificate.
-pub(crate) fn is_tls_handshake_failure(text: &str) -> bool {
-    let t = text.to_ascii_lowercase();
-    [
-        "tls handshake",
-        "tlserror",
-        "does not support tls",
-        "invalid peer certificate",
-        "certificate verify failed",
-    ]
-    .iter()
-    .any(|p| t.contains(p))
-}
-
-/// Name the `url:` host and port when a connection failed before the server answered —
-/// an unresolvable name, a refused port, a timeout — since the driver's text alone
-/// does not say which part of the URL is wrong. Other errors pass through unchanged.
-pub(crate) fn describe_connect_error(url: &str, err: anyhow::Error) -> anyhow::Error {
-    let text = format!("{err:#}").to_ascii_lowercase();
-    let (host, port) = url_host_port(url);
-    let at = if port.is_empty() {
-        host.clone()
-    } else {
-        format!("{host}:{port}")
-    };
-    if is_tls_handshake_failure(&text) {
-        return TlsHandshakeFailed::wrap(err, Some(&at));
-    }
-    let hint = if [
-        "failed to lookup address",
-        "nodename nor servname",
-        "name or service not known",
-        "no such host",
-        "temporary failure in name resolution",
-        "dns error",
-    ]
-    .iter()
-    .any(|p| text.contains(p))
-    {
-        format!("cannot resolve host `{host}` — check the host name in `url:`")
-    } else if text.contains("connection refused") {
-        format!("nothing is listening on {at} — check the port in `url:` and that the server is up")
-    } else if text.contains("timed out") || text.contains("timeout") {
-        format!("no answer from {at} — check the host and port in `url:`, and the firewall")
-    } else {
-        return err;
-    };
-    anyhow::Error::msg(UnreachableTarget(format!("{hint} (driver: {err:#})")))
-}
-
-/// A connect that never reached the server, named by host:port — rivet's own verdict, so no setup hint goes in front.
-#[derive(Debug)]
-pub(crate) struct UnreachableTarget(String);
-
-impl std::fmt::Display for UnreachableTarget {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// The `(host, port)` of a connection URL; the port is empty when the URL has none.
-fn url_host_port(url: &str) -> (String, String) {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
-    let authority = rest.split(['/', '?']).next().unwrap_or(rest);
-    let hosts = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    let first = hosts.split(',').next().unwrap_or(hosts);
-    match first.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
-            (h.trim_matches(['[', ']']).to_string(), p.to_string())
-        }
-        _ => (first.trim_matches(['[', ']']).to_string(), String::new()),
+/// The production bridge — LIVE-ONLY BY CONSTRUCTION, and deliberately not
+/// unit-tested.
+///
+/// Building the `Box<dyn Source>` it is implemented for needs a real database
+/// handle, so no offline test can call this `sample`; a unit test could only be
+/// written against a fake `Source`, which would grade the fake rather than the
+/// one line that matters (WHICH counter the governor listens to). Its oracle is
+/// the three live shed tests, one per engine with a foreign-pressure counter —
+/// `governor_backs_off_under_concurrent_write_pressure` (PostgreSQL),
+/// `mysql_governor_backs_off_under_real_redo_pressure`,
+/// `mssql_governor_backs_off_under_real_log_flush_pressure`
+/// (`tests/live/live_governor.rs`). Each drives real foreign write pressure and
+/// asserts the run logs a `backed off`, so all three go RED against a stubbed
+/// bridge: `-> None` never sheds (an unreadable signal fails OPEN), and a
+/// constant `Some(0)`/`Some(1)` never RISES, which is the only thing
+/// `GovernorState::observe` reads as pressure. Verified by hand against the
+/// `Some(0)` mutant, 2026-08-14.
+///
+/// The counterpart guard — that this must NOT be wired to the batch loop's own
+/// extraction counters — is `mysql_governor_ignores_the_exports_own_spill_exhaust`.
+impl crate::tuning::PressureSource for Box<dyn Source> {
+    fn sample(&mut self) -> Option<u64> {
+        // The governor's signal is the FOREIGN-pressure counter, not the batch
+        // loop's own-extraction counter: a keyset export's own pages inflate
+        // the spill counters by design, and a governor listening to them sheds
+        // its own workers to the floor and never recovers (field find,
+        // 2026-08-13 — see `Source::sample_governor_pressure`).
+        Source::sample_governor_pressure(self.as_mut())
     }
 }
 
@@ -611,125 +478,38 @@ pub(crate) fn value_within_ceiling(
     Ok(())
 }
 
-#[cfg(test)]
-mod connect_error_tests {
-    use super::{describe_connect_error, url_host_port};
-
-    fn described(url: &str, driver: &str) -> String {
-        format!(
-            "{:#}",
-            describe_connect_error(url, anyhow::anyhow!("{driver}"))
-        )
-    }
-
-    #[test]
-    fn an_unresolvable_host_is_named_on_every_engine() {
-        let cases = [
-            (
-                "postgresql://u:p@nosuch-host.invalid:5432/db",
-                "error connecting to server: failed to lookup address information: nodename nor servname provided, or not known",
-            ),
-            (
-                "mysql://u:p@nosuch-host.invalid:3306/db",
-                "DriverError { Could not connect to address `nosuch-host.invalid:3306': failed to lookup address information: nodename nor servname provided, or not known }",
-            ),
-            (
-                "sqlserver://u:p@nosuch-host.invalid:1433/db",
-                "mssql: TCP connect failed: failed to lookup address information: nodename nor servname provided, or not known",
-            ),
-            (
-                "mongodb://nosuch-host.invalid:27017/db",
-                "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: nosuch-host.invalid:27017, Type: Unknown, Error: Kind: I/O error: failed to lookup address information: nodename nor servname provided, or not known, labels: {}, source: None } ] }",
-            ),
-            (
-                "postgresql://u:p@nosuch-host.invalid/db",
-                "error connecting to server: Name or service not known",
-            ),
-        ];
-        for (url, driver) in cases {
-            let msg = described(url, driver);
-            assert!(
-                msg.starts_with(
-                    "cannot resolve host `nosuch-host.invalid` — check the host name in `url:`"
-                ),
-                "{url}: {msg}"
-            );
-            assert!(msg.contains("driver:"), "the driver's text stays: {msg}");
+/// The keyset keys among a table's single-column unique-index columns, given as (column, is the primary key): the primary key's column first, each column once.
+pub(crate) fn keyset_keys_primary_first(columns: &[(String, bool)]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for primary in [true, false] {
+        for (col, is_primary) in columns {
+            if *is_primary == primary && !keys.contains(col) {
+                keys.push(col.clone());
+            }
         }
     }
+    keys
+}
 
-    const MONGO_TLS_EOF: &str = "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: 127.0.0.1:27017, Type: Unknown, Error: Kind: I/O error: tls handshake eof, labels: {\"SystemOverloadedError\", \"RetryableError\"}, source: None, server response: None } ] }, labels: {}, source: None, server response: None";
-    const MONGO_UNREACHABLE: &str = "Kind: Server selection timeout: No available servers. Topology: { Type: Unknown, Servers: [ { Address: 10.0.0.9:27017, Type: Unknown, Error: Kind: I/O error: connection timed out, labels: {}, source: None } ] }";
-
-    #[test]
-    fn a_mongo_tls_handshake_failure_is_permanent_and_says_tls_first() {
-        let e = describe_connect_error(
-            "mongodb://127.0.0.1:27017/rivet",
-            anyhow::anyhow!("{MONGO_TLS_EOF}"),
-        );
-        assert_eq!(
-            crate::pipeline::retry::classify_error(&e),
-            crate::pipeline::retry::RetryClass::Permanent
-        );
-        assert!(
-            format!("{e:#}").starts_with("TLS handshake with 127.0.0.1:27017 failed"),
-            "{e:#}"
-        );
-    }
+#[cfg(test)]
+mod keyset_key_order_tests {
+    use super::keyset_keys_primary_first;
 
     #[test]
-    fn an_unreachable_mongo_host_stays_transient() {
-        let e = describe_connect_error(
-            "mongodb://10.0.0.9:27017/rivet",
-            anyhow::anyhow!("{MONGO_UNREACHABLE}"),
-        );
-        assert!(crate::pipeline::retry::classify_error(&e).is_transient());
-        assert!(format!("{e:#}").starts_with("no answer from 10.0.0.9:27017"));
-    }
-
-    #[test]
-    fn a_refused_port_and_a_timeout_name_the_endpoint() {
-        let refused = described(
-            "postgresql://u:p@127.0.0.1:1/db",
-            "error connecting to server: Connection refused (os error 61)",
-        );
-        assert!(
-            refused.starts_with("nothing is listening on 127.0.0.1:1"),
-            "{refused}"
-        );
-        let timeout = described(
-            "mysql://u:p@10.0.0.9:3306/db",
-            "DriverError { Could not connect to address `10.0.0.9:3306': connection timed out }",
-        );
-        assert!(
-            timeout.starts_with("no answer from 10.0.0.9:3306"),
-            "{timeout}"
-        );
-    }
-
-    #[test]
-    fn other_errors_pass_through_unchanged() {
-        let auth = "MySqlError { ERROR 1045 (28000): Access denied for user 'u'@'%' }";
-        assert_eq!(described("mysql://u:p@db.example:3306/db", auth), auth);
-    }
-
-    #[test]
-    fn host_and_port_come_out_of_any_url_shape() {
-        let hp = |u: &str| {
-            let (h, p) = url_host_port(u);
-            format!("{h}|{p}")
+    fn the_primary_key_comes_first_and_a_column_is_listed_once() {
+        let cols = |list: &[(&str, bool)]| -> Vec<(String, bool)> {
+            list.iter().map(|(c, p)| (c.to_string(), *p)).collect()
         };
+        let keys = |list: &[(&str, bool)]| keyset_keys_primary_first(&cols(list));
+        assert_eq!(keys(&[("email", false), ("id", true)]), ["id", "email"]);
+        assert_eq!(keys(&[("id", true), ("email", false)]), ["id", "email"]);
+        assert_eq!(keys(&[("a", false), ("b", false)]), ["a", "b"]);
         assert_eq!(
-            hp("postgresql://u:p%40ss@db.example:5432/db?sslmode=require"),
-            "db.example|5432"
+            keys(&[("id", false), ("id", true), ("id", false)]),
+            ["id"],
+            "a column under two unique indexes is one key"
         );
-        assert_eq!(hp("mysql://u:p@10.0.0.5/billing"), "10.0.0.5|");
-        assert_eq!(
-            hp("mongodb://a.example:27017,b.example:27017/db?replicaSet=rs0"),
-            "a.example|27017"
-        );
-        assert_eq!(hp("sqlserver://sa:p@[::1]:1433/db"), "::1|1433");
-        assert_eq!(hp("localhost:5432"), "localhost|5432");
+        assert!(keys(&[]).is_empty());
     }
 }
 
@@ -804,482 +584,7 @@ pub(crate) fn warn_if_tls_disabled(config: &SourceConfig) {
     });
 }
 
-/// Whether the host in a `scheme://[user[:pass]@]host[:port][/db][?…]`
-/// connection URL is a loopback address (`127.0.0.0/8`, `::1`) or the literal
-/// `localhost`.
-///
-/// Used by [`require_tls_or_loopback`] to decide TLS posture from the host:
-/// loopback is the docker / local-dev case where the bytes never leave the box,
-/// so plaintext is fine; a remote host without TLS leaks credentials and rows.
-///
-/// Fails **closed**: any URL we cannot confidently parse a loopback host out of
-/// is treated as non-loopback, so a parse gap can only ever *tighten* the gate
-/// (refuse a connection), never silently allow plaintext to an unverified host.
-/// The `host[:port][,host:port…]` span of a URL — scheme stripped, path/query
-/// dropped, `user[:pass]@` userinfo removed (rsplit the last `@` so an `@` in a
-/// password stays with the userinfo). Empty when the URL carries no authority.
-pub(crate) fn host_port_span(url: &str) -> &str {
-    let after_scheme = match url.split_once("://") {
-        Some((_, rest)) => rest,
-        None => url,
-    };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    match authority.rsplit_once('@') {
-        Some((_, hp)) => hp,
-        None => authority,
-    }
-}
-
-pub(crate) fn host_is_loopback(url: &str) -> bool {
-    let host_port = host_port_span(url);
-    // A comma seedlist (`host1:p1,host2:p2` — valid for MongoDB AND multi-host
-    // PostgreSQL) is loopback ONLY if EVERY host is: reading just the first host
-    // let `127.0.0.1:5432,evil.com:5432` dial evil.com in plaintext under the
-    // gate (bug-hunt find). Empty authority ⇒ not loopback (fail closed).
-    !host_port.is_empty()
-        && host_port.split(',').all(one_host_is_loopback)
-        && query_hosts(url).all(query_host_is_local)
-}
-
-/// The libpq `host=` / `hostaddr=` query values a driver dials besides the authority.
-fn query_hosts(url: &str) -> impl Iterator<Item = &str> {
-    let query = url.split_once('?').map_or("", |(_, q)| q);
-    let query = query.split('#').next().unwrap_or(query);
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .filter(|(k, _)| matches!(*k, "host" | "hostaddr"))
-        .flat_map(|(_, v)| v.split(','))
-}
-
-/// A query host that stays on the box: a unix-socket path, or a loopback name/address.
-fn query_host_is_local(v: &str) -> bool {
-    v.starts_with('/')
-        || v.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("%2f"))
-        || v.parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-        || one_host_is_loopback(v)
-}
-
-/// Loopback test for a single `host[:port]` (or bracketed `[ipv6][:port]`).
-fn one_host_is_loopback(host_port: &str) -> bool {
-    // IPv6 literals are bracketed (`[::1]:5432`); the host is the bracketed span,
-    // and any `:` inside is part of the address.
-    let host = if let Some(rest) = host_port.strip_prefix('[') {
-        match rest.split_once(']') {
-            Some((h, _)) => h,
-            None => return false, // unterminated bracket — fail closed
-        }
-    } else {
-        // Bare host or IPv4: the host ends at the (single) port `:`.
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // `IpAddr::is_loopback` covers the whole 127.0.0.0/8 block and `::1`.
-    host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// Refuse a URL that carries no host authority (`mysql://`, `postgres:///db`)
-/// with a clear parse error, BEFORE any engine-specific setup hint can blanket
-/// it (dogfood LOW: `rivet cdc --source mysql://` reported a binlog-grants
-/// problem for a host that doesn't exist). No URL echo — the userinfo may hold
-/// credentials — and no `user:pass@` pattern in the message (the redactor
-/// mangles it).
-pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
-    if host_port_span(url).is_empty() {
-        anyhow::bail!(
-            "source: invalid URL — no host found. Expected a URL of the form \
-             scheme://host:port/database."
-        );
-    }
-    Ok(())
-}
-
-/// Gate plaintext / trust-any-cert connections by host (CWE-319 / CWE-295).
-///
-/// When no `tls:` block is configured (`tls == None`) **and** the resolved host
-/// is not loopback, refuse the connection *before any network I/O* with a
-/// TLS-required policy error. This stops the per-engine connect helpers from
-/// silently dialing a remote database in cleartext (Postgres/MySQL `NoTls`) or
-/// trusting any server certificate (MSSQL `trust_cert`).
-///
-/// Loopback hosts (docker / local dev) keep today's behaviour — plaintext is
-/// allowed there because the bytes never leave the box. An explicit
-/// `tls: { mode: disable }` is `Some(..)`, so it is the operator's opt-in to
-/// remote plaintext and is **not** refused here.
-/// Marker error for the TLS-required policy refusal, so callers whose remedy
-/// differs (init: a FLAG, not a config block) can recognize it by type.
-#[derive(Debug)]
-pub(crate) struct TlsRequiredError;
-impl std::fmt::Display for TlsRequiredError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "TLS required for a remote host")
-    }
-}
-impl std::error::Error for TlsRequiredError {}
-
-pub(crate) fn require_tls_or_loopback(url: &str, tls: Option<&TlsConfig>) -> Result<()> {
-    // An explicit `tls: {..}` (including `mode: disable`) is the operator's
-    // opt-in and is never refused here — including for a host-LESS URL, which a
-    // driver resolves as a LOCAL unix socket (`postgres:///db?host=/var/run/
-    // postgresql`). The host-presence check must therefore live INSIDE the
-    // no-tls branch: hoisting it above (da7abbf) rejected a valid socket URL that
-    // worked on main whenever `tls: { mode: disable }` was set (#16 bughunt).
-    if tls.is_none() {
-        // A URL with NO host at all (`mysql://`, `postgres:///db`) is not a
-        // "remote host" — it is malformed. Prescribing a TLS block there sends the
-        // operator chasing a security setting for a host that doesn't exist.
-        require_url_has_host(url)?;
-    }
-    if tls.is_none() && !host_is_loopback(url) {
-        // The message must name TLS *and* that it is a policy refusal for a
-        // remote host. Emit it at `error` level (→ stderr) as well as returning
-        // it: callers like `doctor` print the `Err` to stdout in their own
-        // `[FAIL]` style and only re-raise a generic summary, so the log line is
-        // what guarantees the TLS-required reason reaches stderr. Deliberately
-        // avoids socket-error vocabulary ("could not connect", "timeout", "os
-        // error") so it is never mistaken for a connect-time failure.
-        let msg = "source: TLS required — refusing to connect to a remote (non-loopback) \
-             host without TLS; credentials and every exported row would cross the network \
-             in cleartext. Add `source.tls: { mode: verify-full }` (with `ca_file:` for a \
-             private CA; not yet supported for Oracle) to enable transport security, or explicitly opt into remote \
-             plaintext with `source.tls: { mode: disable }` if this network path is \
-             already trusted.";
-        log::error!("{msg}");
-        // Typed, not just a string: `rivet init` has no config file to add a
-        // `tls:` block TO (it generates one), so its dispatch matches on this
-        // marker and re-prescribes the `--tls` flag instead — detection by
-        // downcast, never by string-matching the message (#146).
-        return Err(anyhow::Error::new(TlsRequiredError).context(msg));
-    }
-    Ok(())
-}
-
-/// The URL without its `sslmode`, and the [`TlsConfig`] that `sslmode` asks for:
-/// `require` / `verify-ca` / `verify-full` enforce, anything else is `None`; last occurrence wins, like libpq.
-pub(crate) fn url_tls(url: &str) -> (String, Option<TlsConfig>) {
-    let query = url.split_once('?').map_or("", |(_, q)| q);
-    let mut mode = None;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key != "sslmode" {
-            continue;
-        }
-        mode = match value {
-            "require" => Some(crate::config::TlsMode::Require),
-            "verify-ca" => Some(crate::config::TlsMode::VerifyCa),
-            "verify-full" => Some(crate::config::TlsMode::VerifyFull),
-            _ => None,
-        };
-    }
-    let tls = mode.map(|mode| TlsConfig {
-        mode,
-        ..TlsConfig::default()
-    });
-    (strip_url_query_key(url, "sslmode"), tls)
-}
-
-/// Remove a query parameter (case-insensitive key) from a URL, keeping the rest of the query.
-pub(crate) fn strip_url_query_key(url: &str, key: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
-    };
-    let kept: Vec<&str> = query
-        .split('&')
-        .filter(|pair| {
-            let k = pair.split('=').next().unwrap_or(pair);
-            !k.eq_ignore_ascii_case(key)
-        })
-        .collect();
-    if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    }
-}
-
-#[cfg(test)]
-mod url_tls_tests {
-    use super::url_tls;
-    use crate::config::TlsMode;
-
-    fn mode(url: &str) -> Option<TlsMode> {
-        url_tls(url).1.map(|t| t.mode)
-    }
-
-    #[test]
-    fn sslmode_enforced_values_map_to_tls_modes() {
-        assert_eq!(
-            mode("postgresql://u:p@h:5432/d?sslmode=require"),
-            Some(TlsMode::Require)
-        );
-        assert_eq!(
-            mode("postgresql://u:p@h/d?sslmode=verify-ca"),
-            Some(TlsMode::VerifyCa)
-        );
-        assert_eq!(
-            mode("mysql://u:p@h/d?sslmode=verify-full"),
-            Some(TlsMode::VerifyFull)
-        );
-    }
-
-    /// `require`, not the `#[default]` VerifyFull, so dropping `mode` from the struct is visible.
-    #[test]
-    fn url_sslmode_lands_in_the_config_it_builds() {
-        let t = url_tls("postgresql://u:p@h/db?sslmode=require")
-            .1
-            .expect("require maps");
-        assert_eq!(t.mode, TlsMode::Require);
-        assert!(!t.accept_invalid_certs && t.ca_file.is_none());
-    }
-
-    #[test]
-    fn sslmode_plaintext_missing_and_unrecognized_values_stay_plaintext() {
-        for url in [
-            "postgresql://u:p@localhost/d",
-            "postgresql://u:p@db/d?sslmode=disable",
-            "postgresql://u:p@db/d?sslmode=prefer",
-            "postgresql://u:p@db/d?sslmode=allow",
-            "postgresql://u:p@db/d?sslmode=REQUIRE",
-            "postgresql://u:p@db/d?sslmode=garbage",
-            "postgresql://u:p@db/d?sslmode",
-            "postgresql://u:p@db/d?sslmode=",
-        ] {
-            assert_eq!(mode(url), None, "url: {url}");
-        }
-    }
-
-    #[test]
-    fn sslmode_exact_key_among_other_params_and_last_occurrence_wins() {
-        assert_eq!(mode("postgresql://u:p@db/d?xsslmode=require"), None);
-        assert_eq!(
-            mode("postgresql://u:p@db/d?connect_timeout=10&sslmode=require&application_name=x"),
-            Some(TlsMode::Require)
-        );
-        assert_eq!(
-            mode("postgresql://u:p@db/d?sslmode=disable&sslmode=require"),
-            Some(TlsMode::Require)
-        );
-        assert_eq!(
-            mode("postgresql://u:p@db/d?sslmode=require&sslmode=disable"),
-            None
-        );
-    }
-
-    #[test]
-    fn url_tls_strips_sslmode_and_keeps_other_params() {
-        assert_eq!(
-            url_tls("mysql://u:p@db:3306/d?stmt_cache_size=5&sslmode=require&prefer_socket=false")
-                .0,
-            "mysql://u:p@db:3306/d?stmt_cache_size=5&prefer_socket=false"
-        );
-        assert_eq!(
-            url_tls("mysql://u:p@db/d?sslmode=require").0,
-            "mysql://u:p@db/d"
-        );
-        assert_eq!(url_tls("mysql://u:p@db/d").0, "mysql://u:p@db/d");
-    }
-
-    /// The MySQL driver refuses any URL parameter it does not know, so `sslmode` must be gone before it parses.
-    #[test]
-    fn mysql_url_with_sslmode_parses_after_url_tls() {
-        let raw = "mysql://u:p@db.prod:3306/d?sslmode=verify-full&stmt_cache_size=5";
-        assert!(
-            mysql::Opts::from_url(raw).is_err(),
-            "the driver must reject the raw URL"
-        );
-        let (clean, tls) = url_tls(raw);
-        assert!(
-            mysql::Opts::from_url(&clean).is_ok(),
-            "cleaned URL must parse: {clean}"
-        );
-        assert_eq!(tls.map(|t| t.mode), Some(TlsMode::VerifyFull));
-    }
-}
-
-#[cfg(test)]
-mod tls_gate_tests {
-    use super::{host_is_loopback, host_port_span, require_tls_or_loopback};
-    use crate::config::{TlsConfig, TlsMode};
-
-    /// The marker must be REACHABLE (downcast finds it on the chain) and must
-    /// SAY something (a `Display` stubbed to nothing turns `{:#}` chains into
-    /// a trailing colon and empty segment). Both halves lib-side, where the
-    /// marker lives — init's flag-naming remedy is tested bin-side.
-    #[test]
-    fn tls_required_error_is_downcastable_and_self_describing() {
-        let err = require_tls_or_loopback("mysql://u:p@203.0.113.9/db", None)
-            .expect_err("remote + no tls refuses");
-        assert!(
-            err.chain()
-                .any(|c| c.downcast_ref::<super::TlsRequiredError>().is_some()),
-            "the refusal must carry the typed marker"
-        );
-        let display = format!("{}", super::TlsRequiredError);
-        assert!(
-            display.contains("TLS required"),
-            "the marker's own text must name the policy: {display:?}"
-        );
-    }
-
-    #[test]
-    fn loopback_variants_are_loopback() {
-        assert!(host_is_loopback(
-            "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
-        ));
-        assert!(host_is_loopback(
-            "postgresql://rivet:rivet@localhost:5432/rivet"
-        ));
-        assert!(host_is_loopback("mysql://root@127.0.0.1:3306/db"));
-        // Whole 127.0.0.0/8 block is loopback.
-        assert!(host_is_loopback("postgresql://u:p@127.255.0.9/db"));
-        // IPv6 loopback, bracketed with and without a port.
-        assert!(host_is_loopback("postgresql://u:p@[::1]:5432/db"));
-        assert!(host_is_loopback("sqlserver://sa:pw@[::1]/master"));
-        // Case-insensitive host, no port, no db.
-        assert!(host_is_loopback("mysql://root@LOCALHOST"));
-        // An `@` inside the password must not be mistaken for the host boundary.
-        assert!(host_is_loopback("postgresql://u:p@ss@127.0.0.1:5432/db"));
-    }
-
-    #[test]
-    fn roast_seedlist_with_any_remote_host_is_not_loopback() {
-        // Multi-host / seedlist authority (`host1:p1,host2:p2`): the TLS gate must
-        // treat it as loopback ONLY if EVERY host is loopback. Reading just the
-        // first host let `127.0.0.1:5432,evil.com:5432` (a valid PostgreSQL and
-        // MongoDB seedlist) pass the gate and dial evil.com in plaintext
-        // (bug-hunt find; the shared gate reaches every engine, PG supports
-        // multi-host URLs).
-        assert!(!host_is_loopback(
-            "postgresql://u:p@127.0.0.1:5432,evil.com:5432/db"
-        ));
-        assert!(!host_is_loopback(
-            "mongodb://u:p@127.0.0.1:27017,evil.com:27017/db"
-        ));
-        // All-loopback seedlist stays loopback.
-        assert!(host_is_loopback(
-            "mongodb://u:p@127.0.0.1:27017,[::1]:27018/db"
-        ));
-    }
-
-    #[test]
-    fn remote_hosts_are_not_loopback() {
-        assert!(!host_is_loopback(
-            "postgresql://rivet:rivet@10.255.255.1:5432/rivet"
-        ));
-        assert!(!host_is_loopback(
-            "postgresql://u:p@db.example.com:5432/app"
-        ));
-        assert!(!host_is_loopback("mysql://root@192.168.1.10:3306/db"));
-        assert!(!host_is_loopback("sqlserver://sa:pw@10.0.0.5:1433/master"));
-        // Not loopback: an unbracketed IPv6-looking address won't parse here, so
-        // it fails closed (treated as remote).
-        assert!(!host_is_loopback("postgresql://u:p@::1:5432/db"));
-    }
-
-    #[test]
-    fn gate_refuses_remote_plaintext_only() {
-        let remote = "postgresql://rivet:rivet@10.255.255.1:5432/rivet";
-        let loopback = "postgresql://rivet:rivet@127.0.0.1:5432/rivet";
-        let disable = TlsConfig {
-            mode: TlsMode::Disable,
-            ..Default::default()
-        };
-        let verify = TlsConfig {
-            mode: TlsMode::VerifyFull,
-            ..Default::default()
-        };
-
-        // Remote + no tls block → refused.
-        assert!(require_tls_or_loopback(remote, None).is_err());
-        // Loopback + no tls block → allowed (docker / dev path).
-        assert!(require_tls_or_loopback(loopback, None).is_ok());
-        // Explicit `mode: disable` is the remote-plaintext opt-in → allowed.
-        assert!(require_tls_or_loopback(remote, Some(&disable)).is_ok());
-        // Enforced TLS to a remote host → allowed (the connect path uses TLS).
-        assert!(require_tls_or_loopback(remote, Some(&verify)).is_ok());
-    }
-
-    #[test]
-    fn a_query_host_or_hostaddr_cannot_route_a_loopback_url_off_the_box() {
-        for u in [
-            "postgresql://u:p@localhost:5432/db?hostaddr=203.0.113.5",
-            "postgresql://u:p@127.0.0.1/db?host=db.example.com",
-            "postgresql://u:p@localhost/db?sslmode=disable&host=localhost,db.example.com",
-        ] {
-            assert!(require_tls_or_loopback(u, None).is_err(), "{u}");
-        }
-        for u in [
-            "postgresql://u:p@localhost/db?hostaddr=127.0.0.1",
-            "postgresql://u:p@localhost/db?hostaddr=::1",
-            "postgresql://u:p@localhost/db?host=/var/run/postgresql",
-            "postgresql://u:p@localhost/db?host=%2Fvar%2Frun%2Fpostgresql",
-        ] {
-            assert!(require_tls_or_loopback(u, None).is_ok(), "{u}");
-        }
-    }
-
-    #[test]
-    fn host_port_span_extracts_the_authority() {
-        assert_eq!(host_port_span("mysql://u:p@host:3306/db"), "host:3306");
-        assert_eq!(
-            host_port_span("postgres://127.0.0.1:5432/db"),
-            "127.0.0.1:5432"
-        );
-        // No authority at all.
-        assert_eq!(host_port_span("mysql://"), "");
-        assert_eq!(host_port_span("postgres:///db"), "");
-    }
-
-    #[test]
-    fn hostless_url_is_a_parse_error_not_a_tls_refusal() {
-        // #dogfood LOW: `mysql://` has NO host, yet the gate reported "remote
-        // (non-loopback) host, TLS required" and prescribed a TLS block for a
-        // host that doesn't exist. It must be a clear parse error instead.
-        for u in ["mysql://", "postgres:///db", "sqlserver://"] {
-            let err = require_tls_or_loopback(u, None)
-                .expect_err("a host-less URL must error, not connect");
-            let msg = err.to_string();
-            assert!(
-                msg.contains("no host found"),
-                "host-less URL must be a parse error: {msg}"
-            );
-            assert!(
-                !msg.contains("TLS required"),
-                "host-less URL must NOT prescribe a TLS block: {msg}"
-            );
-        }
-    }
-
-    #[test]
-    fn hostless_socket_url_with_explicit_tls_disable_is_allowed() {
-        // #16 bughunt: a unix-socket URL has no authority host (the socket path
-        // lives in `?host=`), so the host-presence check rejected it. But an
-        // explicit `tls: { mode: disable }` is the operator's opt-in for a LOCAL
-        // connection — it must connect, as it did on main (where the gate was
-        // skipped whenever tls was Some). The check now lives inside the no-tls
-        // branch, so tls=Some(disable) is never refused.
-        let disable = TlsConfig {
-            mode: TlsMode::Disable,
-            ..Default::default()
-        };
-        for u in [
-            "postgres:///rivet?host=/var/run/postgresql",
-            "mysql://",
-            "postgres:///db",
-        ] {
-            require_tls_or_loopback(u, Some(&disable))
-                .expect("an explicit tls: { mode: disable } must not be refused for a socket URL");
-        }
-    }
-}
+pub(crate) use crate::config::url::{host_is_loopback, url_tls};
 
 /// Batch positional-mapping guard: every engine's batch decoder indexes wire
 /// rows by the RESOLVE-time column order (`SELECT *` is positional at the

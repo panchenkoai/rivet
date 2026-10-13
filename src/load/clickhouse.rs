@@ -153,9 +153,11 @@ impl ClickhouseLoader {
             };
             if retry_after(failure, repeat, attempt) {
                 log::warn!("ClickHouse attempt {attempt} failed, retrying: {err:#}");
-                std::thread::sleep(Duration::from_millis(
-                    crate::pipeline::retry::retry_backoff_ms(RETRY_BASE_MS, attempt, 0),
-                ));
+                std::thread::sleep(Duration::from_millis(crate::tuning::retry_backoff_ms(
+                    RETRY_BASE_MS,
+                    attempt,
+                    0,
+                )));
                 continue;
             }
             return Err(err.context(format!(

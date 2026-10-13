@@ -37,6 +37,7 @@ ledger fails loudly instead of silently yielding zero scenarios.
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
 import re
@@ -212,8 +213,7 @@ def _sqlite_counts(db: Path) -> dict[str, int]:
     }
     if not db.exists():
         return out
-    con = sqlite3.connect(str(db))
-    try:
+    with closing(sqlite3.connect(str(db))) as con:
 
         def one(sql: str) -> int:
             try:
@@ -233,8 +233,6 @@ def _sqlite_counts(db: Path) -> dict[str, int]:
         out["file_log_rows"] = one("SELECT COUNT(*) FROM file_log")
         out["load_run_rows"] = one("SELECT COUNT(*) FROM load_run")
         out["loaded_source_run_ids"] = one("SELECT COUNT(*) FROM loaded_source_run")
-    finally:
-        con.close()
     return out
 
 
@@ -920,16 +918,14 @@ def load_scenario(sid: str, eng: str, work: Path):
                         db = work / ".rivet_state.db"
                         if not db.exists():
                             return False
-                        con = sqlite3.connect(str(db))
-                        try:
-                            r = con.execute(
-                                "SELECT COUNT(*) FROM run_status WHERE status='running'"
-                            ).fetchone()
-                            return bool(r and r[0])
-                        except sqlite3.Error:
-                            return False
-                        finally:
-                            con.close()
+                        with closing(sqlite3.connect(str(db))) as con:
+                            try:
+                                r = con.execute(
+                                    "SELECT COUNT(*) FROM run_status WHERE status='running'"
+                                ).fetchone()
+                                return bool(r and r[0])
+                            except sqlite3.Error:
+                                return False
 
                     raced = False
                     for _ in range(60):

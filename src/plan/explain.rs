@@ -19,8 +19,14 @@
 
 use crate::config::{ExportConfig, ExportMode};
 use crate::plan::ExtractionStrategy;
-use crate::preflight::{ExportDiagnostic, SMALL_TABLE_ROW_THRESHOLD};
+use crate::preflight::ExportDiagnostic;
 use crate::tuning::memory::{DEFAULT_MEM_BUDGET_MB, estimate_peak_rss_mb};
+
+/// Tables at or below this row count are a one-shot full copy, not a workload
+/// worth a "DEGRADED" warning. Mirrors `init::TableInfo::suggest_mode`, which
+/// recommends plain `mode: full` (no index/cursor) up to the same threshold —
+/// so the scaffold init writes must not then be scolded by `check`.
+pub(crate) const SMALL_TABLE_ROW_THRESHOLD: i64 = 100_000;
 
 /// Build a concise (1–3 sentence) narrative explaining why this export's
 /// strategy — mode, chunk geometry, parallelism — was chosen, plus its risk

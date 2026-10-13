@@ -397,7 +397,7 @@ Splits a `full`, `chunked` or `incremental` export's rows into Hive-style
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value captured at sink construction and shared by every batch/row that sink writes — effectively one value per export run in single mode, per chunk (or keyset page) in multi-part modes) |
+| `exported_at` | boolean | `false` | Add `_rivet_exported_at` column (Timestamp UTC; one value captured at sink construction and shared by every batch/row that sink writes — effectively one value per export run in single mode, per chunk (or keyset page) in multi-part modes. It differs between two runs over the same rows, and so do the part bytes and `content_fingerprint`; every other column is identical) |
 | `row_hash` | boolean or list of column names | `false` | Add `_rivet_row_hash` column — lower 64 bits of `xxHash3-128`, written as `Int64` for fast `PARTITION BY` / `JOIN`. `true` hashes every column; a list (`row_hash: [id, status, updated_at]`) hashes exactly those columns in that order and records the covered set in the run manifest. Deterministic across runs; distinguishes NULL from empty string. |
 
 ---
@@ -463,6 +463,8 @@ destination:
 ```
 
 With an export named `orders` running on 2026-05-14, this resolves to `exports/2026-05-14/orders/`.
+
+For an export that continues from a stored cursor (`incremental`, `keyset_incremental`, MongoDB `resume`), the destination and the `format` are compared between runs. The destination is compared as written, with the placeholder in place: `exports/{date}/{export}/` is the same destination on every day. Another bucket, `path` or `prefix`, another store or another `format` is refused (`RIVET_STATE_CURSOR_DESTINATION_MISMATCH`, exit 5), because the new location would hold only the rows past the cursor: restore the setting to continue, or run `rivet state reset -c <config> --export <name>` for a full pass delivered where the config points now. A value that comes from `${VAR}` is compared after substitution, so a destination that should change from run to run is spelled with `{date}`.
 
 ---
 

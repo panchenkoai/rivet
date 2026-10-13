@@ -85,6 +85,27 @@ impl DestinationType {
 }
 
 impl DestinationConfig {
+    /// The destination as an operator would type it to find the prefix again: `file://`, `s3://`, `gs://`, `az://<container>/` or `stdout`.
+    pub fn uri(&self) -> String {
+        let in_bucket = |scheme: &str| {
+            format!(
+                "{scheme}://{}/{}",
+                self.bucket.as_deref().unwrap_or(""),
+                self.prefix.as_deref().unwrap_or("")
+            )
+        };
+        match self.destination_type {
+            DestinationType::Local => {
+                let path = self.path.as_deref().or(self.prefix.as_deref());
+                format!("file://{}", path.unwrap_or("."))
+            }
+            DestinationType::S3 => in_bucket("s3"),
+            DestinationType::Gcs => in_bucket("gs"),
+            DestinationType::Azure => in_bucket("az"),
+            DestinationType::Stdout => "stdout".to_string(),
+        }
+    }
+
     /// The state key of a CDC table's snapshot baseline: its destination.
     pub fn state_key(&self) -> String {
         format!(
@@ -112,6 +133,32 @@ mod tests {
         assert_eq!(d.state_key(), "b/p/");
         d.path = Some("out/".into());
         assert_eq!(d.state_key(), "b/out/");
+    }
+
+    #[test]
+    fn a_destination_uri_names_its_store_with_its_bucket_and_prefix_or_its_path() {
+        use DestinationType::*;
+        let at =
+            |destination_type, bucket: Option<&str>, prefix: Option<&str>, path: Option<&str>| {
+                DestinationConfig {
+                    destination_type,
+                    bucket: bucket.map(Into::into),
+                    prefix: prefix.map(Into::into),
+                    path: path.map(Into::into),
+                    ..Default::default()
+                }
+                .uri()
+            };
+        assert_eq!(at(Local, None, Some("p/"), Some("/out")), "file:///out");
+        assert_eq!(at(Local, None, Some("p/"), None), "file://p/");
+        assert_eq!(at(Local, None, None, None), "file://.");
+        assert_eq!(at(S3, Some("b"), Some("p/"), Some("/out")), "s3://b/p/");
+        assert_eq!(at(S3, Some("b"), None, None), "s3://b/");
+        assert_eq!(at(Gcs, Some("b"), Some("p/"), None), "gs://b/p/");
+        assert_eq!(at(Gcs, Some("b"), None, None), "gs://b/");
+        assert_eq!(at(Azure, Some("c"), Some("p/"), None), "az://c/p/");
+        assert_eq!(at(Azure, Some("c"), None, None), "az://c/");
+        assert_eq!(at(Stdout, Some("b"), Some("p/"), Some("/out")), "stdout");
     }
 
     #[test]

@@ -507,7 +507,7 @@ can serve that log is an engine + replica-config question, not a rivet limitatio
 | engine | from a replica? | what the replica needs | verified |
 | --- | --- | --- | --- |
 | **MySQL** | ✅ yes | `log_bin = ON` **and `log_replica_updates = ON`** (`log_slave_updates` pre-8.0.26) so the replica re-logs replicated changes into its *own* binlog — this is **off by default**: a replica applies changes but does not re-log them without it. Plus the `REPLICATION SLAVE` / `REPLICATION CLIENT` grant and a `server_id` distinct from both the primary and the replica. rivet **refuses** a replica with `log_replica_updates = OFF` at start, because its binlog holds none of the replicated changes. | live test + release gate: capture from a re-logging replica, refusal on one that does not |
-| **PostgreSQL** | ✅ 16+, **continuous mode only** | Logical decoding on a standby is a PostgreSQL 16 feature. Run with `cdc.until_current: false`: the default bounded run **refuses** on a standby, because the position it bounds by (`pg_current_wal_lsn()`) does not exist during recovery. The first run creates the slot on the standby and waits until the primary logs a running-transactions snapshot (routine on a busy primary; `SELECT pg_log_standby_snapshot()` on the primary forces one). Set `hot_standby_feedback = on` on the standby so the primary keeps the rows the slot still needs. Below 16 a standby cannot host a logical slot — point rivet at the primary. | live test + release gate: continuous capture from a 16 standby, refusal of the bounded mode |
+| **PostgreSQL** | ✅ 16+, **continuous mode only** | Logical decoding on a standby is a PostgreSQL 16 feature. Run with `cdc.until_current: false`: the default bounded run **refuses** on a standby, because the position it bounds by (`pg_current_wal_lsn()`) does not exist during recovery. The refusal (`RIVET_SOURCE_CDC_PREREQUISITE`) comes before a slot or a baseline is written, and `rivet init` against a standby writes `until_current: false`. The first run creates the slot on the standby and waits until the primary logs a running-transactions snapshot (routine on a busy primary; `SELECT pg_log_standby_snapshot()` on the primary forces one). Set `hot_standby_feedback = on` on the standby so the primary keeps the rows the slot still needs. Below 16 a standby cannot host a logical slot — point rivet at the primary. | live test + release gate: continuous capture from a 16 standby, refusal of the bounded mode |
 | **SQL Server** | ✅ yes (readable secondary) | CDC is enabled and captured on the **primary** (the capture job runs there); the `cdc.*` change tables replicate to an Always On secondary with `SECONDARY_ROLE (ALLOW_CONNECTIONS = ALL)`, and rivet reads them there with plain `SELECT`s. | live test + release gate: a read-scale availability group (`CLUSTER_TYPE = NONE`), capture read from the secondary |
 | **MongoDB** | ✅ yes (secondary) | Point `source.url` at a secondary with `readPreference=secondary` (and `directConnection=true` for one member); the change stream reads that member's oplog. | live test + release gate: a two-member replica set, capture from the secondary |
 
@@ -734,6 +734,10 @@ prefix to stay small.
 Without `--output`, rivet emits the changes as NDJSON (one JSON object per change)
 to stdout, as the engine delivered them: `op`, `schema`, `table`, `before`,
 `after`, `pos`, `seq`. NDJSON is NOT split: a key change is one `update` line.
+When a drain to stdout ends it acknowledges the last commit it printed, so on
+PostgreSQL the slot advances and the next drain starts after that commit. A drain
+that stops before its end acknowledges nothing and the next one prints the same
+lines again: a consumer of the pipe must tolerate a repeated line.
 `before` holds the old image's cells in the order the engine logged them. On
 PostgreSQL every UPDATE that carries an old image also gets `before_columns`, which
 names those cells. That is the replica identity's columns, or under
@@ -852,7 +856,12 @@ slot-invalidated error and you [re-baseline](cdc-failure-modes.md#the-shape-of-e
 > `binlog_row_image=FULL`, and whether the checkpoint's binlog file is still
 > retained (a purged file is reported *before* the run fails with ERROR 1236);
 > SQL Server — CDC enabled, the capture instance exists, the checkpoint is
-> within retention, and the Agent service is running.
+> within retention, and the Agent service is running. On PostgreSQL, MySQL and
+> Oracle doctor also asks the question the run refuses by, through the same
+> function: a prerequisite the run would refuse (PostgreSQL `wal_level`, a
+> bounded drain on a standby, a table that does not exist; MySQL
+> `binlog_row_metadata`, binlog compression, a replica that does not re-log) is
+> a failed `CDC run prerequisites` check carrying the run's own message.
 
 ### MySQL — the binlog was purged
 

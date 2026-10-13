@@ -95,6 +95,7 @@ MUTATES A SHARED SERVER and it MEASURES WALL-CLOCK.
 
 from __future__ import annotations
 
+from contextlib import closing
 import atexit
 import fcntl
 import json
@@ -526,8 +527,8 @@ def _state_db(work: Path, tag: str) -> Path:
 def journal_sheds(state_db: Path, tag: str) -> tuple[int, int]:
     """(backed off, recovered) across every export in the run."""
     try:
-        db = sqlite3.connect(state_db)
-        rows = list(db.execute("SELECT journal_json FROM run_journal"))
+        with closing(sqlite3.connect(state_db)) as db:
+            rows = list(db.execute("SELECT journal_json FROM run_journal"))
     except sqlite3.Error as e:
         raise Fail(f"leg {tag}: cannot read run_journal from {state_db}: {e}",
                    hint="the shed count is the whole verdict — an unreadable journal is a "
@@ -544,9 +545,9 @@ def journal_sheds(state_db: Path, tag: str) -> tuple[int, int]:
 
 def delivered(state_db: Path, tag: str) -> dict:
     try:
-        db = sqlite3.connect(state_db)
-        return dict(db.execute(
-            "SELECT export_name, total_rows FROM export_metrics WHERE status='success'"))
+        with closing(sqlite3.connect(state_db)) as db:
+            return dict(db.execute(
+                "SELECT export_name, total_rows FROM export_metrics WHERE status='success'"))
     except sqlite3.Error as e:
         raise Fail(f"leg {tag}: cannot read export_metrics from {state_db}: {e}") from e
 

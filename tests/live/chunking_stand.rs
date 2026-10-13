@@ -275,9 +275,9 @@ fn seed_gappy_split(
 /// is set the source then GAINS rows `grow.0..=grow.1` (the input that shifts a
 /// re-sampled partition); run 2 resumes. The manifest must DECLARE every
 /// ORIGINAL id afterwards — read with the orphan-immune `dir_manifest_copy_id_set`
-/// (a crash leaves pre-shift orphans a raw read would miscount). Whether the new
-/// rows also land depends on which unit held the open window, so only the
-/// original-snapshot guarantee is asserted.
+/// (a crash leaves pre-shift orphans a raw read would miscount). Every unit is
+/// unfinished after the crash and plans the keys its window holds now, the last
+/// window has no ceiling, so the rows gained land too: every current id, once.
 fn run_pool_split_resume(
     eng: Eng,
     table: &str,
@@ -462,17 +462,15 @@ fn run_pool_split_rerun_with(
         missing.len(),
         &missing[..missing.len().min(8)]
     );
-    if !resume {
-        let grown = grow.map_or(0, |(lo, hi)| hi - lo + 1);
-        assert_eq!(
-            (
-                declared.len() as i64,
-                dir_manifest_copy_total_rows(&rig.out_dir())
-            ),
-            (n + grown, n + grown),
-            "a fresh re-run declares every current id exactly once"
-        );
-    }
+    let grown = grow.map_or(0, |(lo, hi)| hi - lo + 1);
+    assert_eq!(
+        (
+            declared.len() as i64,
+            dir_manifest_copy_total_rows(&rig.out_dir())
+        ),
+        (n + grown, n + grown),
+        "a re-run, resumed or fresh, declares every current id exactly once"
+    );
 }
 
 /// Drops the stand's temp table on scope exit, per engine.

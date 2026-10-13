@@ -349,25 +349,53 @@ seeds:
     engines:
       postgres:
         cells:
-          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_postgres
-          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_postgres
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_postgres
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_postgres
       mysql:
         cells:
-          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_mysql
-          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_mysql
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql
       mssql:
         cells:
-          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_mssql
-          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_mssql
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mssql
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mssql
       oracle:
         cells:
-          - crashed_one_chunk_range_run_then_checkpoint_removed_finish_the_run_oracle
-          - crashed_one_chunk_range_run_then_checkpoint_removed_reset_oracle
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_oracle
+          - a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_oracle
       mongo:
         na: "a Mongo export has no `mode: chunked`, so no plan of it is a single pass that stands for a paging mode"
       lib:
         cells:
           - "lib:a_single_pass_of_a_chunked_export_is_refused_as_a_chunked_run_without_its_checkpoint"
+
+  - name: chunked-shape-validated-only-past-one-chunk
+    class: "a check of the config's shape placed after a shortcut that depends on the table's size: the planner's small-table escape returned one pass before the `chunk_column` type and the key were validated, so a `mode: chunked` config refused on a large table ran with exit 0 on a small one"
+    history: "2026-10-09 - found by the checkpoint-removed cells following the row estimate (#511) - a DECIMAL `chunk_column` and a keyless table refused over 10 rows ran over 3 on PostgreSQL, MySQL, SQL Server and Oracle"
+    scope: source
+    patch: chunked-shape-validated-only-past-one-chunk/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres
+          - a_keyless_table_is_refused_whatever_the_row_estimate_postgres
+      mysql:
+        cells:
+          - a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql
+          - a_keyless_table_is_refused_whatever_the_row_estimate_mysql
+      mssql:
+        cells:
+          - a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql
+          - a_keyless_table_is_refused_whatever_the_row_estimate_mssql
+      oracle:
+        cells:
+          - a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle
+          - a_keyless_table_is_refused_whatever_the_row_estimate_oracle
+      mongo:
+        na: "a Mongo export has no `mode: chunked`"
+      lib:
+        cells:
+          - "lib:a_chunked_shape_is_validated_whatever_the_row_estimate"
 
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
@@ -1030,6 +1058,193 @@ seeds:
       lib:
         cells: ["lib:an_accepted_edit_keeps_the_cursor_under_what_the_export_reads_now"]
 
+  - name: resumed-chunk-run-keeps-its-stale-plan
+    class: a run that resumes a crashed range-chunk checkpoint executes the task list the crashed run stored and never looks at the source's key span again
+    history: "2026-10-08, sabotage rows kill_then_source_grows_range_checkpoint and kill_then_source_fills_empty_range_checkpoint - three rows inserted after the crash were in no part (200 of 203), and an empty table killed mid-run and then filled was delivered as 0 of 40, exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: resumed-chunk-run-keeps-its-stale-plan/shared.patch
+    engines:
+      postgres:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_postgres, a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_postgres, stand_pool_split_resume_grows_postgres]
+      mysql:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mysql, a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_mysql, stand_pool_split_resume_grows_mysql]
+      mssql:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_mssql, a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_mssql, stand_pool_split_resume_grows_mssql]
+      mongo:
+        na: "a MongoDB export has no range-chunk checkpoint (validate_non_sql_source_modes allows no chunked mode)"
+      oracle:
+        cells: [a_range_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle, a_range_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle, a_run_killed_over_an_empty_table_before_it_fills_delivers_the_source_oracle, a_range_checkpoint_run_killed_before_the_source_grows_is_resumed_to_the_source_oracle, stand_pool_split_resume_grows_oracle]
+      lib:
+        cells: ["lib:a_resume_extends_the_stored_plan_to_the_ranges_detected_now"]
+
+  - name: resumed-parallel-keyset-stops-at-its-last-range
+    class: a resumed parallel keyset run skips its committed, open-ended last range and reads no key above the highest one that range delivered
+    history: "2026-10-08, sabotage row kill_then_source_grows_keyset_checkpoint_parallel - killed when its last key range committed, the resume left three rows inserted after the crash in no part (200 of 203), exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: resumed-parallel-keyset-stops-at-its-last-range/shared.patch
+    engines:
+      postgres:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_postgres, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_postgres]
+      mysql:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mysql, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mysql]
+      mssql:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_mssql, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_mssql]
+      mongo:
+        na: "a MongoDB parallel read keeps no per-range checkpoint (`keyset_range` is written by the SQL keyset runner only)"
+      oracle:
+        cells: [a_keyset_checkpoint_parallel_run_killed_before_the_source_grows_delivers_the_source_oracle, a_keyset_checkpoint_parallel_run_with_no_recorded_top_killed_before_the_source_grows_delivers_the_source_oracle]
+      lib:
+        cells: ["lib:only_a_committed_open_ended_last_range_leaves_a_tail_to_read"]
+
+  - name: cursor-continued-into-another-destination
+    class: an export that continues from a stored cursor keeps it when its destination or its format was edited, so the new location holds only the rows past the cursor
+    history: "2026-10-08, sabotage rows edit_destination_path_incremental and edit_format_incremental - a moved `destination.path` held 3 of 43 rows under a success manifest, and a changed `format` left parquet and csv parts in one prefix, exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: cursor-continued-into-another-destination/shared.patch
+    engines:
+      postgres:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_postgres, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_postgres, a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres]
+      mysql:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mysql, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mysql, a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mysql]
+      mssql:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_mssql, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_mssql, a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mssql]
+      mongo:
+        cells: [a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo, a_resume_export_whose_format_is_edited_is_refused_and_walked_out_mongo, a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_mongo]
+      oracle:
+        cells: [an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle, an_incremental_export_whose_format_is_edited_is_refused_and_walked_out_oracle, a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_oracle]
+      lib:
+        cells: ["lib:a_cursor_is_refused_for_another_destination_or_format_until_restored_or_reset"]
+
+  - name: unfinished-run-finished-in-another-format
+    class: an unfinished checkpointed run is continued in another format than the parts it already wrote, and its success manifest names parts of both
+    history: "2026-10-08, sabotage row edit_format_unfinished_checkpoint - a range-checkpoint run killed after three parquet parts and resumed under `format: csv` finished with a manifest naming parquet and csv parts, exit 0 on main 95bef44a and on v0.31.0"
+    scope: source
+    patch: unfinished-run-finished-in-another-format/shared.patch
+    engines:
+      postgres:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_postgres, an_unfinished_run_whose_format_is_edited_is_refused_twice_postgres]
+      mysql:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mysql, an_unfinished_run_whose_format_is_edited_is_refused_twice_mysql]
+      mssql:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_mssql, an_unfinished_run_whose_format_is_edited_is_refused_twice_mssql]
+      mongo:
+        na: "a MongoDB `resume: true` run has no crash point a cell can place, so no unfinished MongoDB run is staged; the format check it shares (StateStore::refuse_unfinished_run) is graded by the lib cell"
+      oracle:
+        cells: [an_unfinished_run_whose_format_is_edited_is_refused_and_walked_out_oracle, an_unfinished_run_whose_format_is_edited_is_refused_twice_oracle]
+      lib:
+        cells: ["lib:an_unfinished_run_is_refused_for_another_format_than_its_parts_until_it_is_abandoned"]
+
+  - name: cdc-anchor-written-before-the-refusal
+    class: a CDC open writes its durable anchor (a replication slot, a first-run checkpoint) before it asks the prerequisites it refuses by
+    history: "known_red sweep 15 and gate run 1 (2026-10-08): a PostgreSQL run refused for a missing table left an inactive slot pinning WAL; a MySQL first run refused for binlog compression left `cdc.ckpt added (112 bytes)`; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: cdc-anchor-written-before-the-refusal/postgres.patch
+        cells: [a_refused_changes_only_cdc_run_on_a_missing_table_leaves_no_slot_postgres]
+      mysql:
+        patch: cdc-anchor-written-before-the-refusal/mysql.patch
+        cells:
+          - roast_mysql_cdc_refuses_a_view_whose_binlog_identity_is_the_base_table
+          - cdc_from_a_replica_that_does_not_relog_refuses_instead_of_capturing_nothing
+          - a_refused_cdc_run_on_a_missing_table_leaves_no_checkpoint_mysql
+      oracle:
+        patch: cdc-anchor-written-before-the-refusal/oracle.patch
+        cells: [doctor_is_not_green_where_the_cdc_run_refuses_a_table_without_all_column_logging_oracle]
+      mssql:
+        na: "the SQL Server open writes no anchor: the stream floors at fn_cdc_get_min_lsn and the checkpoint is the sink's, written at the first ack"
+      mongo:
+        na: "the MongoDB anchor is the resume token of the change stream the open has already been given, so there is nothing to write before the server accepted the watch"
+
+  - name: doctor-green-where-the-run-refuses
+    class: doctor grades a CDC export with its own probes and never asks the prerequisites the run refuses by
+    history: "CLI sweep (advice parity) and devbox row 330: `doctor` reported all checks passed for `wal_level=replica` and for a replica with `log_replica_updates = OFF`, which `run` refuses; on main and on v0.31.0"
+    scope: source
+    patch: doctor-green-where-the-run-refuses/shared.patch
+    engines:
+      postgres:
+        cells: [doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres]
+      mysql:
+        cells: [doctor_is_not_green_where_the_cdc_run_refuses_a_replica_that_does_not_relog_mysql]
+      mssql:
+        na: "CdcEngine::refuse_unmet_prerequisites asks nothing on SQL Server; doctor's verdict there is mssql_verdicts' own (the capture instance, the Agent, retention)"
+      mongo:
+        na: "CdcEngine::refuse_unmet_prerequisites asks nothing on MongoDB; doctor's verdict there is mongo_capability_verdicts' own (the replica-set requirement)"
+      oracle:
+        na: "oracle_checks already reports the same prerequisites (container, table vetting, supplemental logging) through oracle::cdc::prerequisites, so the cell stays red-proof without this check"
+
+  - name: stdout-drain-never-acks
+    class: the `rivet cdc` stdout driver prints and checkpoints but never acks the source, so a consuming anchor never moves
+    history: "CLI sweep 16: three `rivet cdc` runs to stdout over three changes emitted [3, 3, 3] on PostgreSQL, with or without `--checkpoint`; on main and on v0.31.0"
+    scope: source
+    patch: stdout-drain-never-acks/shared.patch
+    engines:
+      postgres:
+        cells: [cdc_to_stdout_emits_each_change_once_postgres]
+      mysql:
+        na: "the MySQL read position is the checkpoint file the driver saves at each commit; ack is the trait's no-op"
+      mssql:
+        na: "the SQL Server read position is the checkpoint file the driver saves at each commit; ack moves nothing on the server"
+      mongo:
+        na: "the MongoDB read position is the resume token the driver saves at each commit; ack is the trait's no-op"
+      oracle:
+        na: "the Oracle read position is the checkpoint the driver saves at each commit; ack only re-saves the frontier of an exhausted drain"
+      lib:
+        cells: ["lib:the_ndjson_driver_acks_the_last_commit_it_emitted_or_passed"]
+
+  - name: message-only-window-ends-the-drain
+    class: a PostgreSQL peek window that holds only a logical message outside a transaction yields nothing and ends the drain with commits pending behind it
+    history: "gaps round four: every `rivet cdc --output <dir> --rollover 1` run exited 0 with a Success manifest of 0 rows over three pending commits (the previous run's drain barrier filled the one-change window); `rollover: 1` in config mode the same; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: message-only-window-ends-the-drain/postgres.patch
+        cells:
+          - pg_cdc_cli_rollover_1_delivers_the_pending_changes
+          - pg_cdc_rollover_1_delivers_the_commits_behind_an_idle_runs_barrier
+      mysql:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+      mssql:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+      mongo:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+      oracle:
+        na: "the peek window over a consuming slot and the drain barrier are PostgreSQL's (pg_logical_slot_peek_changes, pg_logical_emit_message)"
+
+  - name: bounded-standby-refused-after-the-baseline
+    class: the pre-baseline prerequisite check asks without the run's drain mode, so a refusal that depends on it comes after the anchor and the baseline
+    history: "known_red sweep 15 (standby twin): a bounded run on a PostgreSQL standby was refused after its slot, the snapshot baseline with `_SUCCESS` and a `cdc_snapshot` row were written; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: bounded-standby-refused-after-the-baseline/postgres.patch
+        cells: [a_bounded_cdc_run_refused_on_a_standby_leaves_nothing_and_its_remedy_runs_postgres]
+      mysql:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); a MySQL replica is an ordinary binlog source"
+      mssql:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); a readable secondary takes the bounded drain"
+      mongo:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); a MongoDB secondary takes the bounded drain"
+      oracle:
+        na: "the refusal that depends on the drain mode is PostgreSQL's (a bounded drain on a hot standby); Oracle refuses the continuous mode when the config is read, before any source is opened"
+
+  - name: init-bounds-a-drain-on-a-standby
+    class: "`rivet init --mode cdc` scaffolds a drain mode the run refuses on the server it introspected"
+    history: "devbox sweep E2: `rivet init --mode cdc` against a PostgreSQL standby wrote `until_current: true`, which the run refuses on a standby; on main and on v0.31.0"
+    scope: source
+    engines:
+      postgres:
+        patch: init-bounds-a-drain-on-a-standby/postgres.patch
+        cells: [the_config_init_writes_runs_cdc_on_a_standby_postgres]
+      mysql:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); the scaffold's bounded drain runs on a MySQL replica"
+      mssql:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); the scaffold's bounded drain runs on a readable secondary"
+      mongo:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); the scaffold's bounded drain runs on a secondary"
+      oracle:
+        na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); Oracle CDC is bounded only"
+
   - name: part-named-by-the-clock
     class: a runner stamps its part name from the wall clock instead of from its run id, so two runs of one export in one millisecond write one file name
     history: "v0.31.0 - two `rivet run` of one incremental export ended their read in one millisecond: one part, two Success manifests, and file_log and export_metrics counting 400 rows over a 200-row file (#507; the MongoDB parallel reader stamped its worker parts the same way)"
@@ -1047,3 +1262,125 @@ seeds:
         cells: [parallel_parts_are_named_after_their_run_mongo]
       oracle:
         cells: [incremental_runs_started_together_each_declare_their_own_part_oracle]
+
+  - name: unit-of-work-begins-deferred
+    class: a state unit of work that reads before it writes opens a deferred SQLite transaction, so a writer that commits in between fails its first write with `database is locked` and no wait
+    history: "2026-10-09, #508 - the unit of `apply --pool --split --resume` that extends its plan read the last chunk index, then inserted; its sibling unit committed in between and the run ended exit 1 with `database is locked: Error code 517` (`stand_pool_split_gappy_key_postgres` in CI run 37841398187 and in two local sweeps, `stand_pool_split_resume_grows_mssql` in a third)"
+    scope: state
+    patch: unit-of-work-begins-deferred/shared.patch
+    engines:
+      sqlite-state:
+        cells: ["lib:a_unit_of_work_that_reads_first_writes_beside_another_writer", "lib:a_replan_beside_another_writer_of_the_state_waits_for_it"]
+      postgres-state:
+        na: "a PostgreSQL unit of work runs READ COMMITTED: a statement after a read takes its own snapshot and waits for a row lock, so there is no stale read snapshot to refuse the write"
+
+  - name: statement-described-by-another-read
+    class: the PostgreSQL source sends a statement whose columns follow a user table as a named prepared statement of a recurring text, so a pooler that keeps prepared statements by text describes it from another read
+    history: "v0.31.0 and main 418fb865 (2026-10-09) - behind a transaction-mode pgBouncer 1.26.0 every export read through `FETCH n FROM _rivet`: a second table of the same width was delivered under the first table's column names and types, exit 0 (1.5 as BIGINT 4609434218613702656); a wider one failed with `DataRow field count does not match the number of columns`; a widened range key failed with `cached plan must not change result type`"
+    scope: source
+    engines:
+      postgres:
+        patch: statement-described-by-another-read/postgres.patch
+        cells:
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_full_postgres
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_keyset_postgres
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_range_postgres
+          - a_second_table_through_one_transaction_pooler_arrives_as_itself_incremental_postgres
+          - a_wider_second_table_through_one_transaction_pooler_is_delivered_full_postgres
+          - a_retyped_column_through_one_transaction_pooler_arrives_as_the_source_holds_it_full_postgres
+          - a_gained_column_through_one_transaction_pooler_is_delivered_keyset_postgres
+          - a_widened_key_through_one_transaction_pooler_is_delivered_range_postgres
+      mysql:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement; MySQL through ProxySQL delivered every scenario as a direct export does (v0.31.0, 2026-10-09)"
+      mssql:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
+      mongo:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
+      oracle:
+        na: "the defect is how the PostgreSQL adapter names its statements (rust-postgres prepares a named statement per query, pgBouncer keeps one by its text); this engine's adapter has no such statement"
+  - name: lease-granted-without-a-keeper
+    class: a PostgreSQL-state lease is granted to a process that has no live connection renewing it, so the work it guards runs under a lease that lapses
+    history: "0.31.0 - `rivet load --pool 16` under `ulimit -n 256`: 12 heartbeat threads died at connect, their tables printed LOAD OK and the load exited 0"
+    scope: state
+    engines:
+      postgres-state:
+        patch: lease-granted-without-a-keeper/postgres-state.patch
+        cells: [a_load_that_cannot_open_its_lease_keeper_refuses_twice_then_loads]
+      sqlite-state:
+        na: the SQLite lease is an flock on a sidecar file, held by its descriptor until the holder ends - nothing renews it and no connection can fail to open
+  - name: query-prefix-cut-mid-character
+    class: a query recogniser slices the query text at a keyword's byte length, inside a multi-byte character, and the run ends in a panic instead of reading the query
+    history: "2026-10-11: `/* <Cyrillic> */ SELECT 1 AS id` and `WITH <e-acute> AS (...) SELECT ...` in `mode: full` ended with exit 101 and 0 files on main and v0.31.0 (`byte index 6 is not a char boundary`); every request tries the query for `SELECT * FROM t`"
+    scope: source
+    patch: query-prefix-cut-mid-character/shared.patch
+    engines:
+      postgres:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_postgres]
+      mysql:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_mysql]
+      mssql:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_mssql]
+      oracle:
+        cells: [a_query_opening_with_non_ascii_text_delivers_its_rows_oracle]
+      mongo:
+        cells: [a_query_opening_with_non_ascii_text_is_refused_like_its_ascii_spelling_mongo]
+      lib:
+        cells:
+          - "lib:a_keyword_prefix_is_stripped_only_from_text_that_starts_with_it"
+  - name: projection-scan-cut-mid-character
+    class: the chunked planner scans a query's projection for `FROM` by slicing four bytes at every offset, inside a multi-byte character, and the run ends in a panic instead of planning
+    history: "2026-10-11: `SELECT g AS id, 'caf<e-acute>' AS label FROM generate_series(1, 100) AS g` with `chunk_column: id` ended with exit 101 and 0 files on main and v0.31.0 (`byte index 14 is not a char boundary`); the ASCII spelling delivered 100 rows"
+    scope: source
+    patch: projection-scan-cut-mid-character/shared.patch
+    engines:
+      postgres:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_postgres]
+      mysql:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_mysql]
+      mssql:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_mssql]
+      oracle:
+        cells: [a_chunked_query_holding_non_ascii_text_delivers_its_rows_oracle]
+      mongo:
+        na: "chunked mode is rejected for MongoDB at config validation - there is no SQL projection to scan"
+      lib:
+        cells:
+          - "lib:the_from_keyword_is_found_at_the_same_offset_around_multi_byte_text"
+
+  - name: session-set-on-a-pooled-connection
+    class: "a PostgreSQL batch connection sends a session-level `SET`, which stays on the server connection a transaction-mode pooler hands to its other clients"
+    history: "v0.30.0 and v0.31.0 - behind an idle pgBouncer in transaction mode (pool sizes 1 and 5) the pid-flip detection saw a direct connection, so every run left TimeZone, DateStyle, IntervalStyle and bytea_output set on the pooled session; on a database whose default is `escape` another client then read `bytea::text` in hex"
+    scope: source
+    patch: session-set-on-a-pooled-connection/postgres.patch
+    engines:
+      postgres:
+        cells: [every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres]
+      mysql:
+        na: "the patched code is the PostgreSQL dial; the MySQL export puts its session variables back under MysqlSessionGuard (src/source/mysql/mod.rs), held through ProxySQL by mysql_proxysql_session_vars_clean_after_successful_export"
+      mssql:
+        na: "the patched code is the PostgreSQL dial; SQL Server puts LOCK_TIMEOUT and the isolation level back when the source drops (impl Drop for MssqlSource), and the stand has no SQL Server pooler to read a shared session through"
+      mongo:
+        na: "MongoDB has no session-level setting and no external pooler: the driver pools its own connections"
+      oracle:
+        na: "the patched code is the PostgreSQL dial; the stand has no Oracle connection pooler (DRCP, CMAN) to read a shared session through"
+      lib:
+        cells: ["lib:the_dial_sends_no_statement"]
+
+  - name: session-set-on-a-pooled-cdc-connection
+    class: "the PostgreSQL CDC reader sends a session-level `SET` when it opens, which stays on the server connection a transaction-mode pooler hands to its other clients"
+    history: "v0.19.1 through v0.31.0 - the test_decoding reader set DateStyle, bytea_output, IntervalStyle, extra_float_digits and TimeZone with session SETs at every open (no pooler detection); through pgBouncer in transaction mode a refused run and a run that read changes alike left all five with pg_settings.source = session on the pooled backend"
+    scope: source
+    patch: session-set-on-a-pooled-cdc-connection/postgres.patch
+    engines:
+      postgres:
+        cells: [a_cdc_run_refused_through_a_transaction_pooler_leaves_its_session_as_it_was_postgres]
+      mysql:
+        na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs); MySQL CDC is a binlog dump, which no query proxy carries (docs/reference/cdc.md)"
+      mssql:
+        na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs), which no other engine runs; the stand has no SQL Server pooler to read a shared session through"
+      mongo:
+        na: "MongoDB has no session-level setting and no external pooler: the driver pools its own connections"
+      oracle:
+        na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs), which no other engine runs; the stand has no Oracle connection pooler (DRCP, CMAN) to read a shared session through"
+      lib:
+        cells: ["lib:the_open_sends_no_statement_before_its_first_read"]

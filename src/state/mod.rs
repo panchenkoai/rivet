@@ -13,7 +13,7 @@ mod load_lease;
 // Named so a caller can HOLD a lease across a scope it owns — the cleanup delete
 // needs one that outlives the call that took it. Every other holder infers the type.
 pub(crate) use cdc_snapshot_store::joins_capture;
-pub use cursor::{Accepted, ProgressClaim, ProgressKey};
+pub use cursor::{Accepted, Landing, ProgressClaim, ProgressKey};
 pub use load_lease::LoadLease;
 mod load_spec_store;
 mod metrics;
@@ -76,9 +76,9 @@ pub(super) fn pg_sql(sql: &str) -> String {
 ///
 /// The state backend connects to its store using only a URL (`RIVET_STATE_URL`)
 /// — there is no YAML `tls:` block — so the transport-security policy is derived
-/// from the URL's `sslmode` query parameter ([`crate::source::url_tls`]), exactly as `rivet init` does for
+/// from the URL's `sslmode` query parameter ([`crate::config::url::url_tls`]), exactly as `rivet init` does for
 /// source connections. The connection itself goes through the shared
-/// [`crate::source::postgres::connect_client`] path so the state backend and
+/// [`crate::connect::postgres::connect_client`] path so the state backend and
 /// source connections apply identical TLS rules.
 ///
 /// - missing / `disable` / `prefer` / `allow` / unrecognized → `NoTls`
@@ -89,9 +89,20 @@ pub(super) fn pg_sql(sql: &str) -> String {
 /// reconnection paths in `checkpoint.rs`, so every PG state connection is
 /// TLS-aware.
 pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
-    let tls = crate::source::url_tls(url).1;
-    crate::source::postgres::connect_client(url, tls.as_ref())
+    let tls = crate::config::url::url_tls(url).1;
+    let connect = || crate::connect::postgres::connect_client(url, tls.as_ref());
+    // The client panics where it cannot build its runtime (no file descriptor left).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(connect))
+        .unwrap_or_else(|panic| Err(anyhow::anyhow!(client_panic_message(&*panic))))
         .map_err(|e| anyhow::anyhow!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e))
+}
+
+/// The connect error a panic of the PostgreSQL client becomes.
+fn client_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    format!(
+        "the PostgreSQL client could not start: {}",
+        crate::workers::panic_text(payload)
+    )
 }
 
 // ─── Backend connection ────────────────────────────────────────────────────────
@@ -419,7 +430,7 @@ impl StateStore {
 
 /// A state URL that reaches a non-loopback host without an `sslmode` asking for TLS.
 fn is_plaintext_remote(url: &str) -> bool {
-    !crate::source::host_is_loopback(url) && crate::source::url_tls(url).1.is_none()
+    !crate::config::url::host_is_loopback(url) && crate::config::url::url_tls(url).1.is_none()
 }
 
 // ─── Migration tests ──────────────────────────────────────────────────────────
@@ -577,6 +588,19 @@ mod empty_state_path_guard {
 }
 
 #[cfg(test)]
+mod client_panic_tests {
+    /// A client panic becomes a connect error that keeps the panic's own words.
+    #[test]
+    fn a_client_panic_reads_as_a_connect_error() {
+        let panic = std::panic::catch_unwind(|| panic!("Too many open files")).unwrap_err();
+        assert_eq!(
+            super::client_panic_message(&*panic),
+            "the PostgreSQL client could not start: Too many open files"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// Round-10 mutants: the NOTADB `||` in the migrate-lock error split was
     /// un-graded — `&&` reverts corrupt-DB reporting to the phantom
@@ -615,6 +639,49 @@ mod tests {
         assert_eq!(pg_sql("no placeholders"), "no placeholders");
         // ?N with two digits
         assert_eq!(pg_sql("?10 AND ?11"), "$10 AND $11");
+    }
+
+    /// Only `?` followed by a digit is a placeholder; a bare `?` stays, at the end of the text too.
+    #[test]
+    fn a_question_mark_without_a_digit_is_not_a_placeholder() {
+        assert_eq!(pg_sql("WHERE a ? b"), "WHERE a ? b");
+        assert_eq!(pg_sql("WHERE a = ?1 OR b ?"), "WHERE a = $1 OR b ?");
+        assert_eq!(pg_sql("?"), "?");
+        assert_eq!(pg_sql(""), "");
+    }
+
+    /// The SQLite state file sits in the config's own directory, whatever the config is called.
+    #[test]
+    fn the_sqlite_state_file_lives_beside_the_config() {
+        use std::path::Path;
+        assert_eq!(
+            StateStore::state_db_path("/etc/rivet/prod.yaml"),
+            Path::new("/etc/rivet/.rivet_state.db")
+        );
+        assert_eq!(
+            StateStore::state_db_path("configs/nightly.yaml"),
+            Path::new("configs/.rivet_state.db")
+        );
+        assert_eq!(
+            StateStore::state_db_path("rivet.yaml"),
+            Path::new(".rivet_state.db")
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("r.yaml");
+        let named = StateStore::state_db_path(cfg.to_str().unwrap());
+        assert!(!named.exists());
+        let store = StateStore::open_sqlite(cfg.to_str().unwrap()).unwrap();
+        assert!(
+            named.is_file(),
+            "the path the CLI names must be the file the store created: {}",
+            named.display()
+        );
+        assert!(
+            matches!(store.state_ref(), StateRef::Sqlite(opened) if *opened == named),
+            "the store must be the SQLite file at {}",
+            named.display()
+        );
     }
 
     #[test]

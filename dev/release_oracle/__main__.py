@@ -57,6 +57,7 @@ from . import (
     field_state,
     fix_cells,
     gifs,
+    guarantees,
     init_delta,
     live_modules,
     partner_shape,
@@ -130,7 +131,8 @@ def start_stores(led: Ledger) -> None:
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=5).read()
+        with urllib.request.urlopen(req, timeout=5) as r:
+            r.read()
     except (urllib.error.HTTPError, urllib.error.URLError, OSError):
         pass  # already exists, or the emulator is down — the summary below says which
 
@@ -507,6 +509,7 @@ def _self_test() -> int:
     from dev.seeded import recall as seeded
 
     seeded.self_test()
+    guarantees.self_test()
     off = Ledger(colour=False)
     off._buf = []
     verify_seeded_recall(off, False)
@@ -649,8 +652,33 @@ def _self_test() -> int:
             _sc.verify_live_only_coverage(probe)
             rows = {c.scenario: c.status for c in probe.cells}
             assert rows.get("battery") == want, (skipped, probe.cells)
+        # A self-skip naming the env var the stage can set is run again under it, and only that leg is its verdict.
+        real_live, _legs = _sc.nextest_live, []
+
+        def _two_legs(_log, expr, env=None, _threads=None):
+            _legs.append(expr)
+            if len(_legs) % 2:
+                return ({f"m::{t}": "PASS" for t in "abcde"}, 5, {**{f"m::{t}": "set RIVET_GATE_STATE_URL" for t in "abe"}, "m::d": "X unset"}, {})
+            here = (env or {}).get("RIVET_GATE_STATE_URL", "").startswith("postgres")
+            return {"m::a": "PASS", "m::b": "PASS"}, 2, {"m::b": "still"} if here else {"m::a": "still", "m::b": "still"}, {}
+        _sc.nextest_live = _two_legs
+        try:
+            for again, want in ((("RIVET_GATE_STATE_URL", {"RIVET_GATE_STATE_URL": "postgresql://s"}), "PFPFF"), (None, "FFPFF")):
+                probe = Ledger(colour=False)
+                _sc._run_live_modules(probe, "probe", "probe", "probe", ["m"], again=again)
+                got = "".join("P" if c.status == Status.PASS else "F" for c in probe.cells)
+                assert got == want, (again, probe.cells)
+            assert _legs[1] == "test(=m::a) | test(=m::b) | test(=m::e)" and len(_legs) == 3, _legs
+        finally:
+            _sc.nextest_live = real_live
     finally:
         _sc.run, _sc.have = real_run, real_have
+    print("self-test ok: a live test that self-skips for an env var the stage can set is graded by its second leg")
+    # Leftovers of killed runs (2087 Mongo databases, 2026-10-09) held the open files the gate's cells needed.
+    import re as _re
+    assert _re.search(r"^release-oracle-full:[^#\n]*\bsweep-test-db\b", (ROOT / "Makefile").read_text(), _re.M), \
+        "`make release-oracle-full` must depend on sweep-test-db: the gate starts on a swept stand"
+    print("self-test ok: the full gate sweeps the stand's leftovers before it starts")
     from . import state_lib as _sl
     assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})
@@ -687,6 +715,18 @@ def _self_test() -> int:
     assert perf_verdict("postgres", base, Sample(True, 1.05, 0.05, 50 * 1024 * 1024, {})) == []
     assert perf_verdict("postgres", base, Sample(True, 2.0, 0.02, 50 * 1024 * 1024, {}))
     assert perf_verdict("postgres", base, Sample(True, 1.0, 0.02, 200 * 1024 * 1024, {}))
+    # A path under a second is measured more often: three runs of a two-mode wall can all be the slow mode.
+    from .perf import REPS, SHORT_REPS, SHORT_WALL, measured_reps
+    assert (measured_reps(SHORT_WALL - 0.01), measured_reps(SHORT_WALL)) == (SHORT_REPS, REPS) and SHORT_REPS >= 3 * REPS
+    # A best run no slower than the previous release's median run is the slow mode of the same wall, not a regression.
+    from .perf import _best
+    runs = [Sample(True, w, 0.02, 50 * 1024 * 1024, {}) for w in (0.14, 0.44, 0.38, 0.40, 0.14)]
+    two_modes = _best(runs)
+    assert (two_modes.wall, two_modes.typical) == (0.14, 0.38), two_modes
+    assert perf_verdict("postgres", two_modes, Sample(True, 0.38, 0.02, 50 * 1024 * 1024, {})) == []
+    assert perf_verdict("postgres", two_modes, Sample(True, 0.42, 0.02, 50 * 1024 * 1024, {})) == [
+        "wall 0.42s > 0.14s×1.5 and its median 0.38s"]
+    assert perf_verdict("postgres", _best(runs[:1] + runs[-1:] + runs[1:2]), Sample(True, 0.38, 0.02, 50 * 1024 * 1024, {}))
     # A plan evicted between the two SQL Server readings takes nothing away from the run's
     # own reads; an unanswered reading is not a measurement; rivet's report yields to it.
     from .perf import measured_harm
@@ -694,6 +734,8 @@ def _self_test() -> int:
                          {"mssql_logical_reads": 0, "mssql_worktables_created": 1}) == {
         "mssql_logical_reads": 50, "mssql_worktables_created": 1}
     assert measured_harm("mssql://h", {}, {"new": 7}, {}) == {"mssql_logical_reads": 7}
+    assert measured_harm("mssql://h", {"again": 900, "kept": 100}, {"again": 120, "kept": 130}, {}) == {
+        "mssql_logical_reads": 150}, "a statement compiled again between the readings counts by its new total"
     assert measured_harm("mssql://h", None, {"new": 7}, {"mssql_logical_reads": 7}) is None
     assert measured_harm("postgresql://h", {"pg_tup_returned": 5}, {"pg_tup_returned": 9}, {}) == {
         "pg_tup_returned": 4}
@@ -1086,6 +1128,8 @@ def gate_stages(ns: argparse.Namespace) -> list[Stage]:
         measured("previous-release differential", lambda led: regression.verify_previous_release_differential(led)),
         measured("field symptom replay", lambda led: regression.verify_field_symptom_replay(led)),
         measured("scale memory", lambda led: regression.verify_scale_memory(led)),
+        measured("flat rss", lambda led: guarantees.verify_flat_rss(led)),
+        serial("byte-identical parts", lambda led: guarantees.verify_byte_identical_parts(led)),
         serial("state backend parity", lambda led: state_parity.verify_state_backend_parity(led, **state)),
         warehouse("shared state", lambda led: shared_state.verify_shared_state_same_name(led)),
         warehouse("warehouse layout", lambda led: warehouse_layout.verify_warehouse_layout(led)),

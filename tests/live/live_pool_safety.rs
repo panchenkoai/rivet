@@ -111,7 +111,7 @@ fn pg_show_statement_timeout(client: &mut PgClient) -> String {
 #[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
 fn pg_statement_timeout_not_leaked_after_successful_export() {
     require_alive(LiveService::Postgres);
-    require_alive(LiveService::PgBouncer);
+    let _alone = pgbouncer_alone();
 
     let mut source = PostgresSource::connect(PGBOUNCER_URL).unwrap();
     source
@@ -144,7 +144,7 @@ fn pg_statement_timeout_not_leaked_after_successful_export() {
 #[ignore = "live: requires docker compose --profile pool up -d pgbouncer (transaction mode, pool_size=1)"]
 fn pg_connection_usable_and_clean_after_failed_export() {
     require_alive(LiveService::Postgres);
-    require_alive(LiveService::PgBouncer);
+    let _alone = pgbouncer_alone();
 
     let mut source = PostgresSource::connect(PGBOUNCER_URL).unwrap();
     let result = source.export(

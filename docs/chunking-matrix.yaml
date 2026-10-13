@@ -187,6 +187,14 @@ scenarios:
     mongo:    { na: "chunked mode is rejected for MongoDB at config validation; there is no SQL projection" }
     oracle:   { test: a_query_that_aliases_the_chunk_column_delivers_its_rows_oracle }
 
+  - id: range_query_non_ascii_text
+    what: "query: holds a non-ASCII character before its outer FROM (a literal, a comment) → the planner reads the projection as text without cutting a character, and the export delivers the rows and the literal of the same query spelled in ASCII"
+    postgres: { test: a_chunked_query_holding_non_ascii_text_delivers_its_rows_postgres }
+    mysql:    { test: a_chunked_query_holding_non_ascii_text_delivers_its_rows_mysql }
+    mssql:    { test: a_chunked_query_holding_non_ascii_text_delivers_its_rows_mssql }
+    mongo:    { na: "chunked mode is rejected for MongoDB at config validation; there is no SQL projection" }
+    oracle:   { test: a_chunked_query_holding_non_ascii_text_delivers_its_rows_oracle }
+
   - id: keyset_parallel_incremental_narrow_int_key
     what: "parallel + keyset_incremental on a 16-bit integer key delivers every row on run 1 and only the new keys on run 2"
     postgres: { test: parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_postgres }

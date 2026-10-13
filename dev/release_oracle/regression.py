@@ -55,6 +55,7 @@ regression being measured.
 
 from __future__ import annotations
 
+from contextlib import closing
 import ast
 import os
 import re
@@ -1769,14 +1770,11 @@ def _last_run_harm(envdir: Path) -> dict[str, int]:
     db = envdir / ".rivet_state.db"
     if not db.exists():
         return {}
-    con = sqlite3.connect(db)
-    try:
+    with closing(sqlite3.connect(db)) as con:
         rows = con.execute(
             "SELECT metric, delta FROM export_harm WHERE run_id = "
             "(SELECT run_id FROM export_harm ORDER BY id DESC LIMIT 1)"
         ).fetchall()
-    finally:
-        con.close()
     return {m: int(d) for m, d in rows}
 
 
