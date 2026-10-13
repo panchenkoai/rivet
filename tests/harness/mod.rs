@@ -1,6 +1,6 @@
 //! Black-box end-to-end matrix for `rivet load` (ADR-0001).
 //!
-//! It drives the **shipped binaries** end-to-end and re-reads the warehouse to
+//! It drives the binary built from this tree (see [`rivet`]) end-to-end and re-reads the warehouse to
 //! assert oracles:
 //!
 //! ```text
@@ -26,6 +26,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+/// The `rivet` these cells grade: the binary cargo built from this tree, or the one `RIVET_BIN_OVERRIDE` names (a release under comparison). Never whatever `rivet` is on PATH: an installed older release there made every cell pass on a tree whose load was broken. The binary and its version are printed once.
+fn rivet() -> Command {
+    static BIN: LazyLock<std::ffi::OsString> = LazyLock::new(|| {
+        let bin = std::env::var_os("RIVET_BIN_OVERRIDE")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_rivet").into());
+        let version = Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|e| format!("not runnable: {e}"));
+        eprintln!(
+            "warehouse cells grade {} ({version})",
+            Path::new(&bin).display()
+        );
+        bin
+    });
+    Command::new(&*BIN)
+}
 
 // ── Axes (the matrix columns × the mode encoded in the scenario id) ──────────
 
@@ -569,27 +588,18 @@ impl Verification {
         let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
         // Anchor: one bounded CDC run BEFORE any change pins the resume token, so
         // the mutations below are captured (Mongo has no server-side anchor).
-        run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
-            "rivet run (anchor)",
-        )?;
+        run(rivet().args(["run", "-c"]).arg(&cfg), "rivet run (anchor)")?;
         self.mongosh(
             db,
             &format!(
                 "db.{coll}.updateOne({{_id:1}},{{$set:{{v:'a2'}}}}); db.{coll}.deleteOne({{_id:2}});"
             ),
         )?;
-        run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
-            "rivet run (capture)",
-        )?;
+        run(rivet().args(["run", "-c"]).arg(&cfg), "rivet run (capture)")?;
 
         // Load the change log + (re)build the current-state dedup view. Mode
         // (cdc) and the pk (_id) come from the config's `load:` block.
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
-            "rivet load (cdc)",
-        )?;
+        run(rivet().args(["load", "-c"]).arg(&cfg), "rivet load (cdc)")?;
 
         let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
         let t = self.wh_table(&view);
@@ -656,11 +666,11 @@ impl Verification {
         // `table:` (collection), not a SQL query (see extraction_yaml).
         let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (mongo batch extract)",
         )?;
         run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            rivet().args(["load", "-c"]).arg(&cfg),
             "rivet load (mongo batch)",
         )?;
 
@@ -734,20 +744,14 @@ impl Verification {
         let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
         // Anchor → full snapshot of the N preexisting rows → drain (initial: snapshot).
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (snapshot)",
         )?;
         // Live changes AFTER the backfill: one insert, one update, one delete.
         self.churn_backfill(&t, n)?;
-        run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
-            "rivet run (drain)",
-        )?;
+        run(rivet().args(["run", "-c"]).arg(&cfg), "rivet run (drain)")?;
         // Mode (cdc) + the pk come from the config's `load:` block now.
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
-            "rivet load (cdc)",
-        )?;
+        run(rivet().args(["load", "-c"]).arg(&cfg), "rivet load (cdc)")?;
 
         let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
         let vt = self.wh_table(&view);
@@ -847,11 +851,11 @@ impl Verification {
             ),
         );
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (incremental 1)",
         )?;
         run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            rivet().args(["load", "-c"]).arg(&cfg),
             "rivet load (incremental 1)",
         )?;
         // Delta: bump id=1's cursor (update), add a new row above the watermark.
@@ -861,11 +865,11 @@ impl Verification {
             n + 1
         ))?;
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (incremental 2)",
         )?;
         run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            rivet().args(["load", "-c"]).arg(&cfg),
             "rivet load (incremental 2)",
         )?;
 
@@ -1199,7 +1203,7 @@ impl Verification {
         self.reset_warehouse_objects(env, &self.loaded_table_name())?;
         let cfg = work.write("extract.yaml", &self.extraction_yaml(env, &prefix)?);
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (extract → gcs)",
         )?;
         Ok(full_prefix)
@@ -1215,10 +1219,7 @@ impl Verification {
         // a top-level `load:` block. `rivet load` REPLACES the target from GCS
         // (storage is the source of truth). Free OSS command, no license.
         let cfg = work.path("extract.yaml");
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
-            "rivet load",
-        )?;
+        run(rivet().args(["load", "-c"]).arg(&cfg), "rivet load")?;
         self.warehouse_table_ref(env, &table)
     }
 
