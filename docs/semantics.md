@@ -106,11 +106,13 @@ The trade-off is **at-least-once at the destination**: a crash between write and
 
 `rivet run --resume` consults the state DB to decide what work is outstanding. A
 **plain** `rivet run` (no `--resume`) never skips the chunks of a run that
-FINISHED — it does a fresh full pass. A checkpointed run holds its export's run
+FINISHED — it does a fresh full pass. Every run holds its export's run
 lease (an `flock` beside a SQLite state DB, a session advisory lock on a Postgres
 one) for as long as the process lives, and the OS releases it when the process
-dies, `kill -9` included. So when a plain run finds a chunk-checkpoint run still
-in progress:
+dies, `kill -9` included. A second run of the same export while the first is alive
+is refused (`RIVET_STATE_RUN_IN_PROGRESS`, exit 5), whatever the mode, and so are
+`rivet repair --execute` and the `rivet state reset*` commands for that export.
+So when a plain run finds a chunk-checkpoint run still in progress:
 
 - **its process is gone** (the lease is free): the run resumes it, exactly as
   `--resume` would. A `chunk_dense` plan cannot be resumed, so it starts over.

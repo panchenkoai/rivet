@@ -1729,27 +1729,27 @@ fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (concurrent full runs), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_second_concurrent_full_run_does_not_double_the_prefix_postgres() {
     concurrent_full_runs(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (concurrent full runs), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_second_concurrent_full_run_does_not_double_the_prefix_mysql() {
     concurrent_full_runs(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (concurrent full runs), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_second_concurrent_full_run_does_not_double_the_prefix_mssql() {
     concurrent_full_runs(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (concurrent full runs), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_second_concurrent_full_run_does_not_double_the_prefix_oracle() {
     concurrent_full_runs(SqlEngine::Oracle);
 }
 
@@ -1797,20 +1797,20 @@ fn resume_force_runs_over_a_complete_prefix_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres() {
     second_run_beside_a_live_checkpointed_one(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql() {
     second_run_beside_a_live_checkpointed_one(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql() {
     second_run_beside_a_live_checkpointed_one(SqlEngine::Mssql);
 }
 
@@ -2264,8 +2264,8 @@ fn resume_force_runs_over_a_complete_prefix_oracle() {
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle() {
     second_run_beside_a_live_checkpointed_one(SqlEngine::Oracle);
 }
 
@@ -2340,8 +2340,8 @@ fn run_validate_fails_the_run_over_a_failed_validation_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (concurrent full runs), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mongo() {
+#[ignore = "live: requires docker compose mongo"]
+fn a_second_concurrent_full_run_does_not_double_the_prefix_mongo() {
     let (url, _m, _guard) = mongo_db("oc_twofull", MONGO_SLOW);
     two_full_runs(Rig::mongo_batch("t").source_url(&url), MONGO_SLOW, 150);
 }
@@ -2353,8 +2353,8 @@ fn resume_force_runs_over_a_complete_prefix_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (uncoded run-in-progress refusal), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo() {
+#[ignore = "live: requires docker compose mongo"]
+fn a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo() {
     mongo_second_run_beside_a_live_resumable_one();
 }
 

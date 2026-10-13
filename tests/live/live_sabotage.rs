@@ -3157,56 +3157,56 @@ fn parallel_parts_are_named_after_their_run_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (two concurrent range-chunked runs double the destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_range_run_beside_a_live_one_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_second_range_run_beside_a_live_one_delivers_or_refuses_postgres() {
     second_run_beside(SqlEngine::Pg, Shape::Range);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (two concurrent range-chunked runs double the destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_range_run_beside_a_live_one_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_second_range_run_beside_a_live_one_delivers_or_refuses_mysql() {
     second_run_beside(SqlEngine::Mysql, Shape::Range);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (two concurrent range-chunked runs double the destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_range_run_beside_a_live_one_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_second_range_run_beside_a_live_one_delivers_or_refuses_mssql() {
     second_run_beside(SqlEngine::Mssql, Shape::Range);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (two concurrent keyset runs double the destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_keyset_run_beside_a_live_one_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_second_keyset_run_beside_a_live_one_delivers_or_refuses_postgres() {
     second_run_beside(SqlEngine::Pg, Shape::Keyset);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (two concurrent keyset runs double the destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mysql() {
     second_run_beside(SqlEngine::Mysql, Shape::Keyset);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (two concurrent keyset runs double the destination), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mssql() {
     second_run_beside(SqlEngine::Mssql, Shape::Keyset);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a second run beside a live keyset-checkpoint run is refused with no code), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_postgres() {
     second_run_beside(SqlEngine::Pg, Shape::KeysetCheckpoint);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a second run beside a live keyset-checkpoint run is refused with no code), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mysql() {
     second_run_beside(SqlEngine::Mysql, Shape::KeysetCheckpoint);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a second run beside a live keyset-checkpoint run is refused with no code), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mssql() {
     second_run_beside(SqlEngine::Mssql, Shape::KeysetCheckpoint);
 }
 
@@ -3333,8 +3333,8 @@ fn reconcile_beside_a_live_run_delivers_or_fails_loudly_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (repair --execute beside a live run takes its chunks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn repair_beside_a_live_run_delivers_or_fails_loudly_postgres() {
     command_beside(
         SqlEngine::Pg,
         "sab_repair",
@@ -3343,8 +3343,8 @@ fn open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_postgres() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (repair --execute beside a live run takes its chunks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn repair_beside_a_live_run_delivers_or_fails_loudly_mysql() {
     command_beside(
         SqlEngine::Mysql,
         "sab_repair",
@@ -3353,8 +3353,8 @@ fn open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_mysql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (repair --execute beside a live run takes its chunks), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn repair_beside_a_live_run_delivers_or_fails_loudly_mssql() {
     command_beside(
         SqlEngine::Mssql,
         "sab_repair",

@@ -576,11 +576,11 @@ scenarios:
 
   - id: beside_run_full
     what: "a second `rivet run` beside a live one, `mode: full` (RESULTS 4 of docs/operator-contract-matrix.yaml, cited here)"
-    postgres: { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
-    mysql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mysql }
-    mssql:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mssql }
-    mongo:    { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_mongo }
-    oracle:   { test: open_defect_a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
+    postgres: { test: a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
+    mysql:    { test: a_second_concurrent_full_run_does_not_double_the_prefix_mysql }
+    mssql:    { test: a_second_concurrent_full_run_does_not_double_the_prefix_mssql }
+    mongo:    { test: a_second_concurrent_full_run_does_not_double_the_prefix_mongo }
+    oracle:   { test: a_second_concurrent_full_run_does_not_double_the_prefix_oracle }
 
   - id: beside_run_incremental
     what: "a second `rivet run` beside a live one of the same export (`mode: incremental`): each delivers or refuses by code, and a run then delivers the source and `validate` passes"
@@ -592,25 +592,25 @@ scenarios:
 
   - id: beside_run_range
     what: "a second `rivet run` beside a live one of the same export (range-chunked, no checkpoint): each delivers or refuses by code, and a run then delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_second_range_run_beside_a_live_one_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_second_range_run_beside_a_live_one_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_second_range_run_beside_a_live_one_delivers_or_refuses_mssql }
+    postgres: { test: a_second_range_run_beside_a_live_one_delivers_or_refuses_postgres }
+    mysql:    { test: a_second_range_run_beside_a_live_one_delivers_or_refuses_mysql }
+    mssql:    { test: a_second_range_run_beside_a_live_one_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED): its cell of this family is the `mode: full` or the checkpoint row" }
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
   - id: beside_run_keyset
     what: "a second `rivet run` beside a live one of the same export (keyset (`chunk_by_key`), no checkpoint): each delivers or refuses by code, and a run then delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_second_keyset_run_beside_a_live_one_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mssql }
+    postgres: { test: a_second_keyset_run_beside_a_live_one_delivers_or_refuses_postgres }
+    mysql:    { test: a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mysql }
+    mssql:    { test: a_second_keyset_run_beside_a_live_one_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED): its cell of this family is the `mode: full` or the checkpoint row" }
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
   - id: beside_run_keyset_checkpoint
     what: "a second `rivet run` beside a live one of the same export (keyset (`chunk_by_key`), `chunk_checkpoint: true`): each delivers or refuses by code, and a run then delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mssql }
+    postgres: { test: a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_postgres }
+    mysql:    { test: a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mysql }
+    mssql:    { test: a_second_keyset_checkpoint_run_beside_a_live_one_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED): its cell of this family is the `mode: full` or the checkpoint row" }
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 
@@ -624,11 +624,11 @@ scenarios:
 
   - id: beside_run_range_checkpoint
     what: "a second `rivet run` beside a live checkpointed one (RESULTS 11 of docs/operator-contract-matrix.yaml, cited here)"
-    postgres: { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
-    mysql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
-    mssql:    { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
-    mongo:    { test: open_defect_a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo }
-    oracle:   { test: open_defect_a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
+    postgres: { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
+    mysql:    { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
+    mssql:    { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
+    mongo:    { test: a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo }
+    oracle:   { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
 
   - id: beside_run_cdc
     what: "a second `rivet run` beside a live one of the same CDC stream"
@@ -672,9 +672,9 @@ scenarios:
 
   - id: beside_repair
     what: "`rivet repair --execute` beside a live range-checkpoint run: it repairs or fails loudly, the run delivers or refuses by code, and a run then delivers the source and `validate` passes"
-    postgres: { test: open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_postgres }
-    mysql:    { test: open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_mysql }
-    mssql:    { test: open_defect_repair_beside_a_live_run_delivers_or_fails_loudly_mssql }
+    postgres: { test: repair_beside_a_live_run_delivers_or_fails_loudly_postgres }
+    mysql:    { test: repair_beside_a_live_run_delivers_or_fails_loudly_mysql }
+    mssql:    { test: repair_beside_a_live_run_delivers_or_fails_loudly_mssql }
     mongo:    { na: "`rivet reconcile` and `rivet repair` take a `mode: chunked` export, which MongoDB has not (validate_non_sql_source_modes)" }
     oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
 

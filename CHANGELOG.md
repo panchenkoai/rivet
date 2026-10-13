@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **Breaking: a second run of an export while one is alive is refused, whatever the mode.**
+  Every source; a SQLite or PostgreSQL state database. Reproduced on rivet 0.31.0 with
+  PostgreSQL.
+  - **What was wrong in 0.31.0 and earlier.** Only a run with `chunk_checkpoint` (or a MongoDB
+    `resume`) held its export's run lease. Two runs of one export started together in any
+    other mode both exited 0 and both wrote: the destination held every row twice, and both
+    manifests said `success`. Measured with `mode: full` over 200 rows: 400 rows delivered.
+    `rivet repair --execute` beside a live checkpointed run exported that run's pending chunks
+    a second time. `rivet state reset` was accepted while an incremental run was reading, and
+    that run's manifest then described its delta as a first pass.
+  - **Now** every run takes the lease. The second run exits 5 with
+    `RIVET_STATE_RUN_IN_PROGRESS` and writes nothing; the first delivers. `rivet repair
+    --execute` and `rivet state reset` get the same refusal beside a live run.
+  - **Also changed:** the refusal a second run got beside a live checkpointed run was exit 1
+    with no code; it is exit 5 with `RIVET_STATE_RUN_IN_PROGRESS`. The text still starts
+    `chunk checkpoint run ... still in progress in another live rivet process`.
+  - **What to do if a run now refuses:** wait for the live run of that export, or stop it.
+    A scheduler that may start an export while its previous run is still going should treat
+    exit 5 with this code as "skipped, a run is in progress". Two exports with different names
+    never block each other; a `--split` unit and a `partition_by` child have their own names.
+  - On a PostgreSQL state database every run now opens the lease keeper's connection (one
+    more connection per rivet process), where only checkpointed runs did.
+  - The lease is released by the operating system (SQLite state) or expires by its keeper
+    (PostgreSQL state) when the process dies, `kill -9` included; nothing has to be cleaned up.
 - **Fixed: `rivet validate` no longer passes a prefix whose manifest is gone while `_SUCCESS`
   is there.** Every source and destination. Reproduced on rivet 0.31.0 with PostgreSQL and a
   local destination.

@@ -1364,9 +1364,11 @@ fn execute_resolved_plan(
         let summary = synthetic_failed_summary(&plan.export_name, &e);
         return (Err(e), summary);
     }
-    let claim = state.claim(plan.progress_key()).and_then(|progress| {
-        chunked::claim_checkpoint_run(state, plan, &progress, tail.force)
-            .map(|(lease, recovered)| (progress, lease, recovered))
+    // The lease first: a run refused beside a live one claims nothing of the export's progress.
+    let claim = chunked::claim_run(state, plan).and_then(|lease| {
+        let progress = state.claim(plan.progress_key())?;
+        let recovered = chunked::recover_checkpoint_run(plan, &progress, tail.force)?;
+        Ok((progress, lease, recovered))
     });
     let (progress, _run_lease, recovered) = match claim {
         Ok(claim) => claim,
