@@ -69,19 +69,19 @@ impl SfLive {
 
 impl Drop for SfCleanup {
     fn drop(&mut self) {
-        let sql: String = self
-            .tables
-            .iter()
-            .map(|t| {
-                format!(
-                    "DROP VIEW IF EXISTS {s}.{t}; DROP TABLE IF EXISTS {s}.{t}; DROP TABLE IF EXISTS {s}.{t}__changes; ",
-                    s = self.schema
-                )
-            })
-            .collect();
-        let _ = std::process::Command::new("snow")
-            .args(["sql", "-c", &self.connection, "-q", &sql])
-            .output();
+        // One statement per call: `DROP VIEW IF EXISTS` over a table is an error in Snowflake, and it must not stop the rest.
+        for t in &self.tables {
+            for (kind, name) in [
+                ("VIEW", t.clone()),
+                ("TABLE", t.clone()),
+                ("TABLE", format!("{t}__changes")),
+            ] {
+                let sql = format!("DROP {kind} IF EXISTS {}.{name}", self.schema);
+                let _ = std::process::Command::new("snow")
+                    .args(["sql", "-c", &self.connection, "-q", &sql])
+                    .output();
+            }
+        }
         gcs_delete_prefix(&self.bucket, &self.prefix);
     }
 }
