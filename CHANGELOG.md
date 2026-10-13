@@ -2,6 +2,43 @@
 
 ## Unreleased
 
+- **Fix: a `FROM` inside an SQL comment is no longer read as the table a `query:` reads.**
+  PostgreSQL and SQL Server exports with a hand-written `query:`; the preflight probe of
+  `rivet check` on every SQL engine. Reproduced on rivet 0.31.0 with PostgreSQL and SQL Server.
+  - **What was wrong in 0.31.0 and earlier.** To give a `NUMERIC` / `DECIMAL` column its
+    declared precision and scale, rivet reads the table name out of the query text and asks
+    the catalog. The reader did not skip comments, so a `-- ...` line or a `/* ... */` block
+    holding the word `from` before the query's own `FROM` named the table. Measured on a
+    table with a `numeric(10,2)` column:
+    - `-- rows from the last week` (no table of that name): the export failed, exit 1,
+      `1 column(s) have no safe Rivet mapping`, no file written. The same query without
+      the comment exported `decimal(10,2)`.
+    - `-- taken from legacy`, where `legacy` has that column as `numeric(20,6)`: exit 0, and
+      the column was written as `decimal(20,6)`, the other table's type. The values were
+      right.
+    - the same with `legacy` holding `numeric(6,0)`: the export failed, exit 1,
+      `cannot parse DECIMAL "12345.67" as decimal(scale=0)`.
+    - A comment AFTER the table name (`FROM t -- from b`) made the reader give up, with the
+      first outcome.
+    - SQL Server, the same table as `decimal(10,2)`: every one of these exported, exit 0,
+      with another type for the column. With no table of the commented name, or with the
+      comment after the table name, the column was written as `decimal(38,2)`; with
+      `legacy` holding `decimal(20,6)` it was written as `decimal(20,6)`.
+    No wrong value was delivered in any of these; the column's declared type was.
+  - **Now** one reader finds the outermost `FROM` for every caller, and a comment counts as
+    whitespace wherever it stands. Every query above exports `decimal(10,2)` on both engines.
+  - **Also read now, where the reader gave up before:** a query ending in `;`, a table name
+    with a non-ASCII letter (`FROM café`), and on SQL Server a double-quoted name
+    (`FROM "s"."t"`). The preflight probe no longer takes `from x` inside a string literal
+    for the table, and reads `s . t` as `s.t`.
+  - **Unchanged:** a join, a comma list, a subquery or a function call in `FROM` still
+    gives no table, and the column needs a `columns:` override as before. A MySQL `#`
+    comment is not skipped: `#` is an operator in PostgreSQL, and the reader is told no
+    engine.
+  - **Stored progress (unreleased builds only):** the stream of a query's stored progress is
+    read by the same reader, so a query with such a comment now names its real table there.
+    No released version stores a stream.
+
 - **Fix: an Oracle export whose table loses a column while it is being read stops with an
   error instead of a panic.** Oracle only; every batch mode. Seen once in CI on main
   (`07e3e9b7`..`97d3f57b`) as exit 101 of a range-chunked run; not reported from the field.

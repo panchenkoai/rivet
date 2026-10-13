@@ -59,6 +59,8 @@ pub fn sql_query_text(data: &[u8]) {
     let _ = crate::sql::strip_select_star_from(query);
     let _ = crate::sql::row_set(query);
     let _ = crate::sql::outer_from_relation(query);
+    let _ = crate::sql::single_relation(query, true);
+    let _ = crate::sql::single_relation(query, false);
     let _ = crate::preflight::table_from_simple_query(query);
     for engine in [Postgres, Mysql, Mssql, Oracle] {
         let _ = crate::sql::aggregate_sql(engine, "min", "id", query);

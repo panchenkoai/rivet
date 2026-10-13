@@ -325,28 +325,183 @@ fn quote_closer(c: u8) -> Option<u8> {
     }
 }
 
-/// Byte offset of the first `keyword` of `query` outside quotes and parentheses.
+/// Byte length of the comment that starts `rest`: a `--` line up to its line break, or a `/* */` block with the blocks nested in it (an unclosed one runs to the end); 0 when `rest` starts no comment.
+fn comment_len(rest: &[u8]) -> usize {
+    if rest.starts_with(b"--") {
+        return rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len());
+    }
+    if !rest.starts_with(b"/*") {
+        return 0;
+    }
+    let (mut i, mut open) = (2, 1usize);
+    while i < rest.len() && open > 0 {
+        if rest[i..].starts_with(b"*/") {
+            open -= 1;
+            i += 2;
+        } else if rest[i..].starts_with(b"/*") {
+            open += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    i
+}
+
+/// `rest` past its leading whitespace and comments.
+fn skip_blank(rest: &str) -> &str {
+    let mut rest = rest.trim_start();
+    loop {
+        match comment_len(rest.as_bytes()) {
+            0 => return rest,
+            n => rest = rest.get(n..).unwrap_or("").trim_start(),
+        }
+    }
+}
+
+/// Byte offset of the first `keyword` of `query` outside quotes, comments and parentheses.
 fn outer_keyword(query: &str, keyword: &str) -> Option<usize> {
     let (b, kw) = (query.as_bytes(), keyword.as_bytes());
-    let (mut depth, mut quote) = (0i32, None);
-    b.iter().enumerate().find_map(|(i, &c)| {
+    let (mut depth, mut quote, mut i) = (0usize, None, 0);
+    while i < b.len() {
+        let c = b[i];
         if let Some(end) = quote {
             quote = Some(end).filter(|&e| e != c);
-            return None;
+            i += 1;
+            continue;
+        }
+        let comment = comment_len(&b[i..]);
+        if comment > 0 {
+            i += comment;
+            continue;
         }
         quote = quote_closer(c);
         match c {
             b'(' => depth += 1,
-            b')' => depth -= 1,
+            b')' => depth = depth.saturating_sub(1),
             _ => {}
         }
-        let found = depth == 0
-            && b[i..].len() >= kw.len()
-            && b[i..i + kw.len()].eq_ignore_ascii_case(kw)
-            && (i == 0 || !ident_byte(b[i - 1]))
-            && b.get(i + kw.len()).is_none_or(|&n| !ident_byte(n));
-        found.then_some(i)
-    })
+        if depth == 0 && keyword_at(&b[i..], kw) && (i == 0 || !ident_byte(b[i - 1])) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `rest` starts with `keyword`, in any letter case, as a whole word.
+fn keyword_at(rest: &[u8], keyword: &[u8]) -> bool {
+    rest.len() >= keyword.len()
+        && rest[..keyword.len()].eq_ignore_ascii_case(keyword)
+        && rest.get(keyword.len()).is_none_or(|&n| !ident_byte(n))
+}
+
+/// One dot-separated part of a relation name, and whether the query quoted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NamePart {
+    pub(crate) name: String,
+    pub(crate) quoted: bool,
+}
+
+/// The name part `rest` starts with and what follows it: a quoted one (`"…"`, `[…]`, `` `…` ``, a doubled closer standing for itself) or a bare run of identifier bytes that does not start with a digit.
+fn name_part(rest: &str) -> Option<(NamePart, &str)> {
+    let first = *rest.as_bytes().first()?;
+    let Some(close) = quote_closer(first).filter(|_| first != b'\'') else {
+        let len = rest.bytes().take_while(|&c| ident_byte(c)).count();
+        let (name, tail) = rest.split_at_checked(len)?;
+        let part = NamePart {
+            name: name.to_string(),
+            quoted: false,
+        };
+        return (len > 0 && !first.is_ascii_digit()).then_some((part, tail));
+    };
+    let close = char::from(close);
+    let mut name = String::new();
+    let mut chars = rest.get(1..)?.chars();
+    while let Some(ch) = chars.next() {
+        if ch != close {
+            name.push(ch);
+        } else if chars.as_str().starts_with(close) {
+            chars.next();
+            name.push(close);
+        } else {
+            let part = NamePart { name, quoted: true };
+            return (!part.name.is_empty()).then_some((part, chars.as_str()));
+        }
+    }
+    None
+}
+
+/// Whether a join, a comma list or a stray dotted name follows a relation.
+fn joins_another(rest: &str) -> bool {
+    const JOINS: [&str; 8] = [
+        "join", "inner", "left", "right", "full", "outer", "cross", "natural",
+    ];
+    rest.starts_with([',', '.'])
+        || JOINS
+            .iter()
+            .any(|kw| keyword_at(rest.as_bytes(), kw.as_bytes()))
+}
+
+/// Whether the clause after a relation starts here, so no alias stands between them.
+fn ends_relation(rest: &str) -> bool {
+    const CLAUSES: [&str; 13] = [
+        "where",
+        "group",
+        "having",
+        "order",
+        "limit",
+        "offset",
+        "fetch",
+        "union",
+        "intersect",
+        "except",
+        "window",
+        "for",
+        "option",
+    ];
+    rest.is_empty()
+        || rest.starts_with(';')
+        || CLAUSES
+            .iter()
+            .any(|kw| keyword_at(rest.as_bytes(), kw.as_bytes()))
+}
+
+/// The relation the outermost `FROM` of `query` names first, part by part, and the text after that name; comments count as whitespace, and `only` skips PostgreSQL's `ONLY` before the name.
+fn outer_name(query: &str, only: bool) -> Option<(Vec<NamePart>, &str)> {
+    let from = outer_keyword(query, "from")?;
+    let mut rest = skip_blank(query.get(from + 4..)?);
+    if only && keyword_at(rest.as_bytes(), b"only") {
+        rest = skip_blank(rest.get(4..)?);
+    }
+    let mut parts = Vec::new();
+    loop {
+        let (part, tail) = name_part(rest)?;
+        parts.push(part);
+        rest = skip_blank(tail);
+        match rest.strip_prefix('.') {
+            Some(after) => rest = skip_blank(after),
+            None => return Some((parts, rest)),
+        }
+    }
+}
+
+/// The one relation the outermost `FROM` of `query` reads, part by part (`schema`, `table`); `None` when there is no such `FROM`, or it reads a subquery, a function call, a join or a comma list.
+pub(crate) fn single_relation(query: &str, only: bool) -> Option<Vec<NamePart>> {
+    let (parts, mut rest) = outer_name(query, only)?;
+    if !ends_relation(rest) && !joins_another(rest) {
+        if keyword_at(rest.as_bytes(), b"as") {
+            rest = skip_blank(rest.get(2..)?);
+        }
+        rest = skip_blank(name_part(rest)?.1);
+    }
+    (!joins_another(rest)).then_some(parts)
+}
+
+/// The relation the outermost `FROM` of `query` names first, for a catalog probe of that table: `None` when a join or a comma list follows the name itself. What follows an alias is not read, so the driving table of `FROM t x CROSS APPLY f(x.id)` is still named.
+pub(crate) fn first_relation(query: &str) -> Option<Vec<NamePart>> {
+    let (parts, rest) = outer_name(query, false)?;
+    (!joins_another(rest)).then_some(parts)
 }
 
 /// The rows `query` selects, as text to compare: the query without its outermost projection and with `?` for the relation its outermost `FROM` names (the stream holds the name), lower-cased and with whitespace folded outside quotes; the whole query when it has no outermost `SELECT ... FROM`.
@@ -388,7 +543,7 @@ pub(crate) fn outer_from_relation(query: &str) -> Option<String> {
 fn outer_relation(query: &str) -> Option<(String, std::ops::Range<usize>)> {
     let (ident, closer) = (ident_byte, quote_closer);
     let after_from = outer_keyword(query, "from")? + 4;
-    let mut rest = query[after_from..].trim_start();
+    let mut rest = skip_blank(query.get(after_from..)?);
     let start = query.len() - rest.len();
     let mut parts: Vec<&str> = Vec::new();
     loop {
@@ -863,6 +1018,226 @@ mod tests {
         proptest::collection::vec(proptest::sample::select(pieces), 0..14).prop_map(|p| p.concat())
     }
 
+    /// The one relation a simple query reads, whatever stands around it; a comment is whitespace wherever it stands.
+    #[test]
+    fn single_relation_reads_one_table_and_declines_the_rest() {
+        let rel = |q: &str| {
+            single_relation(q, true).map(|parts| {
+                let shown = |p: &NamePart| match p.quoted {
+                    true => format!("<{}>", p.name),
+                    false => p.name.clone(),
+                };
+                parts.iter().map(shown).collect::<Vec<_>>().join(".")
+            })
+        };
+        for (q, want) in [
+            ("SELECT a FROM t", Some("t")),
+            ("select a from s.t x where a = 1", Some("s.t")),
+            (
+                "SELECT a FROM ONLY inventory.items",
+                Some("inventory.items"),
+            ),
+            (
+                "SELECT a FROM \"T x\".\"a\"\"b\" AS \"X\" ORDER BY a",
+                Some("<T x>.<a\"b>"),
+            ),
+            ("SELECT a FROM [s].[c]]d] WITH (NOLOCK)", Some("<s>.<c]d>")),
+            ("SELECT a FROM `m`;", Some("<m>")),
+            ("SELECT a FROM t;", Some("t")),
+            ("SELECT a FROM s . t LIMIT 5", Some("s.t")),
+            ("SELECT a FROM db.s.t", Some("db.s.t")),
+            ("SELECT a FROM caf\u{e9} c", Some("caf\u{e9}")),
+            (
+                "SELECT 'it''s from x' AS y, a_from, fromage FROM t",
+                Some("t"),
+            ),
+            ("SELECT (SELECT 1 FROM i) AS s FROM t", Some("t")),
+            ("SELECT a FROM t TABLESAMPLE SYSTEM (1)", Some("t")),
+            ("SELECT a -- rows from the last week\nFROM t", Some("t")),
+            ("SELECT a\n-- taken from legacy\nFROM t", Some("t")),
+            ("SELECT a /* from b */ FROM t", Some("t")),
+            (
+                "SELECT a /* outer /* from b */ still a comment */ FROM t",
+                Some("t"),
+            ),
+            (
+                "SELECT a FROM /* the table */ s /* . */ . t -- from b",
+                Some("s.t"),
+            ),
+            ("SELECT a FROM t -- from b", Some("t")),
+            ("SELECT a FROM t /* from b */ WHERE a = 1", Some("t")),
+            ("SELECT a FROM t/* from b */x", Some("t")),
+            ("SELECT '-- not a comment' AS c FROM t", Some("t")),
+            ("SELECT \"a--b\", [c/*d] FROM t", Some("t")),
+            ("SELECT a FROM t JOIN u ON 1 = 1", None),
+            ("SELECT a FROM t x LEFT JOIN u USING (a)", None),
+            ("SELECT a FROM t NATURAL JOIN u", None),
+            ("SELECT a FROM t, u", None),
+            ("SELECT a FROM t x, u", None),
+            ("SELECT a FROM t x.y", None),
+            ("SELECT a FROM (SELECT * FROM foo) s", None),
+            ("SELECT a FROM generate_series(1, 3)", None),
+            ("SELECT a FROM 1", None),
+            ("SELECT a FROM \"\"", None),
+            ("SELECT a FROM \"never closed", None),
+            ("SELECT a FROM s.", None),
+            ("SELECT a FROM t AS", None),
+            ("SELECT a -- FROM t", None),
+            ("SELECT a /* FROM t", None),
+            ("SELECT 1", None),
+        ] {
+            assert_eq!(rel(q).as_deref(), want, "{q:?}");
+        }
+        assert_eq!(
+            rel("SELECT a FROM only"),
+            None,
+            "ONLY is skipped, and no name follows it"
+        );
+        let plain = |q: &str| single_relation(q, false).map(|p| p[0].name.clone());
+        assert_eq!(plain("SELECT a FROM only").as_deref(), Some("only"));
+        assert_eq!(plain("SELECT a FROM ONLY t").as_deref(), Some("ONLY"));
+    }
+
+    /// The first relation is named when an alias stands before a join or an APPLY, and not when the join follows the name itself.
+    #[test]
+    fn first_relation_names_the_driving_table_past_an_alias() {
+        let first = |q: &str| {
+            first_relation(q).map(|p| {
+                p.iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            })
+        };
+        for (q, want) in [
+            (
+                "SELECT o.* FROM dbo.orders o CROSS APPLY dbo.f(o.id) x",
+                Some("dbo.orders"),
+            ),
+            ("SELECT a FROM t x JOIN u ON 1 = 1", Some("t")),
+            ("SELECT a FROM t x, u", Some("t")),
+            ("SELECT a -- from b\nFROM s . t WHERE a = 1", Some("s.t")),
+            ("SELECT 'it''s from x' AS y FROM t", Some("t")),
+            ("SELECT a FROM t JOIN u ON 1 = 1", None),
+            ("SELECT a FROM t, u", None),
+            ("SELECT a FROM (SELECT 1) s", None),
+        ] {
+            assert_eq!(first(q).as_deref(), want, "{q:?}");
+        }
+    }
+
+    /// A `FROM` inside a comment is not the outermost one: the stream of a commented query is its table.
+    #[test]
+    fn a_comment_is_never_read_as_the_outer_from() {
+        for q in [
+            "SELECT amount -- rows from the last week\nFROM t",
+            "SELECT amount\n-- taken from legacy\nFROM t",
+            "SELECT amount /* from b */ FROM t",
+            "SELECT amount /* from b\n*/ FROM /* from c */ t",
+            "SELECT amount FROM t -- from b",
+        ] {
+            assert_eq!(outer_from_relation(q).as_deref(), Some("t"), "{q:?}");
+        }
+    }
+
+    /// Golden byte offsets of the outermost `FROM`: nesting, a quoted `from`, a doubled quote, identifier boundaries, a stray `)`.
+    #[test]
+    fn the_outer_from_is_found_at_its_byte_offset() {
+        let f = |q: &str| outer_keyword(q, "from");
+        assert_eq!(f("SELECT a FROM t"), Some(9));
+        assert_eq!(f("select a frOm t"), Some(9));
+        for q in [
+            "SELECT (SELECT x FROM i) FROM t",
+            "SELECT 'from' FROM t",
+            "SELECT 'it''s from x' FROM t",
+            "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa, 'it''s' FROM t",
+            "SELECT a_from, fromage FROM t",
+            "SELECT a -- from x\nFROM t",
+            "SELECT a /* from x */ FROM t",
+        ] {
+            assert_eq!(f(q), q.rfind("FROM"), "{q:?}");
+        }
+        assert_eq!(
+            f(") FROM t"),
+            Some(2),
+            "a stray `)` does not hide what follows"
+        );
+        assert_eq!(f("SELECT 1"), None);
+        assert_eq!(f("SELECT (x FROM t)"), None);
+        assert_eq!(f("xfrom t"), None, "preceded by an identifier byte");
+        assert_eq!(f("from_x"), None, "followed by an identifier byte");
+        assert_eq!(f("fro"), None);
+        assert_eq!(f("x from"), Some(2), "the end of the text is a boundary");
+    }
+
+    /// A comment's length: a line up to its break, a block with the blocks nested in it, the rest of the text when it never closes.
+    #[test]
+    fn a_comment_ends_at_its_line_break_or_its_matching_close() {
+        for (text, len) in [
+            ("-- x\ny", 4),
+            ("--", 2),
+            ("-- to the end", 13),
+            ("/* x */y", 7),
+            ("/**/y", 4),
+            ("/* a /* b */ c */y", 17),
+            ("/*  /**/ x */y", 13),
+            ("/* never closed", 15),
+            ("/* a /* b */ still open", 23),
+            ("- not one", 0),
+            ("/ * not one", 0),
+            ("", 0),
+        ] {
+            assert_eq!(comment_len(text.as_bytes()), len, "{text:?}");
+        }
+        assert_eq!(skip_blank("  -- a\n /* b */\n\tx -- c"), "x -- c");
+        assert_eq!(skip_blank("-- only a comment"), "");
+    }
+
+    /// One megabyte of each hostile shape is read in one pass, inside the budget.
+    #[test]
+    fn the_relation_readers_are_linear_on_a_hostile_megabyte() {
+        const MB: usize = 1 << 20;
+        let shapes = [
+            ("dashes", "-".repeat(MB), false),
+            ("open blocks", "/*".repeat(MB / 2), false),
+            ("closed blocks", "/**/".repeat(MB / 4), false),
+            ("open parentheses", "(".repeat(MB), false),
+            ("double quotes", "\"".repeat(MB), false),
+            ("`from` repeated", "from ".repeat(MB / 5), true),
+            (
+                "a name of a megabyte of parts",
+                format!("SELECT a FROM {}", "a.".repeat(MB / 2)),
+                false,
+            ),
+            (
+                "a quoted name never closed",
+                format!("SELECT a FROM \"{}", "a".repeat(MB)),
+                false,
+            ),
+            (
+                "blanks after FROM",
+                format!("SELECT a FROM{}t", " ".repeat(MB)),
+                true,
+            ),
+            (
+                "comments after FROM",
+                format!("SELECT a FROM {}t", "--\n".repeat(MB / 3)),
+                true,
+            ),
+        ];
+        for (label, input, named) in shapes {
+            let (done, result) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let read = single_relation(&input, true).is_some();
+                let _ = done.send((read, outer_from_relation(&input), row_set(&input).len()));
+            });
+            let (read, _, _) = result
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|why| panic!("RELATION READER NOT LINEAR: {label}: {why}"));
+            assert_eq!(read, named, "{label}");
+        }
+    }
+
     const SQL_ENGINES: [SourceType; 4] = [
         SourceType::Postgres,
         SourceType::Mysql,
@@ -876,6 +1251,9 @@ mod tests {
         let _ = strip_simple_projection_from(query);
         let _ = row_set(query);
         let _ = outer_from_relation(query);
+        let _ = single_relation(query, true);
+        let _ = single_relation(query, false);
+        let _ = first_relation(query);
         for engine in SQL_ENGINES {
             let _ = aggregate_sql(engine, "min", "id", query);
             let _ = null_key_probe_sql(engine, "id", query);
