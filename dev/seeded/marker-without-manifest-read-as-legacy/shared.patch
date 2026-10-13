@@ -1,0 +1,31 @@
+diff --git a/src/pipeline/validate_manifest.rs b/src/pipeline/validate_manifest.rs
+index 2d89115d..487fd496 100644
+--- a/src/pipeline/validate_manifest.rs
++++ b/src/pipeline/validate_manifest.rs
+@@ -744,25 +744,7 @@ pub fn verify_at_destination(
+     // path is reserved for *programmer* errors (caller passes a malformed
+     // `manifest_dir`, a future destination breaks an internal invariant).
+     let manifest_bytes = match dest.head(&manifest_key) {
+-        Ok(None) => {
+-            // No manifest is the legacy shape only while there is no marker either.
+-            let mut v = ManifestVerification::legacy();
+-            let orphan_marker = match dest.head(&success_key) {
+-                Ok(None) => None,
+-                Ok(Some(_)) => Some(Failure::ManifestMissingUnderMarker {
+-                    prefix: manifest_dir.to_string(),
+-                }),
+-                Err(e) => Some(Failure::SuccessMarkerReadError {
+-                    detail: format!("_SUCCESS head failed: {e:#}"),
+-                }),
+-            };
+-            if let Some(failure) = orphan_marker {
+-                v.legacy_run = false;
+-                v.failures.push(failure);
+-                v.recompute_passed();
+-            }
+-            return Ok(with_depth(v));
+-        }
++        Ok(None) => return Ok(with_depth(ManifestVerification::legacy())),
+         Ok(Some(_)) => match read_capped(dest, &manifest_key, MANIFEST_MAX_BYTES) {
+             Ok(b) => b,
+             Err(e) => {

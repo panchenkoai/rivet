@@ -396,6 +396,30 @@ seeds:
       lib:
         cells:
           - "lib:a_chunked_shape_is_validated_whatever_the_row_estimate"
+  - name: marker-without-manifest-read-as-legacy
+    class: "a verifier that reads the absence of its evidence as an older format: `rivet validate` took a prefix with no manifest for a pre-manifest export and exited 0, although `_SUCCESS`, which is written only after the manifest, was there"
+    history: "2026-10-09 - sabotage matrix, part 1 (#486) - manifest.json removed from a complete export: `validate` printed `status: legacy_run`, exit 0, on PostgreSQL, MySQL, SQL Server and MongoDB"
+    scope: source
+    patch: marker-without-manifest-read-as-legacy/shared.patch
+    engines:
+      postgres:
+        cells:
+          - validate_fails_on_a_marker_without_a_manifest_postgres
+      mysql:
+        cells:
+          - validate_fails_on_a_marker_without_a_manifest_mysql
+      mssql:
+        cells:
+          - validate_fails_on_a_marker_without_a_manifest_mssql
+      oracle:
+        cells:
+          - validate_fails_on_a_marker_without_a_manifest_oracle
+      mongo:
+        cells:
+          - validate_fails_on_a_marker_without_a_manifest_mongo
+      lib:
+        cells:
+          - "lib:a_success_marker_without_a_manifest_is_not_a_legacy_run"
 
   - name: chunk-run-resumed-by-another-source
     class: an interrupted range-chunk run is looked up by export name alone and resumed by a same-named export of another source
