@@ -1666,6 +1666,24 @@ mod tests {
         assert!(rendered.contains("EU"), "{rendered}");
     }
 
+    /// A job still running at the first poll is asked again under a budget it has not spent, and its id is the answer.
+    #[test]
+    fn a_job_running_at_the_first_poll_is_waited_for() {
+        use stand::{Stand, json};
+        let stand = Stand::start(|_, earlier| match earlier {
+            0 => json(200, r#"{"status":{"state":"RUNNING"}}"#),
+            _ => json(200, r#"{"status":{"state":"DONE"}}"#),
+        });
+        let job_ref = JobRef {
+            project: "p".into(),
+            job_id: "slow".into(),
+            location: None,
+        };
+        let done = stand.api().await_job(&job_ref, Duration::from_secs(3600));
+        assert_eq!(done.unwrap(), "slow");
+        assert_eq!(stand.seen().len(), 2);
+    }
+
     /// The four hours one job may be polled for.
     #[test]
     fn a_job_is_polled_for_four_hours_at_most() {

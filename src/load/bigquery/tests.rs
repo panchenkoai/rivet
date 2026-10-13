@@ -1555,6 +1555,13 @@ fn the_existing_shape_is_the_tables_own_and_an_absent_table_has_none() {
         "nothing was asked of its shape"
     );
     assert!(loader.shape().is_some(), "BigQuery controls shape");
+    let mut asked = on(&stand);
+    asked.clustering = Clustering::Written(vec!["b_col".into()]);
+    let conflict = asked.table_shape_conflict("t").unwrap();
+    assert_eq!(
+        conflict.as_deref(),
+        Some("it is clustered on `a_col`, `cluster_by` is `b_col`")
+    );
 }
 
 /// A recluster is one metadata patch of the change log with the written columns.
