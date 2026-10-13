@@ -1229,6 +1229,8 @@ pub(crate) mod tests {
         counts: RefCell<std::collections::HashMap<String, u64>>,
         overlap: Option<(u64, u64)>,
         prior_changes: bool,
+        /// The column names each `column_overlap` was asked about.
+        overlap_asked: RefCell<Vec<String>>,
         shape_conflict: Option<String>,
         drift: RefCell<Option<ChangelogDrift>>,
         leftovers: Vec<String>,
@@ -1343,6 +1345,7 @@ pub(crate) mod tests {
                 .unwrap_or(ObjectKind::Absent))
         }
         fn column_overlap(&self, _table: &str, names: &[&str]) -> Result<(u64, u64)> {
+            self.overlap_asked.borrow_mut().push(names.join(","));
             let n = names.len() as u64;
             Ok(self.overlap.unwrap_or((n, n)))
         }
@@ -1810,6 +1813,66 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(calls(&f), ["adopt t", "append t"]);
+    }
+
+    /// The table to adopt is compared with the export's own columns: the change-log columns rivet adds are not among them.
+    #[test]
+    fn an_adopted_table_is_compared_by_the_exports_columns_without_the_meta_ones() {
+        let f = full_load_left(5);
+        let mut specs = spec(TargetStatus::Ok);
+        specs.extend(cdc::meta_column_specs(cdc::Warehouse::BigQuery));
+        assert!(adoptable(&f, "t", &specs, Ownership::Own).unwrap());
+        assert_eq!(*f.overlap_asked.borrow(), ["id"]);
+    }
+
+    /// A target table name is spliced into DDL: each dotted part must be a plain identifier.
+    #[test]
+    fn a_target_table_name_that_is_not_a_plain_identifier_is_refused() {
+        let specs = spec(TargetStatus::Ok);
+        for table in ["t", "orders_2026", "ds.orders", "_t"] {
+            validate_specs(table, &specs).unwrap_or_else(|e| panic!("{table}: {e:#}"));
+        }
+        for table in [
+            "",
+            "t; DROP TABLE x",
+            "ds.or`ders",
+            "a b",
+            "ds..t",
+            ".t",
+            "1t",
+            "t-1",
+            "t'--",
+        ] {
+            let err = validate_specs(table, &specs).expect_err(table).to_string();
+            assert!(
+                err.contains("not a plain (optionally dotted) SQL identifier"),
+                "{table:?}: {err}"
+            );
+        }
+    }
+
+    /// The loader takes the plan's clustering when it names columns or was written, even as an empty list; an unwritten empty one leaves the loader's own.
+    #[test]
+    fn the_bigquery_loader_takes_the_clustering_the_plan_states() {
+        use plan::Clustering::{Auto, Written};
+        let taken = |c: plan::Clustering| {
+            let built = build_bigquery_loader("p", "d", None, &c, "run").clustering;
+            (built.columns().to_vec(), built.is_written())
+        };
+        let own = BigQueryLoader::new("p", "d").clustering;
+        assert_eq!(
+            taken(Auto(vec![])),
+            (own.columns().to_vec(), own.is_written())
+        );
+        assert_eq!(
+            taken(Auto(vec!["a".into()])),
+            (vec!["a".to_string()], false)
+        );
+        assert_eq!(taken(Written(vec![])), (vec![], true));
+        assert_eq!(
+            taken(Written(vec!["a".into()])),
+            (vec!["a".to_string()], true)
+        );
     }
 
     #[test]
