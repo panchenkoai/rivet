@@ -1,0 +1,17 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index 6238b564..9cc44250 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -560,10 +560,10 @@ fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> String
+         // instead of matching the one the COPY names.
+         // Snowflake takes `ADD COLUMN` once per statement and `IF NOT EXISTS` per column:
+         // `ADD COLUMN IF NOT EXISTS a T, ADD COLUMN IF NOT EXISTS b T` is a syntax error there.
+-        .map(|s| format!("IF NOT EXISTS {} {}", s.column_name, s.target_type))
++        .map(|s| format!("ADD COLUMN IF NOT EXISTS {} {}", s.column_name, s.target_type))
+         .collect::<Vec<_>>()
+         .join(",\n  ");
+-    format!("ALTER TABLE {fqtn} ADD COLUMN\n  {adds};\n")
++    format!("ALTER TABLE {fqtn}\n  {adds};\n")
+ }
+ 
+ /// The stage URL: the export prefix closed with one `/`. Snowflake joins a stage URL and a `FILES` entry as text, so a prefix written without the slash named `…/orderspart-0.parquet`.

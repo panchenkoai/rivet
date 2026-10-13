@@ -1490,3 +1490,124 @@ seeds:
         na: "the patched code is the PostgreSQL test_decoding reader (src/source/postgres/cdc.rs), which no other engine runs; the stand has no Oracle connection pooler (DRCP, CMAN) to read a shared session through"
       lib:
         cells: ["lib:the_open_sends_no_statement_before_its_first_read"]
+
+  - name: snowflake-probe-counts-by-count-if
+    class: "a catalog probe sums COUNT_IF terms, which are NULL over zero rows, so a free table name has no kind and the load stops before any write"
+    history: "2026-10-13 - found by the first live Snowflake run from devbox and by the rig cells graded through DuckDB's snowflake extension; every load onto a free name failed in 0.26.0 through 0.31.0"
+    scope: source
+    patch: snowflake-probe-counts-by-count-if/shared.patch
+    engines:
+      postgres:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mysql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mssql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mongo:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      oracle:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      lib:
+        cells:
+          - "lib:the_object_kind_is_read_from_the_catalog_answer"
+          - "lib:object_kind_probe_reads_the_schema_catalog_with_uppercased_names"
+
+  - name: snowflake-change-log-told-by-error-text
+    class: "whether a change log exists is read from the text of a failed SELECT, which `snow` wraps at 80 columns"
+    history: "2026-10-13 - found by the first live Snowflake run from devbox and by the rig cells graded through DuckDB's snowflake extension; a table name of 21 to 30 characters split `does not exist` over two lines"
+    scope: source
+    patch: snowflake-change-log-told-by-error-text/shared.patch
+    engines:
+      postgres:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mysql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mssql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mongo:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      oracle:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      lib:
+        cells:
+          - "lib:a_missing_change_log_is_the_first_cycle_by_the_catalog_not_by_an_error_text"
+
+  - name: snowflake-add-column-per-column-keyword
+    class: "the ALTER that reconciles a change log repeats ADD COLUMN per column, a syntax error on Snowflake"
+    history: "2026-10-13 - found by the first live Snowflake run from devbox and by the rig cells graded through DuckDB's snowflake extension; the adopt test and the CDC snapshot cell failed at `unexpected COLUMN`"
+    scope: source
+    patch: snowflake-add-column-per-column-keyword/shared.patch
+    engines:
+      postgres:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mysql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mssql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mongo:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      oracle:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      lib:
+        cells:
+          - "lib:alter_add_columns_reconciles_an_existing_log_and_never_replaces_it"
+
+  - name: snowflake-parquet-read-without-logical-types
+    class: "a part is read without Parquet logical types, so a timestamp without a zone is stored as its microsecond integer taken for seconds and a TIME cannot be cast"
+    history: "2026-10-13 - found by the first live Snowflake run from devbox and by the rig cells graded through DuckDB's snowflake extension; 0.24.2 stored `2026-10-13 21:25:02.145628` as year 56785866 with LOAD OK"
+    scope: source
+    patch: snowflake-parquet-read-without-logical-types/shared.patch
+    engines:
+      postgres:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mysql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mssql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mongo:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      oracle:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      lib:
+        cells:
+          - "lib:both_scripts_read_parts_by_an_inline_format_under_a_closed_stage_url"
+
+  - name: snowflake-binary-column-not-cast
+    class: "a binary column goes through the COPY transform as VARIANT and the load fails on its type"
+    history: "2026-10-13 - found by the first live Snowflake run from devbox and by the rig cells graded through DuckDB's snowflake extension; `expecting BINARY but got VARIANT` on 0.24.2 and on main"
+    scope: source
+    patch: snowflake-binary-column-not-cast/shared.patch
+    engines:
+      postgres:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mysql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mssql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mongo:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      oracle:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      lib:
+        cells:
+          - "lib:both_scripts_read_parts_by_an_inline_format_under_a_closed_stage_url"
+
+  - name: snowflake-stage-url-left-open
+    class: "the stage URL is the destination prefix as written, so without a trailing slash every FILES entry names a file that does not exist"
+    history: "2026-10-13 - found by the first live Snowflake run from devbox and by the rig cells graded through DuckDB's snowflake extension; `Remote file ... was not found` on 0.24.2 and on main"
+    scope: source
+    patch: snowflake-stage-url-left-open/shared.patch
+    engines:
+      postgres:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mysql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mssql:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      mongo:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      oracle:
+        na: "the Snowflake load statements are built from the recorded load spec, not by a source adapter"
+      lib:
+        cells:
+          - "lib:both_scripts_read_parts_by_an_inline_format_under_a_closed_stage_url"

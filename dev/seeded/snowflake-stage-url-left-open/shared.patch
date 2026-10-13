@@ -1,0 +1,13 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index 6238b564..6b74fb2b 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -568,7 +568,7 @@ fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> String
+ 
+ /// The stage URL: the export prefix closed with one `/`. Snowflake joins a stage URL and a `FILES` entry as text, so a prefix written without the slash named `…/orderspart-0.parquet`.
+ fn stage_url(gcs_url: &str) -> String {
+-    format!("{}/", gcs_url.trim_end_matches('/'))
++    gcs_url.to_string()
+ }
+ 
+ /// How every stage and `COPY` reads a part, spelled inline: a named format made by `CREATE … IF NOT EXISTS` is whatever object already has that name. Logical types on, so a Parquet timestamp or time is read as one and not as its raw integer; binary kept as bytes.

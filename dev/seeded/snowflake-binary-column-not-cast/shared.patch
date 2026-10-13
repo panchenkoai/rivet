@@ -1,0 +1,13 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index 6238b564..f3a6d2f8 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -92,7 +92,7 @@ impl SnowflakeLoader {
+                 if needs_parse_json(s) {
+                     format!("PARSE_JSON({path})")
+                 } else if s.target_type == TargetType::Snowflake(SfType::Binary) {
+-                    format!("{path}::BINARY")
++                    path
+                 } else {
+                     path
+                 }

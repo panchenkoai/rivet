@@ -1,0 +1,17 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index 6238b564..b9bb2846 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -371,9 +371,9 @@ impl SnowflakeLoader {
+         format!(
+             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+              USE WAREHOUSE {wh};\n\
+-             SELECT COUNT(CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN 1 END) \
+-             + 2 * COUNT(CASE WHEN TABLE_TYPE = 'VIEW' THEN 1 END) \
+-             + 4 * COUNT(CASE WHEN TABLE_TYPE NOT IN ('BASE TABLE', 'VIEW') THEN 1 END) AS KIND_ \
++             SELECT COUNT_IF(TABLE_TYPE = 'BASE TABLE') \
++             + 2 * COUNT_IF(TABLE_TYPE = 'VIEW') \
++             + 4 * COUNT_IF(TABLE_TYPE NOT IN ('BASE TABLE', 'VIEW')) AS KIND_ \
+              FROM {db}.INFORMATION_SCHEMA.TABLES \
+              WHERE TABLE_SCHEMA = UPPER('{sc}') AND TABLE_NAME = UPPER('{table}');",
+             tag = self.query_tag(table),
