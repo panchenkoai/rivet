@@ -288,6 +288,8 @@ pub enum Failure {
     /// that was never written.  Fatal: a required-but-missing manifest is a
     /// refusal reason, not a "cannot certify" advisory.
     ManifestRequiredButAbsent { prefix: String },
+    /// `_SUCCESS` is present and the manifest it was written after is not: rivet writes the marker only once the manifest is in place, so this prefix lost its manifest and its parts cannot be verified.
+    ManifestMissingUnderMarker { prefix: String },
     /// The manifest's own run status is not `success` (`failed`, `interrupted`,
     /// `running`): the prefix does not hold a completed export, whatever its parts say.
     RunNotSuccessful { status: String },
@@ -356,6 +358,7 @@ impl Failure {
             Failure::UntrackedObject { .. } => "RIVET_VERIFY_UNTRACKED_OBJECT",
             Failure::ContentVerificationUnmet { .. } => "RIVET_VERIFY_CONTENT_UNMET",
             Failure::ManifestRequiredButAbsent { .. } => "RIVET_VERIFY_MANIFEST_REQUIRED",
+            Failure::ManifestMissingUnderMarker { .. } => "RIVET_VERIFY_MANIFEST_MISSING",
             Failure::RunNotSuccessful { .. } => "RIVET_VERIFY_RUN_NOT_SUCCESSFUL",
             Failure::ValueCheckNotAvailable { .. } => "RIVET_VERIFY_VALUE_CHECK_NOT_AVAILABLE",
         }
@@ -447,6 +450,12 @@ impl std::fmt::Display for Failure {
                  pinned --prefix) but none was found — this prefix was never \
                  written, or the data was relocated. Run the export first, or \
                  drop --prefix to validate the config-resolved destination."
+            ),
+            Failure::ManifestMissingUnderMarker { prefix } => write!(
+                f,
+                "`_SUCCESS` is present at {prefix} and manifest.json is not: the marker is written \
+                 only after the manifest, so the manifest was removed and the parts here cannot be \
+                 verified. Restore manifest.json, or run the export again to write the prefix anew."
             ),
             Failure::RunNotSuccessful { status } => write!(
                 f,
@@ -735,7 +744,25 @@ pub fn verify_at_destination(
     // path is reserved for *programmer* errors (caller passes a malformed
     // `manifest_dir`, a future destination breaks an internal invariant).
     let manifest_bytes = match dest.head(&manifest_key) {
-        Ok(None) => return Ok(with_depth(ManifestVerification::legacy())),
+        Ok(None) => {
+            // No manifest is the legacy shape only while there is no marker either.
+            let mut v = ManifestVerification::legacy();
+            let orphan_marker = match dest.head(&success_key) {
+                Ok(None) => None,
+                Ok(Some(_)) => Some(Failure::ManifestMissingUnderMarker {
+                    prefix: manifest_dir.to_string(),
+                }),
+                Err(e) => Some(Failure::SuccessMarkerReadError {
+                    detail: format!("_SUCCESS head failed: {e:#}"),
+                }),
+            };
+            if let Some(failure) = orphan_marker {
+                v.legacy_run = false;
+                v.failures.push(failure);
+                v.recompute_passed();
+            }
+            return Ok(with_depth(v));
+        }
         Ok(Some(_)) => match read_capped(dest, &manifest_key, MANIFEST_MAX_BYTES) {
             Ok(b) => b,
             Err(e) => {
@@ -1369,6 +1396,29 @@ mod tests {
     }
 
     // ── M6 legacy run ───────────────────────────────────────────────────
+
+    /// A marker with no manifest is a prefix that lost its manifest: a verified-wrong failure, not the legacy label; with the marker gone too it is the legacy shape again.
+    #[test]
+    fn a_success_marker_without_a_manifest_is_not_a_legacy_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("_SUCCESS"), b"{}").unwrap();
+        std::fs::write(dir.path().join("part-0.parquet"), b"rows").unwrap();
+        let dest = local_dest(dir.path());
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(!v.legacy_run && !v.passed && !v.manifest_found);
+        assert_eq!(
+            v.failures,
+            [Failure::ManifestMissingUnderMarker { prefix: "".into() }]
+        );
+        assert!(v.has_verified_wrong_failure(), "exit class: integrity");
+        let mut pinned = v.clone();
+        pinned.require_manifest_present("p/");
+        assert_eq!(pinned.failures, v.failures, "one failure, not two");
+
+        std::fs::remove_file(dir.path().join("_SUCCESS")).unwrap();
+        let v = verify_at_destination(&dest, "", ValidateDepth::Full).unwrap();
+        assert!(v.legacy_run && v.failures.is_empty());
+    }
 
     #[test]
     fn no_manifest_returns_legacy_run_label() {
@@ -2381,6 +2431,10 @@ mod tests {
                 "RIVET_VERIFY_MANIFEST_REQUIRED",
             ),
             (
+                Failure::ManifestMissingUnderMarker { prefix: "p".into() },
+                "RIVET_VERIFY_MANIFEST_MISSING",
+            ),
+            (
                 Failure::ValueChecksumMismatch {
                     detail: "flip".into(),
                 },
@@ -2469,6 +2523,7 @@ mod tests {
                 Failure::UntrackedObject { .. } => "UntrackedObject",
                 Failure::ContentVerificationUnmet { .. } => "ContentVerificationUnmet",
                 Failure::ManifestRequiredButAbsent { .. } => "ManifestRequiredButAbsent",
+                Failure::ManifestMissingUnderMarker { .. } => "ManifestMissingUnderMarker",
                 Failure::RunNotSuccessful { .. } => "RunNotSuccessful",
                 Failure::ValueCheckNotAvailable { .. } => "ValueCheckNotAvailable",
             })

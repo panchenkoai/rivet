@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Fixed: `rivet validate` no longer passes a prefix whose manifest is gone while `_SUCCESS`
+  is there.** Every source and destination. Reproduced on rivet 0.31.0 with PostgreSQL and a
+  local destination.
+  - **What was wrong in 0.31.0 and earlier.** With `manifest.json` removed from a complete
+    export, `validate` printed `status: legacy_run (no manifest at this prefix — a pre-0.7.0
+    export ...)` and exited 0, so `rivet validate && deploy` went on over parts nothing had
+    verified. `_SUCCESS` is written only after the manifest, so a marker without a manifest
+    is a prefix that lost its manifest, not an old export.
+  - **Now** the same command exits 3 with `RIVET_VERIFY_MANIFEST_MISSING` (a new code), on
+    every pass, and names the two ways out: restore `manifest.json`, or run the export again.
+    A run of the export writes the prefix anew and `validate` passes after it.
+  - If `_SUCCESS` itself cannot be read (an I/O error, not absence), `validate` reports
+    `RIVET_VERIFY_SUCCESS_READ_ERROR` and exits 1, where it exited 0.
+  - Unchanged: a prefix with neither a manifest nor `_SUCCESS` is still `legacy_run`, exit 0.
 - **Fix: a `FROM` inside an SQL comment is no longer read as the table a `query:` reads.**
   PostgreSQL and SQL Server exports with a hand-written `query:`; the preflight probe of
   `rivet check` on every SQL engine. Reproduced on rivet 0.31.0 with PostgreSQL and SQL Server.
