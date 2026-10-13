@@ -449,6 +449,17 @@ mod tests {
         );
     }
 
+    /// The four types whose Arrow form is a generic container carry their own logical label; a type Arrow already names carries none.
+    #[test]
+    fn a_container_typed_column_carries_its_logical_label() {
+        assert_eq!(logical_type_label(&RivetType::Json), Some("json"));
+        assert_eq!(logical_type_label(&RivetType::Uuid), Some("uuid"));
+        assert_eq!(logical_type_label(&RivetType::Enum), Some("enum"));
+        assert_eq!(logical_type_label(&RivetType::Interval), Some("interval"));
+        assert_eq!(logical_type_label(&RivetType::String), None);
+        assert_eq!(logical_type_label(&RivetType::Int64), None);
+    }
+
     #[test]
     fn unsupported_returns_no_arrow_type() {
         let t = RivetType::Unsupported {
