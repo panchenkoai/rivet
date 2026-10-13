@@ -1396,3 +1396,238 @@ fn a_compaction_with_neither_buffer_nor_leftover_has_nothing_to_merge() {
         "a leftover of a merge that died is merged even with no live buffer"
     );
 }
+
+// ── the loader against a scripted BigQuery (bq_rest::stand) ─────────────────
+
+use crate::load::ShapeControl;
+use crate::load::bq_rest::stand::{Stand, json};
+
+/// How a scripted query job ends.
+enum Job {
+    /// Done, and its result is this one number.
+    Scalar(u64),
+    /// Done with BigQuery's error.
+    Fails(&'static str),
+}
+
+/// A scripted project `p`, dataset `d`: `tables` are (name, `tables.get` resource), a name not listed is absent, and each query job ends as `job` says for its statement.
+fn world(tables: &'static [(&'static str, &'static str)], job: fn(&str) -> Job) -> Stand {
+    let results = std::sync::Mutex::new(std::collections::HashMap::<String, u64>::new());
+    Stand::start(move |seen, _| {
+        let table = seen
+            .path
+            .strip_prefix("/bigquery/v2/projects/p/datasets/d/tables/");
+        match (seen.method.as_str(), table) {
+            ("GET", Some(name)) if name.ends_with("/rowAccessPolicies") => return json(200, "{}"),
+            ("GET", Some(name)) => {
+                let found = tables.iter().find(|(t, _)| *t == name);
+                return found.map_or(
+                    json(404, r#"{"error":{"message":"Not found"}}"#),
+                    |(_, r)| json(200, r),
+                );
+            }
+            ("PATCH", Some(_)) => return json(200, "{}"),
+            _ => {}
+        }
+        if let Some(id) = seen.path.strip_prefix("/bigquery/v2/projects/p/queries/") {
+            let n = results.lock().unwrap().get(id).copied().unwrap_or(0);
+            return json(200, &format!(r#"{{"rows":[{{"f":[{{"v":"{n}"}}]}}]}}"#));
+        }
+        let id = seen.body["jobReference"]["jobId"]
+            .as_str()
+            .unwrap_or("none")
+            .to_string();
+        let sql = seen.body["configuration"]["query"]["query"]
+            .as_str()
+            .unwrap_or("");
+        let status = match job(sql) {
+            Job::Scalar(n) => {
+                results.lock().unwrap().insert(id.clone(), n);
+                r#"{"state":"DONE"}"#.to_string()
+            }
+            Job::Fails(why) => format!(r#"{{"state":"DONE","errorResult":{{"message":"{why}"}}}}"#),
+        };
+        json(
+            200,
+            &format!(r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{status}}}"#),
+        )
+    })
+}
+
+/// A loader of `p.d` whose client is the stand's.
+fn on(stand: &Stand) -> BigQueryLoader {
+    let loader = BigQueryLoader::new("p", "d");
+    assert!(loader.api.set(stand.api()).is_ok());
+    loader
+}
+
+/// Every statement the stand was sent, in order.
+fn statements(stand: &Stand) -> Vec<String> {
+    let sql = |r: &crate::load::bq_rest::stand::Seen| {
+        r.body["configuration"]["query"]["query"]
+            .as_str()
+            .map(String::from)
+    };
+    stand.seen().iter().filter_map(sql).collect()
+}
+
+/// A change log holds prior changes when its probe counts one; a log that is not there is the first cycle, and any other failure is a failure.
+#[test]
+fn a_change_log_has_prior_changes_only_when_its_probe_counts_one() {
+    let stand = world(&[], |sql| match sql {
+        s if s.contains("p.d.some__changes") => Job::Scalar(1),
+        s if s.contains("p.d.none__changes") => Job::Scalar(0),
+        s if s.contains("p.d.absent__changes") => {
+            Job::Fails("Not found: Table p:d.absent__changes was not found")
+        }
+        _ => Job::Fails("Access Denied: Table p:d.denied__changes"),
+    });
+    let loader = on(&stand);
+    assert!(loader.changes_has_prior_changes("some").unwrap());
+    assert!(!loader.changes_has_prior_changes("none").unwrap());
+    assert!(!loader.changes_has_prior_changes("absent").unwrap());
+    let denied = format!(
+        "{:#}",
+        loader.changes_has_prior_changes("denied").unwrap_err()
+    );
+    assert!(denied.contains("Access Denied"), "{denied}");
+    assert!(statements(&stand)[0].contains("WHERE __op IS NOT NULL LIMIT 1"));
+}
+
+/// A table's rows are its metadata count, with no job; a view's are counted by a query.
+#[test]
+fn rows_are_read_from_table_metadata_and_counted_only_for_a_view() {
+    let stand = world(
+        &[
+            ("t", r#"{"type":"TABLE","numRows":"42"}"#),
+            ("v", r#"{"type":"VIEW","numRows":"0"}"#),
+        ],
+        |_| Job::Scalar(7),
+    );
+    let loader = on(&stand);
+    assert_eq!(loader.row_count("t").unwrap(), 42);
+    assert!(
+        statements(&stand).is_empty(),
+        "a table's count costs no job"
+    );
+    assert_eq!(loader.row_count("v").unwrap(), 7);
+    assert_eq!(statements(&stand), ["SELECT COUNT(*) AS n FROM `p.d.v`"]);
+}
+
+/// A statement is sent as written under the operation and table it serves, and its failure is the caller's.
+#[test]
+fn a_statement_is_sent_under_its_operation_and_table() {
+    let stand = world(&[], |sql| match sql.contains("BROKEN") {
+        true => Job::Fails("Syntax error"),
+        false => Job::Scalar(0),
+    });
+    let loader = on(&stand).run_id("r1");
+    loader
+        .run_sql("CREATE TABLE `p.d.x` (a INT64)", "merge", "orders")
+        .unwrap();
+    let sent = &stand.seen()[0].body["configuration"];
+    assert_eq!(sent["query"]["query"], "CREATE TABLE `p.d.x` (a INT64)");
+    assert_eq!(sent["labels"]["rivet_op"], "merge");
+    assert_eq!(sent["labels"]["rivet_table"], "orders");
+    assert!(loader.run_sql("BROKEN", "load", "orders").is_err());
+}
+
+/// The shape of an existing table is read from its metadata; no table has no shape and no conflict.
+#[test]
+fn the_existing_shape_is_the_tables_own_and_an_absent_table_has_none() {
+    let stand = world(
+        &[(
+            "t",
+            r#"{"type":"TABLE","numRows":"1","clustering":{"fields":["a_col"]}}"#,
+        )],
+        |_| Job::Scalar(0),
+    );
+    let loader = on(&stand);
+    assert_eq!(
+        loader.existing_shape("t").unwrap().unwrap().cluster,
+        ["a_col"]
+    );
+    assert_eq!(loader.existing_shape("absent").unwrap(), None);
+    assert_eq!(loader.table_shape_conflict("absent").unwrap(), None);
+    assert_eq!(
+        loader.table_shape_conflict("t").unwrap(),
+        None,
+        "nothing was asked of its shape"
+    );
+    assert!(loader.shape().is_some(), "BigQuery controls shape");
+}
+
+/// A recluster is one metadata patch of the change log with the written columns.
+#[test]
+fn a_recluster_patches_the_change_log_with_the_written_columns() {
+    let stand = world(&[], |_| Job::Scalar(0));
+    let mut loader = on(&stand);
+    loader.clustering = Clustering::Written(vec!["a".into(), "b".into()]);
+    loader.recluster_changelog("t").unwrap();
+    let patch = stand
+        .seen()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .expect("a PATCH");
+    assert_eq!(
+        patch.path,
+        "/bigquery/v2/projects/p/datasets/d/tables/t__changes"
+    );
+    assert_eq!(
+        patch.body["clustering"]["fields"],
+        serde_json::json!(["a", "b"])
+    );
+    assert!(statements(&stand).is_empty(), "no job");
+}
+
+/// A rebuilt copy that does not hold the log's rows is left beside it: nothing is swapped.
+#[test]
+fn a_rebuild_whose_copy_lost_rows_swaps_nothing() {
+    let run = |copy_rows: &'static str| {
+        let tables: &'static [(&'static str, &'static str)] = match copy_rows {
+            "5" => &[
+                ("t__changes", r#"{"type":"TABLE","numRows":"5"}"#),
+                ("t__changes__rebuild", r#"{"type":"TABLE","numRows":"5"}"#),
+            ],
+            _ => &[
+                ("t__changes", r#"{"type":"TABLE","numRows":"5"}"#),
+                ("t__changes__rebuild", r#"{"type":"TABLE","numRows":"4"}"#),
+            ],
+        };
+        let stand = world(tables, |_| Job::Scalar(0));
+        let result = on(&stand)
+            .rebuild_changelog("t")
+            .map_err(|e| format!("{e:#}"));
+        (result, statements(&stand))
+    };
+    let (lost, sent) = run("4");
+    let why = lost.unwrap_err();
+    assert!(
+        why.contains("holds 4 rows") && why.contains("nothing was swapped"),
+        "{why}"
+    );
+    assert_eq!(sent.len(), 1, "the copy and no swap: {sent:?}");
+    let (kept, sent) = run("5");
+    assert_eq!(kept, Ok(()));
+    assert!(sent.len() > 1, "the copy, then the swap: {sent:?}");
+}
+
+/// The clustering list is checked before anything is sent, and the partition expression is the configured one.
+#[test]
+fn a_bad_clustering_list_is_refused_and_the_partition_expression_is_the_plans() {
+    let mut loader = BigQueryLoader::new("p", "d");
+    assert_eq!(loader.partition_expr(), None);
+    loader.check_cluster_by().unwrap();
+    loader.clustering = Clustering::Written(vec!["a; DROP".into()]);
+    assert!(loader.check_cluster_by().is_err());
+    let part = TablePartition {
+        key: crate::load::plan::PartitionKey::Time {
+            column: Some("ts".into()),
+            granularity: crate::load::plan::Granularity::Day,
+        },
+        expr: "DATE(ts)".into(),
+        expiration_days: None,
+        require_filter: false,
+    };
+    assert_eq!(loader.partition(part).partition_expr(), Some("DATE(ts)"));
+}
