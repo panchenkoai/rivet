@@ -1304,6 +1304,48 @@ mod tests {
         );
     }
 
+    /// A plain run that finds a chunk run left in progress (its process gone) runs as its resume; a run that already is a resume, and a plan of another mode, are left as they are.
+    #[test]
+    fn a_plain_run_over_a_chunk_run_left_in_progress_becomes_its_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+        let plan = make_plan("orders");
+        let cp = chunked_plan(&plan).clone();
+        let mut summary = make_summary(&plan, "run-1");
+        let progress = state.claim(plan.progress_key()).unwrap();
+        ensure_chunk_checkpoint_plan(
+            &state,
+            &plan,
+            &cp,
+            &mut summary,
+            &[(1, 100), (101, 200)],
+            "rivet.yaml",
+            &progress,
+        )
+        .expect("the chunk run is opened");
+        assert!(!plan.resume);
+        let resumed = recover_checkpoint_run(&plan, &progress, false)
+            .unwrap()
+            .expect("the plain run takes the crashed run over");
+        assert!(resumed.resume);
+        assert_eq!(resumed.export_name, plan.export_name);
+
+        let mut already = plan.clone();
+        already.resume = true;
+        assert!(
+            recover_checkpoint_run(&already, &progress, false)
+                .unwrap()
+                .is_none()
+        );
+        let mut full = plan.clone();
+        full.strategy = ExtractionStrategy::Snapshot;
+        assert!(
+            recover_checkpoint_run(&full, &progress, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// A chunk run whose task list failed to land must not be left for a plain run to resume as a zero-chunk success.
     #[test]
     fn a_failed_task_insert_leaves_no_chunk_run_to_resume_as_an_empty_success() {

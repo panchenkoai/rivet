@@ -620,6 +620,21 @@ impl Spawned<'_> {
         })
     }
 
+    /// What a run that did not exit 0 printed, logged as ungraded: a run of its group delivered beside it, and a snapshot cannot tell that run's marker, manifest and state rows from what this one left. The delivery's own grade compares the whole prefix with the source, so a part this run wrote would show there.
+    pub fn reaped_beside_a_delivery(
+        mut self,
+        status: std::process::ExitStatus,
+    ) -> std::process::Output {
+        if let Some(case) = self.case.take() {
+            case.ungraded("a run of its group delivered beside it; what it left is graded by that run's delivery");
+        }
+        std::process::Output {
+            status,
+            stdout: std::fs::read(&self.said[0]).expect("spawned stdout"),
+            stderr: std::fs::read(&self.said[1]).expect("spawned stderr"),
+        }
+    }
+
     /// Grade the run once, by its exit.
     fn reaped(&mut self, status: std::process::ExitStatus) {
         self.rig.absorb_product_config_writes();

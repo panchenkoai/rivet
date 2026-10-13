@@ -28,6 +28,13 @@
     more connection per rivet process), where only checkpointed runs did.
   - The lease is released by the operating system (SQLite state) or expires by its keeper
     (PostgreSQL state) when the process dies, `kill -9` included; nothing has to be cleaned up.
+  - **New file beside a SQLite state database:** every run leaves an empty
+    `.rivet_state.db.lease-chunk-run-<export>` next to `.rivet_state.db`, one per export. Only
+    checkpointed runs and loads left such files before. They hold no data and may be deleted
+    while no rivet process runs; the next run creates its own again.
+  - A state database or state directory that is read-only still refuses the run with
+    `RIVET_STATE_NOT_WRITABLE` (exit 1), now also when it is the lease file that cannot be
+    created.
 - **Fixed: a `mode: chunked` config the planner refuses on a large table is refused on a small
   one too.** PostgreSQL, MySQL, SQL Server and Oracle; exports with the `table:` shortcut.
   Reproduced on rivet 0.31.0 with PostgreSQL.

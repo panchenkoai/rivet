@@ -351,14 +351,22 @@ impl Rig {
         }
     }
 
-    /// Start `n` `rivet run` of this rig back to back and reap them once all have ended: what each printed and its exit, each graded like any other run.
+    /// Start `n` `rivet run` of this rig back to back and reap them once all have ended: what each printed and its exit. Each is graded like any other run, except a run that did not exit 0 while another of the group delivered: by then that delivery's marker, manifest and state rows are in the snapshot, so it is logged ungraded and the delivery's grade covers the prefix.
     pub fn runs_at_once(&self, n: usize) -> Vec<std::process::Output> {
         let mut live: Vec<Spawned<'_>> = (0..n).map(|_| self.spawn_args_env(&[], &[])).collect();
-        for run in &mut live {
-            std::process::Child::wait(run).expect("wait for a run started beside another");
-        }
+        let ended: Vec<std::process::ExitStatus> = live
+            .iter_mut()
+            .map(|run| {
+                std::process::Child::wait(run).expect("wait for a run started beside another")
+            })
+            .collect();
+        let one_delivered = ended.iter().any(|s| s.success());
         live.into_iter()
-            .map(|run| run.wait_with_output().expect("reap the run"))
+            .zip(ended)
+            .map(|(run, status)| match one_delivered && !status.success() {
+                true => run.reaped_beside_a_delivery(status),
+                false => run.wait_with_output().expect("reap the run"),
+            })
             .collect()
     }
 
@@ -413,11 +421,14 @@ impl Rig {
             rusqlite::Connection::open(dir.join(".rivet_state.db"))
                 .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())))
                 .expect("checkpoint the state");
-            let state = state_files(&dir);
+            let state: Vec<PathBuf> = state_files(&dir)
+                .into_iter()
+                .filter(|p| !p.to_string_lossy().contains(".rivet_state.db.lease-"))
+                .collect();
             assert_eq!(
                 state.len(),
                 1,
-                "fixture: a state no process has open is one file, with no -wal or -shm: {state:?}"
+                "fixture: a state no process has open is one file beside its lease sidecars, with no -wal or -shm: {state:?}"
             );
         }
         let mut guard = ReadOnly {

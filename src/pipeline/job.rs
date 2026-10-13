@@ -1365,7 +1365,11 @@ fn execute_resolved_plan(
         return (Err(e), summary);
     }
     // The lease first: a run refused beside a live one claims nothing of the export's progress.
-    let claim = chunked::claim_run(state, plan).and_then(|lease| {
+    let lease = chunked::claim_run(state, plan).map_err(|e| match crate::error::error_code(&e) {
+        Some(_) => e,
+        None => state_not_writable(&plan.export_name, &e),
+    });
+    let claim = lease.and_then(|lease| {
         let progress = state.claim(plan.progress_key())?;
         let recovered = chunked::recover_checkpoint_run(plan, &progress, tail.force)?;
         Ok((progress, lease, recovered))
