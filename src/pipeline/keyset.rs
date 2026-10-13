@@ -43,15 +43,18 @@ fn rehydrate_keyset_pages_probed(
     plan: &ResolvedRunPlan,
     summary: &mut crate::pipeline::RunSummary,
 ) -> anyhow::Result<()> {
-    let probe: Option<std::collections::HashSet<String>> =
+    let probe: Option<super::chunked::Listed> =
         match crate::destination::create_destination(&plan.destination) {
             Ok(dest) if dest.capabilities().commit_protocol.leaves_objects_at_rest() => {
                 match dest.list_prefix("") {
                     Ok(listing) => Some(
                         listing
                             .iter()
-                            .map(|m| m.key.rsplit('/').next().unwrap_or(&m.key).to_string())
-                            .collect(),
+                            .map(|m| {
+                                let base = m.key.rsplit('/').next().unwrap_or(&m.key);
+                                (base.to_string(), m.size_bytes)
+                            })
+                            .collect::<super::chunked::Listed>(),
                     ),
                     Err(e) => {
                         log::warn!(

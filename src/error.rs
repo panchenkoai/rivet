@@ -712,6 +712,16 @@ pub mod codes {
         "RIVET_STATE_RUN_IN_PROGRESS",
         "wait for the run to finish, or stop its process, then repeat the command",
     );
+    /// A resume met an unfinished chunk run opened under another query or other chunk settings.
+    pub const STATE_CHUNK_PLAN_CHANGED: Code = refusal(
+        "RIVET_STATE_CHUNK_PLAN_CHANGED",
+        "restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over",
+    );
+    /// The chunk windows stored for an unfinished run are not one unbroken sequence of keys.
+    pub const STATE_CHUNK_WINDOWS_BROKEN: Code = refusal(
+        "RIVET_STATE_CHUNK_WINDOWS_BROKEN",
+        "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run plans the export again and reads every key",
+    );
     /// A checkpointed run found its `chunk_run` row gone when it came to complete it.
     pub const STATE_CHUNK_CHECKPOINT_GONE: Code = refusal(
         "RIVET_STATE_CHUNK_CHECKPOINT_GONE",
@@ -889,6 +899,8 @@ pub mod codes {
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
+        STATE_CHUNK_PLAN_CHANGED,
+        STATE_CHUNK_WINDOWS_BROKEN,
         STATE_LEASE_KEEPER_UNAVAILABLE,
         STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,
