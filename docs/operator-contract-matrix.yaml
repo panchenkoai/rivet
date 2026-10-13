@@ -353,17 +353,17 @@ scenarios:
     oracle:   { test: open_defect_range_chunking_takes_a_number_19_key_oracle }
 
   - id: decimal_chunk_column_verdict_follows_the_estimate
-    what: "2026-10-09 finding: a `mode: chunked` config with a DECIMAL `chunk_column` is refused over 10 rows (chunk_size 4) and must be refused over 3; open defect: over 3 rows it runs, because the small-table escape precedes the shape validation"
-    postgres: { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres }
-    mysql:    { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql }
-    mssql:    { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql }
+    what: "2026-10-09 finding: a `mode: chunked` config with a DECIMAL `chunk_column` is refused over 10 rows (chunk_size 4) and over 3: the shape is validated before the small-table escape"
+    postgres: { test: a_decimal_chunk_column_is_refused_whatever_the_row_estimate_postgres }
+    mysql:    { test: a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mysql }
+    mssql:    { test: a_decimal_chunk_column_is_refused_whatever_the_row_estimate_mssql }
     mongo:    { na: "a Mongo export has no `mode: chunked`" }
-    oracle:   { test: open_defect_a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle }
+    oracle:   { test: a_decimal_chunk_column_is_refused_whatever_the_row_estimate_oracle }
 
   - id: keyless_table_verdict_follows_the_estimate
-    what: "2026-10-09 finding: a `mode: chunked` config with no `chunk_column` over a table with no key is refused over 10 rows (chunk_size 4) and must be refused over 3; open defect: over 3 rows it runs, because the small-table escape precedes the shape validation"
-    postgres: { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_postgres }
-    mysql:    { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mysql }
-    mssql:    { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_mssql }
+    what: "2026-10-09 finding: a `mode: chunked` config with no `chunk_column` over a table with no key is refused over 10 rows (chunk_size 4) and over 3: the shape is validated before the small-table escape"
+    postgres: { test: a_keyless_table_is_refused_whatever_the_row_estimate_postgres }
+    mysql:    { test: a_keyless_table_is_refused_whatever_the_row_estimate_mysql }
+    mssql:    { test: a_keyless_table_is_refused_whatever_the_row_estimate_mssql }
     mongo:    { na: "a Mongo export has no `mode: chunked`" }
-    oracle:   { test: open_defect_a_keyless_table_is_refused_whatever_the_row_estimate_oracle }
+    oracle:   { test: a_keyless_table_is_refused_whatever_the_row_estimate_oracle }

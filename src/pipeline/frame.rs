@@ -104,6 +104,7 @@ mod tests {
             split_window: None,
             bytes_read: Default::default(),
             parts_landed: Default::default(),
+            single_pass_of: None,
             export_name: "frame_probe".into(),
             partition_rollover: None,
             source_table: None,

@@ -1598,14 +1598,14 @@ fn delivered_spent(engine: SqlEngine, out: &Path) -> Vec<(i64, i64)> {
     rows
 }
 
-/// One checkpointed runner shape: its stage, the same stage with the checkpoint removed, where its first run crashes, the state subcommand that abandons it, how many rows the source holds, and the table's columns when not the standard ones.
+/// One checkpointed runner shape: its stage, the same stage with the checkpoint removed, where its first run crashes, the state subcommand that abandons it, how many rows the source holds, and whether the table's `id` is its primary key.
 struct Checkpointed {
     prior: Stage,
     plain: Stage,
     crash_at: &'static str,
     abandon: &'static str,
     rows: i64,
-    columns: Option<&'static str>,
+    primary_key: bool,
 }
 
 const RANGE_CHUNK_RUN: Checkpointed = Checkpointed {
@@ -1614,7 +1614,7 @@ const RANGE_CHUNK_RUN: Checkpointed = Checkpointed {
     crash_at: "after_chunk_complete:0",
     abandon: "reset-chunks",
     rows: 10,
-    columns: None,
+    primary_key: true,
 };
 /// A range-chunk run over a table that fits in one chunk: with a real row estimate the planner runs the uncheckpointed stage as a single pass.
 const ONE_CHUNK_RANGE_RUN: Checkpointed = Checkpointed {
@@ -1623,7 +1623,7 @@ const ONE_CHUNK_RANGE_RUN: Checkpointed = Checkpointed {
     crash_at: "after_chunk_complete:0",
     abandon: "reset-chunks",
     rows: 3,
-    columns: None,
+    primary_key: true,
 };
 /// MySQL only (ADR-0020): no `chunk_column` and no single-integer primary key, so the planner pages a unique key by keyset; the table fits in one chunk.
 const ONE_CHUNK_AUTO_KEYSET_RUN: Checkpointed = Checkpointed {
@@ -1632,10 +1632,7 @@ const ONE_CHUNK_AUTO_KEYSET_RUN: Checkpointed = Checkpointed {
     crash_at: "after_keyset_page:0",
     abandon: "reset",
     rows: 3,
-    columns: Some(
-        "id BIGINT NOT NULL UNIQUE, ext_id BIGINT NOT NULL UNIQUE, server_time DATETIME(6) NOT NULL, \
-         updated_at DATETIME(6) NULL, time_spent INT NULL",
-    ),
+    primary_key: false,
 };
 const KEYSET_RUN: Checkpointed = Checkpointed {
     prior: KEYSET_CHECKPOINT,
@@ -1643,7 +1640,7 @@ const KEYSET_RUN: Checkpointed = Checkpointed {
     crash_at: "after_keyset_page:0",
     abandon: "reset",
     rows: 10,
-    columns: None,
+    primary_key: true,
 };
 const PARALLEL_KEYSET_RUN: Checkpointed = Checkpointed {
     prior: PARALLEL_KEYSET_CHECKPOINT,
@@ -1651,15 +1648,15 @@ const PARALLEL_KEYSET_RUN: Checkpointed = Checkpointed {
     crash_at: "keyset_parallel_range_committed:0",
     abandon: "reset",
     rows: 10,
-    columns: None,
+    primary_key: true,
 };
 
 /// MT10: a checkpointed run crashes with a part of ids 1..=`shape.rows` delivered (the row estimate refreshed first, so the plan does not follow the engine's guess), then the export drops its checkpoint with no reset: refused twice, nothing written. After `remedy` the uncheckpointed run delivers the source as it is (as a single pass when the table fits in one chunk), and the checkpoint put back starts a fresh run over rows changed since.
 fn crashed_run_then_checkpoint_removed(engine: SqlEngine, shape: Checkpointed, remedy: Remedy) {
     engine.alive();
-    let (table, _guard) = match shape.columns {
-        Some(columns) => engine.create("ckpt_removed", columns),
-        None => engine.range_table("ckpt_removed"),
+    let (table, _guard) = match shape.primary_key {
+        true => engine.range_table("ckpt_removed"),
+        false => engine.table_without_a_primary_key("ckpt_removed"),
     };
     engine.insert(&table, 1..=shape.rows, 180, Some(10));
     engine.refresh_row_estimate(&table);
@@ -2066,16 +2063,15 @@ fn crashed_range_chunk_then_checkpoint_removed_reset_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_postgres()
- {
+#[ignore = "live: requires docker compose postgres"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_postgres()
+{
     crashed_run_then_checkpoint_removed(SqlEngine::Pg, ONE_CHUNK_RANGE_RUN, Remedy::FinishTheRun);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql()
- {
+#[ignore = "live: requires docker compose mysql"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql() {
     crashed_run_then_checkpoint_removed(
         SqlEngine::Mysql,
         ONE_CHUNK_RANGE_RUN,
@@ -2084,9 +2080,8 @@ fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_ow
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mssql()
- {
+#[ignore = "live: requires docker compose mssql"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mssql() {
     crashed_run_then_checkpoint_removed(
         SqlEngine::Mssql,
         ONE_CHUNK_RANGE_RUN,
@@ -2096,9 +2091,8 @@ fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_ow
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_oracle()
- {
+#[ignore = "live: requires docker compose oracle"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_oracle() {
     crashed_run_then_checkpoint_removed(
         SqlEngine::Oracle,
         ONE_CHUNK_RANGE_RUN,
@@ -2107,37 +2101,33 @@ fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_ow
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_postgres()
- {
+#[ignore = "live: requires docker compose postgres"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_postgres() {
     crashed_run_then_checkpoint_removed(SqlEngine::Pg, ONE_CHUNK_RANGE_RUN, Remedy::Reset);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql()
-{
+#[ignore = "live: requires docker compose mysql"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql() {
     crashed_run_then_checkpoint_removed(SqlEngine::Mysql, ONE_CHUNK_RANGE_RUN, Remedy::Reset);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mssql()
-{
+#[ignore = "live: requires docker compose mssql"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mssql() {
     crashed_run_then_checkpoint_removed(SqlEngine::Mssql, ONE_CHUNK_RANGE_RUN, Remedy::Reset);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_oracle()
- {
+#[ignore = "live: requires docker compose oracle"]
+fn a_one_chunk_range_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_oracle() {
     crashed_run_then_checkpoint_removed(SqlEngine::Oracle, ONE_CHUNK_RANGE_RUN, Remedy::Reset);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql()
+#[ignore = "live: requires docker compose mysql"]
+fn a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_finish_the_run_mysql()
  {
     crashed_run_then_checkpoint_removed(
         SqlEngine::Mysql,
@@ -2147,9 +2137,8 @@ fn open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a single pass of a chunked export owns its progress as `full`), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql()
- {
+#[ignore = "live: requires docker compose mysql"]
+fn a_one_chunk_auto_keyset_run_without_its_checkpoint_is_refused_as_its_own_mode_reset_mysql() {
     crashed_run_then_checkpoint_removed(SqlEngine::Mysql, ONE_CHUNK_AUTO_KEYSET_RUN, Remedy::Reset);
 }
 
