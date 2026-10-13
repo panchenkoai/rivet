@@ -907,12 +907,10 @@ fn chunked_strategy_from_introspection(
     // chunk_size at detect time from min/max (so comparing the estimate
     // against the static default chunk_size is meaningless), `chunk_by_days`
     // asks for date-ranged chunks, `chunk_checkpoint` asks for resumability a
-    // Snapshot cannot provide, and `chunk_by_key` pins keyset pagination.
+    // Snapshot cannot provide (`chunk_by_key` returned its keyset plan above).
     // None of these may be silently collapsed to one snapshot file.
-    let explicit_chunk_shape = export.chunk_count.is_some()
-        || export.chunk_by_days.is_some()
-        || export.chunk_checkpoint
-        || export.chunk_by_key.is_some();
+    let explicit_chunk_shape =
+        export.chunk_count.is_some() || export.chunk_by_days.is_some() || export.chunk_checkpoint;
     if !explicit_chunk_shape
         && introspection.row_estimate > 0
         && (introspection.row_estimate as usize) <= chunk_size
@@ -2236,6 +2234,37 @@ mod tests {
         single_pass.single_pass_of = Some(PagedMode::Keyset);
         let said = refused_beside_a_chunk_run(&single_pass);
         assert!(said.contains("this export now runs as `keyset`"), "{said}");
+    }
+
+    /// The escape is for a table with a real estimate and no explicit chunk knob: an estimate of zero, `chunk_count`, `chunk_by_days` or `chunk_checkpoint` each keep the chunked plan on a table that fits in one chunk.
+    #[test]
+    fn the_small_table_escape_leaves_an_unknown_estimate_and_explicit_knobs_chunked() {
+        use crate::config::SourceType;
+        let stays_chunked = |export: &ExportConfig, rows: i64| {
+            let i = intro(Some("id"), &["id"], rows, Some(100), &["id"]);
+            matches!(
+                chunked_strategy_from_introspection(
+                    SourceType::Postgres,
+                    export,
+                    "public.t",
+                    3,
+                    &i
+                ),
+                Ok((ExtractionStrategy::Chunked(_), None))
+            )
+        };
+        let plain = chunked_export();
+        assert!(!stays_chunked(&plain, 3), "three rows are one pass");
+        assert!(stays_chunked(&plain, 0), "no estimate is not a small table");
+        let mut count = chunked_export();
+        count.chunk_count = Some(2);
+        assert!(stays_chunked(&count, 3), "chunk_count");
+        let mut days = chunked_export();
+        days.chunk_by_days = Some(1);
+        assert!(stays_chunked(&days, 3), "chunk_by_days");
+        let mut checkpoint = chunked_export();
+        checkpoint.chunk_checkpoint = true;
+        assert!(stays_chunked(&checkpoint, 3), "chunk_checkpoint");
     }
 
     /// A shape refused on a large table is refused on one that fits in a chunk, and a shape that plans is still one pass there.
