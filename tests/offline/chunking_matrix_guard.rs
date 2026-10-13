@@ -239,6 +239,10 @@ const MATRICES: &[(&str, usize)] = &[
     // the value cells assert against an INDEPENDENT oracle (hard-coded string / DuckDB
     // re-read), not the writer's own rendering (the self-oracle that hid the bug). 0 gaps.
     ("docs/csv-fidelity-matrix.yaml", 0),
+    // Source conformance — every `Source` method called directly on a live source, one
+    // test body for the SQL engines. A mutation sweep left 101 whole-body stubs of
+    // these methods alive in all five engines: nothing called them but the CLI. 0 gaps.
+    ("docs/source-conformance-matrix.yaml", 0),
     // Runner-coverage — every PER-EXPORT feature applied on EVERY runner (single /
     // chunked / keyset / mongo_parallel), not just single. Round-8 proved the class:
     // keyset + parallel-Mongo silently dropped the on_schema_drift gate (exit 0 on
