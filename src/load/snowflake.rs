@@ -1040,7 +1040,7 @@ mod tests {
 
     impl Stand {
         /// Answer by `rules`: `(text the statement holds, exit code, stdout, stderr)`.
-        fn start(rules: &[(&str, i32, &str, &str)]) -> Self {
+        fn scripted(rules: &[(&str, i32, &str, &str)]) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let script: Vec<serde_json::Value> = rules
                 .iter()
@@ -1117,12 +1117,12 @@ mod tests {
             (r#"{"KIND_":2}"#, crate::load::ObjectKind::View),
             (r#"{"KIND_":4}"#, crate::load::ObjectKind::Other),
         ] {
-            let stand = Stand::start(&[("INFORMATION_SCHEMA.TABLES", 0, &answer(row), "")]);
+            let stand = Stand::scripted(&[("INFORMATION_SCHEMA.TABLES", 0, &answer(row), "")]);
             assert_eq!(stand.loader().object_kind("orders").unwrap(), want, "{row}");
             assert_eq!(stand.sent().len(), 1);
         }
         // What `COUNT_IF` over no rows gave: a NULL the loader does not take for "absent".
-        let stand = Stand::start(&[(
+        let stand = Stand::scripted(&[(
             "INFORMATION_SCHEMA.TABLES",
             0,
             &answer(r#"{"KIND_":null}"#),
@@ -1133,14 +1133,14 @@ mod tests {
             format!("{err:#}").contains("KIND_ was not in snow's output"),
             "{err:#}"
         );
-        let stand = Stand::start(&[("INFORMATION_SCHEMA.TABLES", 1, "", "denied")]);
+        let stand = Stand::scripted(&[("INFORMATION_SCHEMA.TABLES", 1, "", "denied")]);
         assert!(stand.loader().object_kind("orders").is_err());
     }
 
     /// Whether a change log holds prior changes is asked of the catalog first: a log that is not there is the first cycle and is never selected from, whatever `snow` would print about it.
     #[test]
     fn a_missing_change_log_is_the_first_cycle_by_the_catalog_not_by_an_error_text() {
-        let absent = Stand::start(&[
+        let absent = Stand::scripted(&[
             (
                 "INFORMATION_SCHEMA.TABLES",
                 0,
@@ -1163,7 +1163,7 @@ mod tests {
         );
 
         for (probe, want) in [(1, true), (0, false)] {
-            let there = Stand::start(&[
+            let there = Stand::scripted(&[
                 (
                     "INFORMATION_SCHEMA.TABLES",
                     0,
@@ -1185,7 +1185,7 @@ mod tests {
         }
 
         // A log that is there and cannot be read is an error, not a first cycle.
-        let unreadable = Stand::start(&[
+        let unreadable = Stand::scripted(&[
             (
                 "INFORMATION_SCHEMA.TABLES",
                 0,
@@ -1200,7 +1200,7 @@ mod tests {
                 .changes_has_prior_changes("orders")
                 .is_err()
         );
-        let drifted = Stand::start(&[
+        let drifted = Stand::scripted(&[
             (
                 "INFORMATION_SCHEMA.TABLES",
                 0,
@@ -1222,7 +1222,7 @@ mod tests {
     /// The column overlap and the row count are the catalog's and the table's own numbers.
     #[test]
     fn the_column_overlap_and_the_row_count_are_read_by_name() {
-        let stand = Stand::start(&[
+        let stand = Stand::scripted(&[
             (
                 "INFORMATION_SCHEMA.COLUMNS",
                 0,
@@ -1241,7 +1241,7 @@ mod tests {
         let sent = stand.sent();
         assert!(sent[0].contains("IN ('id', 'amount')"), "{}", sent[0]);
         assert!(sent[1].contains("FROM DB.SC.orders;"), "{}", sent[1]);
-        let none = Stand::start(&[(
+        let none = Stand::scripted(&[(
             "INFORMATION_SCHEMA.COLUMNS",
             0,
             &answer(r#"{"TOTAL_":0,"MATCHED_":0}"#),
