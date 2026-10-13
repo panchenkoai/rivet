@@ -144,11 +144,11 @@ scenarios:
 
   - id: corrupt_success_without_manifest
     what: "`_SUCCESS` and the parts present, manifest.json removed: `validate` does not exit 0"
-    postgres: { test: open_defect_validate_fails_on_a_marker_without_a_manifest_postgres }
-    mysql:    { test: open_defect_validate_fails_on_a_marker_without_a_manifest_mysql }
-    mssql:    { test: open_defect_validate_fails_on_a_marker_without_a_manifest_mssql }
-    mongo:    { test: open_defect_validate_fails_on_a_marker_without_a_manifest_mongo }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    postgres: { test: validate_fails_on_a_marker_without_a_manifest_postgres }
+    mysql:    { test: validate_fails_on_a_marker_without_a_manifest_mysql }
+    mssql:    { test: validate_fails_on_a_marker_without_a_manifest_mssql }
+    mongo:    { test: validate_fails_on_a_marker_without_a_manifest_mongo }
+    oracle:   { test: validate_fails_on_a_marker_without_a_manifest_oracle }
 
   - id: corrupt_manifest_without_success
     what: "manifest.json present, `_SUCCESS` removed: the next run delivers and writes the marker again"

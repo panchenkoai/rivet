@@ -2282,26 +2282,33 @@ fn validate_sees_a_manifest_naming_a_part_that_is_not_there_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (validate passes a prefix with no manifest), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_marker_without_a_manifest_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn validate_fails_on_a_marker_without_a_manifest_postgres() {
     validate_sees_sql(SqlEngine::Pg, Harm::ManifestRemoved, "RIVET_VERIFY_");
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (validate passes a prefix with no manifest), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_marker_without_a_manifest_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn validate_fails_on_a_marker_without_a_manifest_mysql() {
     validate_sees_sql(SqlEngine::Mysql, Harm::ManifestRemoved, "RIVET_VERIFY_");
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (validate passes a prefix with no manifest), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_marker_without_a_manifest_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn validate_fails_on_a_marker_without_a_manifest_mssql() {
     validate_sees_sql(SqlEngine::Mssql, Harm::ManifestRemoved, "RIVET_VERIFY_");
 }
 
+#[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose mongo; open defect (validate passes a prefix with no manifest), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_validate_fails_on_a_marker_without_a_manifest_mongo() {
+#[ignore = "live: requires docker compose oracle"]
+fn validate_fails_on_a_marker_without_a_manifest_oracle() {
+    validate_sees_sql(SqlEngine::Oracle, Harm::ManifestRemoved, "RIVET_VERIFY_");
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn validate_fails_on_a_marker_without_a_manifest_mongo() {
     validate_sees_mongo(Harm::ManifestRemoved, "RIVET_VERIFY_");
 }
 

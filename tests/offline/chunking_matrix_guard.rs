@@ -346,7 +346,7 @@ const MATRICES: &[(&str, usize)] = &[
     // 2026-10-09, 118 -> 119: `refusal_state_lease_lost`. The refusal answers an event during
     // one load (its lease taken while the process is stalled); a second run meets a busy
     // lease, so `refuses_twice_and_walks_out` cannot produce it twice.
-    ("docs/sabotage-matrix.yaml", 119),
+    ("docs/sabotage-matrix.yaml", 118),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
