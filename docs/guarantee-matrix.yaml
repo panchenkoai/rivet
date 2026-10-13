@@ -377,9 +377,6 @@ guarantees:
       mssql: { test: validate_sees_a_truncated_part_mssql, asserts: "rig.validate_fails(finding);" }
       mongo: { test: validate_sees_a_truncated_part_mongo, asserts: "rig.validate_fails(finding);" }
       oracle: { test: validate_sees_a_truncated_part_oracle, asserts: "rig.validate_fails(finding);" }
-    contradicted_by:
-      known_red:
-        - "live_sabotage::open_defect_validate_fails_on_a_marker_without_a_manifest"
 
   - id: validate_never_queries_the_source
     stated:
