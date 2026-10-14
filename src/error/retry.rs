@@ -362,6 +362,36 @@ fn is_oracle_capacity(msg: &str) -> bool {
     CODES.iter().any(|c| msg.contains(c))
 }
 
+/// Is `err` the source refusing to convert a value to a column's type (22P02 and kin, SQL Server 8114/245/241/8115, ORA-01722 and kin)?
+pub(crate) fn is_value_conversion(err: &anyhow::Error) -> bool {
+    use postgres::error::SqlState;
+    let pg = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<postgres::Error>())
+        .and_then(postgres::Error::as_db_error);
+    if let Some(db) = pg {
+        return [
+            SqlState::INVALID_TEXT_REPRESENTATION,
+            SqlState::INVALID_DATETIME_FORMAT,
+            SqlState::DATETIME_FIELD_OVERFLOW,
+            SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
+        ]
+        .contains(db.code());
+    }
+    let msg = format!("{err:#}").to_lowercase();
+    const CODES: &[&str] = &[
+        "(code: 8114,", // error converting data type
+        "(code: 245,",  // conversion failed converting a value
+        "(code: 241,",  // conversion failed converting date/time
+        "(code: 8115,", // arithmetic overflow converting
+        "ora-01722",    // invalid number
+        "ora-01858",    // a non-numeric character where a numeric was expected
+        "ora-01861",    // literal does not match format string
+        "ora-01841",    // year out of range
+    ];
+    CODES.iter().any(|c| msg.contains(c))
+}
+
 fn is_oracle_lost_session(msg: &str) -> bool {
     const CODES: &[&str] = &[
         "ora-00028", // your session has been killed
@@ -1068,6 +1098,31 @@ mod tests {
         );
         for code in [SqlState::CONNECTION_EXCEPTION, SqlState::CONNECTION_FAILURE] {
             assert_eq!(classify_pg_sqlstate(&code), TRANSIENT_RECONNECT, "{code:?}");
+        }
+    }
+
+    /// A value-conversion refusal is recognised by its engine code, and nothing else is.
+    #[test]
+    fn a_value_conversion_is_recognised_by_its_engine_code() {
+        for msg in [
+            "mssql: streaming rows failed: Token error: 'Error converting data type varchar to bigint.' on server s executing  on line 1 (code: 8114, state: 5, class: 16)",
+            "Token error: 'Conversion failed when converting the varchar value 'x' to data type int.' (code: 245, state: 1, class: 16)",
+            "Token error: 'Conversion failed when converting date and/or time from character string.' (code: 241, state: 1, class: 16)",
+            "Token error: 'Arithmetic overflow error converting varchar to data type numeric.' (code: 8115, state: 8, class: 16)",
+            "ORA-01722: invalid number",
+            "ORA-01858: a non-numeric character was found where a numeric was expected",
+            "ORA-01861: literal does not match format string",
+            "ORA-01841: (full) year must be between -4713 and +9999",
+        ] {
+            assert!(is_value_conversion(&anyhow::anyhow!("{msg}")), "{msg}");
+        }
+        for msg in [
+            "Token error: 'Invalid object name.' (code: 208, state: 1, class: 16)",
+            "Token error: 'x' (code: 82450, state: 1, class: 16)",
+            "ORA-00942: table or view does not exist",
+            "connection reset by peer",
+        ] {
+            assert!(!is_value_conversion(&anyhow::anyhow!("{msg}")), "{msg}");
         }
     }
 }

@@ -1529,6 +1529,20 @@ fn reader_crashed(status: &std::process::ExitStatus) -> bool {
     matches!(status.signal(), Some(libc::SIGSEGV | libc::SIGBUS))
 }
 
+/// `(key, value)` integer pairs, sorted, over the parts the Success manifests under `dir` declare, read by the rig oracle's DuckDB: every run's, or the newest run's alone (`latest`).
+pub(crate) fn declared_pairs(dir: &Path, key: &str, value: &str, latest: bool) -> Vec<(i64, i64)> {
+    let spec = serde_json::json!({
+        "export": "*",
+        "dir": dir.display().to_string(),
+        "key": key,
+        "value": value,
+        "latest": latest,
+    });
+    let verdict = run_rig_oracle(&spec, "pairs");
+    serde_json::from_value(verdict["pairs"].clone())
+        .unwrap_or_else(|e| panic!("the rig oracle's pairs: {e}; got {verdict}"))
+}
+
 /// Run `dev/release_oracle/rig_oracle.py <verb>` (pinned by uv.lock) over `spec`; its JSON verdict. A reader that crashed is read once more, logged `RIVET-ORACLE-RERUN`.
 fn run_rig_oracle(spec: &serde_json::Value, verb: &str) -> serde_json::Value {
     run_rig_oracle_once(spec, verb, true).unwrap_or_else(|crash| {

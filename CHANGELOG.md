@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
+  through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision
+  were looked up in that wrapper, which names no table: the run failed with `precision/scale
+  unavailable from query metadata and catalog lookup`, although the same export without
+  `partition_by` ran (0.31.0 and earlier; a `--split` unit wraps the query the same way). **Now**
+  the plan keeps the query before the window (`catalog_query`) and every reader resolves type hints
+  from it. **What to do:** nothing.
+
+- **A stored incremental cursor of another type stopped every run with a raw driver error.**
+  When the stored cursor is not a value the cursor column can be compared with (the state was
+  edited, or the column changed type), PostgreSQL, SQL Server and Oracle failed every run with
+  their own conversion error (`invalid input syntax for type bigint`, `Error converting data type
+  varchar to bigint`), exit 1, no code and no remedy (0.31.0 and earlier; MySQL coerces the text
+  and delivers). **Now** the run is refused with `RIVET_STATE_CURSOR_INCOMPARABLE` (exit 5), which
+  names the cursor, the column and `rivet state reset`. **What to do:** nothing; an export stuck on
+  this error is led out by `rivet state reset -c <config> --export <name>`.
+
 - **A load could be refused as "another `rivet load` ... is writing" right after its own
   process released that table.** SQLite state only. The load lease is an `flock`, and it was
   released by closing the file; a process spawned on another thread at that moment kept a copy

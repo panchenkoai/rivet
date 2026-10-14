@@ -208,6 +208,7 @@ fn fill_keyset_page(
         // predicate internally, so the catalog parser still sees the source
         // table and hints resolve from `query` (`unwrapped`).
         &source::ExportRequest::unwrapped(&plan.base_query, &plan.tuning, &plan.column_overrides)
+            .with_catalog_hint_query(plan.catalog_query.as_deref())
             .with_incremental(Some(key_plan))
             .with_cursor(cursor_state.as_ref())
             .with_upper_bound(upper)

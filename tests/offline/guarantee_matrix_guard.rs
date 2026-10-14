@@ -17,7 +17,7 @@ const GATE_DIR: &str = "dev/release_oracle";
 // 27 -> 26 (2026-10-09): the guarantee checks left unwritten are written (#506, -1).
 // 26 -> 25 (2026-10-09): the docs name `_rivet_exported_at` as the one column that differs between runs, and a cell holds it (#506, -1).
 // 25 -> 23 (2026-10-09): flat-memory.md states what was measured and a capped-run cell holds it; source-safe-under-load.md scopes the one-page sentence to chunked (#506, -2).
-const ROWS_NOT_HELD: usize = 20; // ratchet-pin: guarantee-rows-not-held
+const ROWS_NOT_HELD: usize = 19; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
 // 29 -> 26 (2026-10-14): the `on_schema_drift: fail` cells already existed on MySQL, SQL Server and Oracle
 // (one body, live_schema_drift.rs); the row now cites them.

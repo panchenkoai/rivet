@@ -237,6 +237,14 @@ impl<'a> ExportRequest<'a> {
         }
     }
 
+    /// Resolve catalog type hints from `query` when given: a plan's `catalog_query`, the base before a split or partition window wrapped it.
+    pub fn with_catalog_hint_query(mut self, query: Option<&'a str>) -> Self {
+        if let Some(q) = query {
+            self.catalog_hint_query = Some(q);
+        }
+        self
+    }
+
     /// Attach the incremental cursor plan (the driver builds the `WHERE cursor >
     /// ? ORDER BY` predicate). Pass-through `Option` so mode-polymorphic callers
     /// can forward `strategy.incremental_plan()` directly.
