@@ -485,6 +485,88 @@ fn value_ceiling_ignores_null_cells() {
     assert!(sink.check_value_ceiling(&batch).is_ok());
 }
 
+/// One column of `ty` holding `values` (strings, or their bytes for a binary type).
+fn sized_batch(ty: DataType, values: &[&str]) -> RecordBatch {
+    let col: ArrayRef = match ty {
+        DataType::Utf8 => Arc::new(StringArray::from(values.to_vec())),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::from(values.to_vec())),
+        DataType::Binary => Arc::new(BinaryArray::from_iter_values(
+            values.iter().map(|v| v.as_bytes()),
+        )),
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::from_iter_values(
+            values.iter().map(|v| v.as_bytes()),
+        )),
+        _ => unreachable!(),
+    };
+    let schema = Arc::new(Schema::new(vec![Field::new("body", ty, true)]));
+    RecordBatch::try_new(schema, vec![col]).unwrap()
+}
+
+const SIZED_TYPES: [DataType; 4] = [
+    DataType::Utf8,
+    DataType::LargeUtf8,
+    DataType::Binary,
+    DataType::LargeBinary,
+];
+
+/// Every string and binary type: a value of exactly the ceiling passes, one byte over is refused.
+#[test]
+fn value_ceiling_holds_at_the_limit_for_every_sized_type() {
+    let mut sink = minimal_sink();
+    sink.max_value_bytes = Some(8);
+    for ty in SIZED_TYPES {
+        let at = sized_batch(ty.clone(), &["", "12345678"]);
+        assert!(sink.check_value_ceiling(&at).is_ok(), "{ty:?} at the limit");
+        let over = sized_batch(ty.clone(), &["1", "123456789"]);
+        let err = format!("{:#}", sink.check_value_ceiling(&over).unwrap_err());
+        assert!(
+            err.contains("RIVET_VALUE_TOO_LARGE") && err.contains("'body'"),
+            "{ty:?}: {err}"
+        );
+    }
+}
+
+/// Every string and binary type records its longest value, and a shorter later batch keeps it.
+#[test]
+fn shape_tracks_the_longest_value_of_every_sized_type() {
+    for ty in SIZED_TYPES {
+        let mut sink = minimal_sink();
+        sink.track_shape(&sized_batch(ty.clone(), &["ab", "abcde", "abc"]));
+        sink.track_shape(&sized_batch(ty.clone(), &["a"]));
+        assert_eq!(sink.column_max_bytes.get("body"), Some(&5), "{ty:?}");
+        sink.track_shape(&sized_batch(ty.clone(), &["abcdefg"]));
+        assert_eq!(sink.column_max_bytes.get("body"), Some(&7), "{ty:?}");
+    }
+}
+
+/// Under `fail`, a batch of exactly the memory limit is written; past it the refusal names the sizes.
+#[test]
+fn batch_memory_refusal_holds_at_the_limit_and_names_the_sizes() {
+    let big = "x".repeat(3 * 1024 * 1024 + 12_345);
+    let batch = sized_batch(DataType::Utf8, &[&big, "y"]);
+    let bytes = crate::tuning::SourceTuning::batch_memory_bytes(&batch);
+    let mut sink = minimal_sink();
+    sink.batch_memory_policy = crate::tuning::BatchMemoryPolicy::Fail;
+    sink.max_batch_memory_bytes = Some(bytes);
+    assert!(
+        sink.process_dest_batch(&batch).is_ok(),
+        "a batch of exactly the limit is written"
+    );
+
+    let mut sink = minimal_sink();
+    sink.batch_memory_policy = crate::tuning::BatchMemoryPolicy::Fail;
+    let limit = 1024 * 1024 + 777;
+    sink.max_batch_memory_bytes = Some(limit);
+    let err = format!("{:#}", sink.process_dest_batch(&batch).unwrap_err());
+    let want = format!(
+        "batch memory {} MB exceeds max_batch_memory_mb={} MB (2 rows). Lower batch_size to ~{} ",
+        bytes / (1024 * 1024),
+        limit / (1024 * 1024),
+        (2 * limit / bytes).max(1)
+    );
+    assert!(err.contains(&want), "{err}\nwant: {want}");
+}
+
 // ─── helpers ─────────────────────────────────────────────────
 
 fn minimal_sink() -> ExportSink {
