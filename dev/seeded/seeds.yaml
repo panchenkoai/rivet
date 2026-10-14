@@ -1792,6 +1792,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: dead-runs-stay-running
+    class: "a run that died leaves its `run_status` and `export_metrics` rows `running`, and no later run of the export closes them"
+    history: "2026-10-14 - open defect (a run whose SQLite state volume filled up left its rows `running`) through 0.31.0; fixed by `begin_run_under_lease`, which stamps them `interrupted`"
+    scope: source
+    patch: dead-runs-stay-running/shared.patch
+    engines:
+      postgres:
+        cells: [a_crashed_runs_rows_are_closed_by_the_next_postgres]
+      mysql:
+        cells: [a_crashed_runs_rows_are_closed_by_the_next_mysql]
+      mssql:
+        cells: [a_crashed_runs_rows_are_closed_by_the_next_mssql]
+      mongo:
+        cells: [a_crashed_runs_rows_are_closed_by_the_next_mongo]
+      oracle:
+        cells: [a_crashed_runs_rows_are_closed_by_the_next_oracle]
   - name: partition-child-loses-catalog-hints
     class: a `partition_by` child resolves catalog type hints from the bucket wrapper, which hides the source table, so a PostgreSQL NUMERIC(p,s) column refuses the export
     history: 2026-10-14 - open defect (partition_by over a NUMERIC column refused with `precision/scale unavailable`) through 0.31.0; fixed by the plan's catalog_query

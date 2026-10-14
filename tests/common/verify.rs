@@ -82,6 +82,8 @@ pub(crate) struct Case {
     began: String,
     /// The file holding what the run printed for its one `destination: stdout` export.
     stdout: Option<PathBuf>,
+    /// Why rivet's ledger may be missing: the run said its rows were delivered and its state was not stored; the oracle skips the ledger only when it holds no success row of the run.
+    unrecorded: Option<String>,
 }
 
 /// What a `rivet cdc` invocation adds to its equivalent config: its `--max-events` cap, and whether it printed NDJSON (no `--output`).
@@ -212,15 +214,26 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
     Some(case)
 }
 
-/// Grade a finished invocation by how it exited: exit 0 against its source ([`finish`]), anything else against the snapshot taken before it. Returns whether a known defect disagreed as marked.
+/// Grade a finished invocation by how it exited: exit 0, or a one-export failure whose `stderr` names its rows delivered ([`refusal::names_its_delivery`]), against its source ([`finish`]); anything else against the snapshot taken before it. Returns whether a known defect disagreed as marked.
 pub(crate) fn settle(
     mut case: Case,
     status: std::process::ExitStatus,
     stdout: &[u8],
+    stderr: &[u8],
     envs: &[(&str, &str)],
     opts: &Opts,
 ) -> bool {
-    if status.success() {
+    let delivered_unrecorded = !status.success()
+        && case.exports.len() == 1
+        && case.verb == "run"
+        && refusal::names_its_delivery(&String::from_utf8_lossy(stderr));
+    if status.success() || delivered_unrecorded {
+        if delivered_unrecorded {
+            case.unrecorded = Some(format!(
+                "exit {}: the run says its rows are delivered and its state was not stored, and its ledger holds no success row, so rivet's ledger (export_metrics, file_log) was not compared",
+                status.code().unwrap_or(-1)
+            ));
+        }
         case.delivered(stdout);
         return finish(case, envs, opts);
     }
@@ -429,6 +442,7 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         forks,
         began: chrono::Utc::now().to_rfc3339(),
         stdout: None,
+        unrecorded: None,
     })
 }
 
@@ -921,6 +935,7 @@ impl Case {
             "cursor_expr": cursor_expr,
             "state": state,
             "state_missing": state_missing,
+            "ledger_unrecorded": self.unrecorded,
             "capture_instance": e.get("cdc").and_then(|c| s(c, "capture_instance")),
         }))
     }

@@ -143,7 +143,14 @@ fn graded(
     let (pid, out) = output_of(&mut cmd);
     if let Some(mut case) = case {
         case.ran_as(pid);
-        super::verify::settle(case, out.status, &out.stdout, envs, &Default::default());
+        super::verify::settle(
+            case,
+            out.status,
+            &out.stdout,
+            &out.stderr,
+            envs,
+            &Default::default(),
+        );
     }
     out
 }
@@ -187,7 +194,7 @@ pub fn run_rivet_bounded(
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
             let took = start.elapsed();
             if let Some(case) = case {
-                super::verify::settle(case, status, &[], &[], &Default::default());
+                super::verify::settle(case, status, &[], &[], &[], &Default::default());
             }
             assert!(status.success(), "bounded rivet run exited non-zero");
             return Some(took);
@@ -294,7 +301,14 @@ pub fn run_rivet_args_bounded_env(
         if let Some(status) = child.try_wait().expect("try_wait rivet") {
             let stdout = std::fs::read_to_string(&path).expect("read captured stdout");
             if let Some(case) = case {
-                super::verify::settle(case, status, stdout.as_bytes(), envs, &Default::default());
+                super::verify::settle(
+                    case,
+                    status,
+                    stdout.as_bytes(),
+                    &[],
+                    envs,
+                    &Default::default(),
+                );
             }
             assert!(status.success(), "bounded rivet run exited non-zero");
             return Some(stdout);

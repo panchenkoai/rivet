@@ -103,13 +103,15 @@ pub enum Leftover {
     SuccessManifest,
     /// A journal row with status success.
     SuccessRecord,
+    /// A journal row still `running`: a run that could not record its own stop (its state store took no write); the next run under the export's lease closes it.
+    UnfinishedRecord,
     /// A journal row whose status the oracle does not know.
     UnknownStatus,
 }
 
 impl Leftover {
     /// Every kind, in report order.
-    pub const ALL: [Leftover; 18] = [
+    pub const ALL: [Leftover; 19] = [
         Leftover::FailureRecord,
         Leftover::FailedManifest,
         Leftover::ManifestBeforeAWrite,
@@ -127,6 +129,7 @@ impl Leftover {
         Leftover::SuccessMarker,
         Leftover::SuccessManifest,
         Leftover::SuccessRecord,
+        Leftover::UnfinishedRecord,
         Leftover::UnknownStatus,
     ];
 
@@ -150,6 +153,7 @@ impl Leftover {
             Leftover::SuccessMarker => "success-marker",
             Leftover::SuccessManifest => "success-manifest",
             Leftover::SuccessRecord => "success-record",
+            Leftover::UnfinishedRecord => "unfinished-record",
             Leftover::UnknownStatus => "unknown-status",
         }
     }
@@ -632,6 +636,7 @@ fn state_changes(
                 (true, Some("success")) => Leftover::SuccessRecord,
                 (true, Some("failed")) if t == "load_run" => Leftover::LoadAttempt,
                 (true, Some(s)) if NOT_SUCCESS.contains(&s) => Leftover::FailureRecord,
+                (true, Some("running")) => Leftover::UnfinishedRecord,
                 (true, _) => Leftover::UnknownStatus,
             };
             out.push(Finding {
@@ -662,6 +667,21 @@ pub(crate) enum Verdict {
     },
     /// Something undeclared: one line per finding.
     Fail(Vec<String>),
+}
+
+/// The codes of a failure that the product raises only after the rows and the manifest are durable.
+const DELIVERED_UNRECORDED: &[&str] = &["RIVET_STATE_CURSOR_NOT_STORED"];
+
+/// Whether a run's stderr ends it on a failure that names its rows delivered and its state not stored.
+pub(crate) fn names_its_delivery(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("Error: ["))
+        .any(|l| {
+            DELIVERED_UNRECORDED
+                .iter()
+                .any(|c| l.starts_with(&format!("{c}]")))
+        })
 }
 
 /// Drop what an export that recorded success left when the exit may not be its own (`may`: a sibling failed in a multi-export invocation, or the test declared [`Leftover::DeliveredRun`]); returns those exports.
@@ -961,6 +981,7 @@ mod tests {
                 "INSERT INTO chunk_task VALUES (1, 'r', 'completed');
                  INSERT INTO export_metrics VALUES (1, 'e', 'success');
                  INSERT INTO export_metrics VALUES (2, 'e', 'done');
+                 INSERT INTO export_metrics VALUES (3, 'e', 'running');
                  INSERT INTO export_schema VALUES ('other', '[b]');
                  UPDATE export_schema SET columns_json = '[a, b]' WHERE export_name = 'e';
                  INSERT INTO file_log VALUES (1, 'e', 'part-1.parquet');
@@ -975,6 +996,7 @@ mod tests {
                 Leftover::ChunkCheckpoint,
                 Leftover::SuccessRecord,
                 Leftover::UnknownStatus,
+                Leftover::UnfinishedRecord,
                 Leftover::ResumePoint,
                 Leftover::ObservedSchema,
                 Leftover::ResumePoint,
@@ -1079,6 +1101,21 @@ mod tests {
     #[should_panic(expected = "can only be a known defect")]
     fn a_test_cannot_declare_that_a_failed_run_leaves_a_success_marker() {
         declared_in_env("success-marker");
+    }
+
+    #[test]
+    fn only_a_coded_failure_after_the_delivery_names_the_delivery() {
+        assert!(names_its_delivery(
+            "WARN x\nError: [RIVET_STATE_CURSOR_NOT_STORED] export 't': the rows are delivered\n"
+        ));
+        for not in [
+            "Error: [RIVET_STATE_NOT_WRITABLE] export 't': did not start\n",
+            "WARN the text mentions [RIVET_STATE_CURSOR_NOT_STORED] in passing\n",
+            "Error: db error: RIVET_STATE_CURSOR_NOT_STORED\n",
+            "",
+        ] {
+            assert!(!names_its_delivery(not), "{not}");
+        }
     }
 
     #[test]

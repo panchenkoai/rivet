@@ -1804,9 +1804,9 @@ fn destination_fills_up(rig: Rig, mid_run: impl Fn(&Rig) -> bool) {
 }
 
 /// What a run whose state store filled up leaves beside a stopped run's parts.
-const STATE_FULL: &[Leftover] = &[Leftover::ObservedSchema];
+const STATE_FULL: &[Leftover] = &[Leftover::ObservedSchema, Leftover::UnfinishedRecord];
 
-/// The volume under the SQLite state of a live run fills up once `mid_run`: the run delivers or fails loudly, so does every run while it is full, and with the space back a run delivers the source.
+/// The volume under the SQLite state of a live run fills up once `mid_run`: the run delivers or fails loudly, so does every run while it is full, and with the space back a run delivers the source and closes the `running` rows the stopped run could not.
 fn state_volume_fills_up(rig: Rig, mid_run: impl Fn(&Rig) -> bool) {
     let Some(volume) = TinyVolume::mounted(4) else {
         return;
@@ -1815,6 +1815,15 @@ fn state_volume_fills_up(rig: Rig, mid_run: impl Fn(&Rig) -> bool) {
     std::fs::create_dir(&dir).expect("mkdir the config directory");
     let rig = rig.config_dir(dir);
     taken_away(&rig, &[], mid_run, |_| volume.fill(), |()| volume.free());
+    for table in ["run_status", "export_metrics"] {
+        let open = rig.state_count(&format!(
+            "SELECT count(*) FROM {table} WHERE export_name = '{{export}}' AND status = 'running'"
+        ));
+        assert_eq!(
+            open, 0,
+            "the run after the space came back left {open} `running` row(s) in {table}: the stop of the run that could not record it was never closed"
+        );
+    }
 }
 
 fn state_volume_fills_up_sql(engine: SqlEngine) {
@@ -1826,6 +1835,39 @@ fn state_volume_fills_up_sql(engine: SqlEngine) {
         stopped_mid_run(rig, STATE_FULL).slowed(150),
         Rig::has_a_part,
     );
+}
+
+/// [`crashed_runs_rows_closed_by_the_next`] on a `mode: full` export of `engine`.
+fn a_crashed_runs_rows_are_closed_by_the_next(engine: SqlEngine) {
+    let (_table, rig, _guard) = shaped(engine, "sab_dead", Shape::Full);
+    crashed_runs_rows_closed_by_the_next(&rig);
+}
+
+/// A run of `rig` that resumes nothing crashes after its part and leaves its `running` rows; the next run closes them `interrupted` and delivers the source.
+fn crashed_runs_rows_closed_by_the_next(rig: &Rig) {
+    let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "after_file_write");
+    assert!(
+        !crash.status.success(),
+        "fixture: the run crashes after its part"
+    );
+    let open = |table: &str| {
+        rig.state_count(&format!(
+            "SELECT count(*) FROM {table} WHERE export_name = '{{export}}' AND status = 'running'"
+        ))
+    };
+    assert_eq!(
+        open("run_status"),
+        1,
+        "fixture: the crashed run left its run-status row `running`"
+    );
+    recovers(rig, &[]);
+    for table in ["run_status", "export_metrics"] {
+        assert_eq!(
+            open(table),
+            0,
+            "the next run left the crashed run's row in {table} `running`"
+        );
+    }
 }
 
 /// The most open files a capped run gets: stdin, stdout, stderr and five more, fewer than a run needs for its config, state, source and part.
@@ -4979,33 +5021,65 @@ fn a_run_whose_destination_volume_fills_up_delivers_or_fails_loudly_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_postgres() {
+#[ignore = "live: docker compose postgres"]
+fn a_crashed_runs_rows_are_closed_by_the_next_postgres() {
+    a_crashed_runs_rows_are_closed_by_the_next(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: docker compose mysql"]
+fn a_crashed_runs_rows_are_closed_by_the_next_mysql() {
+    a_crashed_runs_rows_are_closed_by_the_next(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: docker compose mssql"]
+fn a_crashed_runs_rows_are_closed_by_the_next_mssql() {
+    a_crashed_runs_rows_are_closed_by_the_next(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: docker compose oracle"]
+fn a_crashed_runs_rows_are_closed_by_the_next_oracle() {
+    a_crashed_runs_rows_are_closed_by_the_next(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: docker compose mongo"]
+fn a_crashed_runs_rows_are_closed_by_the_next_mongo() {
+    let (rig, _m, _guard) = mongo_live("sab_dead");
+    crashed_runs_rows_closed_by_the_next(&rig.mongo("page_size: 20000"));
+}
+
+#[test]
+#[ignore = "live: docker compose postgres"]
+fn a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_postgres() {
     state_volume_fills_up_sql(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mysql() {
+#[ignore = "live: docker compose mysql"]
+fn a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mysql() {
     state_volume_fills_up_sql(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mssql() {
+#[ignore = "live: docker compose mssql"]
+fn a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mssql() {
     state_volume_fills_up_sql(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle() {
+#[ignore = "live: docker compose oracle"]
+fn a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle() {
     state_volume_fills_up_sql(SqlEngine::Oracle);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mongo; open defect (a run whose state volume is full leaves what a failed run may not), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo() {
+#[ignore = "live: docker compose mongo"]
+fn a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo() {
     {
         if not_sqlite_state("a SQLite state on a volume that fills up") {
             return;

@@ -1047,11 +1047,19 @@ scenarios:
 
   - id: exhaust_state_volume_full
     what: "the volume under the SQLite state of a live run filled once the run has committed a part: the run delivers or fails loudly, so does every run while it is full, and with the space back a run delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_postgres }
-    mysql:    { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mysql }
-    mssql:    { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mssql }
-    mongo:    { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo }
-    oracle:   { test: open_defect_a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle }
+    postgres: { test: a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_postgres }
+    mysql:    { test: a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mysql }
+    mssql:    { test: a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mssql }
+    mongo:    { test: a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo }
+    oracle:   { test: a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_oracle }
+
+  - id: crash_running_rows_closed
+    what: "a run that resumes nothing (`mode: full`) crashed after its part (`RIVET_TEST_PANIC_AT=after_file_write`) leaves its `running` rows; the next run, holding the export's run lease, closes them `interrupted` in run_status and export_metrics and delivers the source"
+    postgres: { test: a_crashed_runs_rows_are_closed_by_the_next_postgres }
+    mysql:    { test: a_crashed_runs_rows_are_closed_by_the_next_mysql }
+    mssql:    { test: a_crashed_runs_rows_are_closed_by_the_next_mssql }
+    mongo:    { test: a_crashed_runs_rows_are_closed_by_the_next_mongo }
+    oracle:   { test: a_crashed_runs_rows_are_closed_by_the_next_oracle }
 
   - id: exhaust_open_files
     what: "every run capped at 8 open files (`RLIMIT_NOFILE`, `Rig::open_files`) fails loudly, never by a crash, and a run without the cap then delivers the source and `validate` passes; the cells of the other engines run on the SQLite state, since a Postgres state puts the PostgreSQL client, the open defect of the postgres cell, into every run"

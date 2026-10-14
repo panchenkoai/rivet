@@ -1097,7 +1097,8 @@ fn finalize_keyset_anchor(
 /// the live run too. The `prefix` recorded in the ledger is the run's write URI,
 /// which `gc_orphans` matches at-or-under its load prefix. The ledger row is the
 /// run's first state write: a state that does not take it refuses the run here,
-/// before a row is exported or anything is written to the destination.
+/// before a row is exported or anything is written to the destination. Called under
+/// the export's run lease, so it first closes the `running` rows of runs that died.
 fn ledger_begin_run(
     state: &StateStore,
     plan: &ResolvedRunPlan,
@@ -1107,7 +1108,7 @@ fn ledger_begin_run(
     let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
     let started_at = chrono::Utc::now().to_rfc3339();
     state
-        .begin_run(run_id, &plan.export_name, &prefix, &started_at)
+        .begin_run_under_lease(run_id, &plan.export_name, &prefix, &started_at)
         .map_err(|e| state_not_writable(&plan.export_name, &e))?;
     super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
     Ok(())
@@ -2975,6 +2976,25 @@ mod tests {
              incremental cursor could not be stored (attempt to write a readonly database), so \
              the next run delivers the same rows again. Repair the state database before the \
              next run."
+        );
+    }
+
+    #[test]
+    fn a_run_that_begins_closes_the_running_rows_of_the_runs_that_died_before_it() {
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let plan = chunked_plan_with_quality(None);
+        ledger_begin_run(&state, &plan, "orders", "run_dead").expect("a writable state");
+        ledger_begin_run(&state, &plan, "orders", "run_next").expect("a writable state");
+        let rows = state.recent_run_status(10, false).unwrap();
+        let mut seen: Vec<(String, String)> =
+            rows.into_iter().map(|r| (r.run_id, r.status)).collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                ("run_dead".to_string(), "interrupted".to_string()),
+                ("run_next".to_string(), "running".to_string())
+            ]
         );
     }
 
