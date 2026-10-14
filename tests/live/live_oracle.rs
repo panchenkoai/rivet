@@ -1085,6 +1085,70 @@ fn crash_after_source_read_leaves_state_completely_clean_oracle() {
     );
 }
 
+/// A crash after the part is written and before the manifest and cursor: the part stays, no manifest, no cursor, no successful run; the recovery run re-exports (at-least-once at the destination) and declares every source id once.
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn crash_after_file_write_leaves_file_but_no_manifest_or_cursor_oracle() {
+    require_alive(LiveService::Oracle);
+    let t = OracleTable::create(
+        "ora_afw",
+        "id NUMBER(10) PRIMARY KEY, updated_at TIMESTAMP(6) NOT NULL",
+    );
+    ora_exec(&format!(
+        "INSERT INTO {} SELECT LEVEL, TIMESTAMP '2024-01-01 00:00:00' + NUMTODSINTERVAL(LEVEL, 'SECOND') \
+         FROM dual CONNECT BY LEVEL <= 10",
+        t.name()
+    ));
+    let export = unique_name("ora_afw_exp");
+    let rig = Rig::oracle_batch(t.name())
+        .export_named(&export)
+        .mode("incremental")
+        .export_line("cursor_column: UPDATED_AT");
+    let crash = rig.run_args_env(&[], &[(PANIC, "after_file_write")]);
+    assert!(
+        String::from_utf8_lossy(&crash.stderr).contains("rivet test-hook: injected"),
+        "the run must die at the hook:\n{}",
+        String::from_utf8_lossy(&crash.stderr)
+    );
+    assert_eq!(
+        files_with_extension(&rig.out_dir(), "parquet").len(),
+        1,
+        "after_file_write must have left exactly one part on disk"
+    );
+    assert!(
+        files_with_extension(&rig.out_dir(), "json").is_empty(),
+        "after_file_write must leave manifest empty"
+    );
+    let (runs, cursor) = run_statuses_and_cursor(&rig.config_path(), &export);
+    assert_eq!(cursor, None, "the cursor must not advance");
+    assert!(
+        !runs.iter().any(|s| s == "success"),
+        "no run may be recorded successful: {runs:?}"
+    );
+    assert_ok(&rig.run_args(&[]), "recovery");
+    let source: BTreeSet<i64> = (1..=10).collect();
+    let (ids, physical) = ids_and_rows(&read_all_parts(&rig.out_dir()));
+    assert_eq!(
+        ids, source,
+        "recovery must leave every source id (1..=10) at the destination"
+    );
+    assert!(
+        physical >= 10,
+        "at-least-once: physical destination rows ({physical}) must be >= source (10)"
+    );
+    assert_eq!(
+        ids_and_rows(&rig.read_declared_parts()),
+        (source, 10),
+        "the success manifest declares every source id once"
+    );
+    assert!(
+        run_statuses_and_cursor(&rig.config_path(), &export)
+            .1
+            .is_some(),
+        "the recovery run stores the cursor"
+    );
+}
+
 /// `run --reconcile` and `rivet reconcile` both count the source through a derived table.
 #[test]
 #[ignore = "live: requires docker compose oracle"]
