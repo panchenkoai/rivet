@@ -600,6 +600,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_a_conversion_error_over_a_stored_cursor_is_refused_by_code() {
+        let plan = minimal_plan();
+        let cursor = crate::types::CursorState {
+            export_name: "test_export".into(),
+            last_cursor_value: Some("abc".into()),
+            last_run_at: None,
+            cursor_column: None,
+        };
+        let code = |e: &anyhow::Error| {
+            e.downcast_ref::<crate::error::CodedError>()
+                .map(|c| c.code())
+        };
+        let conversion = || anyhow::anyhow!("ORA-01722: invalid number");
+        let refused = refuse_an_incomparable_cursor(conversion(), Some(&cursor), &plan);
+        assert_eq!(code(&refused), Some("RIVET_STATE_CURSOR_INCOMPARABLE"));
+        assert!(
+            refused.to_string().contains("rivet state reset"),
+            "{refused}"
+        );
+        let other = refuse_an_incomparable_cursor(
+            anyhow::anyhow!("ORA-00942: table or view does not exist"),
+            Some(&cursor),
+            &plan,
+        );
+        assert_eq!(code(&other), None);
+        assert_eq!(other.to_string(), "ORA-00942: table or view does not exist");
+        let first_run = refuse_an_incomparable_cursor(conversion(), None, &plan);
+        assert_eq!(code(&first_run), None);
+    }
+
     // ── minimal plan builder ─────────────────────────────────────────────────
 
     fn minimal_plan() -> ResolvedRunPlan {
