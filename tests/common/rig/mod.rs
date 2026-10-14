@@ -730,6 +730,31 @@ impl Stages {
     }
 }
 
+/// `(distinct ids, physical rows)` over `batches`: the `id` column found whatever its case, read as i64 whatever its width.
+pub fn ids_and_rows(
+    batches: &[arrow::record_batch::RecordBatch],
+) -> (std::collections::BTreeSet<i64>, usize) {
+    use arrow::array::{Array, Int64Array};
+    let (mut ids, mut rows) = (std::collections::BTreeSet::new(), 0);
+    for b in batches {
+        let at = b
+            .schema()
+            .fields()
+            .iter()
+            .position(|f| f.name().eq_ignore_ascii_case("id"))
+            .expect("an id column");
+        let col = arrow::compute::cast(b.column(at), &arrow::datatypes::DataType::Int64)
+            .expect("an integer id");
+        let col = col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("i64 after the cast");
+        rows += b.num_rows();
+        ids.extend((0..b.num_rows()).map(|r| col.value(r)));
+    }
+    (ids, rows)
+}
+
 /// Read every parquet part under `dir` (non-recursive), in filename order.
 pub fn read_all_parts(dir: &Path) -> Vec<arrow::record_batch::RecordBatch> {
     // A MISSING dir is a harness bug (wrong path, dest never created), not

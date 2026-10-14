@@ -111,6 +111,7 @@ impl Rig {
         case: Option<crate::common::verify::Case>,
         status: std::process::ExitStatus,
         stdout: &[u8],
+        stderr: &[u8],
         envs: &[(&str, &str)],
     ) {
         let Some(case) = case else { return };
@@ -125,7 +126,7 @@ impl Rig {
             key: self.census_key.as_deref(),
             leaves: &self.failed_run_leaves,
         };
-        if crate::common::verify::settle(case, status, stdout, envs, &opts) {
+        if crate::common::verify::settle(case, status, stdout, stderr, envs, &opts) {
             self.oracle_xfailed.set(true);
         }
     }
@@ -166,6 +167,7 @@ fn settle_after_writing(rig: &Rig, file: &str, exit: i32, envs: &[(&str, &str)])
     rig.oracle_settle(
         case,
         std::process::ExitStatus::from_raw(exit << 8),
+        &[],
         &[],
         envs,
     );
