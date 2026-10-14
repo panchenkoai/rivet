@@ -1485,8 +1485,9 @@ fn wave_header(label: &str, total: usize, pending: usize) -> Option<String> {
     (total > 1).then(|| format!("\n  ── wave {label} · {pending} export(s) ──"))
 }
 
-/// The pool's closing line: the actual makespan against the predicted one, in minutes.
-fn makespan_graded(actual_secs: f64, predicted_secs: f64) -> String {
+/// The pool's closing line: the actual makespan (`actual_ms`) against the predicted one, in minutes.
+fn makespan_graded(actual_ms: i64, predicted_secs: f64) -> String {
+    let actual_secs = actual_ms as f64 / 1000.0;
     format!(
         "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
         actual_secs / 60.0,
@@ -2061,8 +2062,13 @@ pub(crate) fn run_pool(
         run_harm.close_and_warn(window);
     }
 
-    let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
-    eprintln!("{}", makespan_graded(actual_secs, predicted_secs));
+    eprintln!(
+        "{}",
+        makespan_graded(
+            (finished_at - started_at).num_milliseconds(),
+            predicted_secs
+        )
+    );
 
     let mut summaries: Vec<RunSummary> = Vec::new();
     let mut failures: Vec<anyhow::Error> = Vec::new();
@@ -2314,7 +2320,7 @@ mod pool_decision_tests {
     #[test]
     fn the_pool_lines_read_minutes_and_a_single_export_has_no_wave_header() {
         assert_eq!(
-            makespan_graded(150.0, 120.0),
+            makespan_graded(150_000, 120.0),
             "  Pool: actual makespan 2.5 min vs predicted 2.0 min (+25%) — the model grades itself every run"
         );
         assert_eq!(wave_header("1", 1, 1), None);
