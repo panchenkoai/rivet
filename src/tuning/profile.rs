@@ -677,6 +677,20 @@ mod tests {
         let r = t.resource_summary();
         assert_eq!(r.batch_size_memory_mb, Some(64));
     }
+
+    /// `max_value_mb` converts to bytes; 0 and unset both disable the ceiling.
+    #[test]
+    fn max_value_bytes_converts_megabytes_and_zero_disables() {
+        let mut t = SourceTuning::from_config(None);
+        t.max_value_mb = Some(3);
+        assert_eq!(t.max_value_bytes(), Some(3 * 1024 * 1024));
+        t.max_value_mb = Some(1);
+        assert_eq!(t.max_value_bytes(), Some(1024 * 1024));
+        t.max_value_mb = Some(0);
+        assert_eq!(t.max_value_bytes(), None);
+        t.max_value_mb = None;
+        assert_eq!(t.max_value_bytes(), None);
+    }
 }
 
 #[cfg(test)]
