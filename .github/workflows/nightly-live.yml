@@ -57,7 +57,7 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -302,7 +302,7 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -397,7 +397,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -444,7 +444,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -500,7 +500,7 @@ jobs:
         if: steps.day.outputs.sunday == 'yes'
       - uses: Swatinem/rust-cache@v2
         if: steps.day.outputs.sunday == 'yes'
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
