@@ -23,10 +23,15 @@ dependencies = [
     # 2026-09-20 gate. Exact-pinned like duckdb: a hash that moves between two
     # runs of the same gate is not an oracle.
     "xxhash==4.0.1",
-    # The Snowflake ADBC driver the DuckDB `snowflake` community extension reads through
-    # (dev/release_oracle/duck.py); rivet's loader shells out to `snow`, so the two share no code.
-    "adbc-driver-snowflake==1.11.0",
 ]
+
+# The Snowflake ADBC driver the DuckDB `snowflake` community extension reads through
+# (dev/release_oracle/duck.py); rivet's loader shells out to `snow`, so the two share no code.
+# A group of its own: `uv run` installs it (default-groups), the `rivet-duckdb` container,
+# which reads Parquet only, exports the lock without it (docker-compose.yaml).
+[dependency-groups]
+snowflake = ["adbc-driver-snowflake==1.11.0"]
 
 [tool.uv]
 package = false
+default-groups = ["snowflake"]

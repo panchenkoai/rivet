@@ -423,7 +423,6 @@ name = "rivet-harness"
 version = "0.0.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "adbc-driver-snowflake" },
     { name = "duckdb" },
     { name = "oracledb" },
     { name = "pyarrow" },
@@ -433,9 +432,13 @@ dependencies = [
     { name = "xxhash" },
 ]
 
+[package.dev-dependencies]
+snowflake = [
+    { name = "adbc-driver-snowflake" },
+]
+
 [package.metadata]
 requires-dist = [
-    { name = "adbc-driver-snowflake", specifier = "==1.11.0" },
     { name = "duckdb", specifier = "==1.5.5" },
     { name = "oracledb", specifier = "==26.0.1" },
     { name = "pyarrow", specifier = "==18.1.0" },
@@ -444,6 +447,9 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "xxhash", specifier = "==4.0.1" },
 ]
+
+[package.metadata.requires-dev]
+snowflake = [{ name = "adbc-driver-snowflake", specifier = "==1.11.0" }]
 
 [[package]]
 name = "typing-extensions"
