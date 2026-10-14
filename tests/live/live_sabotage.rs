@@ -1196,6 +1196,57 @@ fn state_reset_beside(engine: SqlEngine) {
     recovers(&rig, &[]);
 }
 
+/// The rig's seam under `state_reset_beside`: a run refused while the action beside it holds the run lease is left ungraded, whatever the action changed while that run was alive. A first run paused after its snapshot holds the lease, so the second is refused by code every time; the action removes the cursor row and waits for the first run.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_refused_while_the_action_beside_it_holds_the_lease_is_left_ungraded_postgres() {
+    let engine = SqlEngine::Pg;
+    let (table, _guard) = seeded(engine, "sab_took_over");
+    let rig = Shape::Incremental.staged(engine, engine.rig(&table));
+    rig.run_ok();
+    engine.insert(&table, N + 1..=N + 3, 170, Some(10));
+    let marker = std::env::temp_dir().join(format!("rivet-took-over-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let marker_env = marker.to_string_lossy().into_owned();
+    let holder = rig.spawn_args_env(
+        &[],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:4000"),
+            ("RIVET_TEST_PAUSE_MARKER", &marker_env),
+        ],
+    );
+    let t0 = std::time::Instant::now();
+    while !marker.exists() {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "fixture: the first run never paused after its snapshot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let met = rig.beside_a_live_run_it_may_refuse(
+        &[],
+        |_| true,
+        move |r| {
+            r.edit_state("DELETE FROM export_state WHERE export_name = '{export}'", 1);
+            holder
+                .wait_with_output()
+                .expect("reap the run that holds the lease")
+        },
+        |held| held.status.success(),
+    );
+    let _ = std::fs::remove_file(&marker);
+    let said = String::from_utf8_lossy(&met.run.stderr);
+    assert!(
+        said.contains("RIVET_STATE_RUN_IN_PROGRESS"),
+        "premise: the run beside the held lease is refused by code\n{said}"
+    );
+    assert!(
+        met.acted.status.success(),
+        "the run that held the lease delivers\n{}",
+        String::from_utf8_lossy(&met.acted.stderr)
+    );
+}
+
 /// One command beside a live checkpointed run that continues a complete export: it delivers, refuses by code or fails verification; the run delivers or refuses by code; a run then delivers the source.
 fn command_beside(engine: SqlEngine, tag: &str, command: &[&str]) {
     let (table, rig, _guard) = live(engine, tag, Shape::RangeCheckpoint);

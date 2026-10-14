@@ -310,7 +310,9 @@ impl Rig {
         let seen = wait_mid_run(
             || ready(self),
             || {
-                exited = live.try_wait().expect("try_wait").is_some();
+                exited = std::process::Child::try_wait(&mut live)
+                    .expect("try_wait")
+                    .is_some();
                 exited
             },
             CEILING,
@@ -345,10 +347,14 @@ impl Rig {
     ) -> Met<T> {
         let mut live = self.spawn_mid_run(envs, ready);
         let acted = act(self);
-        let outlived = live.try_wait().expect("try_wait").is_none();
+        // Polled on the child itself: `Spawned::try_wait` grades a run the moment it exits, before
+        // `took_over` can say the action took its lease first.
+        let outlived = std::process::Child::try_wait(&mut live)
+            .expect("try_wait")
+            .is_none();
         let t0 = std::time::Instant::now();
         let status = loop {
-            if let Some(status) = live.try_wait().expect("try_wait") {
+            if let Some(status) = std::process::Child::try_wait(&mut live).expect("try_wait") {
                 break status;
             }
             if t0.elapsed() >= CEILING {
