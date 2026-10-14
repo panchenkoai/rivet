@@ -279,6 +279,17 @@ class Ledger:
         from . import known_red
         self.known_passed.update(k.match for k in known_red.KNOWN_RED if k.match.startswith(f"{cell} — "))
 
+    def record_evidence(self) -> None:
+        """Every live cell that passed this run goes to docs/evidence/last-green.yaml as a gate run of this tree; a failure to write is said, never raised."""
+        if not GREEN_CELLS:
+            return
+        try:
+            from ..pytools import evidence
+            n = evidence.record_greens(sorted(GREEN_CELLS), by="gate")
+            print(f"  evidence: {n} green live cell(s) recorded in {evidence.LEDGER.relative_to(ROOT)}")
+        except Exception as e:  # noqa: BLE001 — evidence must not fail the gate it describes
+            print(f"  evidence: NOT recorded ({e})")
+
     def close_known_red(self) -> None:
         """After a FULL run: a known-red entry no failure matched is fixed — it must be removed."""
         from . import known_red
@@ -333,6 +344,7 @@ class Ledger:
 
     def report(self, *, full: bool = False) -> int:
         """Print the table and the verdict; only a `full` gate run records a timings line and may say RELEASE-READY."""
+        self.record_evidence()
         print()
         self.phase("Release Oracle result")
         print(f"  {'ENGINE':<10} {'VER':<6} {'SCENARIO':<16} {'STORE':<8} STATUS")
@@ -726,6 +738,8 @@ def target_dir() -> Path:
 #: live_suite tests (bare fn names) and modules a dedicated cell has already run this gate;
 #: the derived `live_modules` cell runs everything else.
 RAN_LIVE_TESTS: set[str] = set()
+#: `module::fn` of every live cell that passed through the gate this run: written to the evidence ledger by the report.
+GREEN_CELLS: set[str] = set()
 RAN_LIVE_MODULES: set[str] = set()
 
 #: Live tests allowed to SELF-SKIP in a gate run (`module::fn` → why). Any other self-skip
