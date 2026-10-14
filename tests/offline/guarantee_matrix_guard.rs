@@ -17,9 +17,11 @@ const GATE_DIR: &str = "dev/release_oracle";
 // 27 -> 26 (2026-10-09): the guarantee checks left unwritten are written (#506, -1).
 // 26 -> 25 (2026-10-09): the docs name `_rivet_exported_at` as the one column that differs between runs, and a cell holds it (#506, -1).
 // 25 -> 23 (2026-10-09): flat-memory.md states what was measured and a capped-run cell holds it; source-safe-under-load.md scopes the one-page sentence to chunked (#506, -2).
-const ROWS_NOT_HELD: usize = 19; // ratchet-pin: guarantee-rows-not-held
+// 19 -> 18 (2026-10-14): decimals_never_become_floats is held on every engine by one SqlEngine body.
+const ROWS_NOT_HELD: usize = 18; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
-const GAP_CELLS: usize = 29; // ratchet-pin: guarantee-gap-cells
+// 29 -> 27 (2026-10-14): the decimal golden body holds the SQL Server and Oracle cells.
+const GAP_CELLS: usize = 27; // ratchet-pin: guarantee-gap-cells
 
 fn rows() -> Vec<Value> {
     let doc: Value = serde_yaml_ng::from_str(&subject_text(MATRIX))

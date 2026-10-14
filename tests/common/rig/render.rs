@@ -12,7 +12,7 @@ impl Rig {
 
     pub(crate) fn render(&self) -> String {
         let tables = match &self.query {
-            Some(q) => format!("query: \"{q}\""),
+            Some(q) => format!("query: \"{}\"", yaml_quoted(q)),
             None if self.tables.len() == 1 => format!("table: {}", self.tables[0]),
             None => format!("tables: [{}]", self.tables.join(", ")),
         };
@@ -75,7 +75,7 @@ impl Rig {
                 let lines: String = e.lines.iter().map(|l| format!("    {l}\n")).collect();
                 let subject = match &e.table {
                     Some(t) => format!("table: {t}"),
-                    None => format!("query: \"{}\"", e.query),
+                    None => format!("query: \"{}\"", yaml_quoted(&e.query)),
                 };
                 let cdc = if e.cdc_lines.is_empty() {
                     String::new()
@@ -145,4 +145,18 @@ impl Rig {
             ),
         }
     }
+}
+
+/// `text` as the body of a YAML double-quoted scalar: a backslash and a double quote are escaped (Oracle queries quote their lower-case column names).
+fn yaml_quoted(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[test]
+fn a_query_with_quoted_identifiers_renders_as_one_yaml_scalar() {
+    assert_eq!(
+        yaml_quoted(r#"SELECT "id", "amount" FROM t"#),
+        r#"SELECT \"id\", \"amount\" FROM t"#
+    );
+    assert_eq!(yaml_quoted("SELECT 1"), "SELECT 1");
 }
