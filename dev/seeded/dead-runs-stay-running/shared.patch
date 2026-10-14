@@ -1,0 +1,10 @@
+--- a/src/state/run_status_store.rs
++++ b/src/state/run_status_store.rs
+@@ -190,7 +190,6 @@
+         started_at: &str,
+     ) -> Result<()> {
+         self.transaction(|| {
+-            self.interrupt_dead_runs(export_name, started_at)?;
+             self.begin_run(run_id, export_name, prefix, started_at)
+         })
+     }
