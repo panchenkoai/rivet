@@ -147,9 +147,9 @@ impl Rig {
     }
 }
 
-/// `text` as the body of a YAML double-quoted scalar: a backslash and a double quote are escaped (Oracle queries quote their lower-case column names).
+/// `text` as the body of a YAML double-quoted scalar: a double quote is escaped (Oracle queries quote their lower-case column names); a backslash is kept, so a cell may still spell a YAML escape such as `\n`.
 fn yaml_quoted(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    text.replace('"', "\\\"")
 }
 
 #[test]
@@ -159,4 +159,5 @@ fn a_query_with_quoted_identifiers_renders_as_one_yaml_scalar() {
         r#"SELECT \"id\", \"amount\" FROM t"#
     );
     assert_eq!(yaml_quoted("SELECT 1"), "SELECT 1");
+    assert_eq!(yaml_quoted("SELECT 1 -- c\\n"), "SELECT 1 -- c\\n");
 }
