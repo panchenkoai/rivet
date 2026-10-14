@@ -747,7 +747,7 @@ services:
       # Versions come from the repo's uv.lock (one pin for the Python gate and this
       # container), exported at start; `pyarrow` is the third independent Parquet reader.
       - "pip install --quiet --disable-pip-version-check uv && \
-         uv export --directory /pin --frozen --no-hashes --no-emit-project > /tmp/req.txt && \
+         uv export --directory /pin --frozen --no-hashes --no-emit-project --no-group snowflake > /tmp/req.txt && \
          pip install --quiet --disable-pip-version-check -r /tmp/req.txt && \
          python -c 'import duckdb, pytz, pyarrow; print(\"duckdb\", duckdb.__version__, \"pyarrow\", pyarrow.__version__)' && \
          exec tail -f /dev/null"

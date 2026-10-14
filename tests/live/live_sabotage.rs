@@ -1071,7 +1071,8 @@ fn state_reset_beside(engine: SqlEngine) {
     rig.run_ok();
     engine.insert(&table, N + 1..=N + LIVE_ROWS, 170, Some(10));
     let rig = rig.slowed(150);
-    let met = rig.beside_a_live_run(
+    // A reset that reaches the lease before the run refuses the run and removes the cursor itself.
+    let met = rig.beside_a_live_run_it_may_refuse(
         &[],
         |_| true,
         |r| {
@@ -1080,6 +1081,7 @@ fn state_reset_beside(engine: SqlEngine) {
                 r.cli(&["state", "reset-chunks", "--export", &table]),
             ]
         },
+        |acted| acted.iter().any(|out| out.status.success()),
     );
     for out in &met.acted {
         rig.delivered_or_refused("a state command beside a live incremental run", out);

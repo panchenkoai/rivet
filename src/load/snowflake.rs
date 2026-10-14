@@ -50,6 +50,8 @@ pub struct SnowflakeLoader {
     /// so every statement of one `rivet load` invocation shares a run key —
     /// cost slices per run (across tables) as well as per table. `None` omits it.
     pub run_id: Option<String>,
+    /// The program run in place of `snow`, with its leading arguments; empty runs `snow`.
+    pub(crate) cli: Vec<String>,
 }
 
 impl SnowflakeLoader {
@@ -89,6 +91,8 @@ impl SnowflakeLoader {
                 let path = format!("$1:{}", s.column_name);
                 if needs_parse_json(s) {
                     format!("PARSE_JSON({path})")
+                } else if s.target_type == TargetType::Snowflake(SfType::Binary) {
+                    format!("{path}::BINARY")
                 } else {
                     path
                 }
@@ -142,7 +146,14 @@ impl SnowflakeLoader {
 
     /// Run a SQL script through `snow sql`, returning parsed JSON blocks.
     fn run_snow(&self, sql: &str) -> Result<serde_json::Value> {
-        let mut cmd = Command::new("snow");
+        let mut cmd = match self.cli.split_first() {
+            Some((program, leading)) => {
+                let mut cmd = Command::new(program);
+                cmd.args(leading);
+                cmd
+            }
+            None => Command::new("snow"),
+        };
         cmd.args(["sql", "-c", &self.connection, "--format", "json", "-q", sql]);
         if let Some(key) = &self.private_key_path {
             // snow reads SNOWFLAKE_CONNECTIONS_<CONN>_PRIVATE_KEY_PATH.
@@ -207,23 +218,24 @@ impl TargetLoader for SnowflakeLoader {
     }
 
     fn changes_has_prior_changes(&self, table: &str) -> Result<bool> {
-        match self.run_snow(&self.build_prior_changes_sql(table)) {
-            // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read
-            // as "first cycle" and silently disarm the refusal — the exact
-            // direction this guard exists for. BigQuery's scalar path already
-            // errors; parity.
-            Ok(v) => extract_named(&v, "PROBE_")
-                .map(|n| n > 0)
-                .context("re-baseline probe ran but PROBE_ was not in snow's output"),
-            // A missing __changes table is the FIRST cycle, not an error.
-            // Snowflake merges "does not exist" with "not authorized" in ONE
-            // message, so a SELECT-denied role reads first-cycle here — the
-            // residual is SELF-LIMITING (round-9): append_changelog's own
-            // BEFORE_/AFTER_ COUNT gates need SELECT, so that role fails the
-            // load loudly one statement later, never a silent doomed append.
-            Err(e) if format!("{e:#}").contains("does not exist") => Ok(false),
-            Err(e) => Err(e),
+        // A missing `__changes` table is the FIRST cycle, and the catalog says whether it is
+        // there. The text of a failed SELECT is not asked: `snow` draws it in an 80-column box
+        // and wraps it by words, so "does not exist" was split across two lines for a table name
+        // of 21 to 30 characters and the first cycle read as an error.
+        //
+        // The catalog lists only what the role may see, so a log the role cannot SELECT reads as
+        // absent here; the residual is SELF-LIMITING (round-9): append_changelog's own
+        // BEFORE_/AFTER_ COUNT gates need SELECT, so that role fails the load loudly one
+        // statement later, never a silent doomed append.
+        if self.object_kind(&format!("{table}__changes"))? == super::ObjectKind::Absent {
+            return Ok(false);
         }
+        // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read as "first cycle" and
+        // silently disarm the refusal. BigQuery's scalar path already errors; parity.
+        let v = self.run_snow(&self.build_prior_changes_sql(table))?;
+        extract_named(&v, "PROBE_")
+            .map(|n| n > 0)
+            .context("re-baseline probe ran but PROBE_ was not in snow's output")
     }
 
     fn object_kind(&self, table: &str) -> Result<super::ObjectKind> {
@@ -316,19 +328,18 @@ impl SnowflakeLoader {
              ALTER SESSION SET TIMEZONE = 'UTC';\n\
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
-             CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
-             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
+             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT={PARQUET_FORMAT};\n\
              CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
              COPY INTO {fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) {files};\n\
+             \x20 FILE_FORMAT={PARQUET_FORMAT} {files};\n\
              SELECT COUNT(*) AS ROWS_ FROM {fqtn};",
             tag = self.query_tag(table),
             wh = self.warehouse,
             db = self.database,
             sc = self.schema,
             si = self.storage_integration,
-            url = self.gcs_url,
+            url = stage_url(&self.gcs_url),
         );
 
         Ok(sql)
@@ -355,12 +366,14 @@ impl SnowflakeLoader {
         )
     }
 
+    /// Probe returning `KIND_` = 1·table + 2·view + 4·other for `table`, and 0 when the name is free: `COUNT` over no rows is 0, where Snowflake's `COUNT_IF` over no rows is NULL.
     fn build_object_kind_sql(&self, table: &str) -> String {
         format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
              USE WAREHOUSE {wh};\n\
-             SELECT COUNT_IF(TABLE_TYPE = 'BASE TABLE') + 2 * COUNT_IF(TABLE_TYPE = 'VIEW') \
-             + 4 * COUNT_IF(TABLE_TYPE NOT IN ('BASE TABLE', 'VIEW')) AS KIND_ \
+             SELECT COUNT(CASE WHEN TABLE_TYPE = 'BASE TABLE' THEN 1 END) \
+             + 2 * COUNT(CASE WHEN TABLE_TYPE = 'VIEW' THEN 1 END) \
+             + 4 * COUNT(CASE WHEN TABLE_TYPE NOT IN ('BASE TABLE', 'VIEW') THEN 1 END) AS KIND_ \
              FROM {db}.INFORMATION_SCHEMA.TABLES \
              WHERE TABLE_SCHEMA = UPPER('{sc}') AND TABLE_NAME = UPPER('{table}');",
             tag = self.query_tag(table),
@@ -384,7 +397,8 @@ impl SnowflakeLoader {
         format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
              USE WAREHOUSE {wh};\n\
-             SELECT COUNT(*) AS TOTAL_, COUNT_IF(LOWER(COLUMN_NAME) IN ({list})) AS MATCHED_ \
+             SELECT COUNT(*) AS TOTAL_, \
+             COUNT(CASE WHEN LOWER(COLUMN_NAME) IN ({list}) THEN 1 END) AS MATCHED_ \
              FROM {db}.INFORMATION_SCHEMA.COLUMNS \
              WHERE TABLE_SCHEMA = UPPER('{sc}') AND TABLE_NAME = UPPER('{table}');",
             tag = self.query_tag(table),
@@ -448,21 +462,20 @@ impl SnowflakeLoader {
              ALTER SESSION SET TIMEZONE = 'UTC';\n\
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
-             CREATE FILE FORMAT IF NOT EXISTS rivet_pq TYPE=PARQUET BINARY_AS_TEXT=FALSE;\n\
-             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT=rivet_pq;\n\
+             CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT={PARQUET_FORMAT};\n\
              CREATE TABLE IF NOT EXISTS {changes_fqtn} (\n{ddl}\n){cluster};\n\
              {alter}\
              SELECT COUNT(*) AS BEFORE_ FROM {changes_fqtn};\n\
              COPY INTO {changes_fqtn} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
-             \x20 FILE_FORMAT=(FORMAT_NAME=rivet_pq) FORCE=TRUE {files};\n\
+             \x20 FILE_FORMAT={PARQUET_FORMAT} FORCE=TRUE {files};\n\
              SELECT COUNT(*) AS AFTER_ FROM {changes_fqtn};",
             tag = self.query_tag(&changes),
             wh = self.warehouse,
             db = self.database,
             sc = self.schema,
             si = self.storage_integration,
-            url = self.gcs_url,
+            url = stage_url(&self.gcs_url),
             alter = build_alter_add_columns_sql(&changes_fqtn, &full),
         );
         Ok(sql)
@@ -531,7 +544,7 @@ fn is_meta_column(name: &str) -> bool {
 /// is written at extraction and gained a load spec, so every pre-existing log
 /// was suddenly one column short.
 ///
-/// `ADD COLUMN IF NOT EXISTS` is the only safe verb: additive, idempotent,
+/// `ADD COLUMN` with `IF NOT EXISTS` per column is the only safe verb: additive, idempotent,
 /// metadata-only, and existing rows read NULL for the new column. Trailing
 /// newline (not `Option`) so the caller interpolates it unconditionally; an
 /// empty spec list yields an empty string rather than a bare `ALTER TABLE t ;`.
@@ -545,16 +558,21 @@ fn build_alter_add_columns_sql(fqtn: &str, specs: &[TargetColumnSpec]) -> String
         // this loader creates its columns unquoted (Snowflake upper-cases them),
         // so a quoted `"col"` here would ADD a second, case-sensitive column
         // instead of matching the one the COPY names.
-        .map(|s| {
-            format!(
-                "ADD COLUMN IF NOT EXISTS {} {}",
-                s.column_name, s.target_type
-            )
-        })
+        // Snowflake takes `ADD COLUMN` once per statement and `IF NOT EXISTS` per column:
+        // `ADD COLUMN IF NOT EXISTS a T, ADD COLUMN IF NOT EXISTS b T` is a syntax error there.
+        .map(|s| format!("IF NOT EXISTS {} {}", s.column_name, s.target_type))
         .collect::<Vec<_>>()
         .join(",\n  ");
-    format!("ALTER TABLE {fqtn}\n  {adds};\n")
+    format!("ALTER TABLE {fqtn} ADD COLUMN\n  {adds};\n")
 }
+
+/// The stage URL: the export prefix closed with one `/`. Snowflake joins a stage URL and a `FILES` entry as text, so a prefix written without the slash named `…/orderspart-0.parquet`.
+fn stage_url(gcs_url: &str) -> String {
+    format!("{}/", gcs_url.trim_end_matches('/'))
+}
+
+/// How every stage and `COPY` reads a part, spelled inline: a named format made by `CREATE … IF NOT EXISTS` is whatever object already has that name. Logical types on, so a Parquet timestamp or time is read as one and not as its raw integer; binary kept as bytes.
+const PARQUET_FORMAT: &str = "(TYPE=PARQUET BINARY_AS_TEXT=FALSE USE_LOGICAL_TYPE=TRUE)";
 
 /// A column is loaded through `PARSE_JSON` iff its native type is `VARIANT`
 /// (Rivet's Snowflake resolver maps JSON → `VARIANT`); a plain `COPY` would
@@ -781,9 +799,15 @@ mod tests {
             "must ALTER the log in place; got: {sql}"
         );
         assert!(
-            sql.contains("ADD COLUMN IF NOT EXISTS __op VARCHAR")
-                && sql.contains("ADD COLUMN IF NOT EXISTS _rivet_row_hash NUMBER(38,0)"),
+            sql.contains("IF NOT EXISTS __op VARCHAR")
+                && sql.contains("IF NOT EXISTS _rivet_row_hash NUMBER(38,0)"),
             "every declared column is added idempotently; got: {sql}"
+        );
+        assert_eq!(
+            sql,
+            "ALTER TABLE DB.SC.t__changes ADD COLUMN\n  IF NOT EXISTS __op VARCHAR,\n  \
+             IF NOT EXISTS _rivet_row_hash NUMBER(38,0);\n",
+            "one ADD COLUMN, IF NOT EXISTS per column: the form Snowflake parses"
         );
         assert!(
             !sql.to_uppercase().contains("REPLACE") && !sql.to_uppercase().contains("DROP"),
@@ -882,6 +906,38 @@ mod tests {
         assert_eq!(extract_named(&v, "MISSING_"), None);
     }
 
+    /// Both load scripts read a part through the inline format (never a named object another statement could have made), under a stage URL closed with one slash, and cast a binary column.
+    #[test]
+    fn both_scripts_read_parts_by_an_inline_format_under_a_closed_stage_url() {
+        let format = "FILE_FORMAT=(TYPE=PARQUET BINARY_AS_TEXT=FALSE USE_LOGICAL_TYPE=TRUE)";
+        let specs = [
+            col("id", SfType::NumberPs(38, 0)),
+            col("raw", SfType::Binary),
+        ];
+        let uris = ["gs://bkt/exports/orders/part-0.parquet".to_string()];
+        for url in ["gcs://bkt/exports/orders", "gcs://bkt/exports/orders/"] {
+            let mut l = adoption_loader();
+            l.gcs_url = url.into();
+            l.storage_integration = "RIVET_GCS".into();
+            let scripts = [
+                l.build_materialize_sql("orders", &specs, &uris).unwrap(),
+                l.build_append_changelog_sql("orders", &specs, &uris)
+                    .unwrap(),
+            ];
+            for sql in scripts {
+                assert_eq!(sql.matches(format).count(), 2, "stage and COPY: {sql}");
+                assert!(
+                    !sql.contains("rivet_pq") && !sql.contains("CREATE FILE FORMAT"),
+                    "{sql}"
+                );
+                assert!(sql.contains("URL='gcs://bkt/exports/orders/' "), "{sql}");
+                assert!(sql.contains("FILES=('part-0.parquet')"), "{sql}");
+                assert!(sql.contains("$1:raw::BINARY"), "{sql}");
+                assert!(sql.contains("$1:id,") || sql.contains("$1:id "), "{sql}");
+            }
+        }
+    }
+
     fn adoption_loader() -> SnowflakeLoader {
         let mut l = SnowflakeLoader::new("rivet".to_string());
         l.warehouse = "WH".into();
@@ -971,13 +1027,239 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("AS KIND_"), "{sql}");
+        assert!(
+            !sql.contains("COUNT_IF"),
+            "COUNT_IF over no rows is NULL on Snowflake, and a free name must read as 0: {sql}"
+        );
+    }
+
+    /// A scripted `snow`: a Python file that answers each statement by the first rule whose text the statement holds, and logs every statement it was sent.
+    struct Stand {
+        dir: tempfile::TempDir,
+    }
+
+    impl Stand {
+        /// Answer by `rules`: `(text the statement holds, exit code, stdout, stderr)`.
+        fn scripted(rules: &[(&str, i32, &str, &str)]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let script: Vec<serde_json::Value> = rules
+                .iter()
+                .map(|(when, exit, out, err)| {
+                    serde_json::json!({ "when": when, "exit": exit, "stdout": out, "stderr": err })
+                })
+                .collect();
+            std::fs::write(
+                dir.path().join("script.json"),
+                serde_json::to_vec(&script).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.path().join("snow.py"),
+                "import json, pathlib, sys\n\
+                 here = pathlib.Path(__file__).parent\n\
+                 sql = sys.argv[sys.argv.index('-q') + 1]\n\
+                 with open(here / 'calls.jsonl', 'a') as f:\n\
+                 \x20   f.write(json.dumps(sql) + '\\n')\n\
+                 for rule in json.load(open(here / 'script.json')):\n\
+                 \x20   if rule['when'] in sql:\n\
+                 \x20       sys.stderr.write(rule['stderr'])\n\
+                 \x20       sys.stdout.write(rule['stdout'])\n\
+                 \x20       sys.exit(rule['exit'])\n\
+                 sys.stderr.write('stand: no rule for this statement\\n')\n\
+                 sys.exit(97)\n",
+            )
+            .unwrap();
+            Self { dir }
+        }
+
+        /// A loader of `DB.SC` that talks to this stand.
+        fn loader(&self) -> SnowflakeLoader {
+            let mut l = adoption_loader();
+            l.cli = vec![
+                "python3".to_string(),
+                self.dir
+                    .path()
+                    .join("snow.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ];
+            l
+        }
+
+        /// Every statement the stand was sent, in order.
+        fn sent(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("calls.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+    }
+
+    /// What Snowflake's catalog answers for a name: `[[status], [status], [row]]`, as `snow sql --format json` prints three statements.
+    fn answer(row: &str) -> String {
+        format!(r#"[[{{"status":"ok"}}],[{{"status":"ok"}}],[{row}]]"#)
+    }
+
+    /// What `snow` prints on stderr for a table that is not there: an 80-column box, the text wrapped by words.
+    const BOXED_MISSING: &str = "╭─ Error ──────────────────────────────────────────────────────────────────────╮\n\
+        │ 002003 (42S02): SQL compilation error:                                       │\n\
+        │ Object 'DB.SC.SF_PROBE_WRAP_AAAAAAAAAA__CHANGES' does not                    │\n\
+        │ exist or not authorized.                                                     │\n\
+        ╰──────────────────────────────────────────────────────────────────────────────╯\n";
+
+    /// The kind of an object is its catalog code, a free name is absent, and an answer without the code is an error.
+    #[test]
+    fn the_object_kind_is_read_from_the_catalog_answer() {
+        for (row, want) in [
+            (r#"{"KIND_":0}"#, crate::load::ObjectKind::Absent),
+            (r#"{"KIND_":1}"#, crate::load::ObjectKind::Table),
+            (r#"{"KIND_":2}"#, crate::load::ObjectKind::View),
+            (r#"{"KIND_":4}"#, crate::load::ObjectKind::Other),
+        ] {
+            let stand = Stand::scripted(&[("INFORMATION_SCHEMA.TABLES", 0, &answer(row), "")]);
+            assert_eq!(stand.loader().object_kind("orders").unwrap(), want, "{row}");
+            assert_eq!(stand.sent().len(), 1);
+        }
+        // What `COUNT_IF` over no rows gave: a NULL the loader does not take for "absent".
+        let stand = Stand::scripted(&[(
+            "INFORMATION_SCHEMA.TABLES",
+            0,
+            &answer(r#"{"KIND_":null}"#),
+            "",
+        )]);
+        let err = stand.loader().object_kind("orders").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("KIND_ was not in snow's output"),
+            "{err:#}"
+        );
+        let stand = Stand::scripted(&[("INFORMATION_SCHEMA.TABLES", 1, "", "denied")]);
+        assert!(stand.loader().object_kind("orders").is_err());
+    }
+
+    /// Whether a change log holds prior changes is asked of the catalog first: a log that is not there is the first cycle and is never selected from, whatever `snow` would print about it.
+    #[test]
+    fn a_missing_change_log_is_the_first_cycle_by_the_catalog_not_by_an_error_text() {
+        let absent = Stand::scripted(&[
+            (
+                "INFORMATION_SCHEMA.TABLES",
+                0,
+                &answer(r#"{"KIND_":0}"#),
+                "",
+            ),
+            ("PROBE_", 1, "", BOXED_MISSING),
+        ]);
+        assert!(
+            !BOXED_MISSING.contains("does not exist or"),
+            "the box splits the phrase"
+        );
+        assert!(!absent.loader().changes_has_prior_changes("orders").unwrap());
+        let sent = absent.sent();
+        assert_eq!(sent.len(), 1, "the log is not selected from: {sent:?}");
+        assert!(
+            sent[0].contains("TABLE_NAME = UPPER('orders__changes')"),
+            "{}",
+            sent[0]
+        );
+
+        for (probe, want) in [(1, true), (0, false)] {
+            let there = Stand::scripted(&[
+                (
+                    "INFORMATION_SCHEMA.TABLES",
+                    0,
+                    &answer(r#"{"KIND_":1}"#),
+                    "",
+                ),
+                (
+                    "PROBE_",
+                    0,
+                    &answer(&format!(r#"{{"PROBE_":{probe}}}"#)),
+                    "",
+                ),
+            ]);
+            assert_eq!(
+                there.loader().changes_has_prior_changes("orders").unwrap(),
+                want
+            );
+            assert_eq!(there.sent().len(), 2);
+        }
+
+        // A log that is there and cannot be read is an error, not a first cycle.
+        let unreadable = Stand::scripted(&[
+            (
+                "INFORMATION_SCHEMA.TABLES",
+                0,
+                &answer(r#"{"KIND_":1}"#),
+                "",
+            ),
+            ("PROBE_", 1, "", BOXED_MISSING),
+        ]);
+        assert!(
+            unreadable
+                .loader()
+                .changes_has_prior_changes("orders")
+                .is_err()
+        );
+        let drifted = Stand::scripted(&[
+            (
+                "INFORMATION_SCHEMA.TABLES",
+                0,
+                &answer(r#"{"KIND_":1}"#),
+                "",
+            ),
+            ("PROBE_", 0, &answer(r#"{"OTHER_":1}"#), ""),
+        ]);
+        let err = drifted
+            .loader()
+            .changes_has_prior_changes("orders")
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("PROBE_ was not in snow's output"),
+            "{err:#}"
+        );
+    }
+
+    /// The column overlap and the row count are the catalog's and the table's own numbers.
+    #[test]
+    fn the_column_overlap_and_the_row_count_are_read_by_name() {
+        let stand = Stand::scripted(&[
+            (
+                "INFORMATION_SCHEMA.COLUMNS",
+                0,
+                &answer(r#"{"TOTAL_":5,"MATCHED_":3}"#),
+                "",
+            ),
+            ("AS N_", 0, &answer(r#"{"N_":42}"#), ""),
+        ]);
+        let l = stand.loader();
+        assert_eq!(
+            l.column_overlap("orders", &["Id", "amount"]).unwrap(),
+            (5, 3)
+        );
+        assert_eq!(l.row_count("orders").unwrap(), 42);
+        assert_eq!(l.fqtn("orders"), "DB.SC.orders");
+        let sent = stand.sent();
+        assert!(sent[0].contains("IN ('id', 'amount')"), "{}", sent[0]);
+        assert!(sent[1].contains("FROM DB.SC.orders;"), "{}", sent[1]);
+        let none = Stand::scripted(&[(
+            "INFORMATION_SCHEMA.COLUMNS",
+            0,
+            &answer(r#"{"TOTAL_":0,"MATCHED_":0}"#),
+            "",
+        )]);
+        assert_eq!(
+            none.loader().column_overlap("absent", &["id"]).unwrap(),
+            (0, 0)
+        );
     }
 
     #[test]
     fn column_overlap_probe_lowercases_the_export_names() {
         let sql = adoption_loader().build_column_overlap_sql("orders", &["Id", "amount"]);
         assert!(
-            sql.contains("COUNT_IF(LOWER(COLUMN_NAME) IN ('id', 'amount')) AS MATCHED_"),
+            sql.contains(
+                "COUNT(CASE WHEN LOWER(COLUMN_NAME) IN ('id', 'amount') THEN 1 END) AS MATCHED_"
+            ),
             "{sql}"
         );
         assert!(sql.contains("COUNT(*) AS TOTAL_"), "{sql}");

@@ -1,0 +1,13 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index 6238b564..ecfdb46c 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -572,7 +572,7 @@ fn stage_url(gcs_url: &str) -> String {
+ }
+ 
+ /// How every stage and `COPY` reads a part, spelled inline: a named format made by `CREATE … IF NOT EXISTS` is whatever object already has that name. Logical types on, so a Parquet timestamp or time is read as one and not as its raw integer; binary kept as bytes.
+-const PARQUET_FORMAT: &str = "(TYPE=PARQUET BINARY_AS_TEXT=FALSE USE_LOGICAL_TYPE=TRUE)";
++const PARQUET_FORMAT: &str = "(TYPE=PARQUET BINARY_AS_TEXT=FALSE)";
+ 
+ /// A column is loaded through `PARSE_JSON` iff its native type is `VARIANT`
+ /// (Rivet's Snowflake resolver maps JSON → `VARIANT`); a plain `COPY` would
