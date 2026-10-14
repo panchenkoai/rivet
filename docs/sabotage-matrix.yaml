@@ -78,6 +78,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
     oracle:   { test: a_changed_cursor_column_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_cursor_incomparable
+    what: "RIVET_STATE_CURSOR_INCOMPARABLE: a stored cursor the source cannot compare with the cursor column; `rivet state reset` delivers, `state reset-chunks` (the sibling command) leaves the refusal"
+    postgres: { test: a_stored_cursor_of_another_type_is_refused_and_walked_out_postgres }
+    mysql:    { na: "MySQL coerces the text cursor to 0 and delivers the table again (a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mysql), so it never refuses" }
+    mssql:    { test: a_stored_cursor_of_another_type_is_refused_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_stored_cursor_of_another_type_is_refused_and_walked_out_oracle }
+
   - id: refusal_state_cursor_stream_mismatch
     what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; own names and `state reset` deliver, `state reset-chunks` leaves the refusal (`state accept`, the third named remedy, is walked by incremental_query_filter_edited and incremental_query_cosmetic_edit_accepted in docs/mode-transition-matrix.yaml)"
     postgres: { test: a_repointed_incremental_export_is_refused_and_walked_out_postgres }

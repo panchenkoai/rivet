@@ -680,7 +680,7 @@ pub mod codes {
     /// The source cannot compare the stored incremental cursor with the cursor column (a value of another type).
     pub const STATE_CURSOR_INCOMPARABLE: Code = refusal(
         "RIVET_STATE_CURSOR_INCOMPARABLE",
-        "`rivet state reset -c <config> --export <name>` starts the cursor over with a full pass; or restore the cursor column's previous type",
+        "`rivet state reset -c <config> --export <name>` starts the cursor over with a full pass",
     );
     /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection, another schema, or other rows of it.
     pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(

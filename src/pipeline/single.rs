@@ -308,7 +308,7 @@ fn refuse_an_incomparable_cursor(
              If `{value}` is not a value of `{column}` (the state was edited, or the column changed \
              type), every run stops here.\n  \
              Hint: `rivet state reset -c <config> --export {export}` starts `{column}` over with a full \
-             pass; or restore the column's previous type."
+             pass."
         ),
     ))
 }

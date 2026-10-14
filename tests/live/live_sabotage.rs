@@ -111,6 +111,28 @@ fn cursor_owner_mismatch(engine: SqlEngine) {
     );
 }
 
+/// RIVET_STATE_CURSOR_INCOMPARABLE: a stored cursor the source cannot compare with the cursor column.
+fn cursor_incomparable(engine: SqlEngine) {
+    let (table, mut rig, _guard) = cursor_edited(engine, "not-a-number");
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_STATE_CURSOR_INCOMPARABLE", 5),
+        vec![
+            Remedy::new(
+                &format!("`rivet state reset -c <config> --export {table}` starts"),
+                Then::DeliversTheSource,
+                |r| state(r, "reset", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, the sibling of the command the text names",
+                Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_INCOMPARABLE", 5)),
+                |r| state(r, "reset-chunks", &table),
+            ),
+        ],
+    );
+}
+
 /// RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table with no reset.
 fn cursor_stream_mismatch(engine: SqlEngine) {
     engine.alive();
@@ -2144,6 +2166,25 @@ fn hostile_dates(engine: SqlEngine) -> Vec<(&'static str, &'static str)> {
 #[ignore = "live: requires docker compose postgres"]
 fn a_changed_cursor_column_is_refused_and_walked_out_postgres() {
     cursor_owner_mismatch(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_postgres() {
+    cursor_incomparable(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_mssql() {
+    cursor_incomparable(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_oracle() {
+    cursor_incomparable(SqlEngine::Oracle);
 }
 
 #[test]
