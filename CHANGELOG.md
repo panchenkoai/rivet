@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **A resumed range-chunk run trusted the checkpoint and the parts it continued.** A
+  checkpoint or a committed part changed between the crash and the resume was continued
+  as it stood, and the run exited 0 over wrong data. Measured on 0.31.0 with 40 source rows,
+  each case through both `rivet run` and `rivet run --resume`:
+  - a pending chunk task marked `completed`: 35 rows delivered;
+  - a task whose upper bound was lowered, leaving a hole between two windows: 38 rows;
+  - two stored windows that share keys: 43 rows, 3 of them twice;
+  - a committed part replaced by its sibling's bytes: 35 distinct ids, one chunk's rows
+    twice and another's missing; a truncated part was declared as it was;
+  - a run planned under another `chunk_size` was refused with no code (exit 1), after
+    rewriting `manifest.json`.
+  - **Now** a committed part that is gone, or is not the size the state DB logged, has its
+    chunk read again, and so does a chunk marked `completed` with no part. Keys between the
+    stored windows are planned again. Windows that share keys are refused
+    (`RIVET_STATE_CHUNK_WINDOWS_BROKEN`, exit 5), and so is a changed chunk plan
+    (`RIVET_STATE_CHUNK_PLAN_CHANGED`, exit 5); both texts name `rivet state reset-chunks`,
+    and the plan refusal also names restoring the settings. Under `verify: content` each
+    committed part is read back too: a row count other than the logged one or a key outside
+    its chunk's window has the chunk read again, which catches a part replaced at its own
+    size.
+  - **What to do:** nothing for runs that were not edited by hand. An export resumed by 0.31.0
+    or earlier after its state DB or destination was edited may hold the wrong rows; run it
+    again whole.
+
 - **`rivet load` into Snowflake stored a `timestamp` column as a wrong date, and several
   loads failed outright.** Snowflake target only; BigQuery and ClickHouse loads are not
   touched.

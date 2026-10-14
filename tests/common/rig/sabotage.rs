@@ -18,6 +18,8 @@ pub enum Damage<'a> {
     Removed,
     /// Replace its bytes with another file's.
     ReplacedBy(&'a Path),
+    /// Replace it with the rows of another Parquet file, as many as it held, written at exactly its length (no Arrow schema in the footer, which carries padding).
+    ReplacedAtItsSize(&'a Path),
     /// Rewrite it as the JSON document this edit leaves.
     Json(&'a dyn Fn(&mut serde_json::Value)),
 }
@@ -40,6 +42,11 @@ pub(crate) fn damaged(before: &[u8], how: &Damage) -> Result<Option<Vec<u8>>, St
         Damage::ReplacedBy(other) => {
             std::fs::read(other).map_err(|e| format!("read {}: {e}", other.display()))?
         }
+        Damage::ReplacedAtItsSize(other) => {
+            let donor =
+                std::fs::read(other).map_err(|e| format!("read {}: {e}", other.display()))?;
+            parquet_at_size(&donor, parquet_rows(before)?, before.len())?
+        }
         Damage::Json(edit) => {
             let was: serde_json::Value =
                 serde_json::from_slice(before).map_err(|e| format!("not JSON before: {e}"))?;
@@ -55,6 +62,74 @@ pub(crate) fn damaged(before: &[u8], how: &Damage) -> Result<Option<Vec<u8>>, St
         return Err("the damage left the same bytes".to_string());
     }
     Ok(Some(after))
+}
+
+/// The row count of a Parquet file.
+fn parquet_rows(bytes: &[u8]) -> Result<usize, String> {
+    let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(bytes),
+    )
+    .map_err(|e| format!("not Parquet: {e}"))?;
+    usize::try_from(b.metadata().file_metadata().num_rows()).map_err(|e| e.to_string())
+}
+
+/// The first `rows` rows of the Parquet file `donor`, written as a Parquet file of exactly `len` bytes: the footer carries padding.
+fn parquet_at_size(donor: &[u8], rows: usize, len: usize) -> Result<Vec<u8>, String> {
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::metadata::KeyValue;
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        bytes::Bytes::copy_from_slice(donor),
+    )
+    .map_err(|e| format!("donor not Parquet: {e}"))?;
+    let schema = reader.schema().clone();
+    let batches: Vec<_> = reader
+        .build()
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let all = arrow::compute::concat_batches(&schema, &batches).map_err(|e| e.to_string())?;
+    if all.num_rows() < rows {
+        return Err(format!(
+            "the donor holds {} rows, {rows} wanted",
+            all.num_rows()
+        ));
+    }
+    let batch = all.slice(0, rows);
+    let write = |pad: usize| -> Vec<u8> {
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(22).expect("level")))
+            .set_key_value_metadata(Some(vec![KeyValue::new(
+                "pad".to_string(),
+                "x".repeat(pad),
+            )]))
+            .build();
+        let mut out = Vec::new();
+        let options = parquet::arrow::arrow_writer::ArrowWriterOptions::new()
+            .with_properties(props)
+            .with_skip_arrow_metadata(true);
+        let mut w =
+            parquet::arrow::ArrowWriter::try_new_with_options(&mut out, schema.clone(), options)
+                .expect("writer");
+        w.write(&batch).expect("write");
+        w.close().expect("close");
+        out
+    };
+    let mut pad = 0usize;
+    for _ in 0..16 {
+        let out = write(pad);
+        match out.len().cmp(&len) {
+            std::cmp::Ordering::Equal => return Ok(out),
+            std::cmp::Ordering::Less => pad += len - out.len(),
+            std::cmp::Ordering::Greater if pad > 0 => pad -= (out.len() - len).min(pad),
+            std::cmp::Ordering::Greater => {
+                return Err(format!(
+                    "the donor's {rows} rows take {} bytes, more than {len}",
+                    out.len()
+                ));
+            }
+        }
+    }
+    Err(format!("no padding gives {len} bytes"))
 }
 
 /// Why two runs of one invocation are neither a delivery nor one refusal, else how it ended.
@@ -400,6 +475,26 @@ mod tests {
         let same = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(same.path(), b"abcd").unwrap();
         assert!(damaged(b"abcd", &Damage::ReplacedBy(same.path())).is_err());
+        let part = |ids: std::ops::Range<i64>| {
+            let a: std::sync::Arc<dyn arrow::array::Array> =
+                std::sync::Arc::new(arrow::array::Int64Array::from_iter_values(ids));
+            let batch = arrow::record_batch::RecordBatch::try_from_iter([("id", a)]).unwrap();
+            let mut out = Vec::new();
+            let mut w =
+                parquet::arrow::ArrowWriter::try_new(&mut out, batch.schema(), None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+            out
+        };
+        let (own, donor) = (part(0..5), part(1000..1050));
+        let donor_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(donor_file.path(), &donor).unwrap();
+        let after = damaged(&own, &Damage::ReplacedAtItsSize(donor_file.path()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.len(), own.len(), "the same length");
+        assert_ne!(after, own);
+        assert_eq!(parquet_rows(&after).unwrap(), 5, "as many rows as it held");
         assert!(damaged(b"{\"a\": 1}", &Damage::Json(&|_| {})).is_err());
         let edit = |d: &mut serde_json::Value| d["a"] = serde_json::json!(2);
         let after = damaged(b"{\"a\": 1}", &Damage::Json(&edit))

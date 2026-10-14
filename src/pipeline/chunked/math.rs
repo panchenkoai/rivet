@@ -75,16 +75,26 @@ pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
     chunks
 }
 
-/// The pieces of the inclusive `ranges` that lie outside the inclusive span `lo..=hi`, in order.
-pub(crate) fn ranges_outside(ranges: &[(i64, i64)], (lo, hi): (i64, i64)) -> Vec<(i64, i64)> {
-    ranges
-        .iter()
-        .flat_map(|&(start, end)| {
-            let below = (start < lo).then(|| (start, end.min(lo - 1)));
-            let above = (end > hi).then(|| (start.max(hi + 1), end));
-            below.into_iter().chain(above)
-        })
-        .collect()
+/// The pieces of the inclusive `ranges` that no window of `windows` covers, in order; `windows` are inclusive, ordered by their first key and do not overlap.
+pub(crate) fn ranges_uncovered(ranges: &[(i64, i64)], windows: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for &(start, end) in ranges {
+        let mut from = Some(start);
+        for &(lo, hi) in windows.iter().filter(|w| w.1 >= start && w.0 <= end) {
+            let Some(at) = from else { break };
+            if lo > at {
+                out.push((at, lo - 1));
+            }
+            from = hi
+                .checked_add(1)
+                .filter(|next| *next <= end)
+                .map(|n| n.max(at));
+        }
+        if let Some(at) = from {
+            out.push((at, end));
+        }
+    }
+    out
 }
 
 pub(crate) fn build_chunk_query_sql(
@@ -531,26 +541,67 @@ mod tests {
     }
 
     #[test]
-    fn ranges_outside_a_span_are_its_ranges_cut_at_the_span() {
+    fn the_uncovered_pieces_of_ranges_are_what_no_window_holds() {
         let ranges = [(1, 10), (11, 20), (21, 30)];
-        assert_eq!(ranges_outside(&ranges, (1, 30)), vec![]);
-        assert_eq!(ranges_outside(&ranges, (1, 20)), vec![(21, 30)]);
-        assert_eq!(ranges_outside(&ranges, (11, 30)), vec![(1, 10)]);
-        assert_eq!(ranges_outside(&ranges, (5, 25)), vec![(1, 4), (26, 30)]);
+        let cut = |windows: &[(i64, i64)]| ranges_uncovered(&ranges, windows);
+        assert_eq!(cut(&[(1, 30)]), vec![]);
+        assert_eq!(cut(&[(1, 20)]), vec![(21, 30)]);
+        assert_eq!(cut(&[(11, 30)]), vec![(1, 10)]);
+        assert_eq!(cut(&[(5, 25)]), vec![(1, 4), (26, 30)]);
         assert_eq!(
-            ranges_outside(&ranges, (12, 14)),
+            cut(&[(12, 14)]),
             vec![(1, 10), (11, 11), (15, 20), (21, 30)]
         );
-        assert_eq!(ranges_outside(&ranges, (40, 50)), ranges.to_vec());
-        assert_eq!(ranges_outside(&ranges, (-9, 0)), ranges.to_vec());
-        assert_eq!(ranges_outside(&[(0, 0)], (0, 0)), vec![]);
-        assert_eq!(ranges_outside(&[], (1, 2)), vec![]);
-        let all = [(i64::MIN, i64::MAX)];
-        assert_eq!(ranges_outside(&all, (i64::MIN, i64::MAX)), vec![]);
+        assert_eq!(cut(&[(40, 50)]), ranges.to_vec());
+        assert_eq!(cut(&[(-9, 0)]), ranges.to_vec());
+        assert_eq!(cut(&[]), ranges.to_vec());
+        // A hole between two stored windows is planned again; nothing else is.
+        assert_eq!(cut(&[(1, 10), (11, 13), (18, 30)]), vec![(14, 17)]);
         assert_eq!(
-            ranges_outside(&all, (0, 0)),
+            cut(&[(1, 4), (8, 12), (25, 30)]),
+            vec![(5, 7), (13, 20), (21, 24)]
+        );
+        assert_eq!(ranges_uncovered(&[(0, 0)], &[(0, 0)]), vec![]);
+        assert_eq!(ranges_uncovered(&[], &[(1, 2)]), vec![]);
+        let all = [(i64::MIN, i64::MAX)];
+        assert_eq!(ranges_uncovered(&all, &[(i64::MIN, i64::MAX)]), vec![]);
+        assert_eq!(
+            ranges_uncovered(&all, &[(0, 0)]),
             vec![(i64::MIN, -1), (1, i64::MAX)]
         );
+        assert_eq!(
+            ranges_uncovered(&all, &[(i64::MIN, 0), (5, i64::MAX)]),
+            vec![(1, 4)]
+        );
+    }
+
+    proptest::proptest! {
+        /// Whatever a run stored and whatever the source holds now, the stored windows and the pieces planned beside them cover every key of the new plan once: none twice, none left out.
+        #[test]
+        fn stored_windows_and_the_uncovered_pieces_cover_the_new_plan_once(
+            min0 in -500i64..500,
+            span0 in 0i64..400,
+            min1 in -900i64..900,
+            span1 in 0i64..900,
+            size in 1i64..60,
+            dropped in proptest::collection::vec(proptest::prelude::any::<proptest::sample::Index>(), 0..4),
+        ) {
+            let mut stored = generate_chunks(min0, min0 + span0, size);
+            for i in &dropped {
+                if stored.len() > 1 {
+                    stored.remove(i.index(stored.len()));
+                }
+            }
+            let plan = generate_chunks(min1, min1 + span1, size);
+            let added = ranges_uncovered(&plan, &stored);
+            let held = |k: i64, set: &[(i64, i64)]| set.iter().filter(|(a, b)| *a <= k && k <= *b).count();
+            for k in min1..=min1 + span1 {
+                proptest::prop_assert_eq!(held(k, &stored) + held(k, &added), 1, "key {}", k);
+            }
+            for (a, b) in &added {
+                proptest::prop_assert!(a <= b && *a >= min1 && *b <= min1 + span1);
+            }
+        }
     }
 
     #[test]

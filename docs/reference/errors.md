@@ -57,6 +57,8 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_STATE_RUN_IN_PROGRESS` | refusal | 5 | wait for the run to finish, or stop its process, then repeat the command |
 | `RIVET_STATE_CHUNK_CHECKPOINT_GONE` | refusal | 5 | run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest) |
+| `RIVET_STATE_CHUNK_PLAN_CHANGED` | refusal | 5 | restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over |
+| `RIVET_STATE_CHUNK_WINDOWS_BROKEN` | refusal | 5 | `rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run plans the export again and reads every key |
 | `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE` | environment | 2 if transient, else 1 | free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease |
 | `RIVET_STATE_LEASE_LOST` | refusal | 5 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse |
 | `RIVET_PLAN_SOURCE_UNREADABLE` | environment | 2 if transient, else 1 | fix what the message names (the connection, the credentials, or the table the export reads), then run `rivet plan` again |
