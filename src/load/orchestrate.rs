@@ -674,6 +674,24 @@ fn identity_engine(ident: &str) -> &str {
     ident.split(':').next().unwrap_or(ident)
 }
 
+/// What an empty selection means when the prefix holds manifests and not one is Success: nothing was loaded, which is not "up to date". `None` for an empty prefix and for a prefix with at least one Success run.
+fn no_success_note(
+    table: &str,
+    prefix: &str,
+    manifests_seen: usize,
+    success_runs: usize,
+) -> Option<String> {
+    (manifests_seen > 0 && success_runs == 0).then(|| {
+        format!(
+            "  load [{table}]: {manifests_seen} manifest(s) under {prefix} and NOT ONE is Success — \
+             every run there aborted or is still writing, so nothing has been loaded. \
+             This is not 'up to date': re-run the export, then load. A crashed run's \
+             parts are deliberately left unread; the retry returns them under a new \
+             run id."
+        )
+    })
+}
+
 /// Reconcile the manifests under a load's prefix into its [`LoadInputs`],
 /// mode-aware and ledger-filtered.
 ///
@@ -788,15 +806,10 @@ fn prepare_load(
     let listed = keyed.clone();
     let new = load::reconcile::select_runs(keyed, &loaded, plan.mode)?;
     if new.is_empty() {
-        if manifests_seen > 0 && success_runs == 0 {
-            eprintln!(
-                "  load [{}]: {manifests_seen} manifest(s) under {} and NOT ONE is Success — \
-                 every run there aborted or is still writing, so nothing has been loaded. \
-                 This is not 'up to date': re-run the export, then load. A crashed run's \
-                 parts are deliberately left unread; the retry returns them under a new \
-                 run id.",
-                plan.table, plan.gcs_prefix
-            );
+        if let Some(note) =
+            no_success_note(&plan.table, &plan.gcs_prefix, manifests_seen, success_runs)
+        {
+            eprintln!("{note}");
         }
         return Ok(None);
     }
@@ -4296,6 +4309,64 @@ mod live_only_decisions {
         assert!(
             format!("{err:#}").contains("could not say which source last loaded"),
             "{err:#}"
+        );
+    }
+
+    /// The "not one is Success" note is for a prefix that holds manifests and no Success run: not for an empty prefix, and not once one run succeeded.
+    #[test]
+    fn the_no_success_note_is_for_manifests_without_one_success() {
+        let note = |seen, ok| no_success_note("orders", "gs://b/p", seen, ok);
+        let said = note(3, 0).expect("three aborted runs");
+        assert!(said.contains("3 manifest(s) under gs://b/p and NOT ONE is Success"));
+        assert!(said.starts_with("  load [orders]:"));
+        assert!(note(1, 0).is_some());
+        assert_eq!(note(0, 0), None, "an empty prefix has its own note");
+        assert_eq!(
+            note(3, 1),
+            None,
+            "one Success run: the selection is up to date"
+        );
+        assert_eq!(note(1, 1), None);
+    }
+
+    /// An append load whose ledger cannot say which runs are loaded is refused for that reason, before anything else is asked of the ledger; an overwriting load goes past that read.
+    #[test]
+    fn an_append_load_is_refused_for_the_unreadable_loaded_set_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fs_store(&dir);
+        let prefix = "gs://b/base";
+        write_at(&dir, "base/part-1.parquet", b"x");
+        let good = success_manifest("run-1", "part-1.parquet");
+        write_at(
+            &dir,
+            "base/manifest-run-1.json",
+            &serde_json::to_vec(&good).unwrap(),
+        );
+        let state = StateStore::open_in_memory().unwrap();
+        state.exec_for_test("DROP TABLE loaded_source_run");
+        let said = |mode| {
+            let err = prepare_load(
+                &store,
+                &plan_at(mode, prefix),
+                Some(&state),
+                "p.d.orders",
+                false,
+            )
+            .err()
+            .expect("an unreadable ledger refuses the load");
+            format!("{err:#}")
+        };
+        for mode in [LoadMode::Incremental, LoadMode::Cdc] {
+            let said = said(mode);
+            assert!(
+                said.contains("cannot read which extraction runs are already loaded")
+                    && said.contains("refusing an append load"),
+                "{mode:?}: {said}"
+            );
+        }
+        assert!(
+            !said(LoadMode::Full).contains("refusing an append load"),
+            "a full load overwrites and does not consult the loaded set"
         );
     }
 

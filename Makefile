@@ -360,6 +360,10 @@ release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckd
 # red (after the same cells passed on the unpatched tree). Needs the live stand. Narrow it with
 # SEEDED_ARGS="--seeds committed-every-event --engines postgres". In the gate: --with-seeded-recall.
 SEEDED_ARGS ?=
+.PHONY: open-defects
+open-defects:  ## Every open_defect_ live cell against its line in dev/release_oracle/known_red.py; CI does not run these cells, so run this after a fixture or harness change.
+	$(LIVE) $(PY) -m dev.release_oracle.open_defects
+
 .PHONY: seeded-recall
 seeded-recall:  ## Seeded-defect recall: re-introduce every known bug class and require the harness to catch it.
 	$(LIVE) env $(GATE_ENV) $(PY) -m dev.seeded $(SEEDED_ARGS)
