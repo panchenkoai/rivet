@@ -129,4 +129,28 @@ mod tests {
         let schema = Arc::new(Schema::new(fields));
         assert_eq!(compute_batch_size_from_memory(1, &schema), 1_000);
     }
+
+    /// Each fixed-width type contributes its width plus one validity byte.
+    #[test]
+    fn each_fixed_width_type_counts_its_width() {
+        for (ty, width) in [
+            (DataType::Boolean, 1),
+            (DataType::Int8, 1),
+            (DataType::UInt8, 1),
+            (DataType::Int16, 2),
+            (DataType::UInt16, 2),
+            (DataType::Int32, 4),
+            (DataType::UInt32, 4),
+            (DataType::Float32, 4),
+            (DataType::Date32, 4),
+            (DataType::Int64, 8),
+            (DataType::Decimal128(38, 9), 16),
+            (DataType::Decimal256(76, 9), 16),
+            (DataType::Utf8, 256),
+            (DataType::Null, 64),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new("c", ty.clone(), true)]));
+            assert_eq!(estimate_row_bytes(&schema), width + 1, "{ty:?}");
+        }
+    }
 }

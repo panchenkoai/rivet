@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A load could be refused as "another `rivet load` ... is writing" right after its own
+  process released that table.** SQLite state only. The load lease is an `flock`, and it was
+  released by closing the file; a process spawned on another thread at that moment kept a copy
+  of the descriptor until its `exec`, and with it the lock. The next load of the same table in
+  this process was refused (exit 5) though nothing was writing it. **Now** the lease is unlocked
+  explicitly before the file is closed. **What to do:** nothing; a refused load can be run again.
+
 - **A resumed range-chunk run trusted the checkpoint and the parts it continued.** A
   checkpoint or a committed part changed between the crash and the resume was continued
   as it stood, and the run exited 0 over wrong data. Measured on 0.31.0 with 40 source rows,
