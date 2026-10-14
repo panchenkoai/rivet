@@ -255,7 +255,7 @@ fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     found
 }
 
-/// `tb` leaves `tables:`, changes, and comes back: refused twice with nothing written; the remedy as printed re-reads it and capture resumes (each green run is graded by the rig oracle).
+/// `tb` leaves `tables:`, changes, and comes back: refused twice (`RIVET_STATE_CDC_TABLE_REJOINED`), the files-only half of the printed remedy leaves the refusal standing, the remedy as printed re-reads `tb` and capture resumes (every run graded by the rig oracle; a refused run leaves nothing).
 pub fn a_table_put_back_is_refused_until_rebaselined(
     mut rig: Rig,
     [ta, tb, tc]: [&str; 3],
@@ -275,13 +275,49 @@ pub fn a_table_put_back_is_refused_until_rebaselined(
     rig.run_ok();
     rig = rig.tables(&[ta, tb, tc]);
     let dir = rig.out_dir().join(tb);
-    let before = files_under(&dir);
-    let first = rejoin_refusal(rig.run_expect_fail());
+    let aside = dir.with_extension("before-rejoin");
+    let files_out = {
+        let (dir, aside) = (dir.clone(), aside.clone());
+        move || std::fs::rename(&dir, &aside).expect("move the table's files out")
+    };
+    let first = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_STATE_CDC_TABLE_REJOINED", 5),
+        vec![
+            Remedy::wrong(
+                "moves the table's files out and keeps its `cdc_snapshot` row",
+                Then::Refuses(Refused::by_code("RIVET_STATE_CDC_TABLE_REJOINED", 5)),
+                {
+                    let files_out = files_out.clone();
+                    move |_| files_out()
+                },
+            ),
+            Remedy::new(
+                &format!("move every file out of `file://{}`", dir.display()),
+                Then::DeliversTheSource,
+                {
+                    let dir = dir.clone();
+                    move |r| {
+                        files_out();
+                        let cleared = clear_cdc_snapshot(
+                            &r.config_path(),
+                            r.export_name(),
+                            &dir.to_string_lossy(),
+                        );
+                        assert_eq!(
+                            cleared, 1,
+                            "fixture: the one `cdc_snapshot` row of the table put back"
+                        );
+                    }
+                },
+            ),
+        ],
+    );
     for said in [
         format!(
             "table `{tb}` is not among the tables this stream captured on its last run ({ta}, {tc})"
         ),
-        format!("move every file out of `file://{}`", dir.display()),
         format!(
             "delete the `cdc_snapshot` row of export '{}', table `{tb}`",
             rig.export_name()
@@ -289,23 +325,6 @@ pub fn a_table_put_back_is_refused_until_rebaselined(
     ] {
         assert!(first.contains(&said), "the refusal says `{said}`:\n{first}");
     }
-    assert_eq!(
-        rejoin_refusal(rig.run_expect_fail()),
-        first,
-        "the second run refuses for the same reason"
-    );
-    assert_eq!(files_under(&dir), before, "a refused run writes nothing");
-    std::fs::rename(&dir, dir.with_extension("before-rejoin")).expect("move the table's files out");
-    let cleared = clear_cdc_snapshot(
-        &rig.config_path(),
-        rig.export_name(),
-        &dir.to_string_lossy(),
-    );
-    assert_eq!(
-        cleared, 1,
-        "fixture: the one `cdc_snapshot` row of the table put back"
-    );
-    rig.run_ok();
     assert!(
         dir.join("snapshot").join("_SUCCESS").exists(),
         "the remedy's run took the table's baseline again"

@@ -346,7 +346,11 @@ const MATRICES: &[(&str, usize)] = &[
     // 2026-10-09, 118 -> 119: `refusal_state_lease_lost`. The refusal answers an event during
     // one load (its lease taken while the process is stalled); a second run meets a busy
     // lease, so `refuses_twice_and_walks_out` cannot produce it twice.
-    ("docs/sabotage-matrix.yaml", 108),
+    // 109 -> 96 (2026-10-14; 108 on main by a sibling fix): the table-rejoined walk (one body, four engines: the files-only half of the
+    // remedy is the wrong one), and eight cells that named a code no site raises on that engine are `na`
+    // (undecodable on PG/SQL Server/Mongo, unrepresentable on Oracle/Mongo, foreign checkpoint on PG/Mongo,
+    // truncate on SQL Server).
+    ("docs/sabotage-matrix.yaml", 96),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
@@ -1692,7 +1696,38 @@ fn items_in(text: &str) -> HashMap<String, String> {
     items
 }
 
-/// The cited test's body plus every same-file `fn`/`const` it reaches by name, transitively.
+/// Every `fn`/`const` under tests/common, the shared harness a cell's body may reach; by name, the first definition in path order wins.
+fn shared_harness_items() -> &'static HashMap<String, String> {
+    static ITEMS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    ITEMS.get_or_init(|| {
+        let mut files = Vec::new();
+        let mut stack = vec![repo_root().join("tests").join("common")];
+        while let Some(dir) = stack.pop() {
+            for p in std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+            {
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        let mut items = HashMap::new();
+        for p in files {
+            for (k, v) in items_in(&std::fs::read_to_string(&p).unwrap_or_default()) {
+                items.entry(k).or_insert(v);
+            }
+        }
+        items
+    })
+}
+
+/// The cited test's body plus every `fn`/`const` it reaches by name, transitively: in its own file, else in tests/common (the shared harness).
 pub(super) fn test_closure(name: &str) -> Option<String> {
     let mut stack = vec![repo_root().join("src"), repo_root().join("tests")];
     while let Some(dir) = stack.pop() {
@@ -1713,16 +1748,18 @@ pub(super) fn test_closure(name: &str) -> Option<String> {
             if !items.contains_key(name) {
                 continue;
             }
+            let shared = shared_harness_items();
+            let lookup = |n: &str| items.get(n).or_else(|| shared.get(n));
             let (mut seen, mut todo, mut out) =
                 (HashSet::new(), vec![name.to_string()], String::new());
             while let Some(n) = todo.pop() {
                 if !seen.insert(n.clone()) {
                     continue;
                 }
-                let Some(body) = items.get(&n) else { continue };
+                let Some(body) = lookup(&n) else { continue };
                 out.push_str(body);
                 for ident in body.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                    if items.contains_key(ident) && !seen.contains(ident) {
+                    if lookup(ident).is_some() && !seen.contains(ident) {
                         todo.push(ident.to_string());
                     }
                 }
@@ -1885,6 +1922,18 @@ fn a_refusal_row_set_that_misses_or_invents_a_code_is_reported() {
         Some("RIVET_STATE_SCHEMA_NEWER")
     );
     assert_eq!(refusal_row_code("corrupt_part_removed"), None);
+}
+
+/// A cell whose walk lives in tests/common (one body for every engine) is followed there.
+#[test]
+fn a_cited_test_reaches_the_shared_harness_body_it_calls() {
+    let body =
+        test_closure("pg_table_removed_from_tables_and_put_back_is_refused_until_rebaselined")
+            .expect("the table-rejoined cell exists");
+    assert_eq!(
+        not_a_refusal_walk(&body, "RIVET_STATE_CDC_TABLE_REJOINED"),
+        None
+    );
 }
 
 #[test]

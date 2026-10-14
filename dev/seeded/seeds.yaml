@@ -16,6 +16,24 @@
 # `cells: []` means the code path exists and NO cell catches it: a MISSED row by declaration.
 
 seeds:
+
+  - name: keyset-key-by-catalog-order
+    class: the auto-selected keyset key is whichever single-column unique key the server's catalog listed first, so two runs of one export can page different keys
+    history: main CI 2026-10-14, a crash-then-resume cell on a MySQL table with unique `id` and `ext_id` and no primary key - the resumed run was refused with RIVET_STATE_CURSOR_OWNER_MISMATCH
+    scope: source
+    engines:
+      mysql:
+        patch: keyset-key-by-catalog-order/lib.patch
+        cells: ["lib:the_primary_key_comes_first_and_a_column_is_listed_once"]
+      postgres:
+        patch: keyset-key-by-catalog-order/lib.patch
+        cells: ["lib:the_primary_key_comes_first_and_a_column_is_listed_once"]
+      mssql:
+        na: "its key query orders by is_pk DESC, name in SQL (src/source/mssql/mod.rs); the shared seam is covered under mysql/postgres"
+      oracle:
+        na: "its key query orders by is_pk DESC, column_name in SQL (src/source/oracle/mod.rs); the shared seam is covered under mysql/postgres"
+      mongo:
+        na: "no SQL catalog and no keyset key introspection; `_id` is the only key"
   - name: committed-every-event
     class: a CDC adapter marks `committed` on every event instead of only the last event of a source transaction
     history: PG and SQL Server lost 7 of 12 rows at rollover 5 (#158)

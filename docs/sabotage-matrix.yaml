@@ -319,10 +319,10 @@ scenarios:
 
   - id: refusal_source_cdc_foreign_checkpoint
     what: "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT: a checkpoint written against another server or stream"
-    postgres: { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    postgres: { na: "the identity verdict is enforced by the MySQL, SQL Server and Oracle streams (`IdentityVerdict::enforce`); the PostgreSQL position lives in the server's own slot, which no other server holds" }
     mysql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mssql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mongo:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mongo:    { na: "the identity verdict is enforced by the MySQL, SQL Server and Oracle streams (`IdentityVerdict::enforce`); a MongoDB resume token is validated by the server it came from" }
     oracle:   { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
 
   - id: refusal_source_cdc_checkpoint_invalid
@@ -345,16 +345,16 @@ scenarios:
     what: "RIVET_SOURCE_CDC_TRUNCATED: a TRUNCATE inside the stream"
     postgres: { test: a_cdc_truncate_is_refused_by_code_postgres }
     mysql:    { test: a_cdc_truncate_is_refused_by_code_mysql }
-    mssql:    { gap: "refused by code in the truncate row of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { na: "no SQL Server site: the server itself refuses TRUNCATE on a table enabled for CDC (the capture stays whole), so there is no truncate inside the stream to refuse" }
     mongo:    { test: a_cdc_collection_drop_is_refused_by_code_mongo }
     oracle:   { test: a_cdc_truncate_is_refused_by_code_oracle }
 
   - id: refusal_source_cdc_undecodable
     what: "RIVET_SOURCE_CDC_UNDECODABLE: a change the stream cannot decode"
-    postgres: { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    postgres: { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
     mysql:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mssql:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mongo:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mssql:    { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
+    mongo:    { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
     oracle:   { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
 
   - id: refusal_source_cdc_cell_unsupported
@@ -370,8 +370,8 @@ scenarios:
     postgres: { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
     mysql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
     mssql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
-    mongo:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
-    oracle:   { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+    mongo:    { na: "raised by the PostgreSQL, MySQL and SQL Server converters (src/source/*/arrow_convert.rs) and the MySQL TIME fix of the CDC value seam; no MongoDB site (documents are carried as JSON)" }
+    oracle:   { na: "raised by the PostgreSQL, MySQL and SQL Server converters (src/source/*/arrow_convert.rs) and the MySQL TIME fix of the CDC value seam; no Oracle site" }
 
   - id: refusal_source_probe_unreadable
     what: "RIVET_SOURCE_PROBE_UNREADABLE: a chunk, page or partition key of a type the min/max probe cannot read"
@@ -383,11 +383,11 @@ scenarios:
 
   - id: refusal_state_cdc_table_rejoined
     what: "RIVET_STATE_CDC_TABLE_REJOINED: a table removed from `tables:` and put back"
-    postgres: { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
-    mysql:    { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
-    mssql:    { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
-    mongo:    { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
-    oracle:   { gap: "asserted by its code in the multi-table CDC cells (the tests/common/mod.rs helper that reads its text); the walk is not written: refuse twice, the per-table re-baseline of the text applied literally, and one wrong remedy, as a multi-table CdcScenario cell" }
+    postgres: { test: pg_table_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+    mysql:    { test: mysql_table_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+    mssql:    { gap: "the walk body (tests/common/mod.rs a_table_put_back_is_refused_until_rebaselined) holds the other four engines; no SQL Server cell builds a three-table capture (one capture instance per table) yet" }
+    mongo:    { test: mongo_cdc_collection_removed_from_tables_and_put_back_is_refused_until_rebaselined }
+    oracle:   { test: oracle_cdc_table_removed_from_tables_and_put_back_is_refused_until_rebaselined }
 
   - id: refusal_state_chunk_run_owner_unknown
     what: "RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN: an unfinished chunk run a rivet that recorded no source left, under a name two sources share"
