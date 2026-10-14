@@ -54,3 +54,74 @@ fn keyset_run_records_parallel_cursor_bounds_and_bytes_read() {
     );
     let _ = c.execute(&format!("DROP TABLE IF EXISTS {table}"), &[]);
 }
+
+/// A keyset run records the first and the last key it read in its metrics row, from the backend the run used.
+fn keyset_run_records_the_cursor_it_started_and_ended_at(e: SqlEngine) {
+    e.alive();
+    let (table, _guard) = e.range_table("km_floor");
+    e.insert(&table, 11..=410, 10, Some(1));
+    let rig = e.staged(
+        e.rig(&table),
+        "chunked",
+        &["chunk_by_key: id", "chunk_size: 100"],
+    );
+    rig.run_ok();
+    let (low, high) = recorded_cursor_bounds(&rig.config_path(), rig.export_name())
+        .expect("a successful run writes its metrics row");
+    assert_eq!(
+        low.as_deref(),
+        Some("11"),
+        "the observed floor is the first key the run read"
+    );
+    assert_eq!(
+        high.as_deref(),
+        Some("410"),
+        "the high-water is the last key the run read"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn keyset_run_records_the_cursor_it_started_and_ended_at_postgres() {
+    keyset_run_records_the_cursor_it_started_and_ended_at(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn keyset_run_records_the_cursor_it_started_and_ended_at_mysql() {
+    keyset_run_records_the_cursor_it_started_and_ended_at(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn keyset_run_records_the_cursor_it_started_and_ended_at_mssql() {
+    keyset_run_records_the_cursor_it_started_and_ended_at(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose up -d oracle"]
+fn keyset_run_records_the_cursor_it_started_and_ended_at_oracle() {
+    keyset_run_records_the_cursor_it_started_and_ended_at(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn keyset_run_records_the_cursor_it_started_and_ended_at_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("km_floor_mg");
+    let mongo = MongoTest::connect(27017, &db);
+    mongo.seed_int_id("c", 300);
+    let rig = Rig::mongo_batch("c")
+        .source_url(&MongoTest::url(27017, &db))
+        .mongo("page_size: 100");
+    rig.run_ok();
+    let (low, _) = recorded_cursor_bounds(&rig.config_path(), rig.export_name())
+        .expect("a successful run writes its metrics row");
+    assert_eq!(
+        low.as_deref(),
+        Some("1"),
+        "the observed floor is the first key the run read"
+    );
+    mongo.drop_database();
+}

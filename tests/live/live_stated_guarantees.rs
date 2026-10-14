@@ -798,17 +798,22 @@ fn every_batch_shape_through_a_transaction_pooler_leaves_its_session_as_it_was_p
         ("incremental", &["cursor_column: id"]),
     ];
     for (mode, lines) in shapes {
+        let dest = tempfile::tempdir().unwrap();
+        let export = unique_name("guar_pool_exp");
         for cycle in 1..=2 {
             let rig = engine
-                .staged(engine.rig(&table), mode, lines)
+                .staged(engine.rig(&table).export_named(&export), mode, lines)
                 .source_url(PGBOUNCER_URL)
-                .export_line("tuning: {statement_timeout_s: 300, lock_timeout_s: 30}");
+                .export_line("tuning: {statement_timeout_s: 300, lock_timeout_s: 30}")
+                .dest_path(dest.path().to_path_buf());
             rig.run_ok();
-            assert_eq!(
-                read_ids(&rig.out_dir()),
-                (1..=ROWS).collect::<Vec<_>>(),
-                "{mode} {lines:?}: every row arrives through the pooler"
-            );
+            if cycle == 1 {
+                assert_eq!(
+                    read_ids(&rig.out_dir()),
+                    (1..=ROWS).collect::<Vec<_>>(),
+                    "{mode} {lines:?}: every row arrives through the pooler"
+                );
+            }
             assert_eq!(
                 pooled_session(),
                 before,

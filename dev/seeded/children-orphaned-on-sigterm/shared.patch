@@ -1,0 +1,14 @@
+diff --git a/src/pipeline/parallel_children.rs b/src/pipeline/parallel_children.rs
+index 4c63d50f..0bfd68b6 100644
+--- a/src/pipeline/parallel_children.rs
++++ b/src/pipeline/parallel_children.rs
+@@ -542,6 +542,9 @@ mod child_reaper {
+ 
+     /// Record a live child PID so the handler can signal it.
+     pub(super) fn register(pid: u32) {
++        if true {
++            return;
++        }
+         let pid = pid as i32;
+         for slot in &SLOTS {
+             if slot

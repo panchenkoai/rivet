@@ -1749,3 +1749,436 @@ seeds:
       oracle:
         cells:
           - "a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_oracle"
+
+  - name: incremental-cursor-never-committed
+    class: an incremental run never stores its cursor after the manifest is durable, so every run re-reads and re-delivers the whole table
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: incremental-cursor-never-committed/shared.patch
+    engines:
+      postgres:
+        cells:
+        - incremental_second_run_on_unchanged_source_exports_zero_new_rows
+        - a_incremental_run_killed_at_each_point_recovers_postgres
+      mysql:
+        cells:
+        - mysql_incremental_second_run_on_unchanged_source_exports_zero_new_rows
+        - a_incremental_run_killed_at_each_point_recovers_mysql
+      mssql:
+        cells:
+        - mssql_incremental_second_run_on_unchanged_source_exports_zero_new_rows
+        - a_incremental_run_killed_at_each_point_recovers_mssql
+      mongo:
+        na: 'a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes), so it stores no incremental cursor'
+      oracle:
+        cells:
+        - an_incremental_timestamp_cursor_resumes_past_the_last_row
+        - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: first-cursor-value-is-a-constant
+    class: the run's observed cursor floor is a constant instead of the first non-null cursor value, so the recorded cursor_min of a keyset run is wrong
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: first-cursor-value-is-a-constant/shared.patch
+    engines:
+      postgres:
+        cells:
+        - keyset_run_records_the_cursor_it_started_and_ended_at_postgres
+      mysql:
+        cells:
+        - keyset_run_records_the_cursor_it_started_and_ended_at_mysql
+      mssql:
+        cells:
+        - keyset_run_records_the_cursor_it_started_and_ended_at_mssql
+      mongo:
+        cells:
+        - keyset_run_records_the_cursor_it_started_and_ended_at_mongo
+      oracle:
+        cells:
+        - keyset_run_records_the_cursor_it_started_and_ended_at_oracle
+  - name: keyset-high-water-forgotten
+    class: the keyset page reports no high-water key, so the runner takes the first page for the last and stops
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: keyset-high-water-forgotten/shared.patch
+    engines:
+      postgres:
+        cells:
+        - parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_postgres
+      mysql:
+        cells:
+        - parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_mysql
+      mssql:
+        cells:
+        - parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_mssql
+      mongo:
+        cells:
+        - mongo_batch_keyset_no_loss_or_dup
+      oracle:
+        cells:
+        - parallel_keyset_incremental_on_a_number5_key_delivers_the_source_rows_oracle
+  - name: max-file-size-never-checked
+    class: the sink never asks whether the open part reached max_file_size, so one part holds the whole export
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: max-file-size-never-checked/shared.patch
+    engines:
+      postgres:
+        cells:
+        - max_file_size_holds_under_auto_sized_row_groups
+      mysql:
+        cells:
+        - rotated_parts_reach_the_destination_whole_mysql
+      mssql:
+        cells:
+        - rotated_parts_reach_the_destination_whole_mssql
+      mongo:
+        cells:
+        - rotated_parts_reach_the_destination_whole_mongo
+      oracle:
+        cells:
+        - rotated_parts_reach_the_destination_whole_oracle
+  - name: parquet-writer-reports-no-bytes
+    class: the Parquet writer reports 0 bytes written, so the byte cap never rotates a part
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: parquet-writer-reports-no-bytes/shared.patch
+    engines:
+      postgres:
+        cells:
+        - max_file_size_holds_under_auto_sized_row_groups
+      mysql:
+        cells:
+        - rotated_parts_reach_the_destination_whole_mysql
+      mssql:
+        cells:
+        - rotated_parts_reach_the_destination_whole_mssql
+      mongo:
+        cells:
+        - rotated_parts_reach_the_destination_whole_mongo
+      oracle:
+        cells:
+        - rotated_parts_reach_the_destination_whole_oracle
+  - name: chunked-drift-gate-skipped
+    class: 'the chunked runner''s pre-chunk schema probe is skipped, so on_schema_drift: fail never aborts a chunked export'
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: chunked-drift-gate-skipped/shared.patch
+    engines:
+      postgres:
+        cells:
+        - chunked_range_export_enforces_on_schema_drift_fail
+      mysql:
+        cells:
+        - chunked_export_enforces_on_schema_drift_fail_mysql
+      mssql:
+        cells:
+        - chunked_export_enforces_on_schema_drift_fail_mssql
+      mongo:
+        na: 'a MongoDB export is `mode: full` or `cdc` only, so it has no chunked runner and no type_mappings drift probe'
+      oracle:
+        cells:
+        - chunked_export_enforces_on_schema_drift_fail_oracle
+  - name: partition-by-sees-no-rows
+    class: the partition_by expansion reads no value span, so a partitioned export expands to nothing and delivers zero rows
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: partition-by-sees-no-rows/shared.patch
+    engines:
+      postgres:
+        cells:
+        - run_partitions_the_fixture_postgres
+      mysql:
+        cells:
+        - apply_forms_partition_like_run_mysql
+      mssql:
+        cells:
+        - apply_forms_partition_like_run_mssql
+      mongo:
+        na: partition_by is refused for a MongoDB source at config load (the bucket probes are SQL)
+      oracle:
+        cells:
+        - apply_forms_partition_like_run_oracle
+  - name: partition-by-span-is-the-epoch
+    class: the partition_by expansion reads the value span as the default date for both ends, so every row outside the epoch bucket is not exported
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: partition-by-span-is-the-epoch/shared.patch
+    engines:
+      postgres:
+        cells:
+        - run_partitions_the_fixture_postgres
+      mysql:
+        cells:
+        - apply_forms_partition_like_run_mysql
+      mssql:
+        cells:
+        - apply_forms_partition_like_run_mssql
+      mongo:
+        na: partition_by is refused for a MongoDB source at config load (the bucket probes are SQL)
+      oracle:
+        cells:
+        - apply_forms_partition_like_run_oracle
+  - name: load-spec-not-recorded-from-the-run
+    class: a run records no load spec from the columns it resolved, so `rivet load` plans from nothing
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: load-spec-not-recorded-from-the-run/shared.patch
+    engines:
+      postgres:
+        cells:
+        - run_records_the_load_spec_key_in_key_order_postgres
+      mysql:
+        cells:
+        - run_records_the_load_spec_key_in_key_order_mysql
+      mssql:
+        cells:
+        - run_records_the_load_spec_key_in_key_order_mssql
+      mongo:
+        cells:
+        - run_records_the_load_spec_of_a_mongo_collection
+      oracle:
+        cells:
+        - run_records_the_load_spec_key_in_key_order_oracle
+  - name: children-orphaned-on-sigterm
+    class: the parent never records its export child processes, so a targeted SIGTERM leaves them running
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: children-orphaned-on-sigterm/shared.patch
+    engines:
+      postgres:
+        cells:
+        - parallel_processes_sigterm_reaps_children_no_orphans
+      mysql:
+        cells:
+        - parallel_processes_sigterm_reaps_children_no_orphans_mysql
+      mssql:
+        cells:
+        - parallel_processes_sigterm_reaps_children_no_orphans_mssql
+      mongo:
+        cells:
+        - parallel_processes_sigterm_reaps_children_no_orphans_mongo
+      oracle:
+        cells:
+        - parallel_processes_sigterm_reaps_children_no_orphans_oracle
+  - name: pool-split-never-realized
+    class: '`apply --pool --split` finds the giant unsplittable and leaves it whole, so the makespan floor the operator asked to break stays'
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: pool-split-never-realized/shared.patch
+    engines:
+      postgres:
+        cells:
+        - stand_pool_split_resume_grows_postgres
+        - stand_pool_split_gappy_key_postgres
+        - stand_pool_split_keyset_recovers_a_crash_postgres
+      mysql:
+        cells:
+        - stand_pool_split_resume_grows_mysql
+        - stand_pool_split_gappy_key_mysql
+        - stand_pool_split_keyset_recovers_a_crash_mysql
+      mssql:
+        cells:
+        - stand_pool_split_resume_grows_mssql
+        - stand_pool_split_gappy_key_mssql
+        - stand_pool_split_keyset_recovers_a_crash_mssql
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        cells:
+        - stand_pool_split_resume_grows_oracle
+        - stand_pool_split_gappy_key_oracle
+        - stand_pool_split_keyset_recovers_a_crash_oracle
+  - name: pool-split-into-no-units
+    class: the split realizes into zero units, so the giant is replaced by nothing and no row is exported
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: pool-split-into-no-units/shared.patch
+    engines:
+      postgres:
+        cells:
+        - stand_pool_split_resume_grows_postgres
+        - stand_pool_split_gappy_key_postgres
+        - stand_pool_split_keyset_recovers_a_crash_postgres
+      mysql:
+        cells:
+        - stand_pool_split_resume_grows_mysql
+        - stand_pool_split_gappy_key_mysql
+        - stand_pool_split_keyset_recovers_a_crash_mysql
+      mssql:
+        cells:
+        - stand_pool_split_resume_grows_mssql
+        - stand_pool_split_gappy_key_mssql
+        - stand_pool_split_keyset_recovers_a_crash_mssql
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        cells:
+        - stand_pool_split_resume_grows_oracle
+        - stand_pool_split_gappy_key_oracle
+        - stand_pool_split_keyset_recovers_a_crash_oracle
+  - name: pool-split-into-one-unit
+    class: the split realizes into one unit that is the giant itself, so no range window is ever set
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: pool-split-into-one-unit/shared.patch
+    engines:
+      postgres:
+        cells:
+        - stand_pool_split_resume_grows_postgres
+        - stand_pool_split_gappy_key_postgres
+        - stand_pool_split_keyset_recovers_a_crash_postgres
+      mysql:
+        cells:
+        - stand_pool_split_resume_grows_mysql
+        - stand_pool_split_gappy_key_mysql
+        - stand_pool_split_keyset_recovers_a_crash_mysql
+      mssql:
+        cells:
+        - stand_pool_split_resume_grows_mssql
+        - stand_pool_split_gappy_key_mssql
+        - stand_pool_split_keyset_recovers_a_crash_mssql
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        cells:
+        - stand_pool_split_resume_grows_oracle
+        - stand_pool_split_gappy_key_oracle
+        - stand_pool_split_keyset_recovers_a_crash_oracle
+  - name: split-key-never-found
+    class: no export is splittable, so `--split` leaves every giant whole
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: split-key-never-found/shared.patch
+    engines:
+      postgres:
+        cells:
+        - stand_pool_split_resume_grows_postgres
+        - stand_pool_split_gappy_key_postgres
+        - stand_pool_split_keyset_recovers_a_crash_postgres
+      mysql:
+        cells:
+        - stand_pool_split_resume_grows_mysql
+        - stand_pool_split_gappy_key_mysql
+        - stand_pool_split_keyset_recovers_a_crash_mysql
+      mssql:
+        cells:
+        - stand_pool_split_resume_grows_mssql
+        - stand_pool_split_gappy_key_mssql
+        - stand_pool_split_keyset_recovers_a_crash_mssql
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        cells:
+        - stand_pool_split_resume_grows_oracle
+        - stand_pool_split_gappy_key_oracle
+        - stand_pool_split_keyset_recovers_a_crash_oracle
+      lib:
+        cells:
+        - lib:incremental_and_cdc_exports_are_not_splittable
+  - name: split-key-is-a-constant
+    class: every export is splittable on a column named xyzzy, including incremental and CDC ones
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: split-key-is-a-constant/shared.patch
+    engines:
+      postgres:
+        cells:
+        - stand_pool_split_resume_grows_postgres
+        - stand_pool_split_gappy_key_postgres
+        - stand_pool_split_keyset_recovers_a_crash_postgres
+      mysql:
+        cells:
+        - stand_pool_split_resume_grows_mysql
+        - stand_pool_split_gappy_key_mysql
+        - stand_pool_split_keyset_recovers_a_crash_mysql
+      mssql:
+        cells:
+        - stand_pool_split_resume_grows_mssql
+        - stand_pool_split_gappy_key_mssql
+        - stand_pool_split_keyset_recovers_a_crash_mssql
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        cells:
+        - stand_pool_split_resume_grows_oracle
+        - stand_pool_split_gappy_key_oracle
+        - stand_pool_split_keyset_recovers_a_crash_oracle
+      lib:
+        cells:
+        - lib:incremental_and_cdc_exports_are_not_splittable
+  - name: split-tile-keeps-the-oldest-unit
+    class: the repair that mints a missing split `_SUCCESS` keeps the first unit manifest seen per ordinal instead of the latest Success
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: split-tile-keeps-the-oldest-unit/shared.patch
+    engines:
+      postgres:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mysql:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mssql:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      lib:
+        cells:
+        - lib:tile_rejects_one_sided_opens_and_prefers_the_newer_success
+  - name: split-reconstruct-underflows-at-unit-zero
+    class: a resume's reconstruction reads the lower bound of unit 0 as a boundary below unit 0
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: split-reconstruct-underflows-at-unit-zero/shared.patch
+    engines:
+      postgres:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mysql:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mssql:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      lib:
+        cells:
+        - lib:a_closed_lower_bound_on_unit_zero_is_no_boundary_and_no_panic
+  - name: ceased-split-units-left-running
+    class: a resume that shrinks the split partition does not close the ledger rows of the ceased units, which then wedge gc of the shared prefix
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
+    scope: source
+    patch: ceased-split-units-left-running/shared.patch
+    engines:
+      postgres:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mysql:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mssql:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      mongo:
+        na: 'no inline SQL range literal: source_type_supports_split leaves a MongoDB giant whole, so no split unit is ever synthesized for it'
+      oracle:
+        na: "engine-agnostic: the function takes the destination and the state ledger and reads the run-unique manifest copies, never a source or an engine type, so every engine runs the same code (docs/pool-split-matrix.yaml); graded once by the lib cell, and the engines' pool-split cells stayed green under this seed"
+      lib:
+        cells:
+        - lib:stamp_ceased_units_closes_both_wedge_halves
+
+  - name: cdc-drain-pass-count-pinned-at-zero
+    class: the CDC drain loop counts the events a pass yielded with a multiplication, so every pass reads as empty and the run stops after one pass
+    history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31; the comment at src/pipeline/cdc/sink.rs run_to_files records the six PostgreSQL re-drain cells it turned red on 2026-08-27
+    scope: source
+    patch: cdc-drain-pass-count-pinned-at-zero/shared.patch
+    engines:
+      postgres:
+        cells:
+          - roast_pg_cdc_reaches_open_bound_past_a_large_uncaptured_transaction
+          - roast_pg_cdc_reaches_open_bound_past_a_large_empty_ddl_span
+      mysql:
+        na: "a bounded run's stream stays drained once it ends: `past_bound` is set at src/source/mysql/cdc.rs:919 and checked at :943, so every later pull returns None and a second pass yields nothing; the single-pass defect has no effect"
+      mssql:
+        na: '`exhausted` is set once (src/source/mssql/cdc.rs:927) and never cleared, and the first pass refills until a poll returns nothing, so it drains the whole window to the bound and a second pass yields nothing; the single-pass defect has no effect'
+      mongo:
+        na: 'a bounded run ends at the open-time bound (idle_poll_stops / past_time_bound in src/source/mongo/cdc.rs) and every later pull stops there too, so a second pass yields nothing; the single-pass defect has no effect'
+      oracle:
+        na: '`exhausted` is set once (src/source/oracle/cdc.rs:1434) and never cleared, and the first pass mines every window to the frontier, so a second pass yields nothing; the single-pass defect has no effect'

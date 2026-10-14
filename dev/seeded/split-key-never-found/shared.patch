@@ -1,0 +1,14 @@
+diff --git a/src/pipeline/split.rs b/src/pipeline/split.rs
+index 48ee469b..81566fa1 100644
+--- a/src/pipeline/split.rs
++++ b/src/pipeline/split.rs
+@@ -70,6 +70,9 @@ pub(crate) fn source_type_supports_split(st: SourceType) -> bool {
+ /// per-unit checkpoint, so a crashed unit could not resume without duplicating.
+ /// Returns the key column, or `None` (leave the export whole).
+ pub(crate) fn splittable_key(export: &ExportConfig) -> Option<String> {
++    if true {
++        return None;
++    }
+     if export.mode == ExportMode::Cdc {
+         return None; // a stream, not a range scan
+     }

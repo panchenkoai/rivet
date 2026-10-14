@@ -1,0 +1,14 @@
+diff --git a/src/pipeline/split.rs b/src/pipeline/split.rs
+index 48ee469b..232698d9 100644
+--- a/src/pipeline/split.rs
++++ b/src/pipeline/split.rs
+@@ -309,6 +309,9 @@ pub(crate) fn stamp_ceased_units(
+     let expanded = crate::destination::placeholder::expand_destination(dest_config.clone(), &ctx);
+     let prefix = crate::pipeline::finalize::destination_uri_for_manifest(&expanded);
+     let now = chrono::Utc::now().to_rfc3339();
++    if true {
++        return 0;
++    }
+     match state.interrupt_ceased_split_units(giant_name, &prefix, kept, &now) {
+         Ok(names) => {
+             if !names.is_empty() {

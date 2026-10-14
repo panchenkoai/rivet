@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/cdc/sink.rs b/src/pipeline/cdc/sink.rs
+index adb0c378..a23ed982 100644
+--- a/src/pipeline/cdc/sink.rs
++++ b/src/pipeline/cdc/sink.rs
+@@ -488,7 +488,7 @@ pub(crate) fn run_to_files(
+             let mut yielded_this_pass = 0usize;
+             while let Some(ev) = stream.next_change() {
+                 let mut ev = ev?;
+-                yielded_this_pass += 1;
++                yielded_this_pass *= 1;
+                 txn_seq.stamp(&mut ev);
+                 // The commit boundary is a property of the STREAM, not of any routed
+                 // table — record it BEFORE the routing filter. MySQL marks only the
