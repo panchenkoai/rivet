@@ -157,17 +157,7 @@ impl StateDb {
             )
             .optional()
             .expect("query export_load_spec")?;
-        let names = columns
-            .map(|c| {
-                serde_json::from_str::<Vec<serde_json::Value>>(&c)
-                    .expect("columns_json")
-                    .iter()
-                    .map(|v| v["name"].as_str().expect("column name").to_string())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let key = key.map(|k| serde_json::from_str(&k).expect("primary_key_json"));
-        Some((names, key))
+        Some(parse_load_spec(columns, key))
     }
 
     /// `(column, rivet_type as recorded)` of the load spec — the TYPE half, for
@@ -330,9 +320,71 @@ pub fn state_url_under_test() -> Option<String> {
         .filter(|u| u.starts_with("postgres"))
 }
 
-/// The primary key recorded for `export`, from the backend rivet used: Postgres when
+/// Every metrics row `(name, status, duration_ms, total_rows)`, oldest first, of the exports named in `names` and of their `<name>#<n>` split units, from the backend the run used.
+pub fn recorded_export_runs(
+    cfg: &std::path::Path,
+    names: &[&str],
+) -> Vec<(String, String, i64, i64)> {
+    const SQL: &str = "SELECT export_name, status, duration_ms, total_rows FROM export_metrics \
+                       WHERE export_name = $1 OR export_name LIKE $1 || '#%' ORDER BY id";
+    let mut out = Vec::new();
+    match state_url_under_test() {
+        Some(url) => {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
+            });
+            for name in names {
+                for r in client
+                    .query(SQL, &[name])
+                    .expect("query export_metrics")
+                    .iter()
+                {
+                    out.push((r.get(0), r.get(1), r.get(2), r.get(3)));
+                }
+            }
+        }
+        None => {
+            let db = StateDb::next_to_config(cfg);
+            let mut stmt = db
+                .conn
+                .prepare(&SQL.replace("$1", "?1"))
+                .expect("prepare export_metrics read");
+            for name in names {
+                let rows = stmt
+                    .query_map([name], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                    .expect("query export_metrics");
+                out.extend(rows.filter_map(|r| r.ok()));
+            }
+        }
+    }
+    out
+}
+
+/// The column names and primary key of one `export_load_spec` row, as stored (JSON text).
+fn parse_load_spec(
+    columns: Option<String>,
+    key: Option<String>,
+) -> (Vec<String>, Option<Vec<String>>) {
+    let names = columns
+        .map(|c| {
+            serde_json::from_str::<Vec<serde_json::Value>>(&c)
+                .expect("columns_json")
+                .iter()
+                .map(|v| v["name"].as_str().expect("column name").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let key = key.map(|k| serde_json::from_str(&k).expect("primary_key_json"));
+    (names, key)
+}
+
+/// The load spec `export` recorded (columns, key), from the backend the run used: Postgres when
 /// the gate grades one, else the SQLite file beside `cfg`.
-pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<String>> {
+pub fn recorded_load_spec(
+    cfg: &std::path::Path,
+    export: &str,
+    unit: Option<&str>,
+) -> Option<(Vec<String>, Option<Vec<String>>)> {
     match state_url_under_test() {
         Some(url) => {
             let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
@@ -340,18 +392,48 @@ pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<S
             });
             client
                 .query_opt(
-                    "SELECT primary_key_json FROM export_load_spec \
-                     WHERE export_name = $1 AND unit = ''",
-                    &[&export],
+                    "SELECT columns_json, primary_key_json FROM export_load_spec \
+                     WHERE export_name = $1 AND unit = $2",
+                    &[&export, &unit.unwrap_or("")],
                 )
                 .expect("query export_load_spec")
-                .and_then(|r| r.get::<_, Option<String>>(0))
-                .map(|j| serde_json::from_str(&j).expect("primary_key_json is a JSON list"))
+                .map(|r| {
+                    parse_load_spec(r.get::<_, Option<String>>(0), r.get::<_, Option<String>>(1))
+                })
         }
-        None => StateDb::next_to_config(cfg)
-            .load_spec(export, None)
-            .and_then(|(_, k)| k),
+        None => StateDb::next_to_config(cfg).load_spec(export, unit),
     }
+}
+
+/// `(cursor_min, cursor_max)` of `export`'s latest successful `export_metrics` row, from the backend the run used.
+pub fn recorded_cursor_bounds(
+    cfg: &std::path::Path,
+    export: &str,
+) -> Option<(Option<String>, Option<String>)> {
+    const SQL: &str = "SELECT cursor_min, cursor_max FROM export_metrics \
+                       WHERE export_name = $1 AND status = 'success' ORDER BY id DESC LIMIT 1";
+    match state_url_under_test() {
+        Some(url) => postgres::Client::connect(&url, postgres::NoTls)
+            .unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
+            })
+            .query_opt(SQL, &[&export])
+            .expect("query export_metrics")
+            .map(|r| (r.get(0), r.get(1))),
+        None => StateDb::next_to_config(cfg)
+            .conn
+            .query_row(&SQL.replace("$1", "?1"), [export], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()
+            .expect("query export_metrics"),
+    }
+}
+
+/// The primary key recorded for `export`, from the backend rivet used: Postgres when
+/// the gate grades one, else the SQLite file beside `cfg`.
+pub fn recorded_primary_key(cfg: &std::path::Path, export: &str) -> Option<Vec<String>> {
+    recorded_load_spec(cfg, export, None).and_then(|(_, key)| key)
 }
 
 /// Delete `export`'s `cdc_snapshot` rows under destination `dest` from the backend the run used, as the documented SQL does; returns how many went.

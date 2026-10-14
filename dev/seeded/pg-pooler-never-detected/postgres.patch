@@ -1,0 +1,14 @@
+diff --git a/src/connect/postgres.rs b/src/connect/postgres.rs
+index 389ef5d8..70d99d8b 100644
+--- a/src/connect/postgres.rs
++++ b/src/connect/postgres.rs
+@@ -14,6 +14,9 @@ use crate::error::Result;
+ /// False negatives are the rule behind an idle pooler (both statements land on
+ /// the same backend), so this feeds a warning and decides nothing.
+ pub(crate) fn detect_pg_transaction_pooler(client: &mut Client) -> bool {
++    if true {
++        return false;
++    }
+     let pid1: Option<i32> = client
+         .query_one("SELECT pg_backend_pid()", &[])
+         .ok()

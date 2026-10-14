@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/split.rs b/src/pipeline/split.rs
+index 48ee469b..5e7712c3 100644
+--- a/src/pipeline/split.rs
++++ b/src/pipeline/split.rs
+@@ -515,7 +515,7 @@ fn reconstruct_units_from_manifests(
+             bmap.insert(ord, h.clone()); // boundary[ord]
+         }
+         if let Some(l) = &w.lo
+-            && ord > 0
++            && ord >= 0
+         {
+             bmap.insert(ord - 1, l.clone()); // boundary[ord-1]
+         }

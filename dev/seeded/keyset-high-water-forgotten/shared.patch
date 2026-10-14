@@ -1,0 +1,15 @@
+diff --git a/src/pipeline/sink/mod.rs b/src/pipeline/sink/mod.rs
+index 4c9edfe8..7353c34d 100644
+--- a/src/pipeline/sink/mod.rs
++++ b/src/pipeline/sink/mod.rs
+@@ -1061,9 +1061,7 @@ impl ExportSink {
+     /// lossless token when it reported one (MongoDB BSON `_id`), else the string
+     /// extracted from the output column (every SQL engine).
+     pub(in crate::pipeline) fn effective_cursor(&self) -> Option<String> {
+-        self.source_cursor
+-            .clone()
+-            .or_else(|| self.last_cursor_value.clone())
++        None
+     }
+ }
+ 

@@ -1753,23 +1753,9 @@ fn parallel_processes_hard_crash_writes_no_partial_file() {
     }
 }
 
-#[test]
-#[ignore = "live: requires docker compose postgres (unix only)"]
+/// A targeted SIGTERM to the parent of `--parallel-export-processes` must reap the export children (OPT-6).
 #[cfg(unix)]
-fn parallel_processes_sigterm_reaps_children_no_orphans() {
-    // OPT-6: a TARGETED SIGTERM to the parent (the case k8s / systemd / a
-    // scheduler `kill <pid>` produces — terminal Ctrl-C, which hits the whole
-    // group, does not) must reap the export children. Without the reaper they
-    // orphan and keep holding source connections.
-    require_alive(LiveService::Postgres);
-    let t1 = seed_pg_numeric_table(5);
-    let t2 = seed_pg_numeric_table(5);
-    let out1 = tempfile::tempdir().unwrap();
-    let rig = Rig::pg_batch(t1.name())
-        .query(&format!("SELECT id, name FROM {}", t1.name()))
-        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
-        .dest_path(out1.path().to_path_buf());
-
+fn assert_sigterm_reaps_children(rig: Rig) {
     let children_of = |ppid: u32| -> Vec<u32> {
         std::process::Command::new("pgrep")
             .args(["-P", &ppid.to_string()])
@@ -1842,6 +1828,86 @@ fn parallel_processes_sigterm_reaps_children_no_orphans() {
          parent (still alive: {survivors:?}) — they must be reaped, not left \
          holding source connections"
     );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres (unix only)"]
+#[cfg(unix)]
+fn parallel_processes_sigterm_reaps_children_no_orphans() {
+    // OPT-6: a TARGETED SIGTERM to the parent (the case k8s / systemd / a
+    // scheduler `kill <pid>` produces — terminal Ctrl-C, which hits the whole
+    // group, does not) must reap the export children. Without the reaper they
+    // orphan and keep holding source connections.
+    require_alive(LiveService::Postgres);
+    let t1 = seed_pg_numeric_table(5);
+    let t2 = seed_pg_numeric_table(5);
+    let out1 = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
+    assert_sigterm_reaps_children(rig);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql (unix only)"]
+#[cfg(unix)]
+fn parallel_processes_sigterm_reaps_children_no_orphans_mysql() {
+    require_alive(LiveService::Mysql);
+    let (t1, t2) = (seed_mysql_numeric_table(5), seed_mysql_numeric_table(5));
+    let out1 = tempfile::tempdir().unwrap();
+    let rig = Rig::mysql_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
+    assert_sigterm_reaps_children(rig);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql (unix only)"]
+#[cfg(unix)]
+fn parallel_processes_sigterm_reaps_children_no_orphans_mssql() {
+    require_alive(LiveService::Mssql);
+    let (t1, t2) = (seed_mssql_numeric_table(5), seed_mssql_numeric_table(5));
+    let out1 = tempfile::tempdir().unwrap();
+    let rig = Rig::mssql_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
+    assert_sigterm_reaps_children(rig);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle (unix only)"]
+#[cfg(unix)]
+fn parallel_processes_sigterm_reaps_children_no_orphans_oracle() {
+    require_alive(LiveService::Oracle);
+    let (t1, t2) = (seed_oracle_numeric_table(5), seed_oracle_numeric_table(5));
+    let out1 = tempfile::tempdir().unwrap();
+    let rig = Rig::oracle_batch(t1.name())
+        .query(&format!("SELECT id, name FROM {}", t1.name()))
+        .also_export(t2.name(), &format!("SELECT id, name FROM {}", t2.name()))
+        .dest_path(out1.path().to_path_buf());
+    assert_sigterm_reaps_children(rig);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mongo (unix only)"]
+#[cfg(unix)]
+fn parallel_processes_sigterm_reaps_children_no_orphans_mongo() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("reap_mongo");
+    let mongo = MongoTest::connect(27017, &db);
+    mongo.seed_int_id("a", 5);
+    mongo.seed_int_id("b", 5);
+    let out1 = tempfile::tempdir().unwrap();
+    let rig = Rig::mongo_batch("a")
+        .source_url(&MongoTest::url(27017, &db))
+        .also_batch_export("b", "b", "full")
+        .dest_path(out1.path().to_path_buf());
+    assert_sigterm_reaps_children(rig);
+    mongo.drop_database();
 }
 
 #[test]

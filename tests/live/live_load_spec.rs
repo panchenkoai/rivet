@@ -18,11 +18,19 @@ fn records_the_key_in_key_order(e: SqlEngine) {
     let rig = e.rig(&table).top_line(LOAD);
     rig.run_ok();
 
-    let (columns, key) = StateDb::next_to_config(&rig.config_path())
-        .load_spec(&table, None)
+    let (columns, key) = recorded_load_spec(&rig.config_path(), &table, None)
         .expect("a successful run records the load spec");
+    let columns: Vec<String> = columns.iter().map(|c| c.to_lowercase()).collect();
     assert_eq!(columns, ["a_key", "b_key", "v"]);
+    let key: Option<Vec<String>> = key.map(|k| k.iter().map(|c| c.to_lowercase()).collect());
     assert_eq!(key, Some(vec!["b_key".to_string(), "a_key".to_string()]));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose up -d oracle"]
+fn run_records_the_load_spec_key_in_key_order_oracle() {
+    records_the_key_in_key_order(SqlEngine::Oracle);
 }
 
 #[test]
@@ -54,8 +62,7 @@ fn run_records_the_load_spec_of_a_mongo_collection() {
         .top_line(LOAD);
     rig.run_ok();
 
-    let (columns, key) = StateDb::next_to_config(&rig.config_path())
-        .load_spec(rig.export_name(), None)
+    let (columns, key) = recorded_load_spec(&rig.config_path(), rig.export_name(), None)
         .expect("a successful run records the load spec");
     assert_eq!(columns, ["_id", "document"]);
     assert_eq!(key, Some(vec!["_id".to_string()]));
@@ -74,8 +81,7 @@ fn a_query_export_records_its_columns_and_no_key() {
         .top_line(LOAD);
     rig.run_ok();
 
-    let (columns, key) = StateDb::next_to_config(&rig.config_path())
-        .load_spec(&table, None)
+    let (columns, key) = recorded_load_spec(&rig.config_path(), &table, None)
         .expect("a successful run records the load spec");
     assert_eq!(columns, ["id", "time_spent"]);
     assert_eq!(key, None);
@@ -93,8 +99,7 @@ fn a_config_without_a_load_block_still_records_the_load_spec() {
     rig.run_ok();
 
     assert_eq!(read_ids(&rig.out_dir()), vec![1, 2, 3]);
-    let (columns, key) = StateDb::next_to_config(&rig.config_path())
-        .load_spec(&table, None)
+    let (columns, key) = recorded_load_spec(&rig.config_path(), &table, None)
         .expect("the run records the spec with no `load:` block");
     assert!(columns.contains(&"id".to_string()), "{columns:?}");
     assert_eq!(key, Some(vec!["id".to_string()]));
@@ -113,11 +118,7 @@ fn a_failed_run_records_no_load_spec() {
         .unwritable_dest_path(std::path::PathBuf::from("/dev/null/rivet-out"));
     rig.run_expect_fail();
 
-    assert!(
-        StateDb::next_to_config(&rig.config_path())
-            .load_spec(&table, None)
-            .is_none()
-    );
+    assert!(recorded_load_spec(&rig.config_path(), &table, None).is_none());
 }
 
 fn load_ok(rig: &Rig) {
@@ -448,9 +449,8 @@ fn a_wide_composite_key_is_recorded_whole_mysql() {
     let rig = e.rig(&table).top_line(LOAD);
     rig.run_ok();
 
-    let (_, key) = StateDb::next_to_config(&rig.config_path())
-        .load_spec(&table, None)
-        .expect("a spec is recorded");
+    let (_, key) =
+        recorded_load_spec(&rig.config_path(), &table, None).expect("a spec is recorded");
     assert_eq!(
         key.as_deref(),
         Some(names.as_slice()),

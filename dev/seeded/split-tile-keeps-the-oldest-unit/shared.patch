@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/split.rs b/src/pipeline/split.rs
+index 48ee469b..2297ee29 100644
+--- a/src/pipeline/split.rs
++++ b/src/pipeline/split.rs
+@@ -368,7 +368,7 @@ pub(crate) fn completed_units_tile(
+             continue;
+         };
+         match latest.get(&ord) {
+-            Some(cur) if cur.finished_at >= m.finished_at => {}
++            Some(_cur) if true => {}
+             _ => {
+                 latest.insert(ord, m);
+             }

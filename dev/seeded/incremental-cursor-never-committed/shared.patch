@@ -1,0 +1,14 @@
+diff --git a/src/pipeline/single.rs b/src/pipeline/single.rs
+index 3c7cf2a8..a9a1f834 100644
+--- a/src/pipeline/single.rs
++++ b/src/pipeline/single.rs
+@@ -439,7 +439,8 @@ pub(super) fn commit_incremental_cursor(
+     plan: &ResolvedRunPlan,
+     summary: &RunSummary,
+ ) -> Result<()> {
+-    if let Some(cursor) = summary.cursor_high.clone() {
++    let _ = (state, plan, summary);
++    if false && let Some(cursor) = summary.cursor_high.clone() {
+         super::run_store::RunStore::finalize(state, plan, summary)
+             .with_cursor(cursor.clone())
+             .with_progression(super::run_store::Progression::Incremental { last_value: cursor })
