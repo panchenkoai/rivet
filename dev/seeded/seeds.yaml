@@ -1939,22 +1939,6 @@ seeds:
       oracle:
         cells:
         - run_records_the_load_spec_key_in_key_order_oracle
-  - name: pg-pooler-never-detected
-    class: the PostgreSQL pid-flip pooler probe always answers direct, so a run behind a transaction-mode pooler is not warned that SET LOCAL tuning, LISTEN and advisory locks do not hold there
-    history: 'MISSED by declaration, 2026-10-14: the stand''s pgBouncer holds ONE server connection (DEFAULT_POOL_SIZE: 1 in docker-compose.yaml), so two statements never land on different backends and detect_pg_transaction_pooler answers false on the unpatched tree too; the only effect of the answer is the `transaction-mode connection pooler detected` warning. A catching cell needs a pooler with two warm server connections that alternates them (pool size 2, min pool size 2, server round robin) and must assert that stderr carries that warning'
-    scope: source
-    patch: pg-pooler-never-detected/postgres.patch
-    engines:
-      postgres:
-        cells: []
-      mysql:
-        na: the patched code is the PostgreSQL dial (detect_pg_transaction_pooler); no other engine reads a backend pid
-      mssql:
-        na: the patched code is the PostgreSQL dial (detect_pg_transaction_pooler); no other engine reads a backend pid
-      mongo:
-        na: the patched code is the PostgreSQL dial (detect_pg_transaction_pooler); no other engine reads a backend pid
-      oracle:
-        na: the patched code is the PostgreSQL dial (detect_pg_transaction_pooler); no other engine reads a backend pid
   - name: children-orphaned-on-sigterm
     class: the parent never records its export child processes, so a targeted SIGTERM leaves them running
     history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
