@@ -52,6 +52,11 @@ def warehouse() -> tuple[str, str, str]:
     return r["bigquery"]["project"], r["gcs"]["bucket"], r["bigquery"]["location"]
 
 
+def snowflake() -> dict[str, str]:
+    """The stand's Snowflake target: connection, warehouse, database, schema, storage_integration."""
+    return dict(load()["snowflake"])
+
+
 def bq_tmp(name: str) -> str:
     """A disposable BigQuery dataset name — the only kind the sweep may drop."""
     return load()["bigquery"]["tmp_prefix"] + name
@@ -75,6 +80,7 @@ def _self_test() -> None:
     assert source("postgres")["container"] == "rivet-postgres-1"
     assert bq_tmp("gate").startswith("rivet_tmp_")
     assert all(warehouse()), "the registry names a project, a bucket and a location"
+    assert set(snowflake()) == {"connection", "warehouse", "database", "schema", "storage_integration"}
     assert not orphaned("users"), "a persistent fixture is never an orphan"
     assert not orphaned(f"t_{os.getpid()}_3"), "a live process's object is spared"
     dead = 2**22 + 12345
