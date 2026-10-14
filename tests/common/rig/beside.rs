@@ -332,20 +332,38 @@ impl Rig {
         ready: impl Fn(&Rig) -> bool,
         act: impl FnOnce(&Rig) -> T,
     ) -> Met<T> {
+        self.beside_a_live_run_it_may_refuse(envs, ready, act, |_| false)
+    }
+
+    /// [`Rig::beside_a_live_run`] for an action that may take the run's lease first: a run that did not exit 0 while `took_over(&acted)` is logged ungraded, as in [`Rig::runs_at_once`] (a snapshot cannot tell what the action removed from what the refused run left).
+    pub fn beside_a_live_run_it_may_refuse<T>(
+        &self,
+        envs: &[(&str, &str)],
+        ready: impl Fn(&Rig) -> bool,
+        act: impl FnOnce(&Rig) -> T,
+        took_over: impl Fn(&T) -> bool,
+    ) -> Met<T> {
         let mut live = self.spawn_mid_run(envs, ready);
         let acted = act(self);
         let outlived = live.try_wait().expect("try_wait").is_none();
         let t0 = std::time::Instant::now();
-        while live.try_wait().expect("try_wait").is_none() {
+        let status = loop {
+            if let Some(status) = live.try_wait().expect("try_wait") {
+                break status;
+            }
             if t0.elapsed() >= CEILING {
                 let _ = live.kill();
                 let _ = live.wait();
                 panic!("the live run did not end within {CEILING:?} of the action beside it");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        };
+        let run = match !status.success() && took_over(&acted) {
+            true => live.reaped_beside_a_delivery(status),
+            false => live.wait_with_output().expect("reap the run"),
+        };
         Met {
-            run: live.wait_with_output().expect("reap the run"),
+            run,
             acted,
             outlived,
         }

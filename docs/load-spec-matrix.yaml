@@ -6,8 +6,9 @@
 # the metabase recorded (D3), so every (type × granularity) pair has one expression, one
 # refusal, or one warehouse-specific mapping — and each is a cell here. The BigQuery
 # `test:` cells for the forms are LIVE (a run + load per cell on the test project, the
-# metadata read back through `tables.get`); the Snowflake ones are SQL-text proofs, since
-# Snowflake is not live-run from this stand. Validation rows are target-agnostic config
+# metadata read back through `tables.get`); the Snowflake ones are SQL-text proofs: the
+# Snowflake load itself is live in tests/live/live_snowflake_load.rs (values read back through
+# DuckDB's `snowflake` extension), its partition forms are not yet. Validation rows are target-agnostic config
 # checks and cite the same test in every load column. ClickHouse partitions by a date or time
 # column (ADR-0035 CH8): the forms are one expression test plus live cells; it has no shape
 # control beyond refusing a change log whose declared partition differs.

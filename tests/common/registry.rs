@@ -22,7 +22,34 @@ fn text(path: &[&str]) -> &'static str {
 
 /// Container name of a stand source (`postgres`, `mongo_rs`, …).
 pub fn stand_container(source: &str) -> &'static str {
-    text(&["sources", source, "container"])
+    static FOUND: std::sync::Mutex<Vec<(String, &'static str)>> = std::sync::Mutex::new(Vec::new());
+    let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, name)) = found.iter().find(|(s, _)| s == source) {
+        return name;
+    }
+    let name = running_container(source).unwrap_or_else(|| text(&["sources", source, "container"]));
+    found.push((source.to_string(), name));
+    name
+}
+
+/// The running container that publishes the source's host port: compose numbers a recreated container, so the registry's name is only the default.
+fn running_container(source: &str) -> Option<&'static str> {
+    let port = stand_host_port(source).rsplit(':').next()?;
+    let out = std::process::Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            &format!("publish={port}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .ok()?;
+    let names = String::from_utf8_lossy(&out.stdout);
+    let mut lines = names.lines().map(str::trim).filter(|l| !l.is_empty());
+    let (one, more) = (lines.next()?, lines.next());
+    more.is_none()
+        .then(|| &*Box::leak(one.to_string().into_boxed_str()))
 }
 
 /// Connection URL of a stand source.

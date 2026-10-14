@@ -731,7 +731,7 @@ guarantees:
         sentence: "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table"
     held_by:
       bigquery: { test: bigquery_load_refuses_a_table_it_did_not_load_on_every_attempt, asserts: "no record of rivet loading it" }
-      snowflake: { gap: "no Snowflake cell loads over a table this state has no record of" }
+      snowflake: { test: snowflake_load_refuses_a_table_it_did_not_load_on_every_attempt_postgres, asserts: "no record of rivet loading it" }
       clickhouse: { test: a_range_refusal_claims_nothing_so_a_table_made_after_it_stays_foreign, asserts: "no record of rivet loading it" }
 
   - id: compact_merges_the_buffer_and_drops_it

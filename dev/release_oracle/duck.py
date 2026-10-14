@@ -37,6 +37,34 @@ READ_TRIES, READ_BUDGET_S = 3, 180.0
 TRANSIENT_CURL = re.compile(r"CURL error \[(7|28|35|52|55|56)\]")
 
 
+#: Where the DuckDB `snowflake` extension looks for its ADBC driver before its own extension directory.
+SF_DRIVER_ENV = "SNOWFLAKE_ADBC_DRIVER_PATH"
+#: The DuckDB secret every Snowflake read names.
+SF_SECRET = "sf_login"
+
+
+def snowflake_login(connection: str) -> dict:
+    """The parameters of one `snow` connection, from the CLI's own listing (the operator's config, never a copy of it)."""
+    import json
+    import subprocess
+
+    out = subprocess.run(["snow", "connection", "list", "--format", "json"], capture_output=True, text=True, check=True).stdout
+    for c in json.loads(out[out.index("["):]):
+        if c.get("connection_name") == connection:
+            return c.get("parameters") or {}
+    raise RuntimeError(f"Snowflake oracle: `snow` has no connection named `{connection}`")
+
+
+def snowflake_secret(login: dict, database: str, warehouse: str) -> str:
+    """The `CREATE SECRET` of a key-pair login; any other authenticator is refused by name."""
+    key = login.get("private_key_file") or login.get("private_key_path")
+    if not key or not login.get("account") or not login.get("user"):
+        raise RuntimeError("Snowflake oracle needs a key-pair `snow` connection (account, user, private_key_file)")
+    q = lambda v: "'" + str(v).replace("'", "''") + "'"  # noqa: E731
+    return (f"CREATE OR REPLACE SECRET {SF_SECRET} (TYPE snowflake, ACCOUNT {q(login['account'])}, USER {q(login['user'])}, "
+            f"AUTH_TYPE 'key_pair', PRIVATE_KEY {q(key)}, DATABASE {q(database)}, WAREHOUSE {q(warehouse)})")
+
+
 class OracleUnavailable(Exception):
     """The oracle's own transport failed on every try: the cell graded nothing, which is not a product verdict."""
 
@@ -90,6 +118,7 @@ class Oracle:
         mssql: str | None = None,
         mongo: str | None = None,
         gcs: bool = False,
+        snowflake: dict | None = None,
         state: str | None = None,
         config: dict | None = None,
     ) -> None:
@@ -137,6 +166,20 @@ class Oracle:
             # the query (`Not found: Dataset …`).
             scope = f" dataset={bq_dataset}" if bq_dataset else ""
             self.db.sql(f"ATTACH 'project={self.project}{scope}' AS bq (TYPE bigquery, READ_ONLY)")
+
+        if snowflake:
+            import adbc_driver_snowflake
+
+            # The driver is the wheel uv.lock pins, not whatever sits in ~/.duckdb.
+            os.environ[SF_DRIVER_ENV] = adbc_driver_snowflake._driver_path()
+            login = snowflake_login(str(snowflake["connection"]))
+            # Community extension: first use downloads it into ~/.duckdb.
+            self.db.sql("INSTALL snowflake FROM community; LOAD snowflake;")
+            self.db.sql(snowflake_secret(login, str(snowflake["database"]), str(snowflake["warehouse"])))
+
+    def snowflake(self, sql: str) -> str:
+        """A DuckDB relation over Snowflake's own answer to `sql`."""
+        return "snowflake_query('" + sql.replace("'", "''") + f"', '{SF_SECRET}')"
 
     def rows(self, sql: str) -> list[tuple]:
         """Every row of one query, over whatever is attached."""

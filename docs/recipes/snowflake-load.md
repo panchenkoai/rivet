@@ -31,14 +31,16 @@ $ rivet load -c cfg.yaml     # COPY → ANALYTICS.PUBLIC.orders
 ```
 
 **What it handles for you** — every autoload quirk the by-hand appendix below
-recovers manually, `rivet load` does automatically (live-verified against a
-type-rich Postgres source):
+recovers manually, `rivet load` does automatically. Each row below is held by a live cell
+that reads the table back through a second client (`tests/live/live_snowflake_load.rs`,
+PostgreSQL and MySQL sources):
 
 | Source type | Lands as | How `rivet load` gets it right |
 |---|---|---|
 | JSON / `jsonb` | `VARIANT` — navigable (`meta:k`) | `PARSE_JSON($1:col)` in the COPY transform |
 | `timestamptz` | `TIMESTAMP_TZ` — instant preserved (`…Z`) | `ALTER SESSION SET TIMEZONE = 'UTC'` before COPY |
-| binary / `bytea` | `BINARY` — raw bytes, `0xFF`-safe | `BINARY_AS_TEXT = FALSE` in the file format |
+| `timestamp` / `datetime`, `TIME` | `TIMESTAMP_NTZ`, `TIME` — microseconds kept | `USE_LOGICAL_TYPE = TRUE` in the inline Parquet format |
+| binary / `bytea` | `BINARY` — raw bytes, `0xFF`-safe | `BINARY_AS_TEXT = FALSE` in the inline Parquet format, `$1:col::BINARY` in the COPY transform |
 | multi-byte UTF-8 | intact (`日本語 🚀`) | — |
 | `BIGINT UNSIGNED > 2^63-1` | exact `NUMBER` | a `decimal(20,0)` column override at extract |
 
@@ -361,6 +363,7 @@ BIGQUERY_TEST_PROJECT=<your-gcp-project> make test-types-bigquery
 ```
 
 Skips silently without `BIGQUERY_TEST_PROJECT`. Implementation:
-`tests/type_roundtrip/bigquery_load.rs`. The Snowflake half is currently
-verified manually against this recipe — a similar oracle would be welcome
-once a service-account login path exists for new Snowflake trial accounts.
+`tests/type_roundtrip/bigquery_load.rs`. The Snowflake half of this by-hand recipe is
+verified manually; what `rivet load` itself lands is held by the live cells in
+`tests/live/live_snowflake_load.rs`, which need a key-pair `snow` connection
+(`RIVET_SF_CONNECTION` and the `RIVET_SF_*` names beside it).

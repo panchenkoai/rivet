@@ -210,7 +210,7 @@ pub fn recreate_dataset(project: &str, dataset: &str) {
 }
 
 /// Delete every object under `gs://bucket/prefix/` (best effort — a cleanup path).
-fn gcs_delete_prefix(bucket: &str, prefix: &str) {
+pub(super) fn gcs_delete_prefix(bucket: &str, prefix: &str) {
     let list = format!("https://storage.googleapis.com/storage/v1/b/{bucket}/o");
     let mut page_token: Option<String> = None;
     loop {

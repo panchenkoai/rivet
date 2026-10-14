@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+- **`rivet load` into Snowflake stored a `timestamp` column as a wrong date, and several
+  loads failed outright.** Snowflake target only; BigQuery and ClickHouse loads are not
+  touched.
+  - **Wrong values with exit 0** (measured on 0.24.2; the statements are the same through
+    0.31.0). A column the source types as a timestamp without a time zone (PostgreSQL
+    `timestamp`, MySQL `datetime`) was read from the Parquet part as its raw microsecond
+    integer and stored as that many seconds: `2026-10-13 21:25:02.145628` landed as year
+    56785866. The load printed `LOAD OK` and the row count matched. A `timestamptz` column
+    was stored correctly.
+  - **Loads that failed** in 0.31.0 and earlier: a table with a `TIME` column (`Failed to
+    cast variant value ... to TIME`); a table with a binary column, `bytea` or `VARBINARY`
+    (`expecting BINARY ... but got VARIANT`); any table whose destination `prefix` is written
+    without a trailing `/` (`Remote file ... was not found`: the stage URL and the file name
+    were joined without a slash).
+  - **Loads that failed from 0.26.0 through 0.31.0:** every load onto a free table name
+    (`object-kind probe ran but KIND_ was not in snow's output`), and the cycle of an
+    incremental or CDC table whose export gained a column (a syntax error at `ADD COLUMN`).
+    A first CDC cycle whose table name is 21 to 30 characters long could also stop on a
+    missing change log, because the "does not exist" answer was searched in a line `snow`
+    wraps at 80 columns.
+  - **Now** each part is read through a Parquet format rivet spells inline, with logical
+    types on: a timestamp, a `timestamptz` and a `TIME` land with their microseconds, a
+    binary column lands as its bytes, and a prefix with or without the trailing `/` loads.
+    Whether a table or a change log exists is asked of the schema catalog, never read from
+    an error text.
+  - **What to do:** a Snowflake table loaded by 0.31.0 or earlier holds wrong values in
+    every timestamp-without-zone column. A `mode: full` export replaces its table on the next
+    `rivet run` and `rivet load`. An incremental or CDC table keeps the rows already in its
+    `<table>__changes` log; decide per table whether to rebuild it from a whole pass.
+  - **Also changed:** rivet no longer creates or reads the named file format `rivet_pq`. One
+    left in the schema by an earlier release is unused and can be dropped; the loading role
+    no longer needs `CREATE FILE FORMAT`.
+  - `rivet compact` on a Snowflake target is unchanged: it exits 0 with `skipped — this
+    warehouse keeps a change log behind a view and never compacts`.
+
 - **Breaking: a second run of an export while one is alive is refused, whatever the mode.**
   Every source; a SQLite or PostgreSQL state database. Reproduced on rivet 0.31.0 with
   PostgreSQL.
