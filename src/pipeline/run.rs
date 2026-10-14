@@ -929,7 +929,7 @@ pub(crate) fn run_waves(
             continue;
         }
         if total > 1 {
-            println!("\n  ── wave {label} · {} export(s) ──", pending.len());
+            eprintln!("\n  ── wave {label} · {} export(s) ──", pending.len());
         }
         // The wave barrier is the loop itself: each strategy below fully drains
         // the wave (the sequential loop, or the blocking child-process join)
@@ -1215,7 +1215,7 @@ pub(super) fn wave_mode_label(peak: usize) -> &'static str {
 /// alone")`, invisible at the default `warn` level (`main.rs`:
 /// `default_filter_or("warn")`). The operator waits out a sequential run
 /// believing they asked for a parallel one; the sibling `--pool` path prints its
-/// schedule with `println!`, so two runners disagreed about the visibility of
+/// schedule on the console, so two runners disagreed about the visibility of
 /// the same fact (round-7 bughunt).
 ///
 /// WARN, per the project rule that a run-start diagnostic telling the operator
@@ -1853,7 +1853,7 @@ pub(crate) fn run_pool(
     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
     let floor_secs = super::pool::makespan_floor_secs(&items, m);
     let (measured_n, attempt_n, placeholder_n) = super::pool::classification_counts(&classified);
-    println!(
+    eprintln!(
         "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
         effective.len(),
         m,
@@ -1864,7 +1864,7 @@ pub(crate) fn run_pool(
     );
     // The ONE honesty claim about the wall, from the RECONCILED classification.
     if let Some(hedge) = super::pool::lower_bound_hedge(attempt_n, placeholder_n) {
-        println!("        {hedge}");
+        eprintln!("        {hedge}");
     }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
@@ -2047,7 +2047,7 @@ pub(crate) fn run_pool(
     }
 
     let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
-    println!(
+    eprintln!(
         "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
         actual_secs / 60.0,
         predicted_secs / 60.0,
@@ -2848,7 +2848,7 @@ mod pool_harm_tests {
     /// each, and the wave loop runs them strictly one after another. The only
     /// thing rivet said about it was an `info` line — and `main.rs` builds its
     /// logger with `default_filter_or("warn")`, so it reached nobody. Meanwhile
-    /// the sibling `--pool` path `println!`s its schedule: two runners, one
+    /// the sibling `--pool` path prints its schedule: two runners, one
     /// fact, opposite visibility.
     ///
     /// Staged from the REAL producer: the widths come from `cost_gate_batches`

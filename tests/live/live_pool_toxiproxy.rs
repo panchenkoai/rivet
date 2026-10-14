@@ -10,7 +10,7 @@
 //!    congested link.
 //! 2. HONESTY of the model: the run prints its predicted makespan up front and
 //!    grades itself against the actual at the end (the predicted-vs-actual
-//!    line) — the self-correction contract, asserted on the run's own stdout.
+//!    line) — the self-correction contract, asserted on the run's own stderr.
 //! 3. The heavy-serialization rule holds end-to-end (one non-parallel_safe
 //!    export at a time) — asserted structurally by the run COMPLETING with the
 //!    heavy primary + safe secondaries mix; the pick rule itself is RED-proven
@@ -89,12 +89,12 @@ fn pool_apply_through_a_bandwidth_capped_link_is_exact_and_grades_itself() {
     // 2. The model states its claim and grades itself — both lines are part of
     //    the pool's contract, not decoration.
     assert!(
-        stdout.contains("predicted makespan"),
-        "the pool must state its predicted makespan up front:\n{stdout}"
+        stderr.contains("predicted makespan"),
+        "the pool must state its predicted makespan up front, on stderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("actual makespan"),
-        "the pool must grade predicted vs actual at the end:\n{stdout}"
+        stderr.contains("actual makespan"),
+        "the pool must grade predicted vs actual at the end, on stderr:\n{stderr}"
     );
 
     toxi_reset_toxics("postgres");

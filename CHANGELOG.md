@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`rivet apply --pool` wrote its own lines into a `destination: stdout` export.** The predicted
+  and actual makespan lines (and the wave headers of a multi-wave run) went to stdout, mixed into the
+  exported CSV or JSON bytes (0.31.0 and earlier). **Now** they go to stderr, like every other run
+  line. **What to do:** a script that read the `Pool:` lines from stdout reads them from stderr.
+
 - **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
   through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision
   were looked up in that wrapper, which names no table: the run failed with `precision/scale

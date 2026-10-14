@@ -1,0 +1,11 @@
+--- a/src/pipeline/run.rs
++++ b/src/pipeline/run.rs
+@@ -1853,7 +1853,7 @@
+     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
+     let floor_secs = super::pool::makespan_floor_secs(&items, m);
+     let (measured_n, attempt_n, placeholder_n) = super::pool::classification_counts(&classified);
+-    eprintln!(
++    println!(
+         "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
+         effective.len(),
+         m,
