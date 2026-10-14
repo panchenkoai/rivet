@@ -67,11 +67,14 @@ mod refusal;
 mod registry;
 mod rig;
 mod runner;
+mod sf_reader;
+mod snowflake;
 mod sql_engine;
 mod state;
 mod storage;
 mod toxi;
 mod verify;
+mod warehouse;
 
 pub use bigquery::*;
 pub use canon::*;
@@ -89,10 +92,12 @@ pub use refusal::{FAILED_RUN_LEAVES_ENV, Leftover};
 pub use registry::*;
 pub use rig::*;
 pub use runner::*;
+pub use snowflake::*;
 pub use sql_engine::*;
 pub use state::*;
 pub use storage::*;
 pub use toxi::*;
+pub use warehouse::*;
 
 // ─── Unique resource naming (races-free suite parallelism) ─────────────────
 

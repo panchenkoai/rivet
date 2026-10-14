@@ -304,6 +304,44 @@ fn chunked_range_export_enforces_on_schema_drift_fail() {
     );
 }
 
+/// A range-chunked export with `on_schema_drift: fail` is refused when a column is dropped between runs.
+fn chunked_export_enforces_on_schema_drift_fail(e: SqlEngine) {
+    e.alive();
+    let (table, _guard) = e.range_table("chunk_drift");
+    e.insert(&table, 1..=4, 10, Some(1));
+    let rig = e.staged(
+        e.rig(&table),
+        "chunked",
+        &["chunk_column: id", "chunk_size: 2", "on_schema_drift: fail"],
+    );
+    rig.run_ok();
+    e.exec(&format!("ALTER TABLE {table} DROP COLUMN time_spent"));
+    let refused = rig.run_expect_fail();
+    assert!(
+        refused.to_lowercase().contains("drift"),
+        "the run must be refused by the drift gate, got:\n{refused}"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn chunked_export_enforces_on_schema_drift_fail_mysql() {
+    chunked_export_enforces_on_schema_drift_fail(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn chunked_export_enforces_on_schema_drift_fail_mssql() {
+    chunked_export_enforces_on_schema_drift_fail(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn chunked_export_enforces_on_schema_drift_fail_oracle() {
+    chunked_export_enforces_on_schema_drift_fail(SqlEngine::Oracle);
+}
+
 #[test]
 #[ignore = "live: requires docker compose postgres"]
 fn stable_schema_across_runs_reports_no_drift() {

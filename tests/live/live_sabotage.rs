@@ -111,6 +111,28 @@ fn cursor_owner_mismatch(engine: SqlEngine) {
     );
 }
 
+/// RIVET_STATE_CURSOR_INCOMPARABLE: a stored cursor the source cannot compare with the cursor column.
+fn cursor_incomparable(engine: SqlEngine) {
+    let (table, mut rig, _guard) = cursor_edited(engine, "not-a-number");
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_STATE_CURSOR_INCOMPARABLE", 5),
+        vec![
+            Remedy::new(
+                &format!("`rivet state reset -c <config> --export {table}` starts"),
+                Then::DeliversTheSource,
+                |r| state(r, "reset", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, the sibling of the command the text names",
+                Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_INCOMPARABLE", 5)),
+                |r| state(r, "reset-chunks", &table),
+            ),
+        ],
+    );
+}
+
 /// RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table with no reset.
 fn cursor_stream_mismatch(engine: SqlEngine) {
     engine.alive();
@@ -153,8 +175,18 @@ fn cursor_stream_mismatch(engine: SqlEngine) {
 
 /// A range-chunked, checkpointed run of a fresh `N`-row table that crashed after its third chunk.
 fn interrupted(engine: SqlEngine, tag: &str) -> (String, Rig, Box<dyn std::any::Any>) {
+    interrupted_with(engine, tag, &[])
+}
+
+/// [`interrupted`] with `extra` settings beside the range checkpoint.
+fn interrupted_with(
+    engine: SqlEngine,
+    tag: &str,
+    extra: &[&str],
+) -> (String, Rig, Box<dyn std::any::Any>) {
     let (table, guard) = seeded(engine, tag);
-    let rig = engine.staged(engine.rig(&table), "chunked", RANGE_CHECKPOINT);
+    let lines: Vec<&str> = RANGE_CHECKPOINT.iter().chain(extra).copied().collect();
+    let rig = engine.staged(engine.rig(&table), "chunked", &lines);
     let crash = rig.run_with_env("RIVET_TEST_PANIC_AT", "after_chunk_complete:2");
     assert!(
         !crash.status.success(),
@@ -195,6 +227,70 @@ fn interrupted_run_owner_mismatch(engine: SqlEngine) {
                     std::fs::remove_dir_all(r.out_dir()).expect("empty the destination");
                     std::fs::create_dir_all(r.out_dir()).expect("the destination directory");
                 },
+            ),
+        ],
+    );
+}
+
+/// RIVET_STATE_CHUNK_PLAN_CHANGED: an unfinished range-chunk run, and a run under another `chunk_size`.
+fn chunk_plan_changed(engine: SqlEngine) {
+    let (table, rig, _guard) = interrupted(engine, "sab_plan_changed");
+    let mut rig = engine.staged(
+        rig,
+        "chunked",
+        &[
+            "chunk_column: id",
+            "chunk_size: 7",
+            "chunk_checkpoint: true",
+        ],
+    );
+    let refused = Refused::by_code("RIVET_STATE_CHUNK_PLAN_CHANGED", 5);
+    rig.refuses_twice_and_walks_out(
+        RERUN,
+        &[],
+        refused,
+        vec![
+            Remedy::new(
+                "restore the query and the chunk settings the interrupted run had and run once to finish it",
+                Then::DeliversTheSource,
+                |r| r.rebuilt(|r| engine.staged(r, "chunked", RANGE_CHECKPOINT)),
+            ),
+            Remedy::new(
+                "abandons it and the next run starts over",
+                Then::DeliversTheSource,
+                |r| state(r, "reset-chunks", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset` where the text names `rivet state reset-chunks`",
+                Then::Refuses(refused),
+                |r| state(r, "reset", &table),
+            ),
+        ],
+    );
+}
+
+/// RIVET_STATE_CHUNK_WINDOWS_BROKEN: an unfinished range-chunk run whose stored windows overlap, and a run.
+fn chunk_windows_broken(engine: SqlEngine) {
+    let (table, mut rig, _guard) = interrupted(engine, "sab_windows");
+    rig.edit_state(
+        &format!("UPDATE chunk_task SET end_key = '38' WHERE chunk_index = 6 AND {ITS_TASKS}"),
+        1,
+    );
+    let refused = Refused::by_code("RIVET_STATE_CHUNK_WINDOWS_BROKEN", 5);
+    rig.refuses_twice_and_walks_out(
+        RERUN,
+        &[],
+        refused,
+        vec![
+            Remedy::new(
+                "abandons the run; the next run plans the export again and reads every key",
+                Then::DeliversTheSource,
+                |r| state(r, "reset-chunks", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset` where the text names `rivet state reset-chunks`",
+                Then::Refuses(refused),
+                |r| state(r, "reset", &table),
             ),
         ],
     );
@@ -379,7 +475,17 @@ const RESUME: &[&str] = &["run", "--resume"];
 
 /// Edit the checkpoint of an unfinished run; `argv` then delivers the source or refuses, and a delivered export validates.
 fn continued_after(engine: SqlEngine, argv: &[&str], sabotage: impl FnOnce(&Rig)) {
-    let (_table, rig, _guard) = interrupted(engine, "sab_resume");
+    continued_after_with(engine, &[], argv, sabotage);
+}
+
+/// [`continued_after`] with `extra` settings beside the range checkpoint; under `verify: content` the local destination cannot pass `validate` (no checksum, docs/reference/config.md), so the oracle and the declared ids grade it.
+fn continued_after_with(
+    engine: SqlEngine,
+    extra: &[&str],
+    argv: &[&str],
+    sabotage: impl FnOnce(&Rig),
+) {
+    let (_table, rig, _guard) = interrupted_with(engine, "sab_resume", extra);
     sabotage(&rig);
     if rig.delivers_or_refuses(argv, &[]) == Survived::Delivered {
         let ids = declared_ids(&rig);
@@ -391,7 +497,9 @@ fn continued_after(engine: SqlEngine, argv: &[&str], sabotage: impl FnOnce(&Rig)
             ids.len(),
             distinct.len()
         );
-        ok(rig.cli(&["validate"]));
+        if !extra.contains(&"verify: content") {
+            ok(rig.cli(&["validate"]));
+        }
     }
 }
 
@@ -496,11 +604,31 @@ fn committed_part_removed(engine: SqlEngine) {
     });
 }
 
-/// A part the unfinished run committed, replaced by the bytes of its sibling before the resume.
+/// A part the unfinished run committed, replaced by the bytes of its sibling (of another size) before the resume.
 fn committed_part_replaced(engine: SqlEngine, argv: &[&str]) {
     continued_after(engine, argv, |rig| {
         let parts = committed_parts(rig);
+        let size = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+        assert_ne!(
+            size(&parts[0]),
+            size(&parts[1]),
+            "premise: the sibling has another size; the same size is the `verify: content` cell"
+        );
         rig.damage(&parts[0], Damage::ReplacedBy(&parts[1]))
+    });
+}
+
+/// Under `verify: content`, a part the unfinished run committed, replaced by its sibling's rows at exactly its own size: `--resume` reads the chunk again and delivers the source.
+fn committed_part_replaced_at_its_size(engine: SqlEngine) {
+    continued_after_with(engine, &["verify: content"], RESUME, |rig| {
+        let parts = committed_parts(rig);
+        let before = std::fs::metadata(&parts[0]).unwrap().len();
+        rig.damage(&parts[0], Damage::ReplacedAtItsSize(&parts[1]));
+        assert_eq!(
+            std::fs::metadata(&parts[0]).unwrap().len(),
+            before,
+            "premise: the replaced part keeps its size"
+        );
     });
 }
 
@@ -1071,7 +1199,8 @@ fn state_reset_beside(engine: SqlEngine) {
     rig.run_ok();
     engine.insert(&table, N + 1..=N + LIVE_ROWS, 170, Some(10));
     let rig = rig.slowed(150);
-    let met = rig.beside_a_live_run(
+    // A reset that reaches the lease before the run refuses the run and removes the cursor itself.
+    let met = rig.beside_a_live_run_it_may_refuse(
         &[],
         |_| true,
         |r| {
@@ -1080,12 +1209,64 @@ fn state_reset_beside(engine: SqlEngine) {
                 r.cli(&["state", "reset-chunks", "--export", &table]),
             ]
         },
+        |acted| acted.iter().any(|out| out.status.success()),
     );
     for out in &met.acted {
         rig.delivered_or_refused("a state command beside a live incremental run", out);
     }
     rig.delivered_or_refused("the live run a state command met", &met.run);
     recovers(&rig, &[]);
+}
+
+/// The rig's seam under `state_reset_beside`: a run refused while the action beside it holds the run lease is left ungraded, whatever the action changed while that run was alive. A first run paused after its snapshot holds the lease, so the second is refused by code every time; the action removes the cursor row and waits for the first run.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_refused_while_the_action_beside_it_holds_the_lease_is_left_ungraded_postgres() {
+    let engine = SqlEngine::Pg;
+    let (table, _guard) = seeded(engine, "sab_took_over");
+    let rig = Shape::Incremental.staged(engine, engine.rig(&table));
+    rig.run_ok();
+    engine.insert(&table, N + 1..=N + 3, 170, Some(10));
+    let marker = std::env::temp_dir().join(format!("rivet-took-over-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let marker_env = marker.to_string_lossy().into_owned();
+    let holder = rig.spawn_args_env(
+        &[],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:4000"),
+            ("RIVET_TEST_PAUSE_MARKER", &marker_env),
+        ],
+    );
+    let t0 = std::time::Instant::now();
+    while !marker.exists() {
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(60),
+            "fixture: the first run never paused after its snapshot"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let met = rig.beside_a_live_run_it_may_refuse(
+        &[],
+        |_| true,
+        move |r| {
+            r.edit_state("DELETE FROM export_state WHERE export_name = '{export}'", 1);
+            holder
+                .wait_with_output()
+                .expect("reap the run that holds the lease")
+        },
+        |held| held.status.success(),
+    );
+    let _ = std::fs::remove_file(&marker);
+    let said = String::from_utf8_lossy(&met.run.stderr);
+    assert!(
+        said.contains("RIVET_STATE_RUN_IN_PROGRESS"),
+        "premise: the run beside the held lease is refused by code\n{said}"
+    );
+    assert!(
+        met.acted.status.success(),
+        "the run that held the lease delivers\n{}",
+        String::from_utf8_lossy(&met.acted.stderr)
+    );
 }
 
 /// One command beside a live checkpointed run that continues a complete export: it delivers, refuses by code or fails verification; the run delivers or refuses by code; a run then delivers the source.
@@ -1988,6 +2169,25 @@ fn a_changed_cursor_column_is_refused_and_walked_out_postgres() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_postgres() {
+    cursor_incomparable(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_mssql() {
+    cursor_incomparable(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_oracle() {
+    cursor_incomparable(SqlEngine::Oracle);
+}
+
+#[test]
 #[ignore = "live: requires docker compose mysql"]
 fn a_changed_cursor_column_is_refused_and_walked_out_mysql() {
     cursor_owner_mismatch(SqlEngine::Mysql);
@@ -2054,6 +2254,56 @@ fn an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_mssql() 
 #[ignore = "live: requires docker compose oracle"]
 fn an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_oracle() {
     interrupted_run_owner_mismatch(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_changed_chunk_plan_is_refused_on_resume_and_walked_out_postgres() {
+    chunk_plan_changed(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_changed_chunk_plan_is_refused_on_resume_and_walked_out_mysql() {
+    chunk_plan_changed(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_changed_chunk_plan_is_refused_on_resume_and_walked_out_mssql() {
+    chunk_plan_changed(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_changed_chunk_plan_is_refused_on_resume_and_walked_out_oracle() {
+    chunk_plan_changed(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn broken_chunk_windows_are_refused_on_resume_and_walked_out_postgres() {
+    chunk_windows_broken(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn broken_chunk_windows_are_refused_on_resume_and_walked_out_mysql() {
+    chunk_windows_broken(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn broken_chunk_windows_are_refused_on_resume_and_walked_out_mssql() {
+    chunk_windows_broken(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn broken_chunk_windows_are_refused_on_resume_and_walked_out_oracle() {
+    chunk_windows_broken(SqlEngine::Oracle);
 }
 
 #[test]
@@ -2457,39 +2707,53 @@ fn validate_sees_a_removed_part_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (resume trusts an edited chunk_task row), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_over_a_task_marked_completed_delivers_or_refuses_postgres() {
     task_marked_completed(SqlEngine::Pg, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (resume trusts an edited chunk_task row), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_over_a_task_marked_completed_delivers_or_refuses_mysql() {
     task_marked_completed(SqlEngine::Mysql, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (resume trusts an edited chunk_task row), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_over_a_task_marked_completed_delivers_or_refuses_mssql() {
     task_marked_completed(SqlEngine::Mssql, RERUN);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (resume trusts edited chunk_task bounds), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_over_a_task_marked_completed_delivers_or_refuses_oracle() {
+    task_marked_completed(SqlEngine::Oracle, RERUN);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_over_edited_task_bounds_delivers_or_refuses_postgres() {
     task_bounds_edited(SqlEngine::Pg, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (resume trusts edited chunk_task bounds), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_over_edited_task_bounds_delivers_or_refuses_mysql() {
     task_bounds_edited(SqlEngine::Mysql, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (resume trusts edited chunk_task bounds), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_over_edited_task_bounds_delivers_or_refuses_mssql() {
     task_bounds_edited(SqlEngine::Mssql, RERUN);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_over_edited_task_bounds_delivers_or_refuses_oracle() {
+    task_bounds_edited(SqlEngine::Oracle, RERUN);
 }
 
 #[test]
@@ -2568,39 +2832,53 @@ fn a_resume_over_a_chunk_run_marked_completed_delivers_or_refuses_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (the plan-fingerprint refusal has no code), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_postgres() {
     plan_fingerprint_edited(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (the plan-fingerprint refusal has no code), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mysql() {
     plan_fingerprint_edited(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (the plan-fingerprint refusal has no code), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mssql() {
     plan_fingerprint_edited(SqlEngine::Mssql);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (resume reuses a truncated committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose oracle"]
+fn an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_oracle() {
+    plan_fingerprint_edited(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres() {
     committed_part_truncated(SqlEngine::Pg, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (resume reuses a truncated committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql() {
     committed_part_truncated(SqlEngine::Mysql, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (resume reuses a truncated committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql() {
     committed_part_truncated(SqlEngine::Mssql, RERUN);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_over_a_truncated_committed_part_delivers_or_refuses_oracle() {
+    committed_part_truncated(SqlEngine::Oracle, RERUN);
 }
 
 #[test]
@@ -2629,21 +2907,53 @@ fn a_resume_over_a_removed_committed_part_delivers_or_refuses_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (resume reuses a replaced committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres() {
     committed_part_replaced(SqlEngine::Pg, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (resume reuses a replaced committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql() {
     committed_part_replaced(SqlEngine::Mysql, RERUN);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (resume reuses a replaced committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql() {
     committed_part_replaced(SqlEngine::Mssql, RERUN);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle() {
+    committed_part_replaced(SqlEngine::Oracle, RERUN);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_postgres() {
+    committed_part_replaced_at_its_size(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_mysql() {
+    committed_part_replaced_at_its_size(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_mssql() {
+    committed_part_replaced_at_its_size(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_oracle() {
+    committed_part_replaced_at_its_size(SqlEngine::Oracle);
 }
 
 #[test]
@@ -2690,8 +3000,8 @@ fn open_defect_a_cursor_moved_forward_delivers_or_refuses_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a cursor of another type is a raw driver error), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres() {
     cursor_of_another_type(SqlEngine::Pg);
 }
 
@@ -2702,9 +3012,16 @@ fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mysql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a cursor of another type is a raw driver error), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql() {
     cursor_of_another_type(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_oracle() {
+    cursor_of_another_type(SqlEngine::Oracle);
 }
 
 // cells: a resource taken away mid-run, two processes on one export, `--resume` over a damaged checkpoint
@@ -3363,39 +3680,53 @@ fn repair_beside_a_live_run_delivers_or_fails_loudly_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (run --resume trusts an edited chunk_task row), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_task_marked_completed_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn run_resume_over_a_task_marked_completed_delivers_or_refuses_postgres() {
     task_marked_completed(SqlEngine::Pg, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (run --resume trusts an edited chunk_task row), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_task_marked_completed_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn run_resume_over_a_task_marked_completed_delivers_or_refuses_mysql() {
     task_marked_completed(SqlEngine::Mysql, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (run --resume trusts an edited chunk_task row), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_task_marked_completed_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn run_resume_over_a_task_marked_completed_delivers_or_refuses_mssql() {
     task_marked_completed(SqlEngine::Mssql, RESUME);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (run --resume trusts edited chunk_task bounds), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose oracle"]
+fn run_resume_over_a_task_marked_completed_delivers_or_refuses_oracle() {
+    task_marked_completed(SqlEngine::Oracle, RESUME);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn run_resume_over_edited_task_bounds_delivers_or_refuses_postgres() {
     task_bounds_edited(SqlEngine::Pg, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (run --resume trusts edited chunk_task bounds), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn run_resume_over_edited_task_bounds_delivers_or_refuses_mysql() {
     task_bounds_edited(SqlEngine::Mysql, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (run --resume trusts edited chunk_task bounds), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn run_resume_over_edited_task_bounds_delivers_or_refuses_mssql() {
     task_bounds_edited(SqlEngine::Mssql, RESUME);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn run_resume_over_edited_task_bounds_delivers_or_refuses_oracle() {
+    task_bounds_edited(SqlEngine::Oracle, RESUME);
 }
 
 #[test]
@@ -3424,39 +3755,53 @@ fn run_resume_over_deleted_tasks_delivers_or_refuses_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (run --resume reuses a truncated committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn run_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres() {
     committed_part_truncated(SqlEngine::Pg, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (run --resume reuses a truncated committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn run_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql() {
     committed_part_truncated(SqlEngine::Mysql, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (run --resume reuses a truncated committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn run_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql() {
     committed_part_truncated(SqlEngine::Mssql, RESUME);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (run --resume reuses a replaced committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres() {
+#[ignore = "live: requires docker compose oracle"]
+fn run_resume_over_a_truncated_committed_part_delivers_or_refuses_oracle() {
+    committed_part_truncated(SqlEngine::Oracle, RESUME);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn run_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres() {
     committed_part_replaced(SqlEngine::Pg, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (run --resume reuses a replaced committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn run_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql() {
     committed_part_replaced(SqlEngine::Mysql, RESUME);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (run --resume reuses a replaced committed part), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_run_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn run_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql() {
     committed_part_replaced(SqlEngine::Mssql, RESUME);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn run_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle() {
+    committed_part_replaced(SqlEngine::Oracle, RESUME);
 }
 
 #[test]

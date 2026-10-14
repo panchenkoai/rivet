@@ -31,6 +31,11 @@ impl LoadLease<'_> {
 
 impl Drop for LoadLease<'_> {
     fn drop(&mut self) {
+        // Unlock before close: a forked child may still hold a copy of the descriptor.
+        if let Some(file) = &self._file {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
         if let Some((keeper, id)) = self.kept.take() {
             keeper.shared.rows().remove(&id);
             let _ = self.store.execute(
@@ -641,6 +646,31 @@ mod tests {
             b.try_load_lease(&key).unwrap().is_some(),
             "free once released"
         );
+    }
+
+    /// A released lease is free at once even while a forked child still holds a copy of its
+    /// descriptor (a sibling thread spawning a process between fork and exec).
+    #[test]
+    fn a_released_lease_is_free_while_a_forked_child_still_holds_its_descriptor() {
+        let a = StateStore::open_in_memory().unwrap();
+        let key = format!("p.d.forked_{}", std::process::id());
+        let held = a.try_load_lease(&key).unwrap().expect("first holder");
+        // The child only sleeps (async-signal-safe) and is killed below.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork");
+        if child == 0 {
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+        drop(held);
+        let again = a.try_load_lease(&key).unwrap().is_some();
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+        }
+        assert!(again, "the lease must be free once its holder drops it");
     }
 }
 

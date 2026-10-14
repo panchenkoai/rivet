@@ -933,15 +933,42 @@ fn materialize_refuses_a_non_identifier_cluster_column() {
     );
 }
 
-/// Live BigQuery load. Requires ADC, a dataset, and a GCS Parquet URI —
-/// the transport is the REST API, so no `bq` CLI on PATH. NOT run offline;
-/// drive it with:
-///
-///   BIGQUERY_TEST_PROJECT=my-proj RIVET_BQ_TEST_DATASET=rivet_test \
-///   RIVET_BQ_TEST_PARQUET_URI=gs://bucket/orders/part-0.parquet \
-///   cargo test -- --ignored bigquery_live
+/// The stand's permanent BigQuery dataset (`RIVET_BQ_TEST_DATASET` overrides) and its GCS bucket, from dev/stand/registry.yaml.
+fn stand_dataset_and_bucket() -> (String, String) {
+    let r: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(include_str!("../../../dev/stand/registry.yaml"))
+            .expect("registry");
+    let dataset = std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| {
+        r["bigquery"]["e2e"]
+            .as_str()
+            .expect("bigquery.e2e")
+            .to_string()
+    });
+    (
+        dataset,
+        r["gcs"]["bucket"].as_str().expect("gcs.bucket").to_string(),
+    )
+}
+
+/// Writes the rows of `select` as one Parquet object through BigQuery's own `EXPORT DATA`; its URI.
+fn export_fixture(loader: &BigQueryLoader, bucket: &str, name: &str, select: &str) -> String {
+    loader
+        .run_sql(
+            &format!(
+                "EXPORT DATA OPTIONS (uri = 'gs://{bucket}/rivet-live/bq-unit/{name}/*.parquet', \
+                 format = 'PARQUET', overwrite = true) AS {select}"
+            ),
+            "fixture",
+            name,
+        )
+        .expect("export the Parquet fixture");
+    format!("gs://{bucket}/rivet-live/bq-unit/{name}/000000000000.parquet")
+}
+
+/// Live BigQuery load of a Parquet fixture the test writes itself. Needs ADC and
+/// `BIGQUERY_TEST_PROJECT`; the transport is the REST API, so no `bq` CLI on PATH.
 #[test]
-#[ignore = "live: needs a BigQuery project + ADC + a GCS Parquet fixture"]
+#[ignore = "live: needs a BigQuery project + ADC"]
 fn bigquery_live_load_round_trips() {
     // Soft-skip when the live BigQuery project isn't configured: CI sweeps
     // `--ignored` (ci.yml) without warehouse creds, so a hard `.expect` here
@@ -949,32 +976,38 @@ fn bigquery_live_load_round_trips() {
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
         return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
-    let dataset =
-        std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
-    let uri = std::env::var("RIVET_BQ_TEST_PARQUET_URI")
-        .expect("set RIVET_BQ_TEST_PARQUET_URI to a GCS Parquet object matching the specs below");
+    let (dataset, bucket) = stand_dataset_and_bucket();
+    let table = format!("rivet_bq_live_test_{}_0", std::process::id());
+    let loader = BigQueryLoader::new(project, dataset);
+    let uri = export_fixture(
+        &loader,
+        &bucket,
+        "load_round_trips",
+        "SELECT id FROM UNNEST([1, 2, 3]) AS id",
+    );
 
     // A plain column (no cast) exercises the FREE LOAD DATA path.
-    let specs = vec![spec("id", None, TargetStatus::Ok)];
+    let specs = vec![typed("id", BqType::Int64)];
 
-    let loader = BigQueryLoader::new(project, dataset);
     // Drive it through the real driver (no gate, no cleanup) — same path prod
     // takes, exercising validate → materialize.
     let report = crate::load::run_load(
         &loader,
-        "rivet_bq_live_test",
+        &table,
         &specs,
         &[uri],
         None,
         None,
         crate::load::Ownership::Own,
-    )
-    .expect("live load should succeed");
-    assert!(
-        report.rows_loaded > 0,
-        "expected rows, got {}",
-        report.rows_loaded
     );
+    let read_back = loader.row_count(&table);
+    let _ = loader.run_sql(
+        &format!("DROP TABLE IF EXISTS `{}`", loader.fqtn(&table)),
+        "cleanup",
+        &table,
+    );
+    assert_eq!(report.expect("live load should succeed").rows_loaded, 3);
+    assert_eq!(read_back.expect("count the loaded table"), 3);
 }
 
 /// THE live proof of the REST transport, needing no GCS fixture: a real
@@ -996,9 +1029,7 @@ fn bigquery_rest_transport_live_round_trips_a_query_job() {
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
         return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
-    let dataset = std::env::var("RIVET_BQ_TEST_DATASET")
-        .or_else(|_| std::env::var("BIGQUERY_TEST_DATASET"))
-        .unwrap_or_else(|_| "rivet_test".to_string());
+    let (dataset, _) = stand_dataset_and_bucket();
     let region = std::env::var("BIGQUERY_TEST_LOCATION")
         .unwrap_or_else(|_| "US".to_string())
         .to_lowercase();
@@ -1093,34 +1124,20 @@ fn bigquery_rest_transport_live_round_trips_a_query_job() {
 /// twice exercises the at-least-once path — `<table>__changes` doubles, but
 /// the current-state view must be unchanged (duplicates lose the
 /// `(__pos,__seq)` tiebreak). Soft delete: the view keeps one row per PK
-/// including tombstones (`__is_deleted = true`), so `RIVET_BQ_CDC_EXPECTED_STATE`
-/// is the distinct-PK count *including* deleted rows. Drive it with:
-///
-///   BIGQUERY_TEST_PROJECT=my-proj RIVET_BQ_TEST_DATASET=rivet_test \
-///   RIVET_BQ_CDC_PARQUET_URI=gs://bucket/orders_cdc/part-0.parquet \
-///   RIVET_BQ_CDC_PK=id RIVET_BQ_CDC_DATA_COLS=id:INT64,val:STRING \
-///   RIVET_BQ_CDC_EXPECTED_STATE=3 \
-///   cargo test -- --ignored bigquery_live_cdc
+/// including tombstones (`__is_deleted = true`). The fixture is a change log the
+/// test writes itself: id 1 inserted then updated, id 2 inserted then deleted,
+/// id 3 inserted, so the view holds 3 keys (incl. the tombstone).
 #[test]
-#[ignore = "live: needs a BigQuery project + ADC + a CDC change-log Parquet fixture"]
+#[ignore = "live: needs a BigQuery project + ADC"]
 fn bigquery_live_cdc_view_dedups_at_least_once() {
     // Soft-skip when unconfigured — see bigquery_live_load_round_trips.
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
         return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
-    let dataset =
-        std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
-    let uri = std::env::var("RIVET_BQ_CDC_PARQUET_URI")
-        .expect("set RIVET_BQ_CDC_PARQUET_URI to a CDC change-log Parquet object");
-    let pk = std::env::var("RIVET_BQ_CDC_PK").unwrap_or_else(|_| "id".to_string());
-    // The fixture's data columns as `name:TYPE,name:TYPE` (meta columns are
-    // prepended by the loader). Defaults to a minimal `id:INT64`.
-    let data_cols =
-        std::env::var("RIVET_BQ_CDC_DATA_COLS").unwrap_or_else(|_| "id:INT64".to_string());
-    let specs: Vec<TargetColumnSpec> = data_cols
-        .split(',')
-        .map(|c| {
-            let (name, ty) = c.split_once(':').expect("data col must be name:TYPE");
+    let (dataset, bucket) = stand_dataset_and_bucket();
+    let specs: Vec<TargetColumnSpec> = [("id", "INT64"), ("val", "STRING")]
+        .into_iter()
+        .map(|(name, ty)| {
             let ty = crate::types::parse_type_str(ty).expect("a column type");
             crate::types::target::ExportTarget::BigQuery.resolve_column(
                 crate::types::target::TargetInput {
@@ -1132,17 +1149,22 @@ fn bigquery_live_cdc_view_dedups_at_least_once() {
             )
         })
         .collect();
-    let expected_state: u64 = std::env::var("RIVET_BQ_CDC_EXPECTED_STATE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
 
-    let table = "rivet_bq_live_cdc_test";
-    let pk_cols: Vec<String> = pk.split(',').map(str::to_string).collect();
+    let table = format!("rivet_bq_live_cdc_test_{}_0", std::process::id());
+    let table = table.as_str();
+    let pk_cols = vec!["id".to_string()];
     let loader = BigQueryLoader::new(&project, &dataset);
+    let uri = export_fixture(
+        &loader,
+        &bucket,
+        "cdc_view_dedups",
+        "SELECT * FROM UNNEST([\
+         STRUCT('insert' AS __op, '1' AS __pos, 1 AS __seq, 1 AS id, 'a' AS val), \
+         ('update', '2', 2, 1, 'b'), ('insert', '3', 3, 2, 'c'), \
+         ('delete', '4', 4, 2, 'c'), ('insert', '5', 5, 3, 'd')])",
+    );
 
-    // Load the same change log twice (at-least-once). No delta gate here —
-    // the fixture's row count is the operator's to assert externally.
+    // Load the same change log twice (at-least-once).
     crate::load::run_load_cdc(
         &loader,
         table,
@@ -1181,13 +1203,19 @@ fn bigquery_live_cdc_view_dedups_at_least_once() {
             &loader.labels("count", table),
         )
         .expect("counting the dedup view should succeed");
-    if expected_state > 0 {
-        assert_eq!(
-            state_rows, expected_state,
-            "the view must collapse duplicates to {expected_state} distinct-PK rows \
-             (incl tombstones), got {state_rows}"
-        );
+    for drop in [
+        format!("DROP VIEW IF EXISTS `{}`", second.target),
+        format!(
+            "DROP TABLE IF EXISTS `{}`",
+            loader.fqtn(&format!("{table}__changes"))
+        ),
+    ] {
+        let _ = loader.run_sql(&drop, "cleanup", table);
     }
+    assert_eq!(
+        state_rows, 3,
+        "the view must collapse duplicates to 3 distinct-PK rows (incl tombstones), got {state_rows}"
+    );
 }
 
 #[test]
@@ -1196,10 +1224,9 @@ fn bigquery_live_adopts_a_full_load_table_as_the_changelog_baseline() {
     let Ok(project) = std::env::var("BIGQUERY_TEST_PROJECT") else {
         return crate::test_hook::skip_live("BIGQUERY_TEST_PROJECT unset");
     };
-    let dataset =
-        std::env::var("RIVET_BQ_TEST_DATASET").unwrap_or_else(|_| "rivet_test".to_string());
+    let (dataset, _) = stand_dataset_and_bucket();
     let loader = BigQueryLoader::new(&project, &dataset);
-    let table = format!("rivet_bq_live_adopt_{}", std::process::id());
+    let table = format!("rivet_bq_live_adopt_{}_0", std::process::id());
     let changes = format!("{table}__changes");
     let (fq, changes_fq) = (loader.fqtn(&table), loader.fqtn(&changes));
     let probe = format!("{table}_probe");

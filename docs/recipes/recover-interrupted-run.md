@@ -40,7 +40,8 @@ What `--resume` does:
 
 - Walks the destination prefix, cross-checks against the state DB and
   the prior manifest, and decides per-chunk: **skip** (already
-  committed), **rewrite** (in-progress / missing part), or **quarantine**
+  committed), **rewrite** (in-progress, missing, or not the size the state DB
+  logged; under `verify: content` also a part whose rows are not its chunk's), or **quarantine**
   (untracked or corrupt object — moved under `_quarantine/<run_id>/`).
 - Refused with `RIVET_DEST_ALREADY_COMPLETE` (exit 5) if the prefix
   already holds a complete export (`_SUCCESS` present).  `--resume --force`

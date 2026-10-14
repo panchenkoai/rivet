@@ -1,0 +1,15 @@
+diff --git a/src/pipeline/sink/mod.rs b/src/pipeline/sink/mod.rs
+index 4c9edfe8..94415433 100644
+--- a/src/pipeline/sink/mod.rs
++++ b/src/pipeline/sink/mod.rs
+@@ -506,10 +506,6 @@ impl ExportSink {
+     }
+ 
+     pub fn maybe_split(&mut self) -> Result<()> {
+-        let written = self.writer.as_ref().map(|w| w.bytes_written()).unwrap_or(0);
+-        if should_split(written, self.max_file_size, self.part_rows) {
+-            self.split_now()?;
+-        }
+         Ok(())
+     }
+ 

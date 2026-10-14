@@ -1,0 +1,15 @@
+diff --git a/src/pipeline/load_spec.rs b/src/pipeline/load_spec.rs
+index a24782b4..4aa36755 100644
+--- a/src/pipeline/load_spec.rs
++++ b/src/pipeline/load_spec.rs
+@@ -51,8 +51,8 @@ fn record_from_run(
+     primary_key: Option<&[String]>,
+     run_id: &str,
+ ) -> Result<()> {
+-    let columns: Vec<LoadSpecColumn> = mappings.iter().map(LoadSpecColumn::from_mapping).collect();
+-    state.record_load_spec(&export.name, None, &columns, primary_key, run_id)
++    let _ = (export, state, mappings, primary_key, run_id);
++    Ok(())
+ }
+ 
+ fn capture_and_record(

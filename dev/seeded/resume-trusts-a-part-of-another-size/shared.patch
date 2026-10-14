@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/chunked/resume_m8.rs b/src/pipeline/chunked/resume_m8.rs
+index 54863bb3..8be7d414 100644
+--- a/src/pipeline/chunked/resume_m8.rs
++++ b/src/pipeline/chunked/resume_m8.rs
+@@ -352,7 +352,7 @@ pub(crate) fn rehydrate_manifest_parts_probed(
+             let base = f.file_name.rsplit('/').next().unwrap_or(&f.file_name);
+             // Gone, or not the bytes the run committed: the size the state logged is the size
+             // the part had when its chunk completed.
+-            if present.get(base).copied() != u64::try_from(f.bytes).ok() {
++            if !present.contains_key(base) {
+                 let idx = super::chunk_index_of(&f.file_name).and_then(|i| i.parse::<u32>().ok());
+                 surviving.remove(super::chunk_index_of(&f.file_name).unwrap_or_default());
+                 missing.push((idx, f.file_name.clone()));

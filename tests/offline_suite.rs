@@ -126,6 +126,8 @@ mod scheduler_contract;
 mod cli_flag_coverage_guard;
 #[path = "offline/error_code_ratchet.rs"]
 mod error_code_ratchet;
+#[path = "offline/known_red_guard.rs"]
+mod known_red_guard;
 #[path = "offline/live_only_purity_gate.rs"]
 mod live_only_purity_gate;
 #[path = "offline/live_service_ports_guard.rs"]

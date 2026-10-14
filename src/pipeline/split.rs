@@ -1109,12 +1109,48 @@ mod tests {
         for f in std::fs::read_dir(dir.path()).unwrap().flatten() {
             std::fs::remove_file(f.path()).unwrap();
         }
-        write("old0", "orders#0", None, Some("x"), "2026-08-21T00:00:00Z");
-        write("new0", "orders#0", None, Some("m"), "2026-08-21T00:05:00Z");
+        write(
+            "a_old0",
+            "orders#0",
+            None,
+            Some("x"),
+            "2026-08-21T00:00:00Z",
+        );
+        write(
+            "z_new0",
+            "orders#0",
+            None,
+            Some("m"),
+            "2026-08-21T00:05:00Z",
+        );
         write("b1", "orders#1", Some("m"), None, "2026-08-21T00:05:00Z");
         assert!(
             completed_units_tile(&dest, "orders"),
             "the NEWER #0 (hi=m) tiles with #1 (lo=m); picking the older breaks it"
+        );
+
+        // The listing order is the destination's, so the newer copy may come first as well.
+        for f in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            std::fs::remove_file(f.path()).unwrap();
+        }
+        write(
+            "a_new0",
+            "orders#0",
+            None,
+            Some("m"),
+            "2026-08-21T00:05:00Z",
+        );
+        write(
+            "z_old0",
+            "orders#0",
+            None,
+            Some("x"),
+            "2026-08-21T00:00:00Z",
+        );
+        write("b1", "orders#1", Some("m"), None, "2026-08-21T00:05:00Z");
+        assert!(
+            completed_units_tile(&dest, "orders"),
+            "the NEWER #0 tiles whichever copy the listing returns first"
         );
     }
 
@@ -1397,6 +1433,27 @@ mod tests {
         };
         let name = run_unique_manifest_name(run_id);
         std::fs::write(dir.join(name), serde_json::to_vec(&m).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_closed_lower_bound_on_unit_zero_is_no_boundary_and_no_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut giant = sample_export("daily");
+        giant.mode = ExportMode::Chunked;
+        giant.chunk_by_key = Some("id".into());
+        giant.destination.path = Some(dir.path().to_string_lossy().into_owned());
+
+        write_unit_manifest(dir.path(), "daily#0", "r0", Some("5"), Some("250"));
+        write_unit_manifest(dir.path(), "daily#1", "r1", Some("250"), None);
+
+        let units = reconstruct_units_from_prefix(&giant.destination, "daily", &giant)
+            .unwrap()
+            .expect("the windows of both units name one boundary");
+        assert_eq!(
+            wins_of(&units),
+            vec![(None, Some("250".into())), (Some("250".into()), None)],
+            "unit #0 has no unit below it, so its lower bound names no boundary"
+        );
     }
 
     #[test]

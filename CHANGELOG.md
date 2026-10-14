@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+- **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
+  through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision
+  were looked up in that wrapper, which names no table: the run failed with `precision/scale
+  unavailable from query metadata and catalog lookup`, although the same export without
+  `partition_by` ran (0.31.0 and earlier; a `--split` unit wraps the query the same way). **Now**
+  the plan keeps the query before the window (`catalog_query`) and every reader resolves type hints
+  from it. **What to do:** nothing.
+
+- **A stored incremental cursor of another type stopped every run with a raw driver error.**
+  When the stored cursor is not a value the cursor column can be compared with (the state was
+  edited, or the column changed type), PostgreSQL, SQL Server and Oracle failed every run with
+  their own conversion error (`invalid input syntax for type bigint`, `Error converting data type
+  varchar to bigint`), exit 1, no code and no remedy (0.31.0 and earlier; MySQL coerces the text
+  and delivers). **Now** the run is refused with `RIVET_STATE_CURSOR_INCOMPARABLE` (exit 5), which
+  names the cursor, the column and `rivet state reset`. **What to do:** nothing; an export stuck on
+  this error is led out by `rivet state reset -c <config> --export <name>`.
+
+- **A load could be refused as "another `rivet load` ... is writing" right after its own
+  process released that table.** SQLite state only. The load lease is an `flock`, and it was
+  released by closing the file; a process spawned on another thread at that moment kept a copy
+  of the descriptor until its `exec`, and with it the lock. The next load of the same table in
+  this process was refused (exit 5) though nothing was writing it. **Now** the lease is unlocked
+  explicitly before the file is closed. **What to do:** nothing; a refused load can be run again.
+
+- **A resumed range-chunk run trusted the checkpoint and the parts it continued.** A
+  checkpoint or a committed part changed between the crash and the resume was continued
+  as it stood, and the run exited 0 over wrong data. Measured on 0.31.0 with 40 source rows,
+  each case through both `rivet run` and `rivet run --resume`:
+  - a pending chunk task marked `completed`: 35 rows delivered;
+  - a task whose upper bound was lowered, leaving a hole between two windows: 38 rows;
+  - two stored windows that share keys: 43 rows, 3 of them twice;
+  - a committed part replaced by its sibling's bytes: 35 distinct ids, one chunk's rows
+    twice and another's missing; a truncated part was declared as it was;
+  - a run planned under another `chunk_size` was refused with no code (exit 1), after
+    rewriting `manifest.json`.
+  - **Now** a committed part that is gone, or is not the size the state DB logged, has its
+    chunk read again, and so does a chunk marked `completed` with no part. Keys between the
+    stored windows are planned again. Windows that share keys are refused
+    (`RIVET_STATE_CHUNK_WINDOWS_BROKEN`, exit 5), and so is a changed chunk plan
+    (`RIVET_STATE_CHUNK_PLAN_CHANGED`, exit 5); both texts name `rivet state reset-chunks`,
+    and the plan refusal also names restoring the settings. Under `verify: content` each
+    committed part is read back too: a row count other than the logged one or a key outside
+    its chunk's window has the chunk read again, which catches a part replaced at its own
+    size.
+  - **What to do:** nothing for runs that were not edited by hand. An export resumed by 0.31.0
+    or earlier after its state DB or destination was edited may hold the wrong rows; run it
+    again whole.
+
+- **`rivet load` into Snowflake stored a `timestamp` column as a wrong date, and several
+  loads failed outright.** Snowflake target only; BigQuery and ClickHouse loads are not
+  touched.
+  - **Wrong values with exit 0** (measured on 0.24.2; the statements are the same through
+    0.31.0). A column the source types as a timestamp without a time zone (PostgreSQL
+    `timestamp`, MySQL `datetime`) was read from the Parquet part as its raw microsecond
+    integer and stored as that many seconds: `2026-10-13 21:25:02.145628` landed as year
+    56785866. The load printed `LOAD OK` and the row count matched. A `timestamptz` column
+    was stored correctly.
+  - **Loads that failed** in 0.31.0 and earlier: a table with a `TIME` column (`Failed to
+    cast variant value ... to TIME`); a table with a binary column, `bytea` or `VARBINARY`
+    (`expecting BINARY ... but got VARIANT`); any table whose destination `prefix` is written
+    without a trailing `/` (`Remote file ... was not found`: the stage URL and the file name
+    were joined without a slash).
+  - **Loads that failed from 0.26.0 through 0.31.0:** every load onto a free table name
+    (`object-kind probe ran but KIND_ was not in snow's output`), and the cycle of an
+    incremental or CDC table whose export gained a column (a syntax error at `ADD COLUMN`).
+    A first CDC cycle whose table name is 21 to 30 characters long could also stop on a
+    missing change log, because the "does not exist" answer was searched in a line `snow`
+    wraps at 80 columns.
+  - **Now** each part is read through a Parquet format rivet spells inline, with logical
+    types on: a timestamp, a `timestamptz` and a `TIME` land with their microseconds, a
+    binary column lands as its bytes, and a prefix with or without the trailing `/` loads.
+    Whether a table or a change log exists is asked of the schema catalog, never read from
+    an error text.
+  - **What to do:** a Snowflake table loaded by 0.31.0 or earlier holds wrong values in
+    every timestamp-without-zone column. A `mode: full` export replaces its table on the next
+    `rivet run` and `rivet load`. An incremental or CDC table keeps the rows already in its
+    `<table>__changes` log; decide per table whether to rebuild it from a whole pass.
+  - **Also changed:** rivet no longer creates or reads the named file format `rivet_pq`. One
+    left in the schema by an earlier release is unused and can be dropped; the loading role
+    no longer needs `CREATE FILE FORMAT`.
+  - `rivet compact` on a Snowflake target is unchanged: it exits 0 with `skipped — this
+    warehouse keeps a change log behind a view and never compacts`.
+
 - **Breaking: a second run of an export while one is alive is refused, whatever the mode.**
   Every source; a SQLite or PostgreSQL state database. Reproduced on rivet 0.31.0 with
   PostgreSQL.

@@ -311,6 +311,23 @@ fn rotated_parts_reach_the_destination_whole_mssql() {
     rotation_reaches_destination(e.rig(&t), "mssql rotation");
 }
 
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn rotated_parts_reach_the_destination_whole_oracle() {
+    require_alive(LiveService::Oracle);
+    let e = SqlEngine::Oracle;
+    let (t, _guard) = e.create(
+        "rot_or",
+        "id NUMBER(18) PRIMARY KEY, payload VARCHAR2(1100) NOT NULL",
+    );
+    e.exec(&format!(
+        "INSERT INTO {t} SELECT level, RPAD(TO_CHAR(level) || '-', 1000, TO_CHAR(level * 7919)) \
+         FROM dual CONNECT BY level <= 1000"
+    ));
+    rotation_reaches_destination(e.rig(&t), "oracle rotation");
+}
+
 #[test]
 #[ignore = "live: requires docker compose mongo"]
 fn rotated_parts_reach_the_destination_whole_mongo() {
@@ -321,4 +338,20 @@ fn rotated_parts_reach_the_destination_whole_mongo() {
     let rig = Rig::mongo_batch("bench").source_url(&MongoTest::url(27017, &db));
     rotation_reaches_destination(rig, "mongo rotation");
     m.drop_database();
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn rotated_parts_reach_the_destination_whole_mysql() {
+    require_alive(LiveService::Mysql);
+    let e = SqlEngine::Mysql;
+    let (t, _guard) = e.create(
+        "rot_my",
+        "id BIGINT PRIMARY KEY, payload VARCHAR(1100) NOT NULL",
+    );
+    e.exec(&format!(
+        "INSERT INTO {t} WITH RECURSIVE seq AS (SELECT 1 n UNION ALL SELECT n+1 FROM seq WHERE n < 1000) \
+         SELECT n, REPEAT(MD5(n), 32) FROM seq"
+    ));
+    rotation_reaches_destination(e.rig(&t), "mysql rotation");
 }

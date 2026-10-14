@@ -1,0 +1,13 @@
+diff --git a/src/format/parquet.rs b/src/format/parquet.rs
+index ca6cd4cb..8748f71e 100644
+--- a/src/format/parquet.rs
++++ b/src/format/parquet.rs
+@@ -126,7 +126,7 @@ impl super::FormatWriter for ParquetFormatWriter {
+     }
+ 
+     fn bytes_written(&self) -> u64 {
+-        self.inner.bytes_written() as u64
++        0
+     }
+ }
+ 

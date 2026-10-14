@@ -1,0 +1,14 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index 6238b564..fdf279a1 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -227,9 +227,6 @@ impl TargetLoader for SnowflakeLoader {
+         // absent here; the residual is SELF-LIMITING (round-9): append_changelog's own
+         // BEFORE_/AFTER_ COUNT gates need SELECT, so that role fails the load loudly one
+         // statement later, never a silent doomed append.
+-        if self.object_kind(&format!("{table}__changes"))? == super::ObjectKind::Absent {
+-            return Ok(false);
+-        }
+         // FAIL-CLOSED (round-8): a `snow` JSON-shape drift must not read as "first cycle" and
+         // silently disarm the refusal. BigQuery's scalar path already errors; parity.
+         let v = self.run_snow(&self.build_prior_changes_sql(table))?;

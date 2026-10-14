@@ -202,6 +202,11 @@ pub(crate) fn prune_superseded_attempts(
     pruned.len()
 }
 
+/// Whether `t` is marked completed with no part and no record of having read zero rows: a state no run writes (an empty chunk completes with a row count of 0).
+fn completed_without_a_part(t: &crate::state::ChunkTaskInfo) -> bool {
+    t.status == "completed" && t.file_name.is_none() && t.rows_written != Some(0)
+}
+
 /// Completed, undeclared chunks whose surviving attempt's `file_log` rows are absent or short of the chunk's rows.
 fn under_logged_chunks(
     tasks: &[crate::state::ChunkTaskInfo],
@@ -249,6 +254,9 @@ pub(crate) fn rehydrate_manifest_parts_from_file_log(
 /// deleted parquet sight-unseen — Success + `_SUCCESS` naming files that do
 /// not exist, rows silently absent. `None` = no probe (the caller could not
 /// list; legacy behavior, caller says why).
+/// What one listing of the destination prefix holds: each object's basename and its size in bytes.
+pub(crate) type Listed = std::collections::HashMap<String, u64>;
+
 /// One part the probe found MISSING at the destination: its chunk index (when
 /// the name carries one — re-exportable) and the file name.
 pub(crate) type MissingPart = (Option<u32>, String);
@@ -257,7 +265,7 @@ pub(crate) fn rehydrate_manifest_parts_probed(
     state: &StateStore,
     run_id: &str,
     summary: &mut RunSummary,
-    present: Option<&std::collections::HashSet<String>>,
+    present: Option<&Listed>,
 ) -> Result<(usize, Vec<MissingPart>)> {
     // Reconstruct from file_log, NOT chunk_task: file_log records EVERY committed
     // part — including every max_file_size rotation sibling — with its real byte
@@ -308,6 +316,17 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         surviving.remove(&idx.to_string());
         missing.push((u32::try_from(idx).ok(), name));
     }
+    // A chunk that completed with rows names the part it wrote; `completed` with no part and no
+    // row count of zero was not written by a run, and trusting it leaves its keys out.
+    for t in tasks.iter().filter(|t| completed_without_a_part(t)) {
+        missing.push((
+            u32::try_from(t.chunk_index).ok(),
+            format!(
+                "(chunk {}: marked completed, no part recorded)",
+                t.chunk_index
+            ),
+        ));
+    }
 
     let mut next_id = summary
         .manifest_parts
@@ -331,8 +350,11 @@ pub(crate) fn rehydrate_manifest_parts_probed(
         }
         if let Some(present) = present {
             let base = f.file_name.rsplit('/').next().unwrap_or(&f.file_name);
-            if !present.contains(base) {
+            // Gone, or not the bytes the run committed: the size the state logged is the size
+            // the part had when its chunk completed.
+            if present.get(base).copied() != u64::try_from(f.bytes).ok() {
                 let idx = super::chunk_index_of(&f.file_name).and_then(|i| i.parse::<u32>().ok());
+                surviving.remove(super::chunk_index_of(&f.file_name).unwrap_or_default());
                 missing.push((idx, f.file_name.clone()));
                 continue;
             }
@@ -441,7 +463,15 @@ pub(crate) fn apply_m8_resume_decisions(
             // (the M8 Rewrite semantics): this same run re-exports it.
             let mut stats = M8Stats::default();
             let present = present_basenames(&*dest);
-            rehydrate_and_reset(state, run_id, summary, present.as_ref(), &mut stats)?;
+            let content = super::part_keys::ContentCheck::of(plan, &*dest);
+            rehydrate_and_reset(
+                state,
+                run_id,
+                summary,
+                present.as_ref(),
+                content.as_ref(),
+                &mut stats,
+            )?;
             return Ok(stats);
         }
         Err(e) => {
@@ -492,7 +522,15 @@ pub(crate) fn apply_m8_resume_decisions(
         // `rivet load` inherits (RED-proven: 225000/300000 declared after a crash+resume).
         let mut stats = M8Stats::default();
         let present = present_basenames(&*dest);
-        rehydrate_and_reset(state, run_id, summary, present.as_ref(), &mut stats)?;
+        let content = super::part_keys::ContentCheck::of(plan, &*dest);
+        rehydrate_and_reset(
+            state,
+            run_id,
+            summary,
+            present.as_ref(),
+            content.as_ref(),
+            &mut stats,
+        )?;
         return Ok(stats);
     }
 
@@ -695,6 +733,7 @@ pub(crate) fn apply_m8_resume_decisions(
         run_id,
         summary,
         Some(&listing_basenames(&listing)),
+        super::part_keys::ContentCheck::of(plan, &*dest).as_ref(),
         &mut stats,
     )?;
 
@@ -717,18 +756,19 @@ pub(crate) fn apply_m8_resume_decisions(
     Ok(stats)
 }
 
-/// The basenames of a prefix listing.
-fn listing_basenames(
-    listing: &[crate::destination::ObjectMeta],
-) -> std::collections::HashSet<String> {
+/// The basenames of a prefix listing, each with its size.
+fn listing_basenames(listing: &[crate::destination::ObjectMeta]) -> Listed {
     listing
         .iter()
-        .map(|m| m.key.rsplit('/').next().unwrap_or(&m.key).to_string())
+        .map(|m| {
+            let base = m.key.rsplit('/').next().unwrap_or(&m.key).to_string();
+            (base, m.size_bytes)
+        })
         .collect()
 }
 
 /// The basenames under the destination prefix, or `None` (said out loud) when it cannot be listed.
-fn present_basenames(dest: &dyn Destination) -> Option<std::collections::HashSet<String>> {
+fn present_basenames(dest: &dyn Destination) -> Option<Listed> {
     match dest.list_prefix("") {
         Ok(listing) => Some(listing_basenames(&listing)),
         Err(e) => {
@@ -741,14 +781,20 @@ fn present_basenames(dest: &dyn Destination) -> Option<std::collections::HashSet
     }
 }
 
-/// Rehydrate this run's committed parts (probed when `present` is known) and re-export every chunk whose part is gone or unlogged.
+/// Rehydrate this run's committed parts (probed when `present` is known, read back under `content`) and re-export every chunk whose part is gone, unlogged or not its chunk's.
 fn rehydrate_and_reset(
     state: &StateStore,
     run_id: &str,
     summary: &mut RunSummary,
-    present: Option<&std::collections::HashSet<String>>,
+    present: Option<&Listed>,
+    content: Option<&super::part_keys::ContentCheck<'_>>,
     stats: &mut M8Stats,
 ) -> Result<usize> {
+    let checked = match (present, content) {
+        (Some(p), Some(c)) => Some(c.keep_parts_of_their_chunk(state, run_id, p)?),
+        _ => None,
+    };
+    let present = checked.as_ref().or(present);
     let (rehydrated, missing) = rehydrate_manifest_parts_probed(state, run_id, summary, present)?;
     for (idx, name) in missing {
         let Some(idx) = idx else {
@@ -768,8 +814,9 @@ fn rehydrate_and_reset(
         if n > 0 {
             stats.reset_for_rewrite += 1;
             log::warn!(
-                "resume: committed part '{name}' is gone from the destination or was never \
-                 logged in the state DB — its chunk is re-exported this run"
+                "resume: committed part '{name}' is gone from the destination, is not the size \
+                 the run committed, or was never logged in the state DB — its chunk is \
+                 re-exported this run"
             );
         }
     }
@@ -815,7 +862,7 @@ fn quarantine_move(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::state::FilePart;
 
     use super::*;
@@ -906,7 +953,7 @@ mod tests {
         }
     }
 
-    fn m8_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
+    pub(crate) fn m8_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
@@ -919,6 +966,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT 1".into(),
             query_template: None,
+            catalog_query: None,
             destination_written: None,
             is_split_unit: false,
             strategy: crate::plan::ExtractionStrategy::Snapshot,
@@ -963,6 +1011,58 @@ mod tests {
         }
     }
 
+    /// A part the destination holds at another size than the run committed is not declared and its chunk is read again; a chunk marked completed with no part and no zero row count is read again too, and an empty chunk is left alone.
+    #[test]
+    fn a_part_of_another_size_and_a_completion_without_a_part_are_read_again() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_sizes";
+        state
+            .insert_chunk_tasks(run_id, &[(0, 9), (10, 19), (20, 29), (30, 39)])
+            .unwrap();
+        let (whole, cut) = (
+            "orders_chunk0_00000000000000aa.parquet",
+            "orders_chunk1_00000000000000bb.parquet",
+        );
+        seed_logged_chunk(&state, run_id, 0, &[(whole, 10)]);
+        seed_logged_chunk(&state, run_id, 1, &[(cut, 10)]);
+        state.complete_chunk_task(run_id, 2, 0, None).unwrap();
+        state.exec_for_test(
+            "UPDATE chunk_task SET status = 'completed' WHERE run_id = 'r_sizes' AND chunk_index = 3",
+        );
+        let present: Listed = [(whole.to_string(), 5), (cut.to_string(), 4)].into();
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+
+        let (n, mut missing) =
+            rehydrate_manifest_parts_probed(&state, run_id, &mut summary, Some(&present)).unwrap();
+        missing.sort();
+        assert_eq!(
+            n, 1,
+            "only the part of the size the run committed is declared"
+        );
+        assert_eq!(
+            summary
+                .manifest_parts
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
+            [whole]
+        );
+        assert_eq!(
+            missing,
+            [
+                (Some(1), cut.to_string()),
+                (
+                    Some(3),
+                    "(chunk 3: marked completed, no part recorded)".to_string()
+                ),
+            ],
+            "the cut part and the completion nothing wrote; the empty chunk 2 is not among them"
+        );
+    }
+
     #[test]
     fn a_probed_rehydration_declares_only_the_parts_the_destination_still_holds() {
         let state_dir = tempfile::tempdir().unwrap();
@@ -990,8 +1090,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let present: std::collections::HashSet<String> =
-            ["orders_chunk0_p0.parquet".to_string()].into();
+        let present: Listed = [("orders_chunk0_p0.parquet".to_string(), 1024)].into();
         let mut summary =
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
 
@@ -1906,6 +2005,117 @@ mod tests {
         );
     }
 
+    /// A Parquet part holding the `id` values `ids`.
+    fn id_part(ids: std::ops::RangeInclusive<i64>) -> Vec<u8> {
+        let a: std::sync::Arc<dyn arrow::array::Array> =
+            std::sync::Arc::new(arrow::array::Int64Array::from_iter_values(ids));
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([("id", a)]).unwrap();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// Under `verify: content` a committed part at its logged size whose keys are another chunk's is not declared and its chunk is read again, while its sibling is declared; without `verify: content`, or outside range chunking, nothing is read back.
+    #[test]
+    fn under_verify_content_a_part_with_another_chunks_keys_is_read_again() {
+        use crate::destination::local::LocalDestination;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_content";
+        state
+            .insert_chunk_tasks(run_id, &[(0, 9), (10, 19)])
+            .unwrap();
+        let (own, foreign) = (
+            "orders_chunk0_00000000000000aa.parquet",
+            "orders_chunk1_00000000000000bb.parquet",
+        );
+        for (chunk, name, bytes) in [(0, own, id_part(0..=9)), (1, foreign, id_part(20..=29))] {
+            std::fs::write(dir.path().join(name), &bytes).unwrap();
+            state.claim_next_chunk_task(run_id).unwrap();
+            state
+                .complete_chunk_task(run_id, chunk, 10, Some(name))
+                .unwrap();
+            state
+                .record_file(FilePart {
+                    run_id,
+                    export_name: "orders",
+                    file_name: name,
+                    rows: 10,
+                    bytes: bytes.len() as i64,
+                    format: "parquet",
+                    compression: None,
+                    cursor_high: None,
+                })
+                .unwrap();
+        }
+        let mut plan = m8_plan(dir.path());
+        plan.verify = crate::config::VerifyMode::Content;
+        plan.strategy = crate::plan::ExtractionStrategy::Chunked(crate::plan::ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 10,
+            chunk_count: None,
+            parallel: 1,
+            by_days: None,
+            checkpoint: true,
+            max_attempts: 3,
+        });
+        let dest = LocalDestination::new(&plan.destination).unwrap();
+        let by_size = crate::plan::ResolvedRunPlan {
+            verify: crate::config::VerifyMode::Size,
+            ..plan.clone()
+        };
+        let snapshot = crate::plan::ResolvedRunPlan {
+            strategy: crate::plan::ExtractionStrategy::Snapshot,
+            ..plan.clone()
+        };
+        assert!(super::super::part_keys::ContentCheck::of(&by_size, &dest).is_none());
+        assert!(super::super::part_keys::ContentCheck::of(&snapshot, &dest).is_none());
+        let content = super::super::part_keys::ContentCheck::of(&plan, &dest);
+        assert!(content.is_some());
+
+        let present = listing_basenames(&dest.list_prefix("").unwrap());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let mut stats = M8Stats::default();
+        let n = rehydrate_and_reset(
+            &state,
+            run_id,
+            &mut summary,
+            Some(&present),
+            content.as_ref(),
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "only the part of its own chunk is declared");
+        assert_eq!(
+            summary
+                .manifest_parts
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
+            [own]
+        );
+        assert_eq!(
+            stats.reset_for_rewrite, 1,
+            "the foreign part's chunk is read again"
+        );
+        let status = |i: i64| {
+            state
+                .list_chunk_tasks_for_run(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.chunk_index == i)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status(0), "completed");
+        assert_ne!(status(1), "completed");
+    }
+
     /// Seed a completed chunk whose part is logged in `file_log` (and optionally on disk).
     fn seed_logged_chunk(
         state: &crate::state::StateStore,
@@ -2000,9 +2210,9 @@ mod tests {
         state
             .complete_chunk_task(run_id, 2, 10, Some(short))
             .unwrap();
-        let present: std::collections::HashSet<String> = [logged, unlogged, short]
+        let present: Listed = [logged, unlogged, short]
             .into_iter()
-            .map(String::from)
+            .map(|name| (name.to_string(), 5))
             .collect();
         let mut summary =
             crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));

@@ -66,7 +66,8 @@ fn export_one_chunk_range(
             base_query,
             &plan.tuning,
             &plan.column_overrides,
-        ),
+        )
+        .with_catalog_hint_query(plan.catalog_query.as_deref()),
         &mut sink,
     )?;
     // NO bare `writer.take() + finish()` here. `ExportSink::finish_writer` is the

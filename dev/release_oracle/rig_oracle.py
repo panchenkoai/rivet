@@ -278,6 +278,28 @@ def declared_parts(root: str, manifests: list[str]) -> list[str]:
     return sorted(out)
 
 
+def pairs(spec: dict) -> dict:
+    """`(key, value)` integer pairs, sorted, over the parts the Success manifests under `dir` declare: every manifest copy, or the newest run's alone (`latest`)."""
+    import duckdb
+    import glob
+
+    root = spec["dir"]
+    names = [os.path.basename(m) for m in sorted(glob.glob(os.path.join(root, "manifest-*.json")))]
+    if not names and os.path.isfile(os.path.join(root, "manifest.json")):
+        names = ["manifest.json"]
+    if spec.get("latest") and names:
+        names = in_run_order(root, names)[-1:]
+    files = declared_parts(root, names)
+    if not files:
+        return {"pairs": []}
+    sql = (
+        f"SELECT CAST({_qi(spec['key'])} AS BIGINT), CAST({_qi(spec['value'])} AS BIGINT) "
+        f"FROM read_parquet({_plist(files)}) ORDER BY 1, 2"
+    )
+    with duckdb.connect() as con:
+        return {"pairs": [[int(a), int(b)] for a, b in con.execute(sql).fetchall()]}
+
+
 def in_run_order(root: str, manifests: list[str]) -> list[str]:
     """The named manifests ordered by when their run finished."""
     return sorted(manifests, key=lambda n: (str(_load(root, n).get("finished_at") or ""), n))
@@ -1427,8 +1449,10 @@ def load_run_filter(spec: dict) -> str:
     name, a schema dot folded to `_`) and by `<dataset>.<table>`, never by the export name."""
     load = spec["load"]
     leaf = str(spec.get("table") or spec["export"]).replace(".", "_")
-    # BigQuery writes `<project>.<dataset>.<table>`, ClickHouse `<database>.<table>`.
-    fq = f"{load.get('database') or 'default'}.{leaf}" if load.get("target") == "clickhouse" else f".{load.get('dataset')}.{leaf}"
+    # BigQuery writes `<project>.<dataset>.<table>`, Snowflake `<database>.<schema>.<table>`, ClickHouse `<database>.<table>`.
+    target = load.get("target")
+    fq = (f"{load.get('database') or 'default'}.{leaf}" if target == "clickhouse"
+          else f".{load.get('schema')}.{leaf}" if target == "snowflake" else f".{load.get('dataset')}.{leaf}")
     return f"export_name = {_lit(leaf)} AND ends_with(target_table, {_lit(fq)})"
 
 
@@ -1439,12 +1463,14 @@ def grade_load(spec: dict) -> dict:
     engine, cdc = spec["engine"], spec["mode"] == "cdc"
     load = spec["load"]
     target = str(load.get("target"))
-    if target not in ("clickhouse", "bigquery"):
-        return {"skip": f"load target `{target}`: the rig oracle grades clickhouse and bigquery"}
+    if target not in ("clickhouse", "bigquery", "snowflake"):
+        return {"skip": f"load target `{target}`: the rig oracle grades clickhouse, bigquery and snowflake"}
     rows, forms, renders, config = _prep(engine, cdc)
     kw = {"state": spec["state"]} if spec.get("state") else {}
     if target == "bigquery":
         kw.update(bigquery=True, bq_project=str(load.get("project") or ""), bq_dataset=str(load.get("dataset") or ""))
+    if target == "snowflake":
+        kw.update(snowflake={k: load.get(k) for k in ("connection", "database", "warehouse")})
     notes: list[str] = []
     partial: list[str] = []
     with ExitStack() as held:
@@ -1481,6 +1507,23 @@ def grade_load(spec: dict) -> dict:
             rel = _clickhouse(load, password, f"SELECT {sel} FROM `{db}`.`{leaf}`")
             if blobs:
                 rel = f"(SELECT * REPLACE ({', '.join(f'unhex(CAST({_qi(c)} AS VARCHAR)) AS {_qi(c)}' for c in blobs)}) FROM {rel})"
+            buffered = 0
+        elif target == "snowflake":
+            sf_db, sf_schema = fq.split(".")[:2]
+            sql = (f"SELECT table_name, table_type FROM {sf_db}.INFORMATION_SCHEMA.TABLES "
+                   f"WHERE table_schema = {_lit(sf_schema.upper())} AND table_name IN ({_lit(leaf.upper())}, {_lit(leaf.upper() + '__CHANGES')})")
+            kinds = dict(ora.rows(f"SELECT * FROM {ora.snowflake(sql)}"))
+            if leaf.upper() not in kinds:
+                if not ora.scalar(f"SELECT count(*) FROM {_state_table(ora, spec, 'load_run')} "
+                                  f"WHERE {mine} AND status = 'success' AND rows_loaded > 0"):
+                    return {"skip": f"no load has written `{fq}` yet (every load row for `{spec['export']}` loaded 0 rows)", "notes": notes}
+                return {"failures": [f"WAREHOUSE: `{fq}` does not exist in Snowflake ({sorted(kinds)} do)"], "notes": notes}
+            # Snowflake folds an unquoted name to upper case; each column is read under the source's own spelling.
+            spelled = {c.upper(): c for c, _ in _columns(ora, "source_rows")}
+            cols = [r[0] for r in ora.rows(f"SELECT * FROM {ora.snowflake(f'SELECT column_name FROM {sf_db}.INFORMATION_SCHEMA.COLUMNS WHERE table_schema = {_lit(sf_schema.upper())} AND table_name = {_lit(leaf.upper())} ORDER BY ordinal_position')}")]
+            named = ", ".join(f"{_qi(c)} AS {_qi(spelled.get(c, c.lower()))}" for c in cols)
+            rel = f"(SELECT {named} FROM {ora.snowflake(f'SELECT * FROM {fq}')})"
+            wh_types = {}
             buffered = 0
         else:
             ds = str(load.get("dataset"))
@@ -1654,6 +1697,19 @@ def _self_test() -> None:
     assert _bound('"ID"', "<=", "10", "NUMBER (by value)") == 'TRY_CAST("ID" AS DECIMAL(38, 10)) <= 10'
     assert _bound('"K"', ">", "10", "VARCHAR2") == """"K" > '10'""", "a text cursor compares as text"
     bq = {"target": "bigquery", "project": "p", "dataset": "d"}
+    sf = {"target": "snowflake", "database": "DB", "schema": "S"}
+    assert load_run_filter({"export": "users", "table": "public.users_pg", "load": sf}) == \
+        "export_name = 'public_users_pg' AND ends_with(target_table, '.S.public_users_pg')"
+    from .duck import snowflake_secret
+
+    made = snowflake_secret({"account": "a", "user": "u", "private_key_file": "/k'.p8"}, "DB", "WH")
+    assert "AUTH_TYPE 'key_pair'" in made and "PRIVATE_KEY '/k''.p8'" in made and "DATABASE 'DB'" in made, made
+    try:
+        snowflake_secret({"account": "a", "user": "u", "password": "x"}, "DB", "WH")
+    except RuntimeError as e:
+        assert "key-pair" in str(e), e
+    else:
+        raise AssertionError("a password login must be refused by name, not sent")
     assert load_run_filter({"export": "users", "table": "public.users_pg", "load": bq}) == \
         "export_name = 'public_users_pg' AND ends_with(target_table, '.d.public_users_pg')"
     assert "'q'" in load_run_filter({"export": "q", "table": None, "load": bq}), "a query export is keyed by its name"
@@ -2024,9 +2080,9 @@ def _ns_self_test() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] in (["grade"], ["grade-load"], ["grade-stdout"], ["image"]):
+    if sys.argv[1:] in (["grade"], ["grade-load"], ["grade-stdout"], ["image"], ["pairs"]):
         spec = json.load(sys.stdin)
-        run = {"grade": grade, "grade-load": grade_load, "grade-stdout": grade_stdout, "image": take_image}[sys.argv[1]]
+        run = {"grade": grade, "grade-load": grade_load, "grade-stdout": grade_stdout, "image": take_image, "pairs": pairs}[sys.argv[1]]
         for attempt in range(3):
             try:
                 verdict = run(spec)

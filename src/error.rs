@@ -677,6 +677,11 @@ pub mod codes {
         "RIVET_STATE_CURSOR_OWNER_MISMATCH",
         "`rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column",
     );
+    /// The source cannot compare the stored incremental cursor with the cursor column (a value of another type).
+    pub const STATE_CURSOR_INCOMPARABLE: Code = refusal(
+        "RIVET_STATE_CURSOR_INCOMPARABLE",
+        "`rivet state reset -c <config> --export <name>` starts the cursor over with a full pass",
+    );
     /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection, another schema, or other rows of it.
     pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
@@ -711,6 +716,16 @@ pub mod codes {
     pub const STATE_RUN_IN_PROGRESS: Code = refusal(
         "RIVET_STATE_RUN_IN_PROGRESS",
         "wait for the run to finish, or stop its process, then repeat the command",
+    );
+    /// A resume met an unfinished chunk run opened under another query or other chunk settings.
+    pub const STATE_CHUNK_PLAN_CHANGED: Code = refusal(
+        "RIVET_STATE_CHUNK_PLAN_CHANGED",
+        "restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over",
+    );
+    /// The chunk windows stored for an unfinished run are not one unbroken sequence of keys.
+    pub const STATE_CHUNK_WINDOWS_BROKEN: Code = refusal(
+        "RIVET_STATE_CHUNK_WINDOWS_BROKEN",
+        "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run plans the export again and reads every key",
     );
     /// A checkpointed run found its `chunk_run` row gone when it came to complete it.
     pub const STATE_CHUNK_CHECKPOINT_GONE: Code = refusal(
@@ -880,6 +895,7 @@ pub mod codes {
         STATE_CURSOR_NOT_STORED,
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
+        STATE_CURSOR_INCOMPARABLE,
         STATE_CURSOR_STREAM_MISMATCH,
         STATE_CURSOR_DESTINATION_MISMATCH,
         STATE_INTERRUPTED_RUN_OWNER_MISMATCH,
@@ -889,6 +905,8 @@ pub mod codes {
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
         STATE_CHUNK_CHECKPOINT_GONE,
+        STATE_CHUNK_PLAN_CHANGED,
+        STATE_CHUNK_WINDOWS_BROKEN,
         STATE_LEASE_KEEPER_UNAVAILABLE,
         STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,

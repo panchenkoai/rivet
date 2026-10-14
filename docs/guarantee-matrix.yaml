@@ -110,12 +110,6 @@ guarantees:
     held_by:
       sqlite_state: { test: i5_completed_chunk_task_is_not_reclaimed, asserts: "completed chunk 0 must not be re-claimed" }
       postgres_state: { gap: "the claim-after-complete invariant test opens the SQLite store only" }
-    contradicted_by:
-      known_red:
-        - "live_sabotage::open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses"
-        - "live_sabotage::open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses"
-        - "live_sabotage::open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses"
-        - "live_sabotage::open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses"
 
   - id: a_resumed_chunk_run_delivers_the_keys_past_its_stored_plan
     stated:
@@ -277,10 +271,6 @@ guarantees:
       mssql: { test: a_changed_cursor_column_is_refused_and_walked_out_mssql, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
       oracle: { test: a_changed_cursor_column_is_refused_and_walked_out_oracle, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
       mongo: { test: a_newer_state_schema_is_refused_and_walked_out_mongo, asserts: "refuses_twice_and_walks_out(" }
-    contradicted_by:
-      known_red:
-        - "live_sabotage::open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out"
-        - "live_sabotage::open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out"
 
   - id: parallel_keyset_reads_every_row_exactly_once
     stated:
@@ -731,7 +721,7 @@ guarantees:
         sentence: "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table"
     held_by:
       bigquery: { test: bigquery_load_refuses_a_table_it_did_not_load_on_every_attempt, asserts: "no record of rivet loading it" }
-      snowflake: { gap: "no Snowflake cell loads over a table this state has no record of" }
+      snowflake: { test: snowflake_load_refuses_a_table_it_did_not_load_on_every_attempt_postgres, asserts: "no record of rivet loading it" }
       clickhouse: { test: a_range_refusal_claims_nothing_so_a_table_made_after_it_stays_foreign, asserts: "no record of rivet loading it" }
 
   - id: compact_merges_the_buffer_and_drops_it

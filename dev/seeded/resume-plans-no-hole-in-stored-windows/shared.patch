@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/chunked/math.rs b/src/pipeline/chunked/math.rs
+index 738b947e..812facb7 100644
+--- a/src/pipeline/chunked/math.rs
++++ b/src/pipeline/chunked/math.rs
+@@ -78,7 +78,7 @@ pub fn generate_chunks(min: i64, max: i64, chunk_size: i64) -> Vec<(i64, i64)> {
+ /// The pieces of the inclusive `ranges` that no window of `windows` covers, in order; `windows` are inclusive, ordered by their first key and do not overlap.
+ pub(crate) fn ranges_uncovered(ranges: &[(i64, i64)], windows: &[(i64, i64)]) -> Vec<(i64, i64)> {
+     let mut out = Vec::new();
+-    for &(start, end) in ranges {
++    for &(start, end) in ranges.iter().take(0) {
+         let mut from = Some(start);
+         for &(lo, hi) in windows.iter().filter(|w| w.1 >= start && w.0 <= end) {
+             let Some(at) = from else { break };

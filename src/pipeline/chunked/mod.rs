@@ -24,7 +24,10 @@ mod detect;
 mod exec;
 pub(crate) mod math;
 mod parallel_checkpoint;
+mod part_keys;
 mod resume_m8;
+#[cfg(test)]
+pub(crate) use resume_m8::tests::m8_plan;
 mod sequential_checkpoint;
 
 /// One checkpointed chunk's result: rows, part records, the chunk's Form-B
@@ -44,6 +47,7 @@ pub(crate) use exec::run_chunked_sequential;
 pub use math::generate_chunks;
 pub(crate) use math::{build_chunk_query_sql, chunk_plan_fingerprint, strip_select_star_from};
 pub(in crate::pipeline) use parallel_checkpoint::run_chunked_parallel_checkpoint;
+pub(crate) use resume_m8::Listed;
 pub(crate) use resume_m8::apply_m8_resume_decisions;
 use resume_m8::prune_superseded_attempts;
 pub(crate) use resume_m8::rehydrate_manifest_parts_probed;
@@ -254,16 +258,40 @@ fn replan(
     if !tasks.iter().any(|t| t.file_name.is_some()) {
         return Ok((!ranges.is_empty(), ranges.to_vec()));
     }
-    let bound = |key: &str| {
-        key.parse::<i64>()
-            .map_err(|_| anyhow::anyhow!("stored chunk bound {key:?} is not an integer"))
-    };
-    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    let windows =
+        stored_windows(tasks).map_err(|why| anyhow::anyhow!("stored chunk windows {why}"))?;
+    Ok((false, math::ranges_uncovered(ranges, &windows)))
+}
+
+/// The stored windows of a chunk run, ordered by their first key; `Err` says why they cannot be read as windows: a bound that is not an integer, a window that ends before it starts, or keys that two windows hold.
+pub(crate) fn stored_windows(
+    tasks: &[crate::state::ChunkTaskInfo],
+) -> std::result::Result<Vec<(i64, i64)>, String> {
+    let mut windows = Vec::with_capacity(tasks.len());
     for t in tasks {
-        lo = lo.min(bound(&t.start_key)?);
-        hi = hi.max(bound(&t.end_key)?);
+        let (Ok(start), Ok(end)) = (t.start_key.parse::<i64>(), t.end_key.parse::<i64>()) else {
+            return Err(format!(
+                "hold a bound that is not an integer (chunk {}: {:?}..{:?})",
+                t.chunk_index, t.start_key, t.end_key
+            ));
+        };
+        if end < start {
+            return Err(format!(
+                "hold a window that ends before it starts (chunk {}: {start}..={end})",
+                t.chunk_index
+            ));
+        }
+        windows.push((start, end));
     }
-    Ok((false, math::ranges_outside(ranges, (lo, hi))))
+    windows.sort_unstable();
+    match windows.windows(2).find(|pair| pair[1].0 <= pair[0].1) {
+        Some(pair) => Err(format!(
+            "put keys {}..={} in two windows",
+            pair[1].0,
+            pair[0].1.min(pair[1].1)
+        )),
+        None => Ok(windows),
+    }
 }
 
 /// Bring the stored plan of the resumed run `run_id` up to `ranges`, the source's key span now; a sealed plan passes none and keeps its tasks.
@@ -286,9 +314,9 @@ fn replan_resumed_run(
         );
     } else {
         log::warn!(
-            "export '{export}': the source's key span grew past the plan of run '{run_id}' — \
-             {} chunk task(s) added for the keys outside it; the windows that run committed \
-             are not read again",
+            "export '{export}': the source holds keys no window of run '{run_id}' covers — \
+             {} chunk task(s) added for them; the windows that run committed are not read \
+             again",
             planned.len()
         );
     }
@@ -514,9 +542,23 @@ pub(super) fn ensure_chunk_checkpoint_plan(
         match crashed {
             Some((rid, stored_hash)) => {
                 if stored_hash != plan_hash {
-                    anyhow::bail!(
-                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume — \
-                         to abandon the interrupted run and start over: `rivet state reset-chunks -c {config_path} -e {}`",
+                    crate::rivet_bail!(
+                        crate::error::codes::STATE_CHUNK_PLAN_CHANGED,
+                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume. \
+                         To finish it: restore the query and the chunk settings the interrupted run had and run once to finish it. \
+                         To abandon it: `rivet state reset-chunks -c {config_path} -e {}` abandons it and the next run starts over",
+                        plan.export_name,
+                        plan.export_name
+                    );
+                }
+                if let Err(why) = stored_windows(&state.list_chunk_tasks_for_run(&rid)?) {
+                    crate::rivet_bail!(
+                        crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,
+                        "export '{}': the chunk windows stored for interrupted run '{rid}' {why}. \
+                         rivet never writes such windows, so the checkpoint was changed outside \
+                         rivet, and resuming it would read keys twice or not at all. `rivet state \
+                         reset-chunks -c {config_path} -e {}` abandons the run; the next run plans the \
+                         export again and reads every key",
                         plan.export_name,
                         plan.export_name
                     );
@@ -852,6 +894,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
             query_template: None,
+            catalog_query: None,
             destination_written: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
@@ -1114,9 +1157,66 @@ mod tests {
         assert_eq!(replan(&committed, &[]).unwrap(), (false, vec![]));
         let said = replan(&[stored_task(0, "a", "9", Some("p0"))], &now).unwrap_err();
         assert!(
-            said.to_string().contains("\"a\" is not an integer"),
+            said.to_string()
+                .contains("hold a bound that is not an integer (chunk 0: \"a\"..\"9\")"),
             "{said}"
         );
+    }
+
+    /// Keys a stored window was cut away from are planned again, whether the hole is between two windows or the source moved away from the stored span; windows that share keys are never planned over.
+    /// A window of one key is a window; one that ends before it starts is refused.
+    #[test]
+    fn a_window_of_one_key_is_stored_and_an_inverted_one_is_refused() {
+        let one = [
+            stored_task(0, "5", "5", Some("p0")),
+            stored_task(1, "6", "9", None),
+        ];
+        assert_eq!(stored_windows(&one).unwrap(), vec![(5, 5), (6, 9)]);
+        assert!(stored_windows(&[stored_task(0, "6", "5", None)]).is_err());
+    }
+
+    #[test]
+    fn a_hole_in_the_stored_windows_is_planned_again_and_shared_keys_are_refused() {
+        let now = [(1, 10), (11, 20), (21, 30)];
+        let cut_short = [
+            stored_task(0, "1", "10", Some("p0")),
+            stored_task(1, "11", "13", None),
+            stored_task(2, "21", "30", None),
+        ];
+        assert_eq!(replan(&cut_short, &now).unwrap(), (false, vec![(14, 20)]));
+        let moved_away = [stored_task(0, "1", "10", Some("p0"))];
+        assert_eq!(
+            replan(&moved_away, &[(200, 250)]).unwrap(),
+            (false, vec![(200, 250)]),
+            "a gap between the stored span and the keys the source holds now is not damage"
+        );
+        assert_eq!(
+            stored_windows(&cut_short),
+            Ok(vec![(1, 10), (11, 13), (21, 30)])
+        );
+        for (tasks, why) in [
+            (
+                vec![
+                    stored_task(0, "1", "10", Some("p0")),
+                    stored_task(1, "8", "20", None),
+                ],
+                "put keys 8..=10 in two windows",
+            ),
+            (
+                vec![
+                    stored_task(0, "1", "30", Some("p0")),
+                    stored_task(1, "11", "20", None),
+                ],
+                "put keys 11..=20 in two windows",
+            ),
+            (
+                vec![stored_task(0, "9", "3", Some("p0"))],
+                "hold a window that ends before it starts (chunk 0: 9..=3)",
+            ),
+        ] {
+            assert_eq!(stored_windows(&tasks), Err(why.to_string()));
+            assert!(replan(&tasks, &now).unwrap_err().to_string().contains(why));
+        }
     }
 
     /// A source whose key spans 1..=230, with no NULL key and no column to drift.

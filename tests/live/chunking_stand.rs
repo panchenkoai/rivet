@@ -325,13 +325,14 @@ fn run_pool_split_rerun_with(
     let n = original_ids.len() as i64;
     let chunk = (n / 4).max(1); // 2 units of n/2 → 2 chunks/pages each → the hook fires
     let sibling_q = format!("SELECT id FROM {} WHERE id <= 100", eng.qualified(table));
+    let sibling = unique_name("split_sibling");
     let rig = eng
         .rig(table)
         .mode("chunked")
         .export_line(key_line)
         .export_line(&format!("chunk_size: {chunk}"))
         .export_line("parallel_safe: true")
-        .also_export("split_sibling", &sibling_q)
+        .also_export(&sibling, &sibling_q)
         .also_export_line("parallel_safe: true");
     let cfg = rig.config_path();
 
@@ -343,7 +344,7 @@ fn run_pool_split_rerun_with(
         primed.status,
         String::from_utf8_lossy(&primed.stderr)
     );
-    for d in [rig.out_dir(), rig.out_dir_for("split_sibling")] {
+    for d in [rig.out_dir(), rig.out_dir_for(&sibling)] {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
     }
@@ -368,8 +369,7 @@ fn run_pool_split_rerun_with(
     // So: check the fixture FIRST, and when it is inert say so with the numbers
     // the advisor actually used, rather than reporting a product failure.
     {
-        let db = StateDb::next_to_config(&cfg);
-        let runs = db.export_runs();
+        let runs = recorded_export_runs(&cfg, &[rig.export_name(), &sibling]);
         // ANY status: this run crashes its units on purpose, so a unit that did
         // its job records a FAILED row, not a successful one.
         let units = runs.iter().filter(|(n, ..)| n.contains('#')).count();
@@ -2777,13 +2777,14 @@ fn pool_split_cloud(crash: Option<(&str, &str)>) {
         "SELECT id FROM {} WHERE id <= 100",
         Eng::Pg.qualified(&table)
     );
+    let sibling = unique_name("split_sibling");
     let rig = Eng::Pg
         .rig(&table)
         .mode("chunked")
         .export_line("chunk_column: id")
         .export_line(&format!("chunk_size: {}", ROWS / 4))
         .export_line("parallel_safe: true")
-        .also_export("split_sibling", &sibling_q)
+        .also_export(&sibling, &sibling_q)
         .also_export_line("parallel_safe: true")
         .dest_s3(bucket, &prefix, MINIO_ENDPOINT);
     let cfg = rig.config_path();
@@ -2816,13 +2817,10 @@ fn pool_split_cloud(crash: Option<(&str, &str)>) {
     // produces no units at all — then the assertion below would pass while
     // grading a plain pool run. (The same guard the local siblings carry, for the
     // same reason: it fired for real on CI at ratio 1.52.)
-    let units = {
-        let db = StateDb::next_to_config(&cfg);
-        db.export_runs()
-            .iter()
-            .filter(|(n, ..)| n.contains('#'))
-            .count()
-    };
+    let units = recorded_export_runs(&cfg, &[rig.export_name(), &sibling])
+        .iter()
+        .filter(|(n, ..)| n.contains('#'))
+        .count();
     assert!(
         units >= 2,
         "FIXTURE INERT: `--split` produced {units} unit(s), so nothing was written by two \

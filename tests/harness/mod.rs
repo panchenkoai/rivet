@@ -1,6 +1,6 @@
 //! Black-box end-to-end matrix for `rivet load` (ADR-0001).
 //!
-//! It drives the **shipped binaries** end-to-end and re-reads the warehouse to
+//! It drives the binary built from this tree (see [`rivet`]) end-to-end and re-reads the warehouse to
 //! assert oracles:
 //!
 //! ```text
@@ -26,6 +26,25 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+/// The `rivet` these cells grade: the binary cargo built from this tree, or the one `RIVET_BIN_OVERRIDE` names (a release under comparison). Never whatever `rivet` is on PATH: an installed older release there made every cell pass on a tree whose load was broken. The binary and its version are printed once.
+fn rivet() -> Command {
+    static BIN: LazyLock<std::ffi::OsString> = LazyLock::new(|| {
+        let bin = std::env::var_os("RIVET_BIN_OVERRIDE")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_rivet").into());
+        let version = Command::new(&bin)
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|e| format!("not runnable: {e}"));
+        eprintln!(
+            "warehouse cells grade {} ({version})",
+            Path::new(&bin).display()
+        );
+        bin
+    });
+    Command::new(&*BIN)
+}
 
 // ── Axes (the matrix columns × the mode encoded in the scenario id) ──────────
 
@@ -57,6 +76,8 @@ pub enum Mode {
 
 #[path = "../common/registry.rs"]
 mod registry;
+#[path = "../common/sf_reader.rs"]
+mod sf_reader;
 use registry::{stand_bench_db, stand_bq_e2e, stand_container, stand_host_port};
 
 static PG_CLIENT: LazyLock<[&str; 6]> =
@@ -231,6 +252,7 @@ pub enum SoakOracle {
 
 // ── Fixture (the "heavy" tier lives here) ────────────────────────────────────
 
+#[derive(Clone)]
 pub struct Fixture {
     /// The source table (`content_items`, `rivet_type_matrix`, …).
     pub table: String,
@@ -360,6 +382,7 @@ pub struct Verification {
     pub mode: Mode,
     pub fixture: Fixture,
     pub warehouse: Warehouse,
+    targets: Vec<Warehouse>,
     initial_snapshot: bool,
 }
 
@@ -384,6 +407,7 @@ impl Verification {
             mode,
             fixture,
             warehouse: Warehouse::BigQuery,
+            targets: vec![Warehouse::BigQuery],
             initial_snapshot: false,
         }
     }
@@ -391,7 +415,69 @@ impl Verification {
     /// Select the warehouse this cell loads into and re-reads (default BigQuery).
     pub fn warehouse(mut self, warehouse: Warehouse) -> Self {
         self.warehouse = warehouse;
+        self.targets = vec![warehouse];
         self
+    }
+
+    /// Load ONE extract into each of `targets` in order and grade each (`cleanup_source` on the last only).
+    pub fn warehouses(mut self, targets: &[Warehouse]) -> Self {
+        self.warehouse = targets[0];
+        self.targets = targets.to_vec();
+        self
+    }
+
+    /// This cell aimed at one warehouse: what the per-warehouse helpers read.
+    fn on(&self, warehouse: Warehouse) -> Verification {
+        Verification {
+            engine: self.engine,
+            mode: self.mode,
+            fixture: self.fixture.clone(),
+            warehouse,
+            targets: vec![warehouse],
+            initial_snapshot: self.initial_snapshot,
+        }
+    }
+
+    /// Drop `table` and its `__changes` in every target warehouse.
+    fn reset_targets(&self, env: &HarnessEnv, table: &str) -> Result<()> {
+        self.targets
+            .iter()
+            .try_for_each(|w| self.on(*w).reset_warehouse_objects(env, table))
+    }
+
+    /// Load the extract under `prefix` into every target in order (`cleanup_source` on the last
+    /// only) and grade each with `grade(cell, last)`; outcome names carry the warehouse when there
+    /// are several.
+    fn load_into_each(
+        &self,
+        env: &HarnessEnv,
+        work: &TempWork,
+        prefix: &str,
+        what: &str,
+        grade: impl Fn(&Verification, bool) -> Result<Vec<(String, OracleOutcome)>>,
+    ) -> Result<Vec<(String, OracleOutcome)>> {
+        let mut out = Vec::new();
+        for (i, w) in self.targets.iter().enumerate() {
+            let cell = self.on(*w);
+            let last = i + 1 == self.targets.len();
+            let cfg = work.write(
+                &format!("load-{}.yaml", w.target()),
+                &cell.extraction_yaml(env, prefix, last)?,
+            );
+            run(
+                rivet().args(["load", "-c"]).arg(&cfg),
+                &format!("{what} into {}", w.target()),
+            )?;
+            for (name, outcome) in grade(&cell, last)? {
+                let name = if self.targets.len() > 1 {
+                    format!("{}:{name}", w.target())
+                } else {
+                    name
+                };
+                out.push((name, outcome));
+            }
+        }
+        Ok(out)
     }
 
     /// Turn on `cdc.initial: snapshot` — the first CDC run anchors, backfills
@@ -403,10 +489,7 @@ impl Verification {
 
     /// Run the full pipeline and evaluate each requested oracle. A CASE with an
     /// empty oracle list, or any `Skipped` outcome, is a strength-floor failure.
-    pub fn run(
-        &self,
-        oracles: &[WarehouseOracle],
-    ) -> Result<Vec<(WarehouseOracle, OracleOutcome)>> {
+    pub fn run(&self, oracles: &[WarehouseOracle]) -> Result<Vec<(String, OracleOutcome)>> {
         // Order matters: an empty oracle list is a CONFIG error whatever the
         // environment, so it is answered before the env check — otherwise a machine
         // without credentials cannot tell a mis-declared cell from a skipped one.
@@ -423,7 +506,7 @@ impl Verification {
                 .iter()
                 .map(|o| {
                     (
-                        *o,
+                        format!("{o:?}"),
                         OracleOutcome::Skipped {
                             why: SKIP_WHY.to_string(),
                         },
@@ -435,22 +518,26 @@ impl Verification {
         let work = TempWork::new("rivet-pro-matrix")?;
 
         self.seed(&env)?;
-        let gcs_prefix = self.extract_to_gcs(&env, &work)?;
-        let bq_table = self.load(&env, &work, &gcs_prefix)?;
-
-        let _ = &env; // preconditions checked; stages already consumed it.
-        oracles
-            .iter()
-            .map(|o| {
-                // StagingWiped checks the GCS prefix (known here), not the
-                // warehouse — every other oracle re-reads the loaded table.
-                let outcome = match o {
-                    WarehouseOracle::StagingWiped => self.staging_wiped(&gcs_prefix)?,
-                    _ => self.evaluate(&bq_table, *o)?,
-                };
-                Ok((*o, outcome))
-            })
-            .collect()
+        let prefix = self.extract_to_gcs(&env, &work)?;
+        let gcs_prefix = format!("gs://{}/{}", env.gcs_bucket, prefix);
+        self.load_into_each(&env, &work, &prefix, "rivet load", |cell, last| {
+            let table = cell.warehouse_table_ref(&env, &cell.loaded_table_name())?;
+            // StagingWiped checks the GCS prefix after the last load; every other
+            // oracle re-reads the loaded table.
+            oracles
+                .iter()
+                .filter(|o| last || **o != WarehouseOracle::StagingWiped)
+                // Values compares through BigQuery's own reader (value_diff.py).
+                .filter(|o| cell.warehouse == Warehouse::BigQuery || **o != WarehouseOracle::Values)
+                .map(|o| {
+                    let outcome = match o {
+                        WarehouseOracle::StagingWiped => cell.staging_wiped(&gcs_prefix)?,
+                        _ => cell.evaluate(&table, *o)?,
+                    };
+                    Ok((format!("{o:?}"), outcome))
+                })
+                .collect()
+        })
     }
 
     /// The CDC soak runner (`SoakFlatRss` / `SoakZeroGap`). Distinct from `run()`:
@@ -486,12 +573,12 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
-        self.reset_warehouse_objects(&env, &self.loaded_table_name())?;
+        self.reset_targets(&env, &self.loaded_table_name())?;
 
         self.reset_cdc_anchor(&prefix);
         self.seed(&env)?; // the heavy base
         // Same filename `pro_load` reads — one config drives both extract & load.
-        let cdc_cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
+        let cdc_cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix, true)?);
 
         // Anchor first: one CDC run BEFORE any churn pins the checkpoint at the
         // current binlog position (MySQL has no server-side anchor), so every
@@ -504,25 +591,26 @@ impl Verification {
             churned.extend(self.churn(cfg)?);
             rss_mb.push(self.cdc_run_peak_rss(&cdc_cfg)?);
         }
-        let bq_table = self.load(&env, &work, &format!("gs://{}/{}", env.gcs_bucket, prefix))?;
-
         churned.sort_unstable();
         churned.dedup();
         let churned_distinct = churned.len() as i64;
 
         // Warehouse oracles (TypeFidelity, null-profile, …) apply to the CDC-loaded
         // table exactly as in batch; soak oracles are process metrics over the run.
-        let mut out = Vec::new();
-        for o in warehouse {
-            out.push((format!("{o:?}"), self.evaluate(&bq_table, *o)?));
-        }
-        for o in soak {
-            out.push((
-                format!("{o:?}"),
-                self.eval_soak(*o, &bq_table, &rss_mb, churned_distinct)?,
-            ));
-        }
-        Ok(out)
+        self.load_into_each(&env, &work, &prefix, "rivet load (soak)", |cell, _| {
+            let table = cell.warehouse_table_ref(&env, &cell.loaded_table_name())?;
+            let mut out = Vec::new();
+            for o in warehouse {
+                out.push((format!("{o:?}"), cell.evaluate(&table, *o)?));
+            }
+            for o in soak {
+                out.push((
+                    format!("{o:?}"),
+                    cell.eval_soak(*o, &table, &rss_mb, churned_distinct)?,
+                ));
+            }
+            Ok(out)
+        })
     }
 
     /// A focused Mongo CDC cell: seed two docs, capture an update + a delete, load
@@ -561,53 +649,46 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
-        self.reset_warehouse_objects(&env, &self.loaded_table_name())?;
+        self.reset_targets(&env, &self.loaded_table_name())?;
         // A fresh checkpoint so the anchor pins at the current resume token.
         let _ =
             std::fs::remove_file(std::env::temp_dir().join(format!("ckpt-matrix_mongo_{coll}_")));
 
-        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
+        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix, true)?);
         // Anchor: one bounded CDC run BEFORE any change pins the resume token, so
         // the mutations below are captured (Mongo has no server-side anchor).
-        run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
-            "rivet run (anchor)",
-        )?;
+        run(rivet().args(["run", "-c"]).arg(&cfg), "rivet run (anchor)")?;
         self.mongosh(
             db,
             &format!(
                 "db.{coll}.updateOne({{_id:1}},{{$set:{{v:'a2'}}}}); db.{coll}.deleteOne({{_id:2}});"
             ),
         )?;
-        run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
-            "rivet run (capture)",
-        )?;
+        run(rivet().args(["run", "-c"]).arg(&cfg), "rivet run (capture)")?;
 
         // Load the change log + (re)build the current-state dedup view. Mode
         // (cdc) and the pk (_id) come from the config's `load:` block.
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
-            "rivet load (cdc)",
-        )?;
+        self.load_into_each(&env, &work, &prefix, "rivet load (cdc)", |cell, _| {
+            let view = cell.warehouse_table_ref(&env, &cell.loaded_table_name())?;
+            let t = cell.wh_table(&view);
+            let live =
+                cell.wh_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE NOT __is_deleted"))?;
+            let tombstoned =
+                cell.wh_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE __is_deleted"))?;
 
-        let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
-        let t = self.wh_table(&view);
-        let live = self.wh_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE NOT __is_deleted"))?;
-        let tombstoned = self.wh_scalar(&format!("SELECT COUNT(*) FROM {t} WHERE __is_deleted"))?;
-
-        Ok(vec![
-            // `_id:1` survives its update; `_id:2` is hidden by the live filter.
-            (
-                "live_excludes_deleted".into(),
-                compare("live-count", live, 1),
-            ),
-            // The delete is an auditable tombstone, not a silent disappearance.
-            (
-                "delete_sets_is_deleted".into(),
-                compare("tombstone-count", tombstoned, 1),
-            ),
-        ])
+            Ok(vec![
+                // `_id:1` survives its update; `_id:2` is hidden by the live filter.
+                (
+                    "live_excludes_deleted".into(),
+                    compare("live-count", live, 1),
+                ),
+                // The delete is an auditable tombstone, not a silent disappearance.
+                (
+                    "delete_sets_is_deleted".into(),
+                    compare("tombstone-count", tombstoned, 1),
+                ),
+            ])
+        })
     }
 
     /// A focused Mongo BATCH cell: seed N docs via `mongosh`, full-scan extract
@@ -650,36 +731,44 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
-        self.reset_warehouse_objects(&env, &coll)?;
+        self.reset_targets(&env, &coll)?;
 
         // ONE config drives extract + load; the Mongo batch source_ref is a
         // `table:` (collection), not a SQL query (see extraction_yaml).
-        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
+        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix, true)?);
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (mongo batch extract)",
         )?;
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+        self.load_into_each(
+            &env,
+            &work,
+            &prefix,
             "rivet load (mongo batch)",
-        )?;
-
-        // For a Mongo batch the export's `table:` (the collection) IS the load
-        // target table — plan_loads names it from the `table:` field, which wins
-        // over the export name — so read back `coll`, NOT the engine-prefixed
-        // `loaded_table_name()` the SQL batch path (which has no `table:`) uses.
-        let table = self.warehouse_table_ref(&env, &coll)?;
-        let t = self.wh_table(&table);
-        let rows = self.wh_scalar(&format!("SELECT COUNT(*) FROM {t}"))?;
-        let distinct = self.wh_scalar(&format!("SELECT COUNT(DISTINCT _id) FROM {t}"))?;
-        let n = n as i64;
-        Ok(vec![
-            // The full scan lands every seeded doc, exactly once.
-            ("RowCount".into(), compare("row-count", rows, n)),
-            ("DistinctId".into(), compare("distinct-_id", distinct, n)),
-            // cleanup_source wiped the staging prefix after the verified load.
-            ("StagingWiped".into(), self.staging_wiped(&full_prefix)?),
-        ])
+            |cell, last| {
+                // For a Mongo batch the export's `table:` (the collection) IS the load
+                // target table — plan_loads names it from the `table:` field, which wins
+                // over the export name — so read back `coll`, NOT the engine-prefixed
+                // `loaded_table_name()` the SQL batch path (which has no `table:`) uses.
+                let table = cell.warehouse_table_ref(&env, &coll)?;
+                let t = cell.wh_table(&table);
+                let rows = cell.wh_scalar(&format!("SELECT COUNT(*) FROM {t}"))?;
+                let distinct = cell.wh_scalar(&format!("SELECT COUNT(DISTINCT _id) FROM {t}"))?;
+                let n = n as i64;
+                let mut out: Vec<(String, OracleOutcome)> = vec![
+                    // The full scan lands every seeded doc, exactly once.
+                    ("RowCount".into(), compare("row-count", rows, n)),
+                    ("DistinctId".into(), compare("distinct-_id", distinct, n)),
+                ];
+                if last {
+                    out.push(
+                        // cleanup_source wiped the staging prefix after the verified load.
+                        ("StagingWiped".into(), cell.staging_wiped(&full_prefix)?),
+                    );
+                }
+                Ok(out)
+            },
+        )
     }
 
     /// A focused CDC **backfill** cell: turn CDC on for a PRE-EXISTING table via
@@ -728,62 +817,61 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
-        self.reset_warehouse_objects(&env, &self.loaded_table_name())?;
+        self.reset_targets(&env, &self.loaded_table_name())?;
         self.reset_cdc_anchor(&prefix);
 
-        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix)?);
+        let cfg = work.write("extract.yaml", &self.extraction_yaml(&env, &prefix, true)?);
         // Anchor → full snapshot of the N preexisting rows → drain (initial: snapshot).
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (snapshot)",
         )?;
         // Live changes AFTER the backfill: one insert, one update, one delete.
         self.churn_backfill(&t, n)?;
-        run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
-            "rivet run (drain)",
-        )?;
-        // Mode (cdc) + the pk come from the config's `load:` block now.
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
-            "rivet load (cdc)",
-        )?;
+        run(rivet().args(["run", "-c"]).arg(&cfg), "rivet run (drain)")?;
+        self.load_into_each(&env, &work, &prefix, "rivet load (cdc)", |cell, last| {
+            let view = cell.warehouse_table_ref(&env, &cell.loaded_table_name())?;
+            let vt = cell.wh_table(&view);
+            let live =
+                cell.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE NOT __is_deleted"))?;
+            let tombstoned =
+                cell.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE __is_deleted"))?;
+            // A middle backfill row the stream never touched — the class the bug hid.
+            let mid = n / 2;
+            // Mongo serialises `_id` to a STRING in the warehouse (SQL sources keep a
+            // numeric `id`), so the mid-row literal must be quoted for Mongo or the
+            // `_id = <int>` comparison is a type error.
+            let mid_lit = match cell.engine {
+                Engine::Mongo => format!("'{mid}'"),
+                _ => mid.to_string(),
+            };
+            let mid_live = cell.wh_scalar(&format!(
+                "SELECT COUNT(*) FROM {vt} WHERE {pk} = {mid_lit} AND NOT __is_deleted"
+            ))?;
 
-        let view = self.warehouse_table_ref(&env, &self.loaded_table_name())?;
-        let vt = self.wh_table(&view);
-        let live = self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE NOT __is_deleted"))?;
-        let tombstoned =
-            self.wh_scalar(&format!("SELECT COUNT(*) FROM {vt} WHERE __is_deleted"))?;
-        // A middle backfill row the stream never touched — the class the bug hid.
-        let mid = n / 2;
-        // Mongo serialises `_id` to a STRING in the warehouse (SQL sources keep a
-        // numeric `id`), so the mid-row literal must be quoted for Mongo or the
-        // `_id = <int>` comparison is a type error.
-        let mid_lit = match self.engine {
-            Engine::Mongo => format!("'{mid}'"),
-            _ => mid.to_string(),
-        };
-        let mid_live = self.wh_scalar(&format!(
-            "SELECT COUNT(*) FROM {vt} WHERE {pk} = {mid_lit} AND NOT __is_deleted"
-        ))?;
-
-        Ok(vec![
-            // N preexisting − 1 delete + 1 insert = N live rows: the backfill survives.
-            ("backfill_all_live".into(), compare("live-count", live, n)),
-            // The delete is an auditable tombstone, not a silent disappearance.
-            (
-                "delete_sets_is_deleted".into(),
-                compare("tombstone-count", tombstoned, 1),
-            ),
-            // The regression guard: an untouched snapshot row must read as live
-            // (NULL `__op` → `COALESCE(.., FALSE)`), not vanish from the live filter.
-            (
-                "untouched_backfill_row_live".into(),
-                compare("mid-row-live", mid_live, 1),
-            ),
-            // The cleanup side-effect: `cleanup_source: true` wiped the staging.
-            ("staging_wiped".into(), self.staging_wiped(&full_prefix)?),
-        ])
+            let mut out: Vec<(String, OracleOutcome)> = vec![
+                // N preexisting − 1 delete + 1 insert = N live rows: the backfill survives.
+                ("backfill_all_live".into(), compare("live-count", live, n)),
+                // The delete is an auditable tombstone, not a silent disappearance.
+                (
+                    "delete_sets_is_deleted".into(),
+                    compare("tombstone-count", tombstoned, 1),
+                ),
+                // The regression guard: an untouched snapshot row must read as live
+                // (NULL `__op` → `COALESCE(.., FALSE)`), not vanish from the live filter.
+                (
+                    "untouched_backfill_row_live".into(),
+                    compare("mid-row-live", mid_live, 1),
+                ),
+            ];
+            if last {
+                out.push(
+                    // The cleanup side-effect: `cleanup_source: true` wiped the staging.
+                    ("staging_wiped".into(), cell.staging_wiped(&full_prefix)?),
+                );
+            }
+            Ok(out)
+        })
     }
 
     /// A focused live INCREMENTAL cell (MySQL batch source — no binlog): a
@@ -847,11 +935,11 @@ impl Verification {
             ),
         );
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (incremental 1)",
         )?;
         run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            rivet().args(["load", "-c"]).arg(&cfg),
             "rivet load (incremental 1)",
         )?;
         // Delta: bump id=1's cursor (update), add a new row above the watermark.
@@ -861,11 +949,11 @@ impl Verification {
             n + 1
         ))?;
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (incremental 2)",
         )?;
         run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
+            rivet().args(["load", "-c"]).arg(&cfg),
             "rivet load (incremental 2)",
         )?;
 
@@ -1053,7 +1141,7 @@ impl Verification {
     fn cdc_run_peak_rss(&self, cdc_cfg: &Path) -> Result<f64> {
         let out = Command::new("/usr/bin/time")
             .arg("-l")
-            .arg("rivet")
+            .arg(rivet().get_program())
             .args(["run", "-c"])
             .arg(cdc_cfg)
             .output()
@@ -1181,6 +1269,7 @@ impl Verification {
     }
 
     // ── stage 2: OSS extract → GCS parquet ───────────────────────────────────
+    /// Extract the cell's table under `matrix/<engine>/<table>/`; that relative prefix.
     fn extract_to_gcs(&self, env: &HarnessEnv, work: &TempWork) -> Result<String> {
         // Trailing slash makes this a real "directory": rivet's GCS `prefix` is a
         // literal string prepended to each file, so `.../content_items` (no slash)
@@ -1196,30 +1285,13 @@ impl Verification {
         let _ = Command::new("gcloud")
             .args(["storage", "rm", "-r", &format!("{full_prefix}**")])
             .status();
-        self.reset_warehouse_objects(env, &self.loaded_table_name())?;
-        let cfg = work.write("extract.yaml", &self.extraction_yaml(env, &prefix)?);
+        self.reset_targets(env, &self.loaded_table_name())?;
+        let cfg = work.write("extract.yaml", &self.extraction_yaml(env, &prefix, true)?);
         run(
-            Command::new("rivet").args(["run", "-c"]).arg(&cfg),
+            rivet().args(["run", "-c"]).arg(&cfg),
             "rivet run (extract → gcs)",
         )?;
-        Ok(full_prefix)
-    }
-
-    // ── stage 3: rivet load → warehouse ──────────────────────────────────────
-    fn load(&self, env: &HarnessEnv, work: &TempWork, _gcs_prefix: &str) -> Result<String> {
-        // `rivet load` names the target after the export's `table:` when present,
-        // else its `name:`. Batch uses `query:` (no `table:`) so the engine-qualified
-        // `name` wins; CDC uses `table:` so the loaded object is the bare table name.
-        let table = self.loaded_table_name();
-        // ONE config drives both extract and load — the same file, which carries
-        // a top-level `load:` block. `rivet load` REPLACES the target from GCS
-        // (storage is the source of truth). Free OSS command, no license.
-        let cfg = work.path("extract.yaml");
-        run(
-            Command::new("rivet").args(["load", "-c"]).arg(&cfg),
-            "rivet load",
-        )?;
-        self.warehouse_table_ref(env, &table)
+        Ok(prefix)
     }
 
     /// The unqualified name `rivet load` gives the target: the engine-qualified
@@ -1592,12 +1664,12 @@ impl Verification {
     }
 
     // ── config generators (hand-written YAML — no serde dep) ─────────────────
-    fn extraction_yaml(&self, env: &HarnessEnv, gcs_prefix: &str) -> Result<String> {
+    fn extraction_yaml(&self, env: &HarnessEnv, gcs_prefix: &str, cleanup: bool) -> Result<String> {
         let lane = self.lane();
         // The `load:` block — per-warehouse target config, declared once.
         let load_block = match self.warehouse {
             Warehouse::BigQuery => format!(
-                "load:\n  target: bigquery\n  project: {project}\n  dataset: {dataset}\n  cleanup_source: true\n",
+                "load:\n  target: bigquery\n  project: {project}\n  dataset: {dataset}\n  cleanup_source: {cleanup}\n",
                 project = env.bq_project()?,
                 dataset = stand_bq_e2e(),
             ),
@@ -1606,7 +1678,7 @@ impl Verification {
                 format!(
                     "load:\n  target: snowflake\n  connection: {conn}\n  warehouse: {wh}\n  \
                      database: {db}\n  schema: {sc}\n  storage_integration: {si}\n  \
-                     cleanup_source: true\n",
+                     cleanup_source: {cleanup}\n",
                     conn = sf.connection,
                     wh = sf.warehouse,
                     db = sf.database,
@@ -1815,32 +1887,39 @@ fn snow_json(conn: &str, sql: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&out[start..]).with_context(|| format!("parse snow json from: {out}"))
 }
 
-/// `snow sql` returning a single scalar (the first column of the first row).
+/// Rows of `sql`, read through DuckDB's `snowflake` extension: the loader drives `snow`, so a read through `snow` would grade the tool with itself.
+fn sf_read(conn: &str, sql: &str) -> Result<Vec<Vec<serde_json::Value>>> {
+    let var = |k: &str| std::env::var(k).with_context(|| format!("{k} unset"));
+    sf_reader::snowflake_rows(
+        conn,
+        &var("RIVET_SF_DATABASE")?,
+        &var("RIVET_SF_WAREHOUSE")?,
+        sql,
+    )
+    .map_err(anyhow::Error::msg)
+}
+
+/// The first column of the first row, as an integer.
 fn sf_scalar(conn: &str, sql: &str) -> Result<i64> {
-    let v = snow_json(conn, sql)?;
-    let val = v
-        .get(0)
-        .and_then(|row| row.as_object())
-        .and_then(|o| o.values().next())
-        .context("snow: empty result")?;
+    let rows = sf_read(conn, sql)?;
+    let val = rows
+        .first()
+        .and_then(|r| r.first())
+        .context("snowflake: empty result")?;
     match val {
-        serde_json::Value::Number(n) => n.as_i64().context("snow: scalar not an i64"),
-        serde_json::Value::String(s) => s.trim().parse().context("snow: parse scalar string"),
-        other => bail!("snow: unexpected scalar {other}"),
+        serde_json::Value::Number(n) => n.as_i64().context("snowflake: scalar not an i64"),
+        serde_json::Value::String(s) => s.trim().parse().context("snowflake: parse scalar string"),
+        other => bail!("snowflake: unexpected scalar {other}"),
     }
 }
 
-/// `snow sql` returning `(col0, col1)` rows. serde_json orders a row's keys
-/// (BTreeMap default, or SELECT order under `preserve_order`) so for a
-/// `SELECT column_name, data_type` both give `(name, type)`.
+/// `(col0, col1)` of every row, in SELECT order.
 fn sf_rows(conn: &str, sql: &str) -> Result<Vec<(String, String)>> {
-    let v = snow_json(conn, sql)?;
     let mut out = Vec::new();
-    for row in v.as_array().context("snow: result not an array")? {
-        let obj = row.as_object().context("snow: row not an object")?;
-        let mut vals = obj.values();
-        let a = vals.next().context("snow: row missing col0")?;
-        let b = vals.next().context("snow: row missing col1")?;
+    for row in sf_read(conn, sql)? {
+        let [a, b, ..] = row.as_slice() else {
+            bail!("snowflake: a row of fewer than two columns: {row:?}")
+        };
         out.push((json_str(a), json_str(b)));
     }
     Ok(out)

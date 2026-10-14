@@ -127,6 +127,8 @@ pub(crate) fn build_plan_on(
         }
     };
     let query_template = written.filter(|w| *w != resolved).map(&bounded);
+    let catalog_query =
+        (export.split.is_some() || export.partition_window.is_some()).then(|| resolved.clone());
     let base_query = bounded(resolved);
 
     let merged = merge_tuning_config(config.source.tuning.as_ref(), export.tuning.as_ref());
@@ -245,6 +247,7 @@ pub(crate) fn build_plan_on(
             .or_else(|| export.table.clone()),
         base_query,
         query_template,
+        catalog_query,
         destination_written,
         is_split_unit: export.split.is_some(),
         // Thread the split window into the plan so finalize records it in the manifest —

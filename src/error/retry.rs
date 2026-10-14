@@ -279,14 +279,8 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
 fn classify_pg_sqlstate(code: &postgres::error::SqlState) -> RetryClass {
     use postgres::error::SqlState;
 
-    // Class 08 — Connection Exception → reconnect
-    if *code == SqlState::CONNECTION_EXCEPTION
-        || *code == SqlState::CONNECTION_DOES_NOT_EXIST
-        || *code == SqlState::CONNECTION_FAILURE
-        || *code == SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
-        || *code == SqlState::SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION
-        || code.code().starts_with("08")
-    {
+    // Class 08 — Connection Exception (08000, 08003, 08006, 08001, 08004, …) → reconnect
+    if code.code().starts_with("08") {
         return TRANSIENT_RECONNECT;
     }
 
@@ -364,6 +358,36 @@ fn is_oracle_capacity(msg: &str) -> bool {
         "ora-12516", // TNS:listener could not find available handler
         "ora-12519", // TNS:no appropriate service handler found
         "ora-12520", // TNS:listener could not find available handler for requested type
+    ];
+    CODES.iter().any(|c| msg.contains(c))
+}
+
+/// Is `err` the source refusing to convert a value to a column's type (22P02 and kin, SQL Server 8114/245/241/8115, ORA-01722 and kin)?
+pub(crate) fn is_value_conversion(err: &anyhow::Error) -> bool {
+    use postgres::error::SqlState;
+    let pg = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<postgres::Error>())
+        .and_then(postgres::Error::as_db_error);
+    if let Some(db) = pg {
+        return [
+            SqlState::INVALID_TEXT_REPRESENTATION,
+            SqlState::INVALID_DATETIME_FORMAT,
+            SqlState::DATETIME_FIELD_OVERFLOW,
+            SqlState::NUMERIC_VALUE_OUT_OF_RANGE,
+        ]
+        .contains(db.code());
+    }
+    let msg = format!("{err:#}").to_lowercase();
+    const CODES: &[&str] = &[
+        "(code: 8114,", // error converting data type
+        "(code: 245,",  // conversion failed converting a value
+        "(code: 241,",  // conversion failed converting date/time
+        "(code: 8115,", // arithmetic overflow converting
+        "ora-01722",    // invalid number
+        "ora-01858",    // a non-numeric character where a numeric was expected
+        "ora-01861",    // literal does not match format string
+        "ora-01841",    // year out of range
     ];
     CODES.iter().any(|c| msg.contains(c))
 }
@@ -917,5 +941,188 @@ mod tests {
         )
         .into();
         assert!(classify_error(&env).is_transient());
+    }
+
+    /// Each credential needle classifies PERMANENT on its own, even beside a transient one.
+    #[test]
+    fn each_credential_needle_is_permanent_beside_a_transient_one() {
+        for needle in [
+            "loading credential",
+            "loadcredential",
+            "metadata.google.internal",
+            "permission denied",
+            "access denied",
+            "invalid_grant",
+            "token has been expired or revoked",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{needle}: connection reset by peer"));
+            assert_eq!(c, PERMANENT, "{needle}");
+        }
+    }
+
+    /// Each OpenDAL transient needle classifies as a brief destination blip on its own.
+    #[test]
+    fn each_destination_blip_needle_classifies_on_its_own() {
+        for msg in [
+            "Unexpected (temporary) at write",
+            "dispatch task is gone",
+            "runtime dropped the dispatch task",
+            "send http request, source: client error (SendRequest)",
+        ] {
+            assert_eq!(
+                classify_error(&anyhow::anyhow!("{msg}")),
+                transient(false, 500),
+                "{msg}"
+            );
+        }
+        // The SendRequest pair counts only together.
+        for half in ["client error (SendRequest)", "send http request"] {
+            assert_ne!(
+                classify_error(&anyhow::anyhow!("{half}")),
+                transient(false, 500),
+                "{half}"
+            );
+        }
+    }
+
+    /// Each server-shutdown SQLSTATE reconnects after the long delay, on its own.
+    #[test]
+    fn each_pg_shutdown_sqlstate_reconnects_after_a_delay() {
+        use postgres::error::SqlState;
+        for code in [
+            SqlState::ADMIN_SHUTDOWN,
+            SqlState::CRASH_SHUTDOWN,
+            SqlState::CANNOT_CONNECT_NOW,
+        ] {
+            assert_eq!(
+                classify_pg_sqlstate(&code),
+                transient(true, 15_000),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// Each MySQL server code maps to its class by code, whatever the message says.
+    #[test]
+    fn each_mysql_code_maps_to_its_class() {
+        let class = |code: u16| {
+            classify_mysql_error(&mysql::Error::MySqlError(mysql::error::MySqlError {
+                state: "HY000".to_string(),
+                message: "x".to_string(),
+                code,
+            }))
+        };
+        assert_eq!(class(1213), Some(transient(false, 1_000)));
+        assert_eq!(class(1205), Some(TRANSIENT_SAME_CONN));
+        for code in [1040, 1053] {
+            assert_eq!(class(code), Some(transient(true, 15_000)), "{code}");
+        }
+        for code in [1045, 1044, 1049, 1146, 1064, 3024] {
+            assert_eq!(class(code), Some(PERMANENT), "{code}");
+        }
+        assert_eq!(class(9999), None);
+    }
+
+    /// Each string needle of the network, duration and lock-wait groups classifies on its own.
+    #[test]
+    fn each_string_needle_classifies_on_its_own() {
+        for (needles, want) in [
+            (
+                &[
+                    "connection reset",
+                    "broken pipe",
+                    "connection refused",
+                    "no route to host",
+                    "network is unreachable",
+                    "name resolution",
+                    "dns",
+                    "ssl handshake",
+                    "i/o timeout",
+                    "unexpected eof",
+                    "closed the connection unexpectedly",
+                    "got an error reading communication packets",
+                    "gone away",
+                    "lost connection",
+                    "the server closed the connection",
+                    "can't connect to mysql server",
+                ][..],
+                TRANSIENT_RECONNECT,
+            ),
+            (
+                &[
+                    "statement timeout after",
+                    "due to statement timeout",
+                    "execution time exceeded",
+                    "max_execution_time",
+                ][..],
+                PERMANENT,
+            ),
+            (
+                &[
+                    "timed out",
+                    "timeout",
+                    "canceling statement",
+                    "lock wait timeout",
+                ][..],
+                TRANSIENT_SAME_CONN,
+            ),
+        ] {
+            for needle in needles {
+                assert_eq!(
+                    classify_error(&anyhow::anyhow!("{needle}")),
+                    want,
+                    "{needle}"
+                );
+            }
+        }
+        // A duration needle wins over the lock-wait needle that follows it in the text.
+        for needle in [
+            "statement timeout after",
+            "due to statement timeout",
+            "execution time exceeded",
+            "max_execution_time",
+        ] {
+            let c = classify_error(&anyhow::anyhow!("{needle}; the query timed out"));
+            assert_eq!(c, PERMANENT, "{needle}");
+        }
+    }
+
+    /// Only 57014 is the duration cancel; a resource SQLSTATE past it keeps its own class.
+    #[test]
+    fn only_query_canceled_is_permanent_among_late_pg_states() {
+        use postgres::error::SqlState;
+        assert_eq!(classify_pg_sqlstate(&SqlState::QUERY_CANCELED), PERMANENT);
+        assert_eq!(
+            classify_pg_sqlstate(&SqlState::DISK_FULL),
+            transient(false, 5_000)
+        );
+        for code in [SqlState::CONNECTION_EXCEPTION, SqlState::CONNECTION_FAILURE] {
+            assert_eq!(classify_pg_sqlstate(&code), TRANSIENT_RECONNECT, "{code:?}");
+        }
+    }
+
+    /// A value-conversion refusal is recognised by its engine code, and nothing else is.
+    #[test]
+    fn a_value_conversion_is_recognised_by_its_engine_code() {
+        for msg in [
+            "mssql: streaming rows failed: Token error: 'Error converting data type varchar to bigint.' on server s executing  on line 1 (code: 8114, state: 5, class: 16)",
+            "Token error: 'Conversion failed when converting the varchar value 'x' to data type int.' (code: 245, state: 1, class: 16)",
+            "Token error: 'Conversion failed when converting date and/or time from character string.' (code: 241, state: 1, class: 16)",
+            "Token error: 'Arithmetic overflow error converting varchar to data type numeric.' (code: 8115, state: 8, class: 16)",
+            "ORA-01722: invalid number",
+            "ORA-01858: a non-numeric character was found where a numeric was expected",
+            "ORA-01861: literal does not match format string",
+            "ORA-01841: (full) year must be between -4713 and +9999",
+        ] {
+            assert!(is_value_conversion(&anyhow::anyhow!("{msg}")), "{msg}");
+        }
+        for msg in [
+            "Token error: 'Invalid object name.' (code: 208, state: 1, class: 16)",
+            "Token error: 'x' (code: 82450, state: 1, class: 16)",
+            "ORA-00942: table or view does not exist",
+            "connection reset by peer",
+        ] {
+            assert!(!is_value_conversion(&anyhow::anyhow!("{msg}")), "{msg}");
+        }
     }
 }

@@ -259,6 +259,8 @@ mod live_shape_drift;
 mod live_shared_state_same_name;
 #[path = "live/live_skip_empty.rs"]
 mod live_skip_empty;
+#[path = "live/live_snowflake_load.rs"]
+mod live_snowflake_load;
 #[path = "live/live_source_conformance.rs"]
 mod live_source_conformance;
 #[path = "live/live_source_parity_sweep.rs"]
@@ -267,6 +269,8 @@ mod live_source_parity_sweep;
 mod live_state_backend_parity;
 #[path = "live/live_temp_spill.rs"]
 mod live_temp_spill;
+#[path = "live/live_three_cycles.rs"]
+mod live_three_cycles;
 #[path = "live/live_type_policy.rs"]
 mod live_type_policy;
 #[path = "live/live_wave_apply.rs"]
