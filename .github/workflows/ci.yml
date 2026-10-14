@@ -1215,11 +1215,19 @@ jobs:
           # is read back off the artifact's own `summary` field by the emitter,
           # so the log and the JSON cannot drift.
           echo "::notice::$(cat summary.txt)"
+      # When was each live cell last green? A report beside the metrics, never a gate:
+      # the ledger is written by whoever runs the stand (gate, nightly, a developer).
+      - name: Evidence freshness of the live cells (report, not a gate)
+        run: |
+          python3 dev/pytools/evidence.py report --json evidence-report.json | tee evidence-report.txt
+          echo "::notice::$(head -1 evidence-report.txt)"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: harness-metrics
-          path: harness-metrics.json
+          path: |
+            harness-metrics.json
+            evidence-report.json
           if-no-files-found: warn
 
   # The gate's own scripts, graded. Seconds, no toolchain. Each `selftest` is a
@@ -1264,6 +1272,8 @@ jobs:
         run: |
           python3 dev/pytools/fault_catalog.py --self-test
           python3 dev/pytools/nightly.py --self-test
+      - name: Evidence ledger self-test
+        run: python3 dev/pytools/evidence.py --self-test
       # The PRIORITISER's classification, graded over a coverage export copied
       # from a real `cargo llvm-cov --lib --bins --json` run: an executed
       # function, an untaken branch inside one, a function measured at zero, a

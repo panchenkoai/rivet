@@ -28,7 +28,7 @@ import tempfile
 from pathlib import Path
 from collections.abc import Callable
 
-from .core import RAN_LIVE_TESTS, SKIP_ALLOWED, Ledger, self_skipped, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
+from .core import GREEN_CELLS, RAN_LIVE_TESTS, SKIP_ALLOWED, Ledger, self_skipped, ROOT, have, nextest_filter, nextest_passed, rivet_bin, run, test_passed
 
 TESTS = (
     "same_named_configs_share_a_postgres_state_cdc_cycle",
@@ -97,6 +97,7 @@ def run_rig_tests(led: Ledger, scenario: str, tests: tuple[str, ...],
                        "allow it in core.SKIP_ALLOWED with a reason, or bring its infrastructure up",
                        "vacuous skip")
         elif test_passed(name, passed):
+            GREEN_CELLS.update(q for q in passed if q == name or q.endswith("::" + name))
             led.passed("all", scenario, cell(name), "postgres", msg(name), "ok")
         else:
             # From the test's captured-output block (`--- STDOUT/STDERR: … <name> ---`):

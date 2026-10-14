@@ -1,0 +1,82 @@
+# Last green run of every live cell: fn -> { green: date, by: local|gate|nightly|ci, at: commit, in: module }.
+# Written by dev/pytools/evidence.py record (from nextest junit or logs); read by `report`,
+# which lists the live cells of docs/*-matrix.yaml with no green run in the last `days`.
+# A line here is EVIDENCE, not coverage: the matrices say what must be tested, this says when
+# each live test last proved it. Hand edits are not evidence; record a run instead.
+
+days: 7
+
+cells:
+  a: { green: '2026-10-14', by: gate, at: 621fcaa2, in: m }
+  c: { green: '2026-10-14', by: gate, at: 621fcaa2, in: m }
+  cdc_into_bigquery_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_bigquery_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_bigquery_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_bigquery_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_bigquery_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_clickhouse_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_clickhouse_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_clickhouse_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_clickhouse_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_duckdb_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_duckdb_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_duckdb_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_duckdb_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_duckdb_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_snowflake_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_snowflake_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_snowflake_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_snowflake_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  cdc_into_snowflake_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_bigquery_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_bigquery_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_bigquery_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_bigquery_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_bigquery_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_clickhouse_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_clickhouse_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_clickhouse_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_clickhouse_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_clickhouse_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_duckdb_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_duckdb_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_duckdb_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_duckdb_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_duckdb_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_snowflake_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_snowflake_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_snowflake_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_snowflake_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  full_into_snowflake_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_bigquery_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_bigquery_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_bigquery_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_bigquery_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_clickhouse_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_clickhouse_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_clickhouse_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_clickhouse_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_duckdb_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_duckdb_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_duckdb_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_duckdb_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_snowflake_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_snowflake_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_snowflake_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  incremental_into_snowflake_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_bigquery_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_bigquery_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_bigquery_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_bigquery_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_clickhouse_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_clickhouse_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_clickhouse_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_clickhouse_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_duckdb_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_duckdb_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_duckdb_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_duckdb_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_snowflake_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_snowflake_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_snowflake_three_cycles_oracle: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
+  keyset_incremental_into_snowflake_three_cycles_postgres: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }

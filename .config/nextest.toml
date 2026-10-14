@@ -9,6 +9,9 @@
 # one-binary-per-file layout provided, at one link instead of N.
 
 [profile.default]
+# Every run leaves its per-test verdicts in target/nextest/<profile>/junit.xml: the evidence
+# ledger (dev/pytools/evidence.py) records which live cells were green, and when.
+junit = { path = "junit.xml" }
 # Don't let a hung test block the whole run forever; terminate after two
 # slow-timeout periods and report it as a failure.
 slow-timeout = { period = "120s", terminate-after = 2 }
