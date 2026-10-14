@@ -2163,6 +2163,15 @@ mod tests {
         assert!(e.contains("sequence 2"), "{e}");
         let e = coded(plan_logs(&[], &[], 150, 350).unwrap_err());
         assert!(e.contains("no redo log covers"), "{e}");
+        let exact = plan_logs(
+            &[log("a2", 2, 150, 300)],
+            &[log("o3", 3, 300, u64::MAX)],
+            150,
+            350,
+        )
+        .expect("a log whose first SCN is the checkpoint's covers it");
+        let names: Vec<_> = exact.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["a2", "o3"]);
     }
 
     #[test]
