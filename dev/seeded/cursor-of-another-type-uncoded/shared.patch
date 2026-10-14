@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/single.rs b/src/pipeline/single.rs
+index 8ed3f46..33e3d1e 100644
+--- a/src/pipeline/single.rs
++++ b/src/pipeline/single.rs
+@@ -291,7 +291,7 @@ fn refuse_an_incomparable_cursor(
+     let Some(value) = cursor.and_then(|c| c.last_cursor_value.as_deref()) else {
+         return err;
+     };
+-    if !crate::error::retry::is_value_conversion(&err) {
++    if value.is_empty() || true {
+         return err;
+     }
+     let column = plan

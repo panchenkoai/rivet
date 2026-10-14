@@ -271,9 +271,6 @@ guarantees:
       mssql: { test: a_changed_cursor_column_is_refused_and_walked_out_mssql, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
       oracle: { test: a_changed_cursor_column_is_refused_and_walked_out_oracle, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
       mongo: { test: a_newer_state_schema_is_refused_and_walked_out_mongo, asserts: "refuses_twice_and_walks_out(" }
-    contradicted_by:
-      known_red:
-        - "live_sabotage::open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out"
 
   - id: parallel_keyset_reads_every_row_exactly_once
     stated:
