@@ -100,6 +100,9 @@ pub struct ResolvedRunPlan {
     /// `base_query` before `${...}` substitution, when the two differ: the rows part of the progress identity is read from it, so a value that changes between runs is not an edit. Absent from a plan with no placeholder and from one sealed before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_template: Option<String>,
+    /// `base_query` before a `--split` key window or a `partition_by` bucket wraps it: catalog type hints (PostgreSQL `NUMERIC` precision) resolve from it, since the wrapper hides the source table. Absent when nothing wraps the base, and from a plan sealed before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_query: Option<String>,
     /// The URI of `destination` before `{date}`-style substitution, when the two differ: the destination part of the progress identity is read from it, so a new day's prefix is not a moved destination. Absent from a plan with no placeholder and from one sealed before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_written: Option<String>,

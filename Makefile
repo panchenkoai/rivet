@@ -364,6 +364,13 @@ SEEDED_ARGS ?=
 open-defects:  ## Every open_defect_ live cell against its line in dev/release_oracle/known_red.py; CI does not run these cells, so run this after a fixture or harness change.
 	$(LIVE) $(PY) -m dev.release_oracle.open_defects
 
+.PHONY: evidence-record evidence-report
+evidence-record:  ## Record the last nextest run's green live cells (target/nextest/default/junit.xml) in docs/evidence/last-green.yaml. EVIDENCE_BY=local|gate|nightly|ci.
+	$(PY) dev/pytools/evidence.py record --junit target/nextest/default/junit.xml --by $(or $(EVIDENCE_BY),local)
+
+evidence-report:  ## The live cells of every coverage ledger with no green run in the last N days (report, not a gate). EVIDENCE_DAYS overrides the ledger's window.
+	$(PY) dev/pytools/evidence.py report $(if $(EVIDENCE_DAYS),--days $(EVIDENCE_DAYS),)
+
 .PHONY: seeded-recall
 seeded-recall:  ## Seeded-defect recall: re-introduce every known bug class and require the harness to catch it.
 	$(LIVE) env $(GATE_ENV) $(PY) -m dev.seeded $(SEEDED_ARGS)

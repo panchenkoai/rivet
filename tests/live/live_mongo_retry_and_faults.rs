@@ -79,7 +79,14 @@ fn mongo_export_recovers_after_mid_stream_proxy_disable_then_enable_with_retries
         toxi_enable("mongo"); // rivet's retry reconnects here
     });
 
-    let rig = proxied(&db);
+    let rig = proxied(&db).a_failed_run_may_leave(
+        &[
+            Leftover::OrphanPart,
+            Leftover::FileLog,
+            Leftover::ObservedSchema,
+        ],
+        "an outage after committed parts is refused loudly; the parts stay for the clean re-run",
+    );
     let out = rig.run(); // may retry through the outage, or safely refuse — both valid
     let _ = bg.join();
 

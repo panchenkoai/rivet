@@ -1,0 +1,12 @@
+diff --git a/src/pipeline/single.rs b/src/pipeline/single.rs
+index 90ed676..fa96656 100644
+--- a/src/pipeline/single.rs
++++ b/src/pipeline/single.rs
+@@ -317,7 +317,6 @@ pub(super) fn run_single_export(
+         &plan.tuning,
+         &plan.column_overrides,
+     )
+-    .with_catalog_hint_query(plan.catalog_query.as_deref())
+     .with_incremental(plan.strategy.incremental_plan())
+     .with_cursor(cursor);
+ 

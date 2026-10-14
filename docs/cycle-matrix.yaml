@@ -1,0 +1,185 @@
+# Cycle matrix — the same config on the same state, three times: the whole source, then an
+# unchanged source, then a delta. Row = pipeline mode x warehouse (every `ExportMode` variant x
+# every `ExportTarget` variant, derived from the enums by the drift guard), column = source engine.
+#
+# Why it exists: the harness graded `first pass + delta` (upgrade continuity, mode transitions,
+# init delta) and `idle` (CDC full cycle into BigQuery) in separate bodies, batch and CDC apart,
+# and no cell asked all three questions of one config: does an unchanged source leave the
+# warehouse, the cursor and the load ledger alone, and does the delta then travel exactly once?
+# The four field defects of 2026 in this class (cursor inherited across a column change, a whole
+# pass overwriting an adopted table, a refusal turning into ownership on the next cycle, a
+# 0-row idle run read as `nothing to load`) all live between cycles.
+#
+# The cells of one row share ONE body (tests/live/live_three_cycles.rs): `three_batch_cycles`
+# for the SQL engines, `three_mongo_full_cycles` for MongoDB's whole-collection export,
+# `three_cdc_cycles` for every CDC engine. The warehouse is asked for metadata between cycles
+# (object kinds, row counts, modification stamps) and read for values ONCE, after the last cycle,
+# through a client the loader does not use (tests/common/warehouse.rs).
+#
+# A cell is EXACTLY one of:
+#   test: <fn>  — the live cell for this engine.
+#   na:   <why> — the combination has no meaning for this engine.
+#   gap:  <why> — it should be graded here and is not yet.
+
+engines: [postgres, mysql, mssql, mongo, oracle]
+
+scenarios:
+  - id: cycle_full_duckdb
+    what: "every cycle takes the whole table: cycle 2 lands the same rows again, cycle 3 the source as it is then; the warehouse holds exactly the source and the load ledger counts each pass. Target: LOCAL Parquet graded by DuckDB over the parts the manifests declare."
+    postgres: { test: full_into_duckdb_three_cycles_postgres }
+    mysql:   { test: full_into_duckdb_three_cycles_mysql }
+    mssql:   { test: full_into_duckdb_three_cycles_mssql }
+    mongo:   { test: full_into_duckdb_three_cycles_mongo }
+    oracle:  { test: full_into_duckdb_three_cycles_oracle }
+
+  - id: cycle_full_clickhouse
+    what: "every cycle takes the whole table: cycle 2 lands the same rows again, cycle 3 the source as it is then; the warehouse holds exactly the source and the load ledger counts each pass. Target: ClickHouse on the stand, read back over HTTP."
+    postgres: { test: full_into_clickhouse_three_cycles_postgres }
+    mysql:   { test: full_into_clickhouse_three_cycles_mysql }
+    mssql:   { test: full_into_clickhouse_three_cycles_mssql }
+    mongo:   { test: full_into_clickhouse_three_cycles_mongo }
+    oracle:  { test: full_into_clickhouse_three_cycles_oracle }
+
+  - id: cycle_full_bigquery
+    what: "every cycle takes the whole table: cycle 2 lands the same rows again, cycle 3 the source as it is then; the warehouse holds exactly the source and the load ledger counts each pass. Target: BigQuery, read back through `bq`."
+    postgres: { test: full_into_bigquery_three_cycles_postgres }
+    mysql:   { test: full_into_bigquery_three_cycles_mysql }
+    mssql:   { test: full_into_bigquery_three_cycles_mssql }
+    mongo:   { test: full_into_bigquery_three_cycles_mongo }
+    oracle:  { test: full_into_bigquery_three_cycles_oracle }
+
+  - id: cycle_full_snowflake
+    what: "every cycle takes the whole table: cycle 2 lands the same rows again, cycle 3 the source as it is then; the warehouse holds exactly the source and the load ledger counts each pass. Target: Snowflake, read back through DuckDB's ADBC reader (never `snow`)."
+    postgres: { test: full_into_snowflake_three_cycles_postgres }
+    mysql:   { test: full_into_snowflake_three_cycles_mysql }
+    mssql:   { test: full_into_snowflake_three_cycles_mssql }
+    mongo:   { test: full_into_snowflake_three_cycles_mongo }
+    oracle:  { test: full_into_snowflake_three_cycles_oracle }
+
+  - id: cycle_incremental_duckdb
+    what: "cycle 1 takes everything and sets the cursor; cycle 2 (no change) exits 0 saying `no new rows`, writes no part, moves no cursor, loads nothing (a 0-row success in the ledger, warehouse metadata unchanged); cycle 3 delivers exactly the five new rows and the log holds 25, never 45. Target: LOCAL Parquet graded by DuckDB over the parts the manifests declare."
+    postgres: { test: incremental_into_duckdb_three_cycles_postgres }
+    mysql:   { test: incremental_into_duckdb_three_cycles_mysql }
+    mssql:   { test: incremental_into_duckdb_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: incremental_into_duckdb_three_cycles_oracle }
+
+  - id: cycle_incremental_clickhouse
+    what: "cycle 1 takes everything and sets the cursor; cycle 2 (no change) exits 0 saying `no new rows`, writes no part, moves no cursor, loads nothing (a 0-row success in the ledger, warehouse metadata unchanged); cycle 3 delivers exactly the five new rows and the log holds 25, never 45. Target: ClickHouse on the stand, read back over HTTP."
+    postgres: { test: incremental_into_clickhouse_three_cycles_postgres }
+    mysql:   { test: incremental_into_clickhouse_three_cycles_mysql }
+    mssql:   { test: incremental_into_clickhouse_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: incremental_into_clickhouse_three_cycles_oracle }
+
+  - id: cycle_incremental_bigquery
+    what: "cycle 1 takes everything and sets the cursor; cycle 2 (no change) exits 0 saying `no new rows`, writes no part, moves no cursor, loads nothing (a 0-row success in the ledger, warehouse metadata unchanged); cycle 3 delivers exactly the five new rows and the log holds 25, never 45. Target: BigQuery, read back through `bq`."
+    postgres: { test: incremental_into_bigquery_three_cycles_postgres }
+    mysql:   { test: incremental_into_bigquery_three_cycles_mysql }
+    mssql:   { test: incremental_into_bigquery_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: incremental_into_bigquery_three_cycles_oracle }
+
+  - id: cycle_incremental_snowflake
+    what: "cycle 1 takes everything and sets the cursor; cycle 2 (no change) exits 0 saying `no new rows`, writes no part, moves no cursor, loads nothing (a 0-row success in the ledger, warehouse metadata unchanged); cycle 3 delivers exactly the five new rows and the log holds 25, never 45. Target: Snowflake, read back through DuckDB's ADBC reader (never `snow`)."
+    postgres: { test: incremental_into_snowflake_three_cycles_postgres }
+    mysql:   { test: incremental_into_snowflake_three_cycles_mysql }
+    mssql:   { test: incremental_into_snowflake_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: incremental_into_snowflake_three_cycles_oracle }
+
+  - id: cycle_chunked_duckdb
+    what: "the chunked cycle that carries state is keyset_incremental (chunk_checkpoint + keyset_incremental); a plain chunked pass keeps no cursor and cycles like full. Cycle 2 (no change) writes no part, moves no anchor, loads nothing; cycle 3 delivers exactly the five keys past the anchor. Target: LOCAL Parquet graded by DuckDB over the parts the manifests declare."
+    postgres: { test: keyset_incremental_into_duckdb_three_cycles_postgres }
+    mysql:   { test: keyset_incremental_into_duckdb_three_cycles_mysql }
+    mssql:   { test: keyset_incremental_into_duckdb_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: keyset_incremental_into_duckdb_three_cycles_oracle }
+
+  - id: cycle_chunked_clickhouse
+    what: "the chunked cycle that carries state is keyset_incremental (chunk_checkpoint + keyset_incremental); a plain chunked pass keeps no cursor and cycles like full. Cycle 2 (no change) writes no part, moves no anchor, loads nothing; cycle 3 delivers exactly the five keys past the anchor. Target: ClickHouse on the stand, read back over HTTP."
+    postgres: { test: keyset_incremental_into_clickhouse_three_cycles_postgres }
+    mysql:   { test: keyset_incremental_into_clickhouse_three_cycles_mysql }
+    mssql:   { test: keyset_incremental_into_clickhouse_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: keyset_incremental_into_clickhouse_three_cycles_oracle }
+
+  - id: cycle_chunked_bigquery
+    what: "the chunked cycle that carries state is keyset_incremental (chunk_checkpoint + keyset_incremental); a plain chunked pass keeps no cursor and cycles like full. Cycle 2 (no change) writes no part, moves no anchor, loads nothing; cycle 3 delivers exactly the five keys past the anchor. Target: BigQuery, read back through `bq`."
+    postgres: { test: keyset_incremental_into_bigquery_three_cycles_postgres }
+    mysql:   { test: keyset_incremental_into_bigquery_three_cycles_mysql }
+    mssql:   { test: keyset_incremental_into_bigquery_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: keyset_incremental_into_bigquery_three_cycles_oracle }
+
+  - id: cycle_chunked_snowflake
+    what: "the chunked cycle that carries state is keyset_incremental (chunk_checkpoint + keyset_incremental); a plain chunked pass keeps no cursor and cycles like full. Cycle 2 (no change) writes no part, moves no anchor, loads nothing; cycle 3 delivers exactly the five keys past the anchor. Target: Snowflake, read back through DuckDB's ADBC reader (never `snow`)."
+    postgres: { test: keyset_incremental_into_snowflake_three_cycles_postgres }
+    mysql:   { test: keyset_incremental_into_snowflake_three_cycles_mysql }
+    mssql:   { test: keyset_incremental_into_snowflake_three_cycles_mssql }
+    mongo:   { na: "a Mongo export accepts only mode: full or cdc (validate_non_sql_source_modes)" }
+    oracle:  { test: keyset_incremental_into_snowflake_three_cycles_oracle }
+
+  - id: cycle_time_window_duckdb
+    what: "a time window keeps no cursor of its own: every run exports the window as it then is, which the full rows grade. Target: LOCAL Parquet graded by DuckDB over the parts the manifests declare."
+    postgres: { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mysql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mssql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mongo:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    oracle:  { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+
+  - id: cycle_time_window_clickhouse
+    what: "a time window keeps no cursor of its own: every run exports the window as it then is, which the full rows grade. Target: ClickHouse on the stand, read back over HTTP."
+    postgres: { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mysql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mssql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mongo:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    oracle:  { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+
+  - id: cycle_time_window_bigquery
+    what: "a time window keeps no cursor of its own: every run exports the window as it then is, which the full rows grade. Target: BigQuery, read back through `bq`."
+    postgres: { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mysql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mssql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mongo:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    oracle:  { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+
+  - id: cycle_time_window_snowflake
+    what: "a time window keeps no cursor of its own: every run exports the window as it then is, which the full rows grade. Target: Snowflake, read back through DuckDB's ADBC reader (never `snow`)."
+    postgres: { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mysql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mssql:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    mongo:   { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+    oracle:  { na: "a time window keeps no cursor: each run exports the window as it then is, graded by the full rows" }
+
+  - id: cycle_cdc_duckdb
+    what: "cycle 1 anchors and snapshots the rows that are there; cycle 2 (no change) captures nothing, loads nothing (a 0-row success, warehouse metadata unchanged); cycle 3 carries five inserts, one update and one delete: the live view equals the source and the log holds the snapshot plus seven changes, nothing twice. Target: LOCAL Parquet graded by DuckDB over the parts the manifests declare."
+    postgres: { test: cdc_into_duckdb_three_cycles_postgres }
+    mysql:   { test: cdc_into_duckdb_three_cycles_mysql }
+    mssql:   { test: cdc_into_duckdb_three_cycles_mssql }
+    mongo:   { test: cdc_into_duckdb_three_cycles_mongo }
+    oracle:  { test: cdc_into_duckdb_three_cycles_oracle }
+
+  - id: cycle_cdc_clickhouse
+    what: "cycle 1 anchors and snapshots the rows that are there; cycle 2 (no change) captures nothing, loads nothing (a 0-row success, warehouse metadata unchanged); cycle 3 carries five inserts, one update and one delete: the live view equals the source and the log holds the snapshot plus seven changes, nothing twice. Oracle: `load:` over an Oracle CDC stream is refused when the config is read (ADR-0037 preview), by code, twice, with no part, no state and no warehouse object; the cell becomes the three cycles when the loader lands. Target: ClickHouse on the stand, read back over HTTP."
+    postgres: { test: cdc_into_clickhouse_three_cycles_postgres }
+    mysql:   { test: cdc_into_clickhouse_three_cycles_mysql }
+    mssql:   { test: cdc_into_clickhouse_three_cycles_mssql }
+    mongo:   { na: "a MongoDB CDC stream cannot load into ClickHouse: its resume token has no integer order for the change log's version (ADR-0035 CH7); the product refuses the config" }
+    oracle:  { test: cdc_into_clickhouse_three_cycles_oracle, oracle: fail_loud }
+
+  - id: cycle_cdc_bigquery
+    what: "cycle 1 anchors and snapshots the rows that are there; cycle 2 (no change) captures nothing, loads nothing (a 0-row success, warehouse metadata unchanged); cycle 3 carries five inserts, one update and one delete: the live view equals the source and the log holds the snapshot plus seven changes, nothing twice. Oracle: refused at config load (ADR-0037 preview), see the ClickHouse row. Target: BigQuery, read back through `bq`."
+    postgres: { test: cdc_into_bigquery_three_cycles_postgres }
+    mysql:   { test: cdc_into_bigquery_three_cycles_mysql }
+    mssql:   { test: cdc_into_bigquery_three_cycles_mssql }
+    mongo:   { test: cdc_into_bigquery_three_cycles_mongo }
+    oracle:  { test: cdc_into_bigquery_three_cycles_oracle, oracle: fail_loud }
+
+  - id: cycle_cdc_snowflake
+    what: "cycle 1 anchors and snapshots the rows that are there; cycle 2 (no change) captures nothing, loads nothing (a 0-row success, warehouse metadata unchanged); cycle 3 carries five inserts, one update and one delete: the live view equals the source and the log holds the snapshot plus seven changes, nothing twice. Oracle: refused at config load (ADR-0037 preview), see the ClickHouse row. Target: Snowflake, read back through DuckDB's ADBC reader (never `snow`)."
+    postgres: { test: cdc_into_snowflake_three_cycles_postgres }
+    mysql:   { test: cdc_into_snowflake_three_cycles_mysql }
+    mssql:   { test: cdc_into_snowflake_three_cycles_mssql }
+    mongo:   { test: cdc_into_snowflake_three_cycles_mongo }
+    oracle:  { test: cdc_into_snowflake_three_cycles_oracle, oracle: fail_loud }
