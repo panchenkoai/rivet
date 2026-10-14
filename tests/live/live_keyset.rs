@@ -1440,6 +1440,58 @@ fn keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun() {
     );
 }
 
+/// A finished checkpointed export run again without `--resume` reads every row again: `chunk_checkpoint` recovers a crash, it never implies incremental.
+fn a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything(e: SqlEngine) {
+    e.alive();
+    let (table, _guard) = e.range_table("plain_rerun");
+    e.insert(&table, 1..=1000, 180, Some(10));
+    let rig = e.staged(
+        e.rig(&table),
+        "chunked",
+        &[
+            "chunk_by_key: id",
+            "chunk_checkpoint: true",
+            "chunk_size: 300",
+        ],
+    );
+    rig.run_ok();
+    let source: BTreeSet<i64> = (1..=1000).collect();
+    assert_eq!(
+        ids_and_rows(&read_all_parts(&rig.out_dir())),
+        (source.clone(), 1000),
+        "run 1 must export all seeded rows"
+    );
+    rig.run_ok();
+    let (keys2, count2) = ids_and_rows(&read_all_parts(&rig.out_dir()));
+    assert_eq!(
+        count2, 2000,
+        "clean re-run must FULLY re-read (2000 rows across both runs); {count2} == 1000 would be a silent incremental skip"
+    );
+    assert_eq!(
+        keys2, source,
+        "the key set stays the 1000 source keys (a re-read, not new data)"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything_postgres() {
+    a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything_mssql() {
+    a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything_oracle() {
+    a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything(SqlEngine::Oracle);
+}
+
 /// #1 (CRITICAL, adversarial-hunt): a FRESH non-incremental keyset run that crashes
 /// AFTER open but BEFORE its first page commit must, on recovery, re-read from the
 /// START — never resume from a PRIOR completed run's stale high-water mark. Before
