@@ -336,6 +336,17 @@ mod tests {
         ));
     }
 
+    /// `by_days` reads only a date or timestamp key, and a date key is not compared without it.
+    #[test]
+    fn a_day_key_needs_by_days_and_by_days_needs_a_day_key() {
+        let days = parquet_of(Arc::new(Date32Array::from(vec![20000])));
+        let ints = parquet_of(Arc::new(Int64Array::from(vec![5])));
+        let v =
+            |b: Vec<u8>, by_days| part_verdict(b, FormatType::Parquet, "id", by_days, 1, 0, 30000);
+        assert!(matches!(v(days, false), PartVerdict::Unchecked(_)));
+        assert!(matches!(v(ints, true), PartVerdict::Unchecked(_)));
+    }
+
     /// A CSV part is read by its header; an empty key is null, and a key that is no number is not compared.
     #[test]
     fn a_csv_part_is_read_by_its_header() {

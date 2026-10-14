@@ -862,7 +862,7 @@ fn quarantine_move(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::state::FilePart;
 
     use super::*;
@@ -953,7 +953,7 @@ mod tests {
         }
     }
 
-    fn m8_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
+    pub(crate) fn m8_plan(dest: &std::path::Path) -> crate::plan::ResolvedRunPlan {
         use crate::config::{DestinationConfig, DestinationType, SourceConfig, SourceType};
         use crate::tuning::SourceTuning;
         crate::plan::ResolvedRunPlan {
@@ -2002,6 +2002,117 @@ mod tests {
             "completed",
             "no task reset off a foreign manifest"
         );
+    }
+
+    /// A Parquet part holding the `id` values `ids`.
+    fn id_part(ids: std::ops::RangeInclusive<i64>) -> Vec<u8> {
+        let a: std::sync::Arc<dyn arrow::array::Array> =
+            std::sync::Arc::new(arrow::array::Int64Array::from_iter_values(ids));
+        let batch = arrow::record_batch::RecordBatch::try_from_iter([("id", a)]).unwrap();
+        let mut out = Vec::new();
+        let mut w = parquet::arrow::ArrowWriter::try_new(&mut out, batch.schema(), None).unwrap();
+        w.write(&batch).unwrap();
+        w.close().unwrap();
+        out
+    }
+
+    /// Under `verify: content` a committed part at its logged size whose keys are another chunk's is not declared and its chunk is read again, while its sibling is declared; without `verify: content`, or outside range chunking, nothing is read back.
+    #[test]
+    fn under_verify_content_a_part_with_another_chunks_keys_is_read_again() {
+        use crate::destination::local::LocalDestination;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let state =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let run_id = "r_content";
+        state
+            .insert_chunk_tasks(run_id, &[(0, 9), (10, 19)])
+            .unwrap();
+        let (own, foreign) = (
+            "orders_chunk0_00000000000000aa.parquet",
+            "orders_chunk1_00000000000000bb.parquet",
+        );
+        for (chunk, name, bytes) in [(0, own, id_part(0..=9)), (1, foreign, id_part(20..=29))] {
+            std::fs::write(dir.path().join(name), &bytes).unwrap();
+            state.claim_next_chunk_task(run_id).unwrap();
+            state
+                .complete_chunk_task(run_id, chunk, 10, Some(name))
+                .unwrap();
+            state
+                .record_file(FilePart {
+                    run_id,
+                    export_name: "orders",
+                    file_name: name,
+                    rows: 10,
+                    bytes: bytes.len() as i64,
+                    format: "parquet",
+                    compression: None,
+                    cursor_high: None,
+                })
+                .unwrap();
+        }
+        let mut plan = m8_plan(dir.path());
+        plan.verify = crate::config::VerifyMode::Content;
+        plan.strategy = crate::plan::ExtractionStrategy::Chunked(crate::plan::ChunkedPlan {
+            column: "id".into(),
+            chunk_size: 10,
+            chunk_count: None,
+            parallel: 1,
+            by_days: None,
+            checkpoint: true,
+            max_attempts: 3,
+        });
+        let dest = LocalDestination::new(&plan.destination).unwrap();
+        let by_size = crate::plan::ResolvedRunPlan {
+            verify: crate::config::VerifyMode::Size,
+            ..plan.clone()
+        };
+        let snapshot = crate::plan::ResolvedRunPlan {
+            strategy: crate::plan::ExtractionStrategy::Snapshot,
+            ..plan.clone()
+        };
+        assert!(super::super::part_keys::ContentCheck::of(&by_size, &dest).is_none());
+        assert!(super::super::part_keys::ContentCheck::of(&snapshot, &dest).is_none());
+        let content = super::super::part_keys::ContentCheck::of(&plan, &dest);
+        assert!(content.is_some());
+
+        let present = listing_basenames(&dest.list_prefix("").unwrap());
+        let mut summary =
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"));
+        let mut stats = M8Stats::default();
+        let n = rehydrate_and_reset(
+            &state,
+            run_id,
+            &mut summary,
+            Some(&present),
+            content.as_ref(),
+            &mut stats,
+        )
+        .unwrap();
+        assert_eq!(n, 1, "only the part of its own chunk is declared");
+        assert_eq!(
+            summary
+                .manifest_parts
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
+            [own]
+        );
+        assert_eq!(
+            stats.reset_for_rewrite, 1,
+            "the foreign part's chunk is read again"
+        );
+        let status = |i: i64| {
+            state
+                .list_chunk_tasks_for_run(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.chunk_index == i)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status(0), "completed");
+        assert_ne!(status(1), "completed");
     }
 
     /// Seed a completed chunk whose part is logged in `file_log` (and optionally on disk).

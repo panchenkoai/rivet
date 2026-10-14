@@ -26,6 +26,8 @@ pub(crate) mod math;
 mod parallel_checkpoint;
 mod part_keys;
 mod resume_m8;
+#[cfg(test)]
+pub(crate) use resume_m8::tests::m8_plan;
 mod sequential_checkpoint;
 
 /// One checkpointed chunk's result: rows, part records, the chunk's Form-B
@@ -1161,6 +1163,17 @@ mod tests {
     }
 
     /// Keys a stored window was cut away from are planned again, whether the hole is between two windows or the source moved away from the stored span; windows that share keys are never planned over.
+    /// A window of one key is a window; one that ends before it starts is refused.
+    #[test]
+    fn a_window_of_one_key_is_stored_and_an_inverted_one_is_refused() {
+        let one = [
+            stored_task(0, "5", "5", Some("p0")),
+            stored_task(1, "6", "9", None),
+        ];
+        assert_eq!(stored_windows(&one).unwrap(), vec![(5, 5), (6, 9)]);
+        assert!(stored_windows(&[stored_task(0, "6", "5", None)]).is_err());
+    }
+
     #[test]
     fn a_hole_in_the_stored_windows_is_planned_again_and_shared_keys_are_refused() {
         let now = [(1, 10), (11, 20), (21, 30)];
