@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
+  through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision
+  were looked up in that wrapper, which names no table: the run failed with `precision/scale
+  unavailable from query metadata and catalog lookup`, although the same export without
+  `partition_by` ran (0.31.0 and earlier; a `--split` unit wraps the query the same way). **Now**
+  the plan keeps the query before the window (`catalog_query`) and every reader resolves type hints
+  from it. **What to do:** nothing.
+
 - **A load could be refused as "another `rivet load` ... is writing" right after its own
   process released that table.** SQLite state only. The load lease is an `flock`, and it was
   released by closing the file; a process spawned on another thread at that moment kept a copy

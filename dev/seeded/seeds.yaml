@@ -1774,6 +1774,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: partition-child-loses-catalog-hints
+    class: a `partition_by` child resolves catalog type hints from the bucket wrapper, which hides the source table, so a PostgreSQL NUMERIC(p,s) column refuses the export
+    history: 2026-10-14 - open defect (partition_by over a NUMERIC column refused with `precision/scale unavailable`) through 0.31.0; fixed by the plan's catalog_query
+    scope: source
+    patch: partition-child-loses-catalog-hints/shared.patch
+    engines:
+      postgres:
+        cells: [partition_by_exports_a_declared_numeric_column]
+      mysql:
+        na: 'MySQL reports NUMERIC precision and scale on the wire; it reads no catalog hint'
+      mssql:
+        na: 'SQL Server reports NUMERIC precision and scale on the wire; it reads no catalog hint'
+      mongo:
+        na: 'MongoDB has no NUMERIC(p,s) column and no catalog hint'
+      oracle:
+        na: 'Oracle reports NUMBER precision and scale on the wire; it reads no catalog hint'
   - name: first-cursor-value-is-a-constant
     class: the run's observed cursor floor is a constant instead of the first non-null cursor value, so the recorded cursor_min of a keyset run is wrong
     history: 2026-10-14 - survived `cargo mutants -- --lib --bins --tests` (no live cell ran) on 74e71a31
