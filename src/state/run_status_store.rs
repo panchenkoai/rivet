@@ -181,6 +181,37 @@ impl StateStore {
         })
     }
 
+    /// [`Self::begin_run`] by a run that holds the export's run lease: the export's dead `running` rows are stamped `interrupted` in the same transaction, so a refused begin leaves them as they were.
+    pub fn begin_run_under_lease(
+        &self,
+        run_id: &str,
+        export_name: &str,
+        prefix: &str,
+        started_at: &str,
+    ) -> Result<()> {
+        self.transaction(|| {
+            self.interrupt_dead_runs(export_name, started_at)?;
+            self.begin_run(run_id, export_name, prefix, started_at)
+        })
+    }
+
+    /// Stamp `interrupted` on every `running` row of `export_name` (run status and metrics), so no live run may own them; returns the run-status rows stamped.
+    pub fn interrupt_dead_runs(&self, export_name: &str, finished_at: &str) -> Result<usize> {
+        self.transaction(|| {
+            let runs = self.execute(
+                "UPDATE run_status SET status = 'interrupted', finished_at = ?2 \
+                 WHERE export_name = ?1 AND status = 'running'",
+                &[export_name.into(), finished_at.into()],
+            )?;
+            self.execute(
+                "UPDATE export_metrics SET status = 'interrupted' \
+                 WHERE export_name = ?1 AND status = 'running'",
+                &[export_name.into()],
+            )?;
+            Ok(runs)
+        })
+    }
+
     /// The `rivet state finish-run` escape hatch: stamp a row `interrupted`
     /// ONLY if it exists and is still `running` — the outcome says which, so
     /// the CLI can refuse loudly instead of "success" on a typo'd id.
@@ -326,6 +357,58 @@ fn live_on_prefix(alias: &str, param: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lease holder closes its export's dead `running` rows in both tables, and leaves finished rows and other exports alone.
+    #[test]
+    fn the_dead_runs_of_an_export_are_stamped_interrupted_and_nothing_else() {
+        let s = StateStore::open_in_memory().unwrap();
+        for (run, export) in [
+            ("o1", "orders"),
+            ("o2", "orders"),
+            ("o3", "orders"),
+            ("u1", "users"),
+        ] {
+            s.begin_run(run, export, "file:///out", "2026-01-01T00:00:00Z")
+                .unwrap();
+            if run != "o3" {
+                s.project_running_aggregate(run, export, "full", "parquet")
+                    .unwrap();
+            }
+        }
+        s.finish_run("o3", "success", "2026-01-01T00:01:00Z")
+            .unwrap();
+        let statuses = |table: &str| {
+            s.query(
+                &format!("SELECT run_id || '=' || status FROM {table} ORDER BY run_id"),
+                &[],
+                |r| r.text(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            s.interrupt_dead_runs("orders", "2026-01-02T00:00:00Z")
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            statuses("run_status"),
+            [
+                "o1=interrupted",
+                "o2=interrupted",
+                "o3=success",
+                "u1=running"
+            ]
+        );
+        assert_eq!(
+            statuses("export_metrics"),
+            ["o1=interrupted", "o2=interrupted", "u1=running"]
+        );
+        assert_eq!(
+            s.interrupt_dead_runs("orders", "2026-01-03T00:00:00Z")
+                .unwrap(),
+            0
+        );
+    }
 
     /// The run a refusal names is the export's newest row still `running`: not a finished one, not another export's.
     #[test]

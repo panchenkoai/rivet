@@ -82,6 +82,8 @@ pub(crate) struct Case {
     began: String,
     /// The file holding what the run printed for its one `destination: stdout` export.
     stdout: Option<PathBuf>,
+    /// Why rivet's ledger is not compared: the run said its rows were delivered and its state was not stored.
+    unrecorded: Option<String>,
 }
 
 /// What a `rivet cdc` invocation adds to its equivalent config: its `--max-events` cap, and whether it printed NDJSON (no `--output`).
@@ -212,15 +214,26 @@ pub(crate) fn begin(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) 
     Some(case)
 }
 
-/// Grade a finished invocation by how it exited: exit 0 against its source ([`finish`]), anything else against the snapshot taken before it. Returns whether a known defect disagreed as marked.
+/// Grade a finished invocation by how it exited: exit 0, or a one-export failure whose `stderr` names its rows delivered ([`refusal::names_its_delivery`]), against its source ([`finish`]); anything else against the snapshot taken before it. Returns whether a known defect disagreed as marked.
 pub(crate) fn settle(
     mut case: Case,
     status: std::process::ExitStatus,
     stdout: &[u8],
+    stderr: &[u8],
     envs: &[(&str, &str)],
     opts: &Opts,
 ) -> bool {
-    if status.success() {
+    let delivered_unrecorded = !status.success()
+        && case.exports.len() == 1
+        && case.verb == "run"
+        && refusal::names_its_delivery(&String::from_utf8_lossy(stderr));
+    if status.success() || delivered_unrecorded {
+        if delivered_unrecorded {
+            case.unrecorded = Some(format!(
+                "exit {}: the run says its rows are delivered and its state was not stored, so its destination is graded as a delivery and rivet's ledger (export_metrics, file_log) is not compared",
+                status.code().unwrap_or(-1)
+            ));
+        }
         case.delivered(stdout);
         return finish(case, envs, opts);
     }
@@ -429,6 +442,7 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         forks,
         began: chrono::Utc::now().to_rfc3339(),
         stdout: None,
+        unrecorded: None,
     })
 }
 
@@ -874,16 +888,19 @@ impl Case {
         let url = source_url(&raw);
         let db = self.config_dir.join(".rivet_state.db");
         let state = match self.state_at(envs) {
+            _ if self.unrecorded.is_some() => None,
             Some(refusal::StateAt::Postgres(url)) => Some(url),
             Some(refusal::StateAt::Sqlite(db)) if db.is_file() => Some(db.display().to_string()),
             _ => None,
         };
         // A run with no findable state is graded PARTIAL, never a silent PASS of a ledger leg that was not compared.
-        let state_missing = (state.is_none() && self.cli.is_none()).then(|| {
-            format!(
-                "no state DB: {} is absent and neither the run's RIVET_STATE_URL nor the backend under test (RIVET_GATE_STATE_URL) is postgres, so rivet's ledger (export_metrics, file_log) was not compared",
-                db.display()
-            )
+        let state_missing = self.unrecorded.clone().or_else(|| {
+            (state.is_none() && self.cli.is_none()).then(|| {
+                format!(
+                    "no state DB: {} is absent and neither the run's RIVET_STATE_URL nor the backend under test (RIVET_GATE_STATE_URL) is postgres, so rivet's ledger (export_metrics, file_log) was not compared",
+                    db.display()
+                )
+            })
         });
         let query = match (s(e, "query"), s(e, "query_file")) {
             (Some(q), _) => Some(q.to_string()),
