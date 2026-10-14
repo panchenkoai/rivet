@@ -282,6 +282,37 @@ pub(crate) fn run_export(
     )
 }
 
+/// `err` as `RIVET_STATE_CURSOR_INCOMPARABLE` when the source refused to convert a value while a stored cursor was compared; any other error unchanged.
+fn refuse_an_incomparable_cursor(
+    err: anyhow::Error,
+    cursor: Option<&crate::types::CursorState>,
+    plan: &ResolvedRunPlan,
+) -> anyhow::Error {
+    let Some(value) = cursor.and_then(|c| c.last_cursor_value.as_deref()) else {
+        return err;
+    };
+    if !crate::error::retry::is_value_conversion(&err) {
+        return err;
+    }
+    let column = plan
+        .strategy
+        .incremental_plan()
+        .map(|p| p.column_for_storage_extract().to_string())
+        .unwrap_or_default();
+    let export = &plan.export_name;
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::STATE_CURSOR_INCOMPARABLE,
+        format!(
+            "export '{export}': the source refused the query that compares `{column}` with the stored \
+             cursor `{value}`: {err:#}\n  \
+             If `{value}` is not a value of `{column}` (the state was edited, or the column changed \
+             type), every run stops here.\n  \
+             Hint: `rivet state reset -c <config> --export {export}` starts `{column}` over with a full \
+             pass; or restore the column's previous type."
+        ),
+    ))
+}
+
 /// A part's file name, `<export>_<run stamp>`: a `_part<N>` suffix whenever the run seals more than one part.
 fn part_file_name(
     export: &str,
@@ -325,15 +356,16 @@ pub(super) fn run_single_export(
     // ExportSink and does the parquet encode/compress so DB I/O overlaps with
     // compression CPU. The worker error (if any) is recovered by `finish()` and
     // takes precedence over the source-side error.
+    let refuse = |e| refuse_an_incomparable_cursor(e, cursor, plan);
     let mut sink = if super::sink::PipelinedSink::enabled() {
         let mut psink = super::sink::PipelinedSink::spawn(plan)?;
         let export_result = src.export(&request, &mut psink);
         let sink = psink.finish()?;
-        export_result?;
+        export_result.map_err(refuse)?;
         sink
     } else {
         let mut sink = ExportSink::new(plan)?;
-        src.export(&request, &mut sink)?;
+        src.export(&request, &mut sink).map_err(refuse)?;
         sink
     };
 

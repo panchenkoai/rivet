@@ -2959,8 +2959,8 @@ fn open_defect_a_cursor_moved_forward_delivers_or_refuses_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a cursor of another type is a raw driver error), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres() {
     cursor_of_another_type(SqlEngine::Pg);
 }
 
@@ -2971,9 +2971,16 @@ fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mysql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a cursor of another type is a raw driver error), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql() {
     cursor_of_another_type(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_oracle() {
+    cursor_of_another_type(SqlEngine::Oracle);
 }
 
 // cells: a resource taken away mid-run, two processes on one export, `--resume` over a damaged checkpoint
