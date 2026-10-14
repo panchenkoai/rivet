@@ -98,7 +98,8 @@ pub(crate) fn run_chunked_sequential(
                 &plan.base_query,
                 &plan.tuning,
                 &plan.column_overrides,
-            ),
+            )
+            .with_catalog_hint_query(plan.catalog_query.as_deref()),
             &mut sink,
         )?;
         sink.finish_writer()?;
@@ -317,7 +318,8 @@ pub(in crate::pipeline) fn run_chunked_parallel(
                             &plan_for_worker.base_query,
                             &plan_for_worker.tuning,
                             &plan_for_worker.column_overrides,
-                        ),
+                        )
+                        .with_catalog_hint_query(plan_for_worker.catalog_query.as_deref()),
                         &mut sink,
                     )?;
                     idle_sources.give(thread_src);
@@ -465,6 +467,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
             query_template: None,
+            catalog_query: None,
             destination_written: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {

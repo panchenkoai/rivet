@@ -274,8 +274,8 @@ fn partition_by_rejects_missing_token() {
 
 /// `partition_by` over a table with a NUMERIC(p,s) column delivers every row, as the unpartitioned export does.
 #[test]
-#[ignore = "live+gate-only: postgres; open defect (partition_by with a NUMERIC column), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_partition_by_exports_a_declared_numeric_column() {
+#[ignore = "live: requires docker compose postgres"]
+fn partition_by_exports_a_declared_numeric_column() {
     require_alive(LiveService::Postgres);
     let table = unique_name("part_numeric");
     pg_connect()
@@ -290,17 +290,6 @@ fn open_defect_partition_by_exports_a_declared_numeric_column() {
     let rig = Rig::pg_batch(&table)
         .export_line("partition_by: created_at")
         .dest_path(out_dir.path().join("{partition}"));
-    let run = rig.run();
-    let said = String::from_utf8_lossy(&run.stderr);
-    let cause = "precision/scale unavailable from query metadata and catalog lookup";
-    assert!(
-        run.status.success(),
-        "`partition_by` over a table with a NUMERIC(10,2) column failed under `rivet run`: {}\n{said}",
-        if said.contains(cause) {
-            cause
-        } else {
-            "another error"
-        }
-    );
+    rig.run_ok();
     assert_eq!(parquet_rows_recursive(out_dir.path()), 30);
 }

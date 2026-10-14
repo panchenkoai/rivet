@@ -289,6 +289,11 @@ exports:
              WHERE \"created_at\" >= '2023-01-03' AND \"created_at\" < '2023-01-04'"
         );
         assert_eq!(day_plan.source_table.as_deref(), Some("events"));
+        assert_eq!(
+            day_plan.catalog_query.as_deref(),
+            Some("SELECT * FROM events"),
+            "catalog hints resolve from the base the bucket wraps"
+        );
         assert!(
             day_plan.column_overrides.contains_key("amount"),
             "a qualified override narrows to the child's table: {:?}",

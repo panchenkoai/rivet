@@ -343,6 +343,15 @@ def axis_artifacts(base: str, new: str, allow: dict[str, str]) -> list[str]:
     """
     print("  ── artifacts ──")
     bad: list[str] = []
+
+    def fail(label: str, line: str) -> None:
+        """An exchange that broke: reported as ALLOWED when `artifacts:<label>` is declared, else an undeclared break."""
+        key = f"artifacts:{label}"
+        if key in allow:
+            print(f"    ALLOWED  {label} — {allow[key]}")
+        else:
+            bad.append(line)
+
     work = Path(tempfile.mkdtemp(prefix="rivet-compat-"))
     table = "rivet_compat_probe"
     seed = shell.run(
@@ -356,42 +365,50 @@ def axis_artifacts(base: str, new: str, allow: dict[str, str]) -> list[str]:
         return bad
     try:
         env = {"RIVET_COMPAT_URL": PG}
-        cfg = work / "cfg.yaml"
-        cfg.write_text(
-            "source: { type: postgres, url_env: RIVET_COMPAT_URL }\n"
-            "exports:\n"
-            f"  - name: {table}\n    table: {table}\n"
-            "    mode: chunked\n    chunk_column: id\n    chunk_size: 50\n"
-            "    format: parquet\n"
-            f"    destination: {{ type: local, path: {work}/out }}\n"
-        )
+
+        def cfg_in(label: str, dest: Path) -> Path:
+            """The exchange's own config directory: the SQLite state DB lives beside the
+            config, and one shared by every exchange is migrated by the first run of the
+            candidate, after which the baseline refuses it (RIVET_STATE_SCHEMA_NEWER) — a
+            declared break of the state axis that then hid every artifact exchange."""
+            d = work / label
+            d.mkdir(exist_ok=True)
+            c = d / "cfg.yaml"
+            c.write_text(
+                "source: { type: postgres, url_env: RIVET_COMPAT_URL }\n"
+                "exports:\n"
+                f"  - name: {table}\n    table: {table}\n"
+                "    mode: chunked\n    chunk_column: id\n    chunk_size: 50\n"
+                "    format: parquet\n"
+                f"    destination: {{ type: local, path: {dest} }}\n"
+            )
+            return c
 
         def plan_apply(planner: str, applier: str, label: str) -> None:
             shutil.rmtree(work / "out", ignore_errors=True)
+            cfg = cfg_in(label, work / "out")
             art = work / f"plan-{label}.json"
             p = shell.run([planner, "plan", "-c", str(cfg), "--format", "json", "-o", str(art)],
                           env=env, timeout=300)
             if not p.ok:
-                bad.append(f"    PLAN FAILED ({label}): {p.out.strip()[:160]}")
+                fail(label, f"    PLAN FAILED ({label}): {p.out.strip()[:160]}")
                 return
             a = shell.run([applier, "apply", str(art)], env=env, timeout=600)
             if not a.ok:
-                bad.append(f"    APPLY FAILED ({label}): {a.out.strip()[:200]}")
+                fail(label, f"    APPLY FAILED ({label}): {a.out.strip()[:200]}")
 
         plan_apply(base, new, "old-plan→new-apply")
         plan_apply(new, base, "new-plan→old-apply")
 
         def run_read(runner: str, reader: str, label: str, sub: str) -> None:
-            out = work / f"o-{label}"
-            c = work / f"cfg-{label}.yaml"
-            c.write_text(cfg.read_text().replace(f"{work}/out", str(out)))
+            c = cfg_in(label, work / f"o-{label}")
             r = shell.run([runner, "run", "-c", str(c)], env=env, timeout=600)
             if not r.ok:
-                bad.append(f"    RUN FAILED ({label}): {r.out.strip()[:160]}")
+                fail(label, f"    RUN FAILED ({label}): {r.out.strip()[:160]}")
                 return
             v = shell.run([reader, sub, "-c", str(c)], env=env, timeout=600)
             if not v.ok:
-                bad.append(f"    {sub.upper()} FAILED ({label}): {v.out.strip()[:200]}")
+                fail(label, f"    {sub.upper()} FAILED ({label}): {v.out.strip()[:200]}")
 
         run_read(base, new, "old-run-new-validate", "validate")
         run_read(new, base, "new-run-old-validate", "validate")
@@ -400,16 +417,15 @@ def axis_artifacts(base: str, new: str, allow: dict[str, str]) -> list[str]:
         # upgrading deployment passes through, and where a recorded-vs-derived
         # identity split shows up as a load that refuses its own output.
         mix = work / "mix"
-        cmix = work / "cfg-mix.yaml"
-        cmix.write_text(cfg.read_text().replace(f"{work}/out", str(mix)))
-        for who in (base, new):
-            r = shell.run([who, "run", "-c", str(cmix)], env=env, timeout=600)
-            if not r.ok:
-                bad.append(f"    MIXED RUN FAILED: {r.out.strip()[:160]}")
+        cmix = {tag: cfg_in(f"mix-{tag}", mix) for tag in ("old", "new")}
         for who, tag in ((base, "old"), (new, "new")):
-            v = shell.run([who, "validate", "-c", str(cmix)], env=env, timeout=600)
+            r = shell.run([who, "run", "-c", str(cmix[tag])], env=env, timeout=600)
+            if not r.ok:
+                fail(f"mix-{tag}", f"    MIXED RUN FAILED ({tag} runner): {r.out.strip()[:160]}")
+        for who, tag in ((base, "old"), (new, "new")):
+            v = shell.run([who, "validate", "-c", str(cmix[tag])], env=env, timeout=600)
             if not v.ok:
-                bad.append(f"    MIXED VALIDATE FAILED ({tag} reader): {v.out.strip()[:200]}")
+                fail(f"mix-{tag}", f"    MIXED VALIDATE FAILED ({tag} reader): {v.out.strip()[:200]}")
         print("    6 cross-version artifact exchanges compared")
     finally:
         shell.run(["docker", "exec", "rivet-postgres-1", "psql", "-U", "rivet", "-d", "rivet",

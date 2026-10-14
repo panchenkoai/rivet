@@ -271,9 +271,6 @@ guarantees:
       mssql: { test: a_changed_cursor_column_is_refused_and_walked_out_mssql, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
       oracle: { test: a_changed_cursor_column_is_refused_and_walked_out_oracle, asserts: 'Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_OWNER_MISMATCH", 5))' }
       mongo: { test: a_newer_state_schema_is_refused_and_walked_out_mongo, asserts: "refuses_twice_and_walks_out(" }
-    contradicted_by:
-      known_red:
-        - "live_sabotage::open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out"
 
   - id: parallel_keyset_reads_every_row_exactly_once
     stated:
@@ -330,10 +327,10 @@ guarantees:
         sentence: "If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error"
     held_by:
       postgres: { test: chunked_range_export_enforces_on_schema_drift_fail, asserts: "a chunked (range) export with `on_schema_drift: fail` must FAIL on a dropped column" }
-      mysql: { gap: "the MySQL drift cells run under the default `warn` policy and assert that the run survives" }
-      mssql: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
-      oracle: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
-      mongo: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
+      mysql: { test: chunked_export_enforces_on_schema_drift_fail_mysql, asserts: "the run must be refused by the drift gate" }
+      mssql: { test: chunked_export_enforces_on_schema_drift_fail_mssql, asserts: "the run must be refused by the drift gate" }
+      oracle: { test: chunked_export_enforces_on_schema_drift_fail_oracle, asserts: "the run must be refused by the drift gate" }
+      mongo: { gap: "a MongoDB export carries documents as JSON and records no source schema, so `on_schema_drift` has no site to refuse at; the sentence does not hold here until a document-shape drift is defined" }
 
   # ── Destination contract (docs/cloud-destinations.md, docs/reference/cli.md) ─────────────
   - id: the_success_marker_implies_every_listed_part
