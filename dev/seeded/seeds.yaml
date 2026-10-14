@@ -17,6 +17,22 @@
 
 seeds:
 
+  - name: oracle-cdc-log-gap-uncoded
+    class: an Oracle CDC data-loss refusal (the retained redo no longer reaches the checkpoint) stops as a plain error with no RIVET_* code and exit 1, so a scheduler retries it as transient
+    history: found 2026-10-14 by the log-gap walk cell on the Mac stand (cycle 1 ended with no RIVET_* code, exit 1), on main through 0.31.0
+    scope: source
+    engines:
+      oracle:
+        patch: oracle-cdc-log-gap-uncoded/lib.patch
+        cells: ["lib:a_start_before_the_oldest_log_or_a_sequence_hole_is_a_data_loss_refusal", "a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle"]
+      postgres:
+        na: "its log-gap refusal (a dropped slot) goes through checkpoint_identity::log_gap already (a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres)"
+      mysql:
+        na: "its log-gap refusal (purged binlogs) goes through checkpoint_identity::log_gap already (binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql)"
+      mssql:
+        na: "its log-gap refusal (a cleaned change table) goes through checkpoint_identity::log_gap already (a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mssql)"
+      mongo:
+        na: "a rolled oplog is refused by the server's resume-token check, through checkpoint_identity::log_gap"
   - name: keyset-key-by-catalog-order
     class: the auto-selected keyset key is whichever single-column unique key the server's catalog listed first, so two runs of one export can page different keys
     history: main CI 2026-10-14, a crash-then-resume cell on a MySQL table with unique `id` and `ext_id` and no primary key - the resumed run was refused with RIVET_STATE_CURSOR_OWNER_MISMATCH

@@ -16,6 +16,14 @@
   run of the export can be alive. **What to do:** nothing; `state finish-run` still closes a row by
   hand.
 
+- **An Oracle CDC checkpoint the retained redo no longer reaches was refused without a code.**
+  When the archived logs between the checkpoint and the oldest available log are gone (or a
+  redo sequence is missing), the run stopped with the data-loss text and the re-baseline recipe
+  but as a plain error: exit 1, no `RIVET_*` code, so a scheduler could not tell it from a
+  transient failure and retried it forever (0.31.0 and earlier). **Now** it is refused as
+  `RIVET_SOURCE_CDC_LOG_GAP` (exit 5), like the same loss on PostgreSQL, MySQL and SQL Server.
+  **What to do:** nothing; the recipe in the text re-baselines the stream.
+
 - **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
   through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision
   were looked up in that wrapper, which names no table: the run failed with `precision/scale
