@@ -21,11 +21,8 @@ def plain(v):
 
 def main() -> None:
     spec = json.load(sys.stdin)
-    ora = Oracle(snowflake=spec)
-    try:
+    with Oracle(snowflake=spec) as ora:
         rows = ora.rows(f"SELECT * FROM {ora.snowflake(spec['sql'])}")
-    finally:
-        ora.close()
     json.dump([[plain(v) for v in r] for r in rows], sys.stdout)
 
 
