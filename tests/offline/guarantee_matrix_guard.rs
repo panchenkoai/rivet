@@ -19,7 +19,9 @@ const GATE_DIR: &str = "dev/release_oracle";
 // 25 -> 23 (2026-10-09): flat-memory.md states what was measured and a capped-run cell holds it; source-safe-under-load.md scopes the one-page sentence to chunked (#506, -2).
 const ROWS_NOT_HELD: usize = 20; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
-const GAP_CELLS: usize = 29; // ratchet-pin: guarantee-gap-cells
+// 29 -> 26 (2026-10-14): the `on_schema_drift: fail` cells already existed on MySQL, SQL Server and Oracle
+// (one body, live_schema_drift.rs); the row now cites them.
+const GAP_CELLS: usize = 26; // ratchet-pin: guarantee-gap-cells
 
 fn rows() -> Vec<Value> {
     let doc: Value = serde_yaml_ng::from_str(&subject_text(MATRIX))
