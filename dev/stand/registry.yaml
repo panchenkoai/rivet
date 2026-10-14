@@ -31,3 +31,12 @@ bigquery:
 
 gcs:
   bucket: rivet_data_test
+
+snowflake:
+  # The `snow` connection name; each machine keeps its own key-pair login under it, never in the repo.
+  connection: rivet
+  warehouse: RIVET_LOAD_TEST
+  database: RIVET_LOAD_TEST
+  # The only schema the stand owns: live tests and the gate, tables named per test.
+  schema: DEVBOX
+  storage_integration: RIVET_GCS
