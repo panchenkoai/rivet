@@ -1244,8 +1244,15 @@ fn mssql_cleanup_past_the_checkpoint(after_a_changes_run: bool) {
          @low_water_mark = @lw, @threshold = 5000;",
         s.table
     ));
-    s.rig
-        .refuses_twice_then(&["run"], &[], Refused::by_code(LOG_GAP, 5), vec![]);
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code(LOG_GAP, 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
 }
 
 /// A single-node replica set in its own container with the smallest oplog the server accepts (990 MB), removed on drop.
