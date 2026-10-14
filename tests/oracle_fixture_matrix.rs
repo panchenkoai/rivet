@@ -86,11 +86,13 @@ fn warehouse_cell_heavy_content_cdc_mysql() {
     );
 }
 
-// ── live smokes: fast end-to-end validation on MySQL → BigQuery ───────────────
+// ── live smokes: one MySQL extract loaded into BigQuery and Snowflake ─────────
 #[test]
-#[ignore = "live smoke: mysql batch → BigQuery"]
+#[ignore = "live smoke: mysql batch → BigQuery + Snowflake"]
 fn warehouse_cell_smoke_batch_mysql() {
-    let v = Verification::new(Engine::Mysql, Mode::Batch, Fixture::smoke("content_items"));
+    // Values compares through BigQuery only; the other oracles run on both warehouses.
+    let v = Verification::new(Engine::Mysql, Mode::Batch, Fixture::smoke("content_items"))
+        .warehouses(&[Warehouse::BigQuery, Warehouse::Snowflake]);
     assert_all_pass(
         v.run(&[
             WarehouseOracle::RowCount,
@@ -119,53 +121,25 @@ fn warehouse_cell_incremental_dedup_mysql() {
 }
 
 #[test]
-#[ignore = "live smoke: mysql cdc soak → BigQuery"]
+#[ignore = "live smoke: mysql cdc soak → BigQuery + Snowflake"]
 fn warehouse_cell_smoke_cdc_mysql() {
-    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("content_items"));
-    assert_all_pass(
-        v.run_soak(
-            &SoakConfig::quick(),
-            &[WarehouseOracle::TypeFidelity],
-            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
-        )
-        .expect("soak"),
-    );
-}
-
-#[test]
-#[ignore = "live smoke: postgres cdc soak → BigQuery"]
-fn warehouse_cell_smoke_cdc_pg() {
-    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("content_items"));
-    assert_all_pass(
-        v.run_soak(
-            &SoakConfig::quick(),
-            &[WarehouseOracle::TypeFidelity],
-            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
-        )
-        .expect("soak"),
-    );
-}
-
-#[test]
-#[ignore = "live smoke: postgres cdc soak → Snowflake"]
-fn warehouse_cell_smoke_cdc_pg_snowflake() {
-    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("content_items"))
-        .warehouse(Warehouse::Snowflake);
-    assert_all_pass(
-        v.run_soak(
-            &SoakConfig::quick(),
-            &[WarehouseOracle::TypeFidelity],
-            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
-        )
-        .expect("soak"),
-    );
-}
-
-#[test]
-#[ignore = "live smoke: mysql cdc soak → Snowflake"]
-fn warehouse_cell_smoke_cdc_mysql_snowflake() {
     let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("content_items"))
-        .warehouse(Warehouse::Snowflake);
+        .warehouses(&[Warehouse::BigQuery, Warehouse::Snowflake]);
+    assert_all_pass(
+        v.run_soak(
+            &SoakConfig::quick(),
+            &[WarehouseOracle::TypeFidelity],
+            &[SoakOracle::FlatRss, SoakOracle::ZeroGap],
+        )
+        .expect("soak"),
+    );
+}
+
+#[test]
+#[ignore = "live smoke: postgres cdc soak → BigQuery + Snowflake"]
+fn warehouse_cell_smoke_cdc_pg() {
+    let v = Verification::new(Engine::Postgres, Mode::Cdc, Fixture::smoke("content_items"))
+        .warehouses(&[Warehouse::BigQuery, Warehouse::Snowflake]);
     assert_all_pass(
         v.run_soak(
             &SoakConfig::quick(),
@@ -198,40 +172,12 @@ fn warehouse_cell_smoke_batch_pg_snowflake() {
     );
 }
 
-// ── MySQL parity: the same full/batch pipeline into Snowflake (COPY FILES) ─────
-// Mirrors smoke_batch_pg_snowflake with a MySQL source (engine-prefixed table
-// `mysql_content_items`, so no collision with the PG cell). Validates the COPY
-// FILES materialize path + type fidelity for a MySQL-sourced snapshot.
-#[test]
-#[ignore = "live smoke: mysql batch → Snowflake"]
-fn warehouse_cell_smoke_batch_mysql_snowflake() {
-    let v = Verification::new(Engine::Mysql, Mode::Batch, Fixture::smoke("content_items"))
-        .warehouse(Warehouse::Snowflake);
-    assert_all_pass(
-        v.run(&[
-            WarehouseOracle::RowCount,
-            WarehouseOracle::DistinctId,
-            WarehouseOracle::NullProfile,
-            WarehouseOracle::TypeFidelity,
-        ])
-        .expect("pipeline"),
-    );
-}
-
 // ── Mongo CDC: soft-delete tombstone in the current-state view ────────────────
 #[test]
-#[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + Snowflake"]
-fn warehouse_cell_mongo_cdc_delete_flag_snowflake() {
+#[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + BigQuery + Snowflake"]
+fn warehouse_cell_mongo_cdc_delete_flag() {
     let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_del"))
-        .warehouse(Warehouse::Snowflake);
-    assert_all_pass(v.run_mongo_cdc_delete().expect("mongo cdc delete"));
-}
-
-#[test]
-#[ignore = "live: needs the mongo replica-set devbox (rivet-mongo-rs-1) + BigQuery"]
-fn warehouse_cell_mongo_cdc_delete_flag_bigquery() {
-    let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_del"))
-        .warehouse(Warehouse::BigQuery);
+        .warehouses(&[Warehouse::BigQuery, Warehouse::Snowflake]);
     assert_all_pass(v.run_mongo_cdc_delete().expect("mongo cdc delete"));
 }
 
@@ -240,30 +186,25 @@ fn warehouse_cell_mongo_cdc_delete_flag_bigquery() {
 // Mongo has no analogue for), so there is no Mongo incremental cell by design.
 // Uses the standalone `rivet-mongo-1` (no replica set needed for a full scan).
 #[test]
-#[ignore = "live: needs the mongo devbox (rivet-mongo-1) + BigQuery"]
-fn warehouse_cell_smoke_batch_mongo_bigquery() {
-    let v = Verification::new(Engine::Mongo, Mode::Batch, Fixture::smoke("mongo_full"));
-    assert_all_pass(v.run_mongo_batch().expect("mongo batch"));
-}
-
-#[test]
-#[ignore = "live: needs the mongo devbox (rivet-mongo-1) + Snowflake"]
-fn warehouse_cell_smoke_batch_mongo_snowflake() {
+#[ignore = "live: needs the mongo devbox (rivet-mongo-1) + BigQuery + Snowflake"]
+fn warehouse_cell_smoke_batch_mongo() {
     let v = Verification::new(Engine::Mongo, Mode::Batch, Fixture::smoke("mongo_full"))
-        .warehouse(Warehouse::Snowflake);
+        .warehouses(&[Warehouse::BigQuery, Warehouse::Snowflake]);
     assert_all_pass(v.run_mongo_batch().expect("mongo batch"));
 }
 
 // ── CDC backfill: initial:snapshot covers a preexisting table; the view keeps ─
 // every backfilled row live (the snapshot/stream seam — NULL __op/__pos rows).
 #[test]
-#[ignore = "live: needs devbox mysql-cdc stack + BigQuery creds"]
+#[ignore = "live: needs devbox mysql-cdc stack + BigQuery + Snowflake"]
 fn warehouse_cell_cdc_backfill_snapshot_mysql() {
     // Engine-distinct table: CDC names the target from `table:`, so every engine's
     // backfill cell must own a table or they collide on `rivet_matrix.<t>__changes`
     // (an `id` vs `_id` schema clash, or silent cross-engine row contamination).
+    // Snowflake's dedup view uses PARSE_JSON(__pos); the backfill must stay live there too.
     let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_bf_mysql"))
-        .initial_snapshot();
+        .initial_snapshot()
+        .warehouses(&[Warehouse::BigQuery, Warehouse::Snowflake]);
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
 }
 
@@ -284,19 +225,6 @@ fn warehouse_cell_cdc_backfill_snapshot_pg() {
 fn warehouse_cell_cdc_backfill_snapshot_mongo() {
     let v = Verification::new(Engine::Mongo, Mode::Cdc, Fixture::smoke("cdc_bf_mongo"))
         .initial_snapshot();
-    assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
-}
-
-// Snowflake parity for the backfill: the dedup view uses PARSE_JSON(__pos) and
-// the `COALESCE(__op='delete',FALSE)` guard must keep the backfill live there too.
-#[test]
-#[ignore = "live: needs devbox mysql-cdc stack + Snowflake (RIVET_SF_* + snow CLI)"]
-fn warehouse_cell_cdc_backfill_snapshot_mysql_snowflake() {
-    // Shares the MySQL source table with the BigQuery cell (different warehouse ⇒
-    // no target collision); run one at a time.
-    let v = Verification::new(Engine::Mysql, Mode::Cdc, Fixture::smoke("cdc_bf_mysql"))
-        .initial_snapshot()
-        .warehouse(Warehouse::Snowflake);
     assert_all_pass(v.run_cdc_backfill().expect("cdc backfill"));
 }
 

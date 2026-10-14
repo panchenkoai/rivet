@@ -222,7 +222,7 @@ refinements over the sketch — on MySQL the binlog file is parsed numerically
 `COALESCE(__op = 'delete', FALSE) AS __is_deleted` so snapshot-backfill rows
 (NULL `__op`) stay live — and a deleted PK survives as `__is_deleted = true`
 rather than vanishing. See the matrix cells `cdc_backfill_snapshot_{mysql,pg,mongo}`
-and the Snowflake parity `mongo_cdc_delete_flag_snowflake`.
+and `mongo_cdc_delete_flag`, which loads one change log into BigQuery and Snowflake.
 
 ### A whole schema: one stream, one warehouse table per source table
 

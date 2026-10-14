@@ -78,7 +78,7 @@ scenarios:
     what: "a delete: cdc keeps a flagged tombstone (__is_deleted=true); incremental cannot observe deletes and never tombstones"
     full:        { na: "a full snapshot mirrors the source — a deleted row is simply absent next run" }
     incremental: { test: inc_dedup_view_orders_by_cursor_and_never_tombstones_on_every_dialect }
-    cdc:         { test: warehouse_cell_mongo_cdc_delete_flag_bigquery }
+    cdc:         { test: warehouse_cell_mongo_cdc_delete_flag }
 
   - id: ledger_skips_already_loaded_runs
     what: "the state DB records each load and skips extraction runs already loaded into a target — the incremental step is DB-driven, not file-driven"
