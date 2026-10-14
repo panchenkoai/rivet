@@ -3303,14 +3303,20 @@ mod load_ledger_tests {
                         && third.refusal.is_none()
                         && third.writes == landed)
                     {
-                        wrong.push((dialect, tag, case, first.writes, second.writes));
+                        wrong.push((
+                            dialect,
+                            tag,
+                            case,
+                            [first.refusal, second.refusal, third.refusal],
+                            [first.writes, second.writes, third.writes],
+                        ));
                     }
                 }
             }
         }
         assert!(
             wrong.is_empty(),
-            "(dialect, mode, what stands at the target, cycle-1 writes, cycle-2 writes): {wrong:?}"
+            "(dialect, mode, what stands at the target, refusals of cycles 1-3, writes of cycles 1-3): {wrong:#?}"
         );
     }
 
