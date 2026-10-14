@@ -57,7 +57,7 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -302,7 +302,7 @@ jobs:
         with:
           toolchain: "1.94"
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -323,7 +323,10 @@ jobs:
           # matrix cells for at least ten consecutive nights (2026-08-16).
           # mongo-rs2-a/-b (`replica` profile): the two-member set whose SECONDARY
           # mongo_cdc_streams_changes_from_a_secondary reads, on :27022/:27023.
-          docker compose --profile replica up -d --wait mongo mongo-rs mongo-auth mongo-rs2-a mongo-rs2-b toxiproxy minio fake-gcs duckdb
+          # clickhouse: the Mongo-into-ClickHouse cell (`a_mongo_resume_export_into_clickhouse_
+          # accumulates_every_run`) is selected by the `mongo` substring and was red on every
+          # matrix version for want of it (2026-10-13..14).
+          docker compose --profile replica up -d --wait mongo mongo-rs mongo-auth mongo-rs2-a mongo-rs2-b toxiproxy minio fake-gcs duckdb clickhouse
           sudo chmod -R 0777 tests/.live-tmp
 
       - name: Run Mongo live tests
@@ -394,7 +397,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -420,10 +423,11 @@ jobs:
           else
             FILTER="live_cdc::pg_cdc_"
           fi
-          # `from_a_standby` needs the PG 16 primary/standby pair (dev/pytools/cdc_stand), which
-          # this lane does not start; ci.yml e2e skips it for the same reason.
+          # `from_a_standby` and `failover_to_the_standby` need the PG 16 primary/standby pair
+          # (dev/pytools/cdc_stand), which this lane does not start; ci.yml e2e skips both for
+          # the same reason (the failover cell was red here every night from 2026-10-13).
           cargo nextest run --run-ignored ignored-only --no-fail-fast \
-            -E "binary(live_suite) and test($FILTER) and not (test(gcs) or test(toxiproxy) or test(from_a_standby))"
+            -E "binary(live_suite) and test($FILTER) and not (test(gcs) or test(toxiproxy) or test(from_a_standby) or test(failover_to_the_standby))"
       - name: Stop services
         if: always()
         run: docker compose down -v
@@ -440,7 +444,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv
@@ -496,7 +500,7 @@ jobs:
         if: steps.day.outputs.sunday == 'yes'
       - uses: Swatinem/rust-cache@v2
         if: steps.day.outputs.sunday == 'yes'
-      - uses: taiki-e/install-action@v2.87.18
+      - uses: taiki-e/install-action@v2.87.22
         with:
           # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
           tool: cargo-nextest,uv

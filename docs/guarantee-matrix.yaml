@@ -39,7 +39,7 @@ guarantees:
       mysql: { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "recovery must leave every source id (1..=8) — a missing id is row LOSS" }
       mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "recovery must leave every source id (1..=8) — a missing id is row LOSS" }
       mongo: { test: mongo_crash_after_file_write_recovers_without_loss, asserts: "recovery after a mid-export crash" }
-      oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
+      oracle: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor_oracle, asserts: "recovery must leave every source id (1..=10) at the destination" }
     contradicted_by:
       known_red:
         - "live_sabotage::open_defect_a_cursor_moved_forward_delivers_or_refuses"
@@ -64,7 +64,7 @@ guarantees:
       mysql: { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "at-least-once: physical destination rows must be >= source (8)" }
       mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "at-least-once: physical destination rows must be >= source (8)" }
       mongo: { test: mongo_crash_after_file_write_recovers_without_loss, asserts: "duckdb_assert_at_least_once(" }
-      oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor and reads the destination" }
+      oracle: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor_oracle, asserts: "at-least-once: physical destination rows ({physical}) must be >= source (10)" }
 
   - id: uncategorized_errors_are_not_retried
     stated:
@@ -82,7 +82,7 @@ guarantees:
       mysql: { test: mysql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "after_file_write must leave manifest empty" }
       mssql: { test: mssql_crash_after_file_write_leaves_file_but_no_manifest_or_cursor, asserts: "after_file_write must leave manifest empty" }
       mongo: { gap: "the Mongo crash cell reads the destination after recovery, not the manifest and cursor between the crash and the recovery" }
-      oracle: { gap: "no Oracle batch cell crashes a run between the write and the cursor" }
+      oracle: { test: crash_after_file_write_leaves_file_but_no_manifest_or_cursor_oracle, asserts: "after_file_write must leave manifest empty" }
 
   - id: a_plain_run_never_skips_a_finished_run
     stated:
@@ -90,9 +90,9 @@ guarantees:
         sentence: "A **plain** `rivet run` (no `--resume`) never skips the chunks of a run that FINISHED"
     held_by:
       mysql: { test: keyset_checkpoint_without_incremental_rereads_on_a_clean_rerun, asserts: "clean re-run must FULLY re-read (2000 rows across both runs)" }
-      postgres: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
-      mssql: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
-      oracle: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
+      postgres: { test: a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything_postgres, asserts: "clean re-run must FULLY re-read (2000 rows across both runs)" }
+      mssql: { test: a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything_mssql, asserts: "clean re-run must FULLY re-read (2000 rows across both runs)" }
+      oracle: { test: a_plain_rerun_of_a_finished_checkpointed_export_rereads_everything_oracle, asserts: "clean re-run must FULLY re-read (2000 rows across both runs)" }
       mongo: { gap: "no cell re-runs a finished checkpointed export without --resume on this engine and counts the rows of both runs" }
 
   - id: a_live_run_refuses_a_second_run
@@ -249,7 +249,7 @@ guarantees:
       mysql: { test: mysql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts, asserts: "every incremental delta must survive; a clobbered part is silent data loss" }
       mssql: { test: mssql_roast_rapid_incremental_runs_into_same_prefix_must_not_clobber_prior_parts, asserts: "every incremental delta must survive; a clobbered part is silent data loss" }
       mongo: { test: mongo_batch_two_rapid_runs_into_same_prefix_do_not_clobber, asserts: "two rapid full runs must each materialise all 100 rows — no clobber" }
-      oracle: { gap: "no Oracle batch cell runs twice into one prefix and reads the rows of both runs" }
+      oracle: { test: rapid_incremental_runs_into_one_prefix_keep_every_part_oracle, asserts: "the run-unique manifest copies sum every run's row" }
 
   - id: settle_holds_a_row_until_it_is_old_enough
     stated:
@@ -327,10 +327,10 @@ guarantees:
         sentence: "If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error"
     held_by:
       postgres: { test: chunked_range_export_enforces_on_schema_drift_fail, asserts: "a chunked (range) export with `on_schema_drift: fail` must FAIL on a dropped column" }
-      mysql: { gap: "the MySQL drift cells run under the default `warn` policy and assert that the run survives" }
-      mssql: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
-      oracle: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
-      mongo: { gap: "no cell runs `on_schema_drift: fail` on this engine" }
+      mysql: { test: chunked_export_enforces_on_schema_drift_fail_mysql, asserts: "the run must be refused by the drift gate" }
+      mssql: { test: chunked_export_enforces_on_schema_drift_fail_mssql, asserts: "the run must be refused by the drift gate" }
+      oracle: { test: chunked_export_enforces_on_schema_drift_fail_oracle, asserts: "the run must be refused by the drift gate" }
+      mongo: { gap: "a MongoDB export carries documents as JSON and records no source schema, so `on_schema_drift` has no site to refuse at; the sentence does not hold here until a document-shape drift is defined" }
 
   # ── Destination contract (docs/cloud-destinations.md, docs/reference/cli.md) ─────────────
   - id: the_success_marker_implies_every_listed_part
