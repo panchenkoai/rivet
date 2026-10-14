@@ -304,6 +304,7 @@ fn three_cdc_cycles(
     }
 }
 
+#[cfg(feature = "oracle")]
 /// Until ADR-0037 lands its loader, `load:` over an Oracle CDC stream is refused when the config is read: by code, on every attempt, before a run anchors anything, with the state and the warehouse untouched. The cell becomes the three cycles the moment the refusal goes.
 fn oracle_cdc_into_a_warehouse_is_refused(kind: WarehouseKind) {
     let Some(mut w) = Warehouse::of(kind, "cyc_cdc") else {

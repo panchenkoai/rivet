@@ -296,7 +296,8 @@ def pairs(spec: dict) -> dict:
         f"SELECT CAST({_qi(spec['key'])} AS BIGINT), CAST({_qi(spec['value'])} AS BIGINT) "
         f"FROM read_parquet({_plist(files)}) ORDER BY 1, 2"
     )
-    return {"pairs": [[int(a), int(b)] for a, b in duckdb.connect().execute(sql).fetchall()]}
+    with duckdb.connect() as con:
+        return {"pairs": [[int(a), int(b)] for a, b in con.execute(sql).fetchall()]}
 
 
 def in_run_order(root: str, manifests: list[str]) -> list[str]:
