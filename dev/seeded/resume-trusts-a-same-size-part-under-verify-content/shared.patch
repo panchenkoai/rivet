@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/chunked/part_keys.rs b/src/pipeline/chunked/part_keys.rs
+index daf781fa..ea5c742f 100644
+--- a/src/pipeline/chunked/part_keys.rs
++++ b/src/pipeline/chunked/part_keys.rs
+@@ -35,7 +35,7 @@ impl<'a> ContentCheck<'a> {
+         let ExtractionStrategy::Chunked(cp) = &plan.strategy else {
+             return None;
+         };
+-        plan.verify.requires_content().then(|| Self {
++        (false && plan.verify.requires_content()).then(|| Self {
+             dest,
+             column: cp.column.clone(),
+             by_days: cp.by_days.is_some(),

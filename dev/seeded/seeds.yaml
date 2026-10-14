@@ -1611,3 +1611,141 @@ seeds:
       lib:
         cells:
           - "lib:both_scripts_read_parts_by_an_inline_format_under_a_closed_stage_url"
+
+  - name: resume-trusts-a-completion-without-a-part
+    class: "a resume trusts a chunk task marked completed that names no part and no row count of zero, so the chunk's keys are never read"
+    history: "2026-10-13 - an open defect of the sabotage matrix (class 4: a resume trusts what it continues), fixed on fix/resume-checks-what-it-continues; present through 0.31.0"
+    scope: source
+    patch: resume-trusts-a-completion-without-a-part/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "a_resume_over_a_task_marked_completed_delivers_or_refuses_postgres"
+          - "run_resume_over_a_task_marked_completed_delivers_or_refuses_postgres"
+      mysql:
+        cells:
+          - "a_resume_over_a_task_marked_completed_delivers_or_refuses_mysql"
+          - "run_resume_over_a_task_marked_completed_delivers_or_refuses_mysql"
+      mssql:
+        cells:
+          - "a_resume_over_a_task_marked_completed_delivers_or_refuses_mssql"
+          - "run_resume_over_a_task_marked_completed_delivers_or_refuses_mssql"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no range-chunk checkpoint"
+      oracle:
+        cells:
+          - "a_resume_over_a_task_marked_completed_delivers_or_refuses_oracle"
+          - "run_resume_over_a_task_marked_completed_delivers_or_refuses_oracle"
+      lib:
+        cells:
+          - "lib:a_part_of_another_size_and_a_completion_without_a_part_are_read_again"
+
+  - name: resume-trusts-a-part-of-another-size
+    class: "a resume declares a committed part that is present at the destination at another size than the state logged, so a cut or replaced part is delivered as the chunk's rows"
+    history: "2026-10-13 - an open defect of the sabotage matrix (class 4: a resume trusts what it continues), fixed on fix/resume-checks-what-it-continues; present through 0.31.0"
+    scope: source
+    patch: resume-trusts-a-part-of-another-size/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "a_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres"
+          - "run_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres"
+          - "a_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres"
+          - "run_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres"
+      mysql:
+        cells:
+          - "a_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql"
+          - "run_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql"
+          - "a_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql"
+          - "run_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql"
+      mssql:
+        cells:
+          - "a_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql"
+          - "run_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql"
+          - "a_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql"
+          - "run_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no range-chunk checkpoint"
+      oracle:
+        cells:
+          - "a_resume_over_a_truncated_committed_part_delivers_or_refuses_oracle"
+          - "run_resume_over_a_truncated_committed_part_delivers_or_refuses_oracle"
+          - "a_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle"
+          - "run_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle"
+      lib:
+        cells:
+          - "lib:a_part_of_another_size_and_a_completion_without_a_part_are_read_again"
+
+  - name: resume-plans-no-hole-in-stored-windows
+    class: "a resume continues the stored chunk windows as they are, so keys between two windows are never read"
+    history: "2026-10-13 - an open defect of the sabotage matrix (class 4: a resume trusts what it continues), fixed on fix/resume-checks-what-it-continues; present through 0.31.0"
+    scope: source
+    patch: resume-plans-no-hole-in-stored-windows/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "a_resume_over_edited_task_bounds_delivers_or_refuses_postgres"
+          - "run_resume_over_edited_task_bounds_delivers_or_refuses_postgres"
+      mysql:
+        cells:
+          - "a_resume_over_edited_task_bounds_delivers_or_refuses_mysql"
+          - "run_resume_over_edited_task_bounds_delivers_or_refuses_mysql"
+      mssql:
+        cells:
+          - "a_resume_over_edited_task_bounds_delivers_or_refuses_mssql"
+          - "run_resume_over_edited_task_bounds_delivers_or_refuses_mssql"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no range-chunk checkpoint"
+      oracle:
+        cells:
+          - "a_resume_over_edited_task_bounds_delivers_or_refuses_oracle"
+          - "run_resume_over_edited_task_bounds_delivers_or_refuses_oracle"
+      lib:
+        cells:
+          - "lib:the_uncovered_pieces_of_ranges_are_what_no_window_holds"
+          - "lib:a_hole_in_the_stored_windows_is_planned_again_and_shared_keys_are_refused"
+
+  - name: resume-accepts-overlapping-windows
+    class: "a resume accepts stored chunk windows that share keys, so those keys are read twice"
+    history: "2026-10-13 - an open defect of the sabotage matrix (class 4: a resume trusts what it continues), fixed on fix/resume-checks-what-it-continues; present through 0.31.0"
+    scope: source
+    patch: resume-accepts-overlapping-windows/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "broken_chunk_windows_are_refused_on_resume_and_walked_out_postgres"
+      mysql:
+        cells:
+          - "broken_chunk_windows_are_refused_on_resume_and_walked_out_mysql"
+      mssql:
+        cells:
+          - "broken_chunk_windows_are_refused_on_resume_and_walked_out_mssql"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no range-chunk checkpoint"
+      oracle:
+        cells:
+          - "broken_chunk_windows_are_refused_on_resume_and_walked_out_oracle"
+      lib:
+        cells:
+          - "lib:a_hole_in_the_stored_windows_is_planned_again_and_shared_keys_are_refused"
+
+  - name: resume-trusts-a-same-size-part-under-verify-content
+    class: "under `verify: content` a resume declares a committed part replaced at its own size without reading it back, so another chunk's rows are delivered in its place"
+    history: "2026-10-13 - an open defect of the sabotage matrix (class 4: a resume trusts what it continues), fixed on fix/resume-checks-what-it-continues; present through 0.31.0"
+    scope: source
+    patch: resume-trusts-a-same-size-part-under-verify-content/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_postgres"
+      mysql:
+        cells:
+          - "a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_mysql"
+      mssql:
+        cells:
+          - "a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_mssql"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no range-chunk checkpoint"
+      oracle:
+        cells:
+          - "a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_oracle"

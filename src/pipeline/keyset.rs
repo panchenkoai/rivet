@@ -43,15 +43,18 @@ fn rehydrate_keyset_pages_probed(
     plan: &ResolvedRunPlan,
     summary: &mut crate::pipeline::RunSummary,
 ) -> anyhow::Result<()> {
-    let probe: Option<std::collections::HashSet<String>> =
+    let probe: Option<super::chunked::Listed> =
         match crate::destination::create_destination(&plan.destination) {
             Ok(dest) if dest.capabilities().commit_protocol.leaves_objects_at_rest() => {
                 match dest.list_prefix("") {
                     Ok(listing) => Some(
                         listing
                             .iter()
-                            .map(|m| m.key.rsplit('/').next().unwrap_or(&m.key).to_string())
-                            .collect(),
+                            .map(|m| {
+                                let base = m.key.rsplit('/').next().unwrap_or(&m.key);
+                                (base.to_string(), m.size_bytes)
+                            })
+                            .collect::<super::chunked::Listed>(),
                     ),
                     Err(e) => {
                         log::warn!(
@@ -1344,6 +1347,42 @@ pub(crate) fn run_keyset(
 
 #[cfg(test)]
 mod tests {
+    /// A keyset page the destination holds at another size than the state logged is refused on resume, never declared; at its logged size it is declared.
+    #[test]
+    fn a_keyset_page_of_another_size_is_refused_on_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let st =
+            crate::state::StateStore::open_at_path(&state_dir.path().join("state.db")).unwrap();
+        let (run_id, name) = ("r_pages", "orders_page_00001.parquet");
+        st.record_file(crate::state::FilePart {
+            run_id,
+            export_name: "orders",
+            file_name: name,
+            rows: 3,
+            bytes: 5,
+            format: "parquet",
+            compression: None,
+            cursor_high: Some("3"),
+        })
+        .unwrap();
+        let plan = crate::pipeline::chunked::m8_plan(dir.path());
+        let summary = || {
+            crate::pipeline::summary::RunSummary::stub_for_testing(run_id, String::from("orders"))
+        };
+        std::fs::write(dir.path().join(name), b"12345").unwrap();
+        let mut whole = summary();
+        rehydrate_keyset_pages_probed(&st, run_id, &plan, &mut whole).unwrap();
+        assert_eq!(
+            whole.manifest_parts.len(),
+            1,
+            "the page at its logged size is declared"
+        );
+        std::fs::write(dir.path().join(name), b"1234567").unwrap();
+        let err = rehydrate_keyset_pages_probed(&st, run_id, &plan, &mut summary()).unwrap_err();
+        assert!(format!("{err:#}").contains(name), "{err:#}");
+    }
+
     fn anchor_key() -> crate::state::ProgressKey {
         crate::state::ProgressKey {
             export_name: "e".into(),

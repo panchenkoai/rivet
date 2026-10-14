@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/chunked/resume_m8.rs b/src/pipeline/chunked/resume_m8.rs
+index 54863bb3..6a22965b 100644
+--- a/src/pipeline/chunked/resume_m8.rs
++++ b/src/pipeline/chunked/resume_m8.rs
+@@ -204,7 +204,7 @@ pub(crate) fn prune_superseded_attempts(
+ 
+ /// Whether `t` is marked completed with no part and no record of having read zero rows: a state no run writes (an empty chunk completes with a row count of 0).
+ fn completed_without_a_part(t: &crate::state::ChunkTaskInfo) -> bool {
+-    t.status == "completed" && t.file_name.is_none() && t.rows_written != Some(0)
++    false && t.status == "completed"
+ }
+ 
+ /// Completed, undeclared chunks whose surviving attempt's `file_log` rows are absent or short of the chunk's rows.
