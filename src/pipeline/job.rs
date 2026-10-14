@@ -1114,6 +1114,19 @@ fn ledger_begin_run(
     Ok(())
 }
 
+/// The run lease of a `mode: cdc` export, refused by code while a live process holds it.
+fn cdc_run_lease<'s>(state: &'s StateStore, export: &str) -> Result<crate::state::LoadLease<'s>> {
+    match chunked::try_run_lease(state, export) {
+        Ok(Some(lease)) => Ok(lease),
+        Ok(None) => crate::rivet_bail!(
+            crate::error::codes::STATE_RUN_IN_PROGRESS,
+            "{}",
+            chunked::live_run_refusal(export, state.newest_running_run(export)?.as_deref(), false)
+        ),
+        Err(e) => Err(state_not_writable(export, &e)),
+    }
+}
+
 /// The refusal of a run whose state store did not take its first write.
 fn state_not_writable(export_name: &str, cause: &anyhow::Error) -> anyhow::Error {
     anyhow::Error::new(crate::error::CodedError::new(
@@ -1760,6 +1773,15 @@ fn run_export_job_inner(
         ) {
             log::warn!("{msg}");
         }
+        // The export's run lease for the whole stream, as a batch run holds it: a second
+        // run beside a live one is refused before it opens the source or writes anything.
+        let _run_lease = match cdc_run_lease(state, &export.name) {
+            Ok(lease) => lease,
+            Err(e) => {
+                let summary = synthetic_failed_summary(&export.name, &e);
+                return (Err(e), summary);
+            }
+        };
         // `initial: snapshot`: anchor first, then each pending table's full
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails
