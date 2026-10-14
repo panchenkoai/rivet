@@ -99,6 +99,16 @@ impl SfLive {
         );
     }
 
+    /// The database the stand owns.
+    pub fn database(&self) -> &str {
+        &self.database
+    }
+
+    /// The schema the stand owns.
+    pub fn schema(&self) -> &str {
+        &self.schema
+    }
+
     /// `<database>.<schema>.<table>`.
     pub fn fq(&self, table: &str) -> String {
         format!("{}.{}.{table}", self.database, self.schema)

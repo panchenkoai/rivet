@@ -373,6 +373,9 @@ const MATRICES: &[(&str, usize)] = &[
     // BigQuery form cells are live (run + load + tables.get per cell); Snowflake cells are
     // SQL-text proofs (no live Snowflake from this stand); duckdb/clickhouse are `na`. 0 gaps.
     ("docs/load-spec-matrix.yaml", 0),
+    // The same config three times (whole, unchanged, delta) per mode x warehouse x engine.
+    // Lowered 3 -> 0 (2026-10-14): the Oracle CDC-into-a-warehouse cells grade the ADR-0037 refusal by code.
+    ("docs/cycle-matrix.yaml", 0),
 ]; // ratchet-pin: end
 
 #[derive(Deserialize)]
@@ -1053,6 +1056,45 @@ fn matrix_cdc_type_rows_cover_every_rivet_type() {
              docs/cdc-type-fidelity-matrix.yaml — add the scenario (a test/gap/na cell per engine)."
         );
     }
+}
+
+/// GENERATIVE row-completeness for the cycle ledger: one row per `ExportMode` variant per
+/// `ExportTarget` variant, named `cycle_<mode>_<target>`, no more and no fewer. A new mode or a
+/// new warehouse cannot ship without saying what its three cycles do on every engine.
+#[test]
+fn matrix_cycle_rows_cover_every_mode_and_target() {
+    fn snake(camel: &str) -> String {
+        let mut out = String::new();
+        for (i, c) in camel.chars().enumerate() {
+            if c.is_ascii_uppercase() && i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        }
+        out
+    }
+    let modes = enum_variants("src/config/export.rs", "ExportMode");
+    let targets = enum_variants("src/types/target.rs", "ExportTarget");
+    assert!(
+        modes.contains("Cdc") && targets.contains("BigQuery"),
+        "enum parse produced modes {modes:?} and targets {targets:?}"
+    );
+    let want: HashSet<String> = modes
+        .iter()
+        .flat_map(|m| {
+            targets
+                .iter()
+                .map(move |t| format!("cycle_{}_{}", snake(m), t.to_lowercase()))
+        })
+        .collect();
+    let matrix = load_matrix("docs/cycle-matrix.yaml");
+    let have: HashSet<String> = matrix.scenarios.iter().map(|s| s.id.clone()).collect();
+    assert_eq!(
+        have, want,
+        "docs/cycle-matrix.yaml rows must be exactly ExportMode x ExportTarget: a missing row \
+         is a mode or a warehouse whose three cycles nobody grades, an extra row names a mode \
+         or warehouse the product does not have"
+    );
 }
 
 /// Guard #7 — GENERATIVE oracle-strength ratchet. Guards #1-#6 ensure a cell

@@ -278,6 +278,27 @@ def declared_parts(root: str, manifests: list[str]) -> list[str]:
     return sorted(out)
 
 
+def pairs(spec: dict) -> dict:
+    """`(key, value)` integer pairs, sorted, over the parts the Success manifests under `dir` declare: every manifest copy, or the newest run's alone (`latest`)."""
+    import duckdb
+    import glob
+
+    root = spec["dir"]
+    names = [os.path.basename(m) for m in sorted(glob.glob(os.path.join(root, "manifest-*.json")))]
+    if not names and os.path.isfile(os.path.join(root, "manifest.json")):
+        names = ["manifest.json"]
+    if spec.get("latest") and names:
+        names = in_run_order(root, names)[-1:]
+    files = declared_parts(root, names)
+    if not files:
+        return {"pairs": []}
+    sql = (
+        f"SELECT CAST({_qi(spec['key'])} AS BIGINT), CAST({_qi(spec['value'])} AS BIGINT) "
+        f"FROM read_parquet({_plist(files)}) ORDER BY 1, 2"
+    )
+    return {"pairs": [[int(a), int(b)] for a, b in duckdb.connect().execute(sql).fetchall()]}
+
+
 def in_run_order(root: str, manifests: list[str]) -> list[str]:
     """The named manifests ordered by when their run finished."""
     return sorted(manifests, key=lambda n: (str(_load(root, n).get("finished_at") or ""), n))
@@ -2058,9 +2079,9 @@ def _ns_self_test() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] in (["grade"], ["grade-load"], ["grade-stdout"], ["image"]):
+    if sys.argv[1:] in (["grade"], ["grade-load"], ["grade-stdout"], ["image"], ["pairs"]):
         spec = json.load(sys.stdin)
-        run = {"grade": grade, "grade-load": grade_load, "grade-stdout": grade_stdout, "image": take_image}[sys.argv[1]]
+        run = {"grade": grade, "grade-load": grade_load, "grade-stdout": grade_stdout, "image": take_image, "pairs": pairs}[sys.argv[1]]
         for attempt in range(3):
             try:
                 verdict = run(spec)

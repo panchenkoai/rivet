@@ -74,6 +74,7 @@ mod state;
 mod storage;
 mod toxi;
 mod verify;
+mod warehouse;
 
 pub use bigquery::*;
 pub use canon::*;
@@ -96,6 +97,7 @@ pub use sql_engine::*;
 pub use state::*;
 pub use storage::*;
 pub use toxi::*;
+pub use warehouse::*;
 
 // ─── Unique resource naming (races-free suite parallelism) ─────────────────
 

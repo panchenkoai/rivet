@@ -438,6 +438,41 @@ pub fn ledger_load_statuses(cfg: &std::path::Path, target_table: &str) -> Vec<St
     }
 }
 
+/// `(status, rows_loaded)` of every load whose target table is `table` (bare or qualified, any case), oldest first, from the backend the run used.
+pub fn ledger_loads(cfg: &std::path::Path, table: &str) -> Vec<(String, i64)> {
+    const SQL: &str = "SELECT target_table, status, rows_loaded FROM load_run ORDER BY finished_at";
+    let rows: Vec<(String, String, i64)> = match state_url_under_test() {
+        Some(url) => {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap_or_else(|e| {
+                panic!("connect to the Postgres state at RIVET_GATE_STATE_URL: {e}")
+            });
+            client
+                .query(SQL, &[])
+                .expect("query load_run")
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect()
+        }
+        None => {
+            let db = StateDb::next_to_config(cfg);
+            let mut stmt = db.conn.prepare(SQL).expect("prepare load_run query");
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .expect("query load_run")
+                .map(|r| r.expect("a load_run row"))
+                .collect()
+        }
+    };
+    rows.into_iter()
+        .filter(|(target, _, _)| {
+            target
+                .rsplit('.')
+                .next()
+                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(table))
+        })
+        .map(|(_, status, rows)| (status, rows))
+        .collect()
+}
+
 const STATE_ADMIN: &str = "host=127.0.0.1 port=5433 user=rivet password=rivet dbname=postgres";
 
 /// A fresh database on the state server, dropped (with anything it holds) when the guard goes.

@@ -269,6 +269,8 @@ mod live_source_parity_sweep;
 mod live_state_backend_parity;
 #[path = "live/live_temp_spill.rs"]
 mod live_temp_spill;
+#[path = "live/live_three_cycles.rs"]
+mod live_three_cycles;
 #[path = "live/live_type_policy.rs"]
 mod live_type_policy;
 #[path = "live/live_wave_apply.rs"]

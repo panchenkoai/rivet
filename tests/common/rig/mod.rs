@@ -954,6 +954,45 @@ impl CdcScenario {
         }
     }
 
+    /// [`Self::pg_with`] with `(id, v)` rows `ids` inserted BEFORE the slot exists, so the first run's snapshot is the only delivery of them (a slot made first replays them from the WAL as well).
+    pub fn pg_seeded_with(
+        label: &str,
+        cols: &str,
+        ids: std::ops::RangeInclusive<i64>,
+        shape: impl FnOnce(Rig, &str) -> Rig,
+    ) -> Self {
+        let table = super::unique_name(label);
+        let slot = super::unique_name(&format!("{label}_slot"));
+        let sguard = super::pg::Slot::new(slot.clone());
+        let mut client = postgres::Client::connect(super::env::POSTGRES_CDC_URL, postgres::NoTls)
+            .expect("connect postgres-cdc");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} ({cols})"
+            ))
+            .unwrap();
+        let tguard = super::pg::PgTable::adopt_on(super::env::POSTGRES_CDC_URL, table.clone());
+        let rows: Vec<String> = ids.map(|i| format!("({i}, {i})")).collect();
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {table} (id, v) VALUES {}",
+                rows.join(", ")
+            ))
+            .unwrap();
+        client
+            .execute(
+                "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+                &[&slot],
+            )
+            .unwrap();
+        Self {
+            rig: shape(Rig::pg_cdc(&table, &slot), &table),
+            table,
+            exec: ScnExec::Pg(Box::new(client)),
+            _guards: vec![Box::new(tguard), Box::new(sguard)],
+        }
+    }
+
     /// MongoDB (replica set :27018): a fresh database, one collection, unpinned and
     /// shaped — see [`Self::mysql_with`]. The scenario's `_id`s are `i64`.
     pub fn mongo_with(label: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
@@ -962,8 +1001,27 @@ impl CdcScenario {
 
     /// [`Self::mongo_with`] on the replica set member listening on `PORT`.
     pub fn mongo_on(port: u16, label: &str, shape: impl FnOnce(Rig, &str) -> Rig) -> Self {
+        Self::mongo_collection_on(port, label, "t", shape)
+    }
+
+    /// [`Self::mongo_with`] with the collection named `collection`: a warehouse that every cell shares one schema of needs the table named per cell.
+    pub fn mongo_collection_with(
+        label: &str,
+        collection: &str,
+        shape: impl FnOnce(Rig, &str) -> Rig,
+    ) -> Self {
+        Self::mongo_collection_on(27018, label, collection, shape)
+    }
+
+    /// [`Self::mongo_on`] with the collection named `collection`.
+    pub fn mongo_collection_on(
+        port: u16,
+        label: &str,
+        collection: &str,
+        shape: impl FnOnce(Rig, &str) -> Rig,
+    ) -> Self {
         let db = super::unique_name(label);
-        let table = "t".to_string();
+        let table = collection.to_string();
         let m = super::mongo::MongoTest::connect(port, &db);
         m.drop_collection(&table);
         let rig = Rig::mongo_cdc(&table).source_url(&super::mongo::MongoTest::url(port, &db));
@@ -1112,6 +1170,52 @@ impl CdcScenario {
                 self.sql(&format!("DELETE FROM {t} WHERE id = {id}"))
             }
         }
+    }
+
+    /// The `(id, v)` pairs of the source table, sorted by id — the re-query oracle for values.
+    pub fn id_v_pairs(&mut self) -> Vec<(i64, i64)> {
+        let t = self.qualified();
+        let mut rows: Vec<(i64, i64)> = match &mut self.exec {
+            ScnExec::MySql(conn) => {
+                use mysql::prelude::Queryable as _;
+                conn.query(format!("SELECT id, v FROM {t} ORDER BY id"))
+                    .expect("pairs")
+            }
+            ScnExec::Pg(client) => client
+                .query(&format!("SELECT id, v FROM {t} ORDER BY id"), &[])
+                .expect("pairs")
+                .iter()
+                .map(|r| (r.get(0), r.get(1)))
+                .collect(),
+            ScnExec::Mssql { .. } => super::mssql::mssql_cdc_query_strings(&format!(
+                "SELECT CONCAT(id, CHAR(9), v) FROM {t} ORDER BY id"
+            ))
+            .iter()
+            .map(|l| {
+                let (a, b) = l.split_once('\t').expect("two columns");
+                (a.parse().expect("id"), b.parse().expect("v"))
+            })
+            .collect(),
+            ScnExec::Mongo(m) => m
+                .current_state_i64(&self.table, "v")
+                .into_iter()
+                .map(|(id, v)| (id, v.parse().expect("v")))
+                .collect(),
+            #[cfg(feature = "oracle")]
+            ScnExec::Oracle => super::ora_text_rows(&format!(
+                "SELECT TO_CHAR(id), TO_CHAR(v) FROM {t} ORDER BY id"
+            ))
+            .iter()
+            .map(|r| {
+                (
+                    r[0].clone().expect("id").parse().expect("id"),
+                    r[1].clone().expect("v").parse().expect("v"),
+                )
+            })
+            .collect(),
+        };
+        rows.sort_unstable();
+        rows
     }
 
     /// `COUNT(*)` of the source table — the re-query oracle, sharing nothing with
