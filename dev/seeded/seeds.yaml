@@ -1792,6 +1792,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: pool-lines-on-stdout
+    class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
+    history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"
+    scope: source
+    patch: pool-lines-on-stdout/shared.patch
+    engines:
+      postgres:
+        cells: [apply_pool_writes_only_the_export_on_stdout]
+      mysql:
+        na: "the pool prints its lines before and after any source is read: one code path, graded by the postgres cell"
+      mssql:
+        na: "the pool prints its lines before and after any source is read: one code path, graded by the postgres cell"
+      mongo:
+        na: "the pool prints its lines before and after any source is read: one code path, graded by the postgres cell"
+      oracle:
+        na: "the pool prints its lines before and after any source is read: one code path, graded by the postgres cell"
   - name: dead-runs-stay-running
     class: "a run that died leaves its `run_status` and `export_metrics` rows `running`, and no later run of the export closes them"
     history: "2026-10-14 - open defect (a run whose SQLite state volume filled up left its rows `running`) through 0.31.0; fixed by `begin_run_under_lease`, which stamps them `interrupted`"

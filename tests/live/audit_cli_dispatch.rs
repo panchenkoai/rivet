@@ -158,8 +158,8 @@ fn run_unknown_export_lists_available_names() {
 
 /// `apply --pool` on a stdout export writes the export alone on stdout.
 #[test]
-#[ignore = "live+gate-only: postgres; open defect (apply --pool on a stdout export), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_apply_pool_writes_only_the_export_on_stdout() {
+#[ignore = "live: postgres"]
+fn apply_pool_writes_only_the_export_on_stdout() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(5);
     let rig = Rig::pg_batch(table.name())
