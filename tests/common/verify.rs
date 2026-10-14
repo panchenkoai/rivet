@@ -82,7 +82,7 @@ pub(crate) struct Case {
     began: String,
     /// The file holding what the run printed for its one `destination: stdout` export.
     stdout: Option<PathBuf>,
-    /// Why rivet's ledger is not compared: the run said its rows were delivered and its state was not stored.
+    /// Why rivet's ledger may be missing: the run said its rows were delivered and its state was not stored; the oracle skips the ledger only when it holds no success row of the run.
     unrecorded: Option<String>,
 }
 
@@ -230,7 +230,7 @@ pub(crate) fn settle(
     if status.success() || delivered_unrecorded {
         if delivered_unrecorded {
             case.unrecorded = Some(format!(
-                "exit {}: the run says its rows are delivered and its state was not stored, so its destination is graded as a delivery and rivet's ledger (export_metrics, file_log) is not compared",
+                "exit {}: the run says its rows are delivered and its state was not stored, and its ledger holds no success row, so rivet's ledger (export_metrics, file_log) was not compared",
                 status.code().unwrap_or(-1)
             ));
         }
@@ -888,19 +888,16 @@ impl Case {
         let url = source_url(&raw);
         let db = self.config_dir.join(".rivet_state.db");
         let state = match self.state_at(envs) {
-            _ if self.unrecorded.is_some() => None,
             Some(refusal::StateAt::Postgres(url)) => Some(url),
             Some(refusal::StateAt::Sqlite(db)) if db.is_file() => Some(db.display().to_string()),
             _ => None,
         };
         // A run with no findable state is graded PARTIAL, never a silent PASS of a ledger leg that was not compared.
-        let state_missing = self.unrecorded.clone().or_else(|| {
-            (state.is_none() && self.cli.is_none()).then(|| {
-                format!(
-                    "no state DB: {} is absent and neither the run's RIVET_STATE_URL nor the backend under test (RIVET_GATE_STATE_URL) is postgres, so rivet's ledger (export_metrics, file_log) was not compared",
-                    db.display()
-                )
-            })
+        let state_missing = (state.is_none() && self.cli.is_none()).then(|| {
+            format!(
+                "no state DB: {} is absent and neither the run's RIVET_STATE_URL nor the backend under test (RIVET_GATE_STATE_URL) is postgres, so rivet's ledger (export_metrics, file_log) was not compared",
+                db.display()
+            )
         });
         let query = match (s(e, "query"), s(e, "query_file")) {
             (Some(q), _) => Some(q.to_string()),
@@ -938,6 +935,7 @@ impl Case {
             "cursor_expr": cursor_expr,
             "state": state,
             "state_missing": state_missing,
+            "ledger_unrecorded": self.unrecorded,
             "capture_instance": e.get("cdc").and_then(|c| s(c, "capture_instance")),
         }))
     }
