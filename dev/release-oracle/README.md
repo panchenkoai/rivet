@@ -127,6 +127,7 @@ RIVET_REGRESSION_SOURCE_URL postgresql://…                       # a PG the ce
 RIVET_SCALE_<ENGINE>_URL    …                                    # batch-tier DBs, per engine
 BQ_ORACLE_PROJECT           …   # BigQuery stage; default dev/stand/registry.yaml's, when a Google credential is at hand
 BQ_ORACLE_DATASET           …   # one dataset PER SOURCE is derived from this; default rivet_tmp_gate
+RIVET_SF_CONNECTION         …   # Snowflake live cells; default dev/stand/registry.yaml's `snowflake:` block (with the other RIVET_SF_*), when that `snow` connection logs in and sees the schema
 ```
 
 `RIVET_PREV_RELEASE_BIN` must be a **downloaded release asset**

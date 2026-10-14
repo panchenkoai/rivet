@@ -425,5 +425,6 @@ infra:
   - id: warehouse_load
     status: partial
     note: "BigQuery live golden IS gated — driven by run_bigquery_golden (dev/release_oracle/bigquery.py),
-      which is this row's driver under a different name; ClickHouse has its own row (clickhouse_load); Snowflake is
-      resolver/type-only (no live load-and-readback)"
+      which is this row's driver under a different name; ClickHouse has its own row (clickhouse_load); Snowflake
+      load-and-readback runs in the live cells (tests/common/snowflake.rs, warehouse_cell_*_snowflake) with
+      the RIVET_SF_* env the gate fills from dev/stand/registry.yaml (`_snowflake_env`)"
