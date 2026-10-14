@@ -11,7 +11,7 @@ const LEDGER: &str = "dev/release_oracle/known_red.py";
 // 25 (2026-10-14): 21 open-defect cells, 4 gate rows (Oracle cdc-load x2, Oracle TIMESTAMP(9) sentinels x2).
 // A new entry is a new acknowledged red: raise this in the same diff, with the entry's reason;
 // a fixed one lowers it.
-const ENTRY_CEILING: usize = 23; // ratchet-pin: known-red-entries
+const ENTRY_CEILING: usize = 22; // ratchet-pin: known-red-entries
 
 /// The horizon every `_open` entry expires at; moves only here and in the ledger together.
 const EXPIRES: &str = "2026-10-31"; // pinned: the ledger's `_EXPIRES`, moved only together with it

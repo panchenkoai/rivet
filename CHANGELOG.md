@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
+  through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision
+  were looked up in that wrapper, which names no table: the run failed with `precision/scale
+  unavailable from query metadata and catalog lookup`, although the same export without
+  `partition_by` ran (0.31.0 and earlier; a `--split` unit wraps the query the same way). **Now**
+  the plan keeps the query before the window (`catalog_query`) and every reader resolves type hints
+  from it. **What to do:** nothing.
+
 - **A stored incremental cursor of another type stopped every run with a raw driver error.**
   When the stored cursor is not a value the cursor column can be compared with (the state was
   edited, or the column changed type), PostgreSQL, SQL Server and Oracle failed every run with

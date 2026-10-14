@@ -276,7 +276,8 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                                     &plan_w.base_query,
                                     &plan_w.tuning,
                                     &plan_w.column_overrides,
-                                ),
+                                )
+                                .with_catalog_hint_query(plan_w.catalog_query.as_deref()),
                                 &mut sink,
                             )?;
                             sink.finish_writer()?;

@@ -348,6 +348,7 @@ pub(super) fn run_single_export(
         &plan.tuning,
         &plan.column_overrides,
     )
+    .with_catalog_hint_query(plan.catalog_query.as_deref())
     .with_incremental(plan.strategy.incremental_plan())
     .with_cursor(cursor);
 
@@ -644,6 +645,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT 1".into(),
             query_template: None,
+            catalog_query: None,
             destination_written: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Snapshot,

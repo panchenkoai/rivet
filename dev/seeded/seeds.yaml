@@ -1774,6 +1774,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: partition-child-loses-catalog-hints
+    class: a `partition_by` child resolves catalog type hints from the bucket wrapper, which hides the source table, so a PostgreSQL NUMERIC(p,s) column refuses the export
+    history: 2026-10-14 - open defect (partition_by over a NUMERIC column refused with `precision/scale unavailable`) through 0.31.0; fixed by the plan's catalog_query
+    scope: source
+    patch: partition-child-loses-catalog-hints/shared.patch
+    engines:
+      postgres:
+        cells: [partition_by_exports_a_declared_numeric_column]
+      mysql:
+        na: 'MySQL reports NUMERIC precision and scale on the wire; it reads no catalog hint'
+      mssql:
+        na: 'SQL Server reports NUMERIC precision and scale on the wire; it reads no catalog hint'
+      mongo:
+        na: 'MongoDB has no NUMERIC(p,s) column and no catalog hint'
+      oracle:
+        na: 'Oracle reports NUMBER precision and scale on the wire; it reads no catalog hint'
   - name: cursor-of-another-type-uncoded
     class: a stored incremental cursor the source cannot compare with the cursor column fails every run with the driver's own conversion error (exit 1, no code, no remedy)
     history: 2026-10-14 - open defect of the sabotage matrix (corrupt_cursor_wrong_type) on PostgreSQL and SQL Server through 0.31.0; fixed by RIVET_STATE_CURSOR_INCOMPARABLE at run_single_export

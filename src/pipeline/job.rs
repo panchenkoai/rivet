@@ -3469,6 +3469,7 @@ mod tests {
             source_table: None,
             base_query: "SELECT id FROM orders".into(),
             query_template: None,
+            catalog_query: None,
             destination_written: None,
             is_split_unit: false,
             strategy: ExtractionStrategy::Chunked(ChunkedPlan {
