@@ -282,6 +282,37 @@ pub(crate) fn run_export(
     )
 }
 
+/// `err` as `RIVET_STATE_CURSOR_INCOMPARABLE` when the source refused to convert a value while a stored cursor was compared; any other error unchanged.
+fn refuse_an_incomparable_cursor(
+    err: anyhow::Error,
+    cursor: Option<&crate::types::CursorState>,
+    plan: &ResolvedRunPlan,
+) -> anyhow::Error {
+    let Some(value) = cursor.and_then(|c| c.last_cursor_value.as_deref()) else {
+        return err;
+    };
+    if !crate::error::retry::is_value_conversion(&err) {
+        return err;
+    }
+    let column = plan
+        .strategy
+        .incremental_plan()
+        .map(|p| p.column_for_storage_extract().to_string())
+        .unwrap_or_default();
+    let export = &plan.export_name;
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::STATE_CURSOR_INCOMPARABLE,
+        format!(
+            "export '{export}': the source refused the query that compares `{column}` with the stored \
+             cursor `{value}`: {err:#}\n  \
+             If `{value}` is not a value of `{column}` (the state was edited, or the column changed \
+             type), every run stops here.\n  \
+             Hint: `rivet state reset -c <config> --export {export}` starts `{column}` over with a full \
+             pass."
+        ),
+    ))
+}
+
 /// A part's file name, `<export>_<run stamp>`: a `_part<N>` suffix whenever the run seals more than one part.
 fn part_file_name(
     export: &str,
@@ -325,15 +356,16 @@ pub(super) fn run_single_export(
     // ExportSink and does the parquet encode/compress so DB I/O overlaps with
     // compression CPU. The worker error (if any) is recovered by `finish()` and
     // takes precedence over the source-side error.
+    let refuse = |e| refuse_an_incomparable_cursor(e, cursor, plan);
     let mut sink = if super::sink::PipelinedSink::enabled() {
         let mut psink = super::sink::PipelinedSink::spawn(plan)?;
         let export_result = src.export(&request, &mut psink);
         let sink = psink.finish()?;
-        export_result?;
+        export_result.map_err(refuse)?;
         sink
     } else {
         let mut sink = ExportSink::new(plan)?;
-        src.export(&request, &mut sink)?;
+        src.export(&request, &mut sink).map_err(refuse)?;
         sink
     };
 
@@ -566,6 +598,37 @@ mod tests {
         ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
             Ok(vec![])
         }
+    }
+
+    #[test]
+    fn only_a_conversion_error_over_a_stored_cursor_is_refused_by_code() {
+        let plan = minimal_plan();
+        let cursor = crate::types::CursorState {
+            export_name: "test_export".into(),
+            last_cursor_value: Some("abc".into()),
+            last_run_at: None,
+            cursor_column: None,
+        };
+        let code = |e: &anyhow::Error| {
+            e.downcast_ref::<crate::error::CodedError>()
+                .map(|c| c.code())
+        };
+        let conversion = || anyhow::anyhow!("ORA-01722: invalid number");
+        let refused = refuse_an_incomparable_cursor(conversion(), Some(&cursor), &plan);
+        assert_eq!(code(&refused), Some("RIVET_STATE_CURSOR_INCOMPARABLE"));
+        assert!(
+            refused.to_string().contains("rivet state reset"),
+            "{refused}"
+        );
+        let other = refuse_an_incomparable_cursor(
+            anyhow::anyhow!("ORA-00942: table or view does not exist"),
+            Some(&cursor),
+            &plan,
+        );
+        assert_eq!(code(&other), None);
+        assert_eq!(other.to_string(), "ORA-00942: table or view does not exist");
+        let first_run = refuse_an_incomparable_cursor(conversion(), None, &plan);
+        assert_eq!(code(&first_run), None);
     }
 
     // ── minimal plan builder ─────────────────────────────────────────────────

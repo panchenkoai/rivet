@@ -111,6 +111,28 @@ fn cursor_owner_mismatch(engine: SqlEngine) {
     );
 }
 
+/// RIVET_STATE_CURSOR_INCOMPARABLE: a stored cursor the source cannot compare with the cursor column.
+fn cursor_incomparable(engine: SqlEngine) {
+    let (table, mut rig, _guard) = cursor_edited(engine, "not-a-number");
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_STATE_CURSOR_INCOMPARABLE", 5),
+        vec![
+            Remedy::new(
+                &format!("`rivet state reset -c <config> --export {table}` starts"),
+                Then::DeliversTheSource,
+                |r| state(r, "reset", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, the sibling of the command the text names",
+                Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_INCOMPARABLE", 5)),
+                |r| state(r, "reset-chunks", &table),
+            ),
+        ],
+    );
+}
+
 /// RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table with no reset.
 fn cursor_stream_mismatch(engine: SqlEngine) {
     engine.alive();
@@ -2147,6 +2169,25 @@ fn a_changed_cursor_column_is_refused_and_walked_out_postgres() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_postgres() {
+    cursor_incomparable(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_mssql() {
+    cursor_incomparable(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_stored_cursor_of_another_type_is_refused_and_walked_out_oracle() {
+    cursor_incomparable(SqlEngine::Oracle);
+}
+
+#[test]
 #[ignore = "live: requires docker compose mysql"]
 fn a_changed_cursor_column_is_refused_and_walked_out_mysql() {
     cursor_owner_mismatch(SqlEngine::Mysql);
@@ -2959,8 +3000,8 @@ fn open_defect_a_cursor_moved_forward_delivers_or_refuses_mssql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a cursor of another type is a raw driver error), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_postgres() {
     cursor_of_another_type(SqlEngine::Pg);
 }
 
@@ -2971,9 +3012,16 @@ fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mysql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a cursor of another type is a raw driver error), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_mssql() {
     cursor_of_another_type(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_of_another_type_delivers_or_is_refused_by_code_and_led_out_oracle() {
+    cursor_of_another_type(SqlEngine::Oracle);
 }
 
 // cells: a resource taken away mid-run, two processes on one export, `--resume` over a damaged checkpoint
