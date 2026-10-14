@@ -1792,6 +1792,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: cdc-run-without-lease
+    class: "a `mode: cdc` run takes no run lease, so a second run beside a live stream reads and delivers the same changes again"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P2): duplicates on MySQL, SQL Server, Oracle, MongoDB CDC, an uncoded slot error on PostgreSQL, through 0.31.0; fixed by `cdc_run_lease`"
+    scope: source
+    patch: cdc-run-without-lease/shared.patch
+    engines:
+      postgres:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres]
+      mysql:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql]
+      mssql:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql]
+      mongo:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
+      oracle:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
   - name: dead-runs-stay-running
     class: "a run that died leaves its `run_status` and `export_metrics` rows `running`, and no later run of the export closes them"
     history: "2026-10-14 - open defect (a run whose SQLite state volume filled up left its rows `running`) through 0.31.0; fixed by `begin_run_under_lease`, which stamps them `interrupted`"
