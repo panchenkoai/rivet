@@ -1,0 +1,24 @@
+diff --git a/src/source/mod.rs b/src/source/mod.rs
+index 2565be19..9a090bbd 100644
+--- a/src/source/mod.rs
++++ b/src/source/mod.rs
+@@ -482,14 +482,11 @@ pub(crate) fn value_within_ceiling(
+ pub(crate) fn keyset_keys_primary_first(columns: &[(String, bool)]) -> Vec<String> {
+     let mut keys: Vec<String> = Vec::new();
+     for primary in [true, false] {
+-        let mut class: Vec<&String> = columns
+-            .iter()
+-            .filter(|(col, is_primary)| *is_primary == primary && !keys.contains(col))
+-            .map(|(col, _)| col)
+-            .collect();
+-        class.sort();
+-        class.dedup();
+-        keys.extend(class.into_iter().cloned());
++        for (col, is_primary) in columns {
++            if *is_primary == primary && !keys.contains(col) {
++                keys.push(col.clone());
++            }
++        }
+     }
+     keys
+ }

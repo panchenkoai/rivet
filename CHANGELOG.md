@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **A MySQL table without a primary key could be paged on a different unique key from one
+  run to the next.** With no `chunk_by_key:` the planner pages such a table by keyset on "the
+  first" single-column unique NOT NULL key, and the list came back in whatever order the
+  server's catalog returned it; a table with two such keys (`id`, `ext_id`) was paged on `id`
+  by one run and on `ext_id` by the next, so a run that resumed or continued stored progress
+  was refused (`RIVET_STATE_CURSOR_OWNER_MISMATCH`, exit 5) though nothing had changed. Seen
+  on main CI on 2026-10-14 in a crash-then-resume cell. **Now** the keys are ordered by rivet:
+  the primary key first, then by column name, on every engine. **What to do:** nothing; an
+  export refused that way runs after `rivet state reset`, as the text says. Pin the key with
+  `chunk_by_key:` where the choice matters.
+
 - **A load could be refused as "another `rivet load` ... is writing" right after its own
   process released that table.** SQLite state only. The load lease is an `flock`, and it was
   released by closing the file; a process spawned on another thread at that moment kept a copy
