@@ -2467,6 +2467,72 @@ fn a_dropped_slot_after_a_changes_run_is_refused_by_code_postgres() {
     pg_dropped_slot_is_refused_by_code(true);
 }
 
+/// An Oracle stream with a baseline and one drained change, with a third row waiting; returns it for the walk.
+#[cfg(feature = "oracle")]
+fn oracle_stream_with_a_change_waiting(label: &str, shape: impl FnOnce(Rig) -> Rig) -> CdcScenario {
+    let mut s = CdcScenario::oracle_with(label, |r, _| shape(r.cdc("initial: snapshot")));
+    s.insert(1);
+    s.rig.run_ok();
+    s.insert(2);
+    s.rig.run_ok();
+    s.insert(3);
+    s
+}
+
+/// The common walk of an Oracle CDC data-loss refusal: refused twice by `code`; the checkpoint deleted alone is refused under the baseline; the re-baseline recipe as printed delivers the source.
+#[cfg(feature = "oracle")]
+fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code(code, 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
+}
+
+/// RESULTS 17 (Oracle): a checkpoint whose SCN the retained redo no longer reaches is refused as `RIVET_SOURCE_CDC_LOG_GAP` (exit 5) on every run; the re-baseline delivers the source.
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let s = oracle_stream_with_a_change_waiting("oc_ogap", |r| r);
+    crate::live_cdc_oracledb::rewrite_checkpoint(&s.rig.checkpoint(), |v| {
+        v["low_water"] = "1".into()
+    });
+    oracle_walk_out_of(s, "RIVET_SOURCE_CDC_LOG_GAP");
+}
+
+/// Oracle: a checkpoint written against another database is refused as `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` (exit 5) on every run; the re-baseline delivers the source.
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn a_checkpoint_of_another_database_is_refused_by_code_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let s = oracle_stream_with_a_change_waiting("oc_odbid", |r| r);
+    crate::live_cdc_oracledb::rewrite_checkpoint(&s.rig.checkpoint(), |v| v["dbid"] = "1".into());
+    oracle_walk_out_of(s, "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT");
+}
+
+/// Oracle: a change written before an ALTER is refused as `RIVET_SOURCE_CDC_UNDECODABLE` (exit 5) on every run, nothing delivered; the re-baseline (anchored past the ALTER) delivers the source.
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn a_change_older_than_an_alter_is_refused_by_code_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let s = oracle_stream_with_a_change_waiting("oc_oalt", |r| {
+        r.oracle_known_defect(
+            "a failed run left: resume-point",
+            "known defect: a run refused for an undecodable change has already replaced the export's drift baseline in export_schema with the table's new shape (src/state/schema.rs `detect_schema_change`), which src/state/migrations.rs v18 documents as success-only",
+        )
+    });
+    ora_exec(&format!("ALTER TABLE {} ADD (w NUMBER(18))", s.table));
+    oracle_walk_out_of(s, "RIVET_SOURCE_CDC_UNDECODABLE");
+}
+
 #[test]
 #[ignore = "live: requires docker compose --profile replica"]
 fn binlogs_purged_past_the_checkpoint_before_the_first_changes_run_are_refused_by_code_mysql() {

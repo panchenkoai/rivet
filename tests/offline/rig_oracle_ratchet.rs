@@ -278,6 +278,11 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "a failed run left: resume-point",
         "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
     ),
+    (
+        "a_change_older_than_an_alter_is_refused_by_code_oracle",
+        "a failed run left: resume-point",
+        "known defect: a run refused for an undecodable change has already replaced the export's drift baseline in export_schema",
+    ),
 ]; // ratchet-pin: end
 
 /// `(enclosing fn, class, reason)` of every `.oracle_known_defect(` / `.run_ok_capture_known_defect(` call in `text`.

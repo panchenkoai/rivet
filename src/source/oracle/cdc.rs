@@ -325,34 +325,38 @@ pub(crate) fn plan_logs(
             threads.entry(thread).or_default().push(f);
         }
     }
-    anyhow::ensure!(
-        !threads.is_empty(),
-        "oracle cdc: no redo log covers SCN {start}..{end} — the archived logs the checkpoint \
-         needs are gone. The changes between the checkpoint and the oldest available log are \
-         LOST to this stream. {}",
-        crate::source::cdc::checkpoint_identity::RECOVER
-    );
+    let log_gap = crate::source::cdc::checkpoint_identity::log_gap;
+    if threads.is_empty() {
+        return Err(log_gap(format!(
+            "oracle cdc: no redo log covers SCN {start}..{end} — the archived logs the checkpoint \
+             needs are gone. The changes between the checkpoint and the oldest available log are \
+             LOST to this stream. {}",
+            crate::source::cdc::checkpoint_identity::RECOVER
+        )));
+    }
     let mut out = Vec::new();
     for (thread, files) in threads {
         let oldest = &files[0];
-        anyhow::ensure!(
-            oldest.first <= start,
-            "oracle cdc: the oldest redo log still available for thread {thread} starts at SCN \
-             {} but the checkpoint needs {start} — the archives in between were deleted and the \
-             changes they held are LOST to this stream. {}",
-            oldest.first,
-            crate::source::cdc::checkpoint_identity::RECOVER
-        );
-        for w in files.windows(2) {
-            anyhow::ensure!(
-                w[1].sequence == w[0].sequence + 1,
-                "oracle cdc: redo sequence {} of thread {thread} is missing (have {} then {}) — \
-                 the changes it held are LOST to this stream. Restore the archived log, or: {}",
-                w[0].sequence + 1,
-                w[0].sequence,
-                w[1].sequence,
+        if oldest.first > start {
+            return Err(log_gap(format!(
+                "oracle cdc: the oldest redo log still available for thread {thread} starts at SCN \
+                 {} but the checkpoint needs {start} — the archives in between were deleted and the \
+                 changes they held are LOST to this stream. {}",
+                oldest.first,
                 crate::source::cdc::checkpoint_identity::RECOVER
-            );
+            )));
+        }
+        for w in files.windows(2) {
+            if w[1].sequence != w[0].sequence + 1 {
+                return Err(log_gap(format!(
+                    "oracle cdc: redo sequence {} of thread {thread} is missing (have {} then {}) — \
+                     the changes it held are LOST to this stream. Restore the archived log, or: {}",
+                    w[0].sequence + 1,
+                    w[0].sequence,
+                    w[1].sequence,
+                    crate::source::cdc::checkpoint_identity::RECOVER
+                )));
+            }
         }
         out.extend(files);
     }
@@ -2128,24 +2132,37 @@ mod tests {
 
     #[test]
     fn a_start_before_the_oldest_log_or_a_sequence_hole_is_a_data_loss_refusal() {
-        let e = plan_logs(
-            &[log("a2", 2, 200, 300)],
-            &[log("o3", 3, 300, u64::MAX)],
-            150,
-            350,
-        )
-        .unwrap_err()
-        .to_string();
+        let coded = |e: anyhow::Error| {
+            assert_eq!(
+                crate::error::error_code(&e),
+                Some("RIVET_SOURCE_CDC_LOG_GAP"),
+                "{e}"
+            );
+            assert_eq!(crate::error::classify_exit(&e), 5, "{e}");
+            e.to_string()
+        };
+        let e = coded(
+            plan_logs(
+                &[log("a2", 2, 200, 300)],
+                &[log("o3", 3, 300, u64::MAX)],
+                150,
+                350,
+            )
+            .unwrap_err(),
+        );
         assert!(e.contains("LOST"), "{e}");
-        let e = plan_logs(
-            &[log("a1", 1, 100, 200)],
-            &[log("o3", 3, 300, u64::MAX)],
-            150,
-            350,
-        )
-        .unwrap_err()
-        .to_string();
+        let e = coded(
+            plan_logs(
+                &[log("a1", 1, 100, 200)],
+                &[log("o3", 3, 300, u64::MAX)],
+                150,
+                350,
+            )
+            .unwrap_err(),
+        );
         assert!(e.contains("sequence 2"), "{e}");
+        let e = coded(plan_logs(&[], &[], 150, 350).unwrap_err());
+        assert!(e.contains("no redo log covers"), "{e}");
     }
 
     #[test]
