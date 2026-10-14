@@ -1198,7 +1198,8 @@ fn oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
 }
 
 /// The checkpoint with `edit` applied to its JSON.
-fn rewrite_checkpoint(ckpt: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+/// Edit the JSON checkpoint at `ckpt` in place.
+pub(crate) fn rewrite_checkpoint(ckpt: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
     let mut v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(ckpt).unwrap()).unwrap();
     edit(&mut v);

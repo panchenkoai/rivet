@@ -350,8 +350,9 @@ const MATRICES: &[(&str, usize)] = &[
     // remedy is the wrong one), and eight cells that named a code no site raises on that engine are `na`
     // (undecodable on PG/SQL Server/Mongo, unrepresentable on Oracle/Mongo, foreign checkpoint on PG/Mongo,
     // truncate on SQL Server).
-    // 96 -> 95 (2026-10-15): the SQL Server log-gap refusal is walked out of (both cells of one body).
-    ("docs/sabotage-matrix.yaml", 95),
+    // 96 -> 93 (2026-10-14): the Oracle log-gap, foreign-checkpoint and undecodable refusals are walked out of.
+    // 93 -> 92 (2026-10-15): the SQL Server log-gap refusal is walked out of (both cells of one body).
+    ("docs/sabotage-matrix.yaml", 92),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

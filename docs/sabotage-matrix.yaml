@@ -323,7 +323,7 @@ scenarios:
     mysql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mssql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mongo:    { na: "the identity verdict is enforced by the MySQL, SQL Server and Oracle streams (`IdentityVerdict::enforce`); a MongoDB resume token is validated by the server it came from" }
-    oracle:   { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { test: a_checkpoint_of_another_database_is_refused_by_code_oracle }
 
   - id: refusal_source_cdc_checkpoint_invalid
     what: "RIVET_SOURCE_CDC_CHECKPOINT_INVALID: a checkpoint file that cannot be read (restore it or re-baseline; deleting it alone is the wrong remedy)"
@@ -339,7 +339,7 @@ scenarios:
     mysql:    { test: binlogs_purged_past_the_checkpoint_after_a_changes_run_are_refused_by_code_mysql }
     mssql:    { test: a_change_table_cleaned_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mssql }
     mongo:    { gap: "refused by code twice and the wrong remedy walked in an_oplog_rolled_past_the_checkpoint_after_a_changes_run_is_refused_by_code_mongo, which then follows the re-baseline recipe and counts the snapshot itself: the rig oracle has no reader for the throwaway replica set the cell starts, so the walk helper cannot grade `DeliversTheSource` there (a reader for a cell-started replica set would close it)" }
-    oracle:   { gap: "refused by code in the log-gone rows of docs/operator-contract-matrix.yaml; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { test: a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle }
 
   - id: refusal_source_cdc_truncated
     what: "RIVET_SOURCE_CDC_TRUNCATED: a TRUNCATE inside the stream"
@@ -355,7 +355,7 @@ scenarios:
     mysql:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mssql:    { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
     mongo:    { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
-    oracle:   { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    oracle:   { test: a_change_older_than_an_alter_is_refused_by_code_oracle }
 
   - id: refusal_source_cdc_cell_unsupported
     what: "RIVET_SOURCE_CDC_CELL_UNSUPPORTED: a captured cell of a type the stream cannot carry"
