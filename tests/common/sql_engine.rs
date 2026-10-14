@@ -74,6 +74,16 @@ impl SqlEngine {
         }
     }
 
+    /// The exact decimal column type of `precision` and `scale`.
+    pub fn decimal(self, precision: u8, scale: u8) -> String {
+        match self {
+            #[cfg(feature = "oracle")]
+            SqlEngine::Oracle => format!("NUMBER({precision}, {scale})"),
+            SqlEngine::Pg => format!("NUMERIC({precision}, {scale})"),
+            _ => format!("DECIMAL({precision}, {scale})"),
+        }
+    }
+
     /// The 64-bit integer column type.
     pub fn int64(self) -> &'static str {
         match self {

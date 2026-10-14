@@ -1408,6 +1408,10 @@ def grade(spec: dict) -> dict:
             extra += misfiled(ora, new_parts, spec["partition_by"])
         part_rows = ora.scalar(f"SELECT count(*) FROM {_parts(ora, new_parts, fmt)}") if new_parts else 0
         f.update(part_rows=part_rows, manifest_rows=manifest_rows, **_counters(ora, spec, new_parts, run_ids))
+        if spec.get("ledger_unrecorded") and f.get("metrics_runs") == 0:
+            for k in ("metrics_runs", "metrics_rows", "file_log_parts", "file_log_rows", "declared_parts", "stream_rows"):
+                f.pop(k, None)
+            partial.append(spec["ledger_unrecorded"])
     failures = grade_findings(f, rows, forms, native, engine != "mongo" and fmt == "parquet", spec.get("overrides") or {}, collapse)
     failures += (f.get("text_form") or []) + extra
     facts = {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}

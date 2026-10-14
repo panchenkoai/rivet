@@ -7,14 +7,17 @@
 //! documented deviation; today we assume parity is the contract.
 //!
 //! Out of scope here:
-//!   - exact column type equivalence (Postgres NUMERIC vs MySQL DECIMAL may
-//!     produce different Arrow physical types through the two driver paths;
-//!     tightening that is backlog Task 2.4 + ADR work).
+//!   - exact column type equivalence beyond decimals (one body below holds
+//!     `decimal(p,s)` -> `Decimal128(p,s)` on every engine; the rest of the
+//!     type families are per-engine goldens).
 //!   - timestamp precision parity (drivers differ on microsecond rounding).
 //!
 //! This file proves the *core* parity: no row loss, no phantom row duplication.
 
 use crate::common::*;
+use arrow::array::types::Decimal128Type;
+use arrow::array::{Array, AsArray};
+use arrow::datatypes::DataType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 fn export_to_parquet_local(
@@ -333,4 +336,104 @@ fn pg_and_mssql_full_exports_agree_on_row_count_and_id_set() {
         read_id_set(&ms_path),
         "PG and MSSQL must export equal id-sets"
     );
+}
+
+/// The scaled values of Decimal128 column `col` over `batches`, in row order; the column must be `Decimal128(p, s)`.
+fn decimal_values(
+    batches: &[arrow::record_batch::RecordBatch],
+    col: &str,
+    p: u8,
+    s: i8,
+) -> Vec<i128> {
+    let mut out = Vec::new();
+    for b in batches {
+        let arr = b
+            .column_by_name(col)
+            .unwrap_or_else(|| panic!("missing column {col}"));
+        assert_eq!(
+            arr.data_type(),
+            &DataType::Decimal128(p, s),
+            "{col} must reach Parquet as Decimal128({p}, {s}), the type its catalog declares, never a float or text"
+        );
+        let prim = arr.as_primitive::<Decimal128Type>();
+        out.extend((0..prim.len()).map(|i| prim.value(i)));
+    }
+    out
+}
+
+/// A `decimal(18,2)` and a `decimal(18,6)` column reach Parquet as `Decimal128` at the precision and scale the engine's catalog declares, with no override, and the values sum exactly.
+fn a_decimal_column_keeps_its_catalog_precision_and_scale(e: SqlEngine) {
+    e.alive();
+    let (id, amount, fee) = (e.col("id"), e.col("amount"), e.col("fee"));
+    let (table, _guard) = e.create(
+        "golden_dec",
+        &format!(
+            "{id} {} PRIMARY KEY, {amount} {}, {fee} {}",
+            e.int64(),
+            e.decimal(18, 2),
+            e.decimal(18, 6)
+        ),
+    );
+    for row in [
+        "1, 0.10, 0.000001",
+        "2, 0.20, 0.000002",
+        "3, 999999999999.99, 10.123456",
+        "4, -100.05, -0.123456",
+    ] {
+        e.exec(&format!(
+            "INSERT INTO {table} ({id}, {amount}, {fee}) VALUES ({row})"
+        ));
+    }
+    let rig = e.rig("golden_dec").query(&format!(
+        "SELECT {id}, {amount}, {fee} FROM {table} ORDER BY {id}"
+    ));
+    rig.run_ok();
+    let batches = read_all_parts(&rig.out_dir());
+    let amounts = decimal_values(&batches, "amount", 18, 2);
+    let fees = decimal_values(&batches, "fee", 18, 6);
+    assert_eq!(
+        amounts,
+        vec![10, 20, 99_999_999_999_999, -10_005],
+        "amount x 10^2, row by row"
+    );
+    assert_eq!(
+        fees,
+        vec![1, 2, 10_123_456, -123_456],
+        "fee x 10^6, row by row"
+    );
+    assert_eq!(
+        amounts.iter().sum::<i128>(),
+        99_999_999_990_024,
+        "SUM(amount) x 10^2 must equal the source's 999999999900.24 (decoding stays exact)"
+    );
+    assert_eq!(
+        fees.iter().sum::<i128>(),
+        10_000_003,
+        "SUM(fee) x 10^6 must equal the source's 10.000003"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_decimal_column_keeps_its_catalog_precision_and_scale_postgres() {
+    a_decimal_column_keeps_its_catalog_precision_and_scale(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_decimal_column_keeps_its_catalog_precision_and_scale_mysql() {
+    a_decimal_column_keeps_its_catalog_precision_and_scale(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_decimal_column_keeps_its_catalog_precision_and_scale_mssql() {
+    a_decimal_column_keeps_its_catalog_precision_and_scale(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_decimal_column_keeps_its_catalog_precision_and_scale_oracle() {
+    a_decimal_column_keeps_its_catalog_precision_and_scale(SqlEngine::Oracle);
 }

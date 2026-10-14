@@ -96,7 +96,7 @@ impl Rig {
         // configs even without --annotate-waves) — absorb it so the hand-edit
         // guard keeps firing only on edits made OUTSIDE an invocation.
         self.absorb_product_config_writes();
-        self.oracle_settle(case, out.status, &out.stdout, envs);
+        self.oracle_settle(case, out.status, &out.stdout, &out.stderr, envs);
         out
     }
 
@@ -320,7 +320,7 @@ impl Rig {
                     stdout: std::fs::read(&out_path).unwrap_or_default(),
                     stderr: std::fs::read(&err_path).unwrap_or_default(),
                 };
-                self.oracle_settle(case, out.status, &out.stdout, envs);
+                self.oracle_settle(case, out.status, &out.stdout, &out.stderr, envs);
                 return Some(out);
             }
             if start.elapsed() >= timeout {
@@ -643,7 +643,9 @@ impl Spawned<'_> {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        self.rig.oracle_settle(self.case.take(), status, &[], &envs);
+        let stderr = std::fs::read(&self.said[1]).unwrap_or_default();
+        self.rig
+            .oracle_settle(self.case.take(), status, &[], &stderr, &envs);
     }
 }
 
