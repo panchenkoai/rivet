@@ -94,6 +94,22 @@ scenarios:
     mongo:    { gap: "an unfinished MongoDB `resume: true` run under another shape is the RESULTS 14 cell (live_operator_contract, an uncoded refusal); the coded refusal needs a MongoDB crash point before the walk can be written" }
     oracle:   { test: an_unfinished_chunk_run_under_another_mode_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_chunk_plan_changed
+    what: "RIVET_STATE_CHUNK_PLAN_CHANGED: an unfinished range-chunk run and a run under another `chunk_size`; restoring the settings and `state reset-chunks` deliver, `state reset` leaves the refusal"
+    postgres: { test: a_changed_chunk_plan_is_refused_on_resume_and_walked_out_postgres }
+    mysql:    { test: a_changed_chunk_plan_is_refused_on_resume_and_walked_out_mysql }
+    mssql:    { test: a_changed_chunk_plan_is_refused_on_resume_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_changed_chunk_plan_is_refused_on_resume_and_walked_out_oracle }
+
+  - id: refusal_state_chunk_windows_broken
+    what: "RIVET_STATE_CHUNK_WINDOWS_BROKEN: an unfinished range-chunk run whose stored windows overlap, and a run; `state reset-chunks` delivers, `state reset` leaves the refusal"
+    postgres: { test: broken_chunk_windows_are_refused_on_resume_and_walked_out_postgres }
+    mysql:    { test: broken_chunk_windows_are_refused_on_resume_and_walked_out_mysql }
+    mssql:    { test: broken_chunk_windows_are_refused_on_resume_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: broken_chunk_windows_are_refused_on_resume_and_walked_out_oracle }
+
   - id: refusal_state_keyset_sequential_anchor_unfinished
     what: "RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED: an unfinished sequential keyset-incremental run and the export now runs with `parallel: 2`; `parallel: 1` delivers, `state reset-chunks` leaves the refusal"
     postgres: { test: an_unfinished_sequential_keyset_run_under_parallel_is_refused_and_walked_out_postgres }
@@ -184,19 +200,19 @@ scenarios:
 
   - id: corrupt_chunk_task_marked_completed
     what: "an unfinished range-chunk run whose pending task is marked `completed` in chunk_task: the resume delivers the source or refuses"
-    postgres: { test: open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_resume_over_a_task_marked_completed_delivers_or_refuses_mssql }
+    postgres: { test: a_resume_over_a_task_marked_completed_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_a_task_marked_completed_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_a_task_marked_completed_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_resume_over_a_task_marked_completed_delivers_or_refuses_oracle }
 
   - id: corrupt_chunk_task_bounds
     what: "an unfinished range-chunk run whose pending task has a lowered upper bound (a hole between two tasks): the resume delivers the source or refuses"
-    postgres: { test: open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_resume_over_edited_task_bounds_delivers_or_refuses_mssql }
+    postgres: { test: a_resume_over_edited_task_bounds_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_edited_task_bounds_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_edited_task_bounds_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_resume_over_edited_task_bounds_delivers_or_refuses_oracle }
 
   - id: corrupt_chunk_tasks_deleted
     what: "an unfinished range-chunk run whose chunk_task rows are deleted, chunk_run kept: the resume delivers the source or refuses (a run that committed no part is planned again over the source's key span)"
@@ -224,19 +240,19 @@ scenarios:
 
   - id: corrupt_chunk_plan_fingerprint
     what: "an unfinished range-chunk run whose stored plan fingerprint is edited: the resume delivers the source, or is refused by code naming `rivet state reset-chunks`, which then delivers it"
-    postgres: { test: open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_postgres }
-    mysql:    { test: open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mysql }
-    mssql:    { test: open_defect_an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mssql }
+    postgres: { test: an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_postgres }
+    mysql:    { test: an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mysql }
+    mssql:    { test: an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: an_edited_plan_fingerprint_delivers_or_is_refused_by_code_and_led_out_oracle }
 
   - id: corrupt_committed_part_truncated
     what: "a part an unfinished range-chunk run committed, cut in half before the resume: the resume delivers the source or refuses"
-    postgres: { test: open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql }
+    postgres: { test: a_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_resume_over_a_truncated_committed_part_delivers_or_refuses_oracle }
 
   - id: corrupt_committed_part_removed
     what: "a part an unfinished range-chunk run committed, deleted before the resume: the resume delivers the source or refuses"
@@ -248,12 +264,19 @@ scenarios:
 
   - id: corrupt_committed_part_replaced
     what: "a part an unfinished range-chunk run committed, replaced by its sibling's bytes before the resume: the resume delivers the source or refuses"
-    postgres: { test: open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql }
+    postgres: { test: a_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: a_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: a_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle }
 
+  - id: corrupt_committed_part_replaced_at_its_size
+    what: "under `verify: content`, an unfinished range-chunk run whose first committed part is replaced by its sibling's rows at exactly its own size: `--resume` reads the part back, finds keys outside its chunk and reads the chunk again"
+    postgres: { test: a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_postgres }
+    mysql:    { test: a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_mysql }
+    mssql:    { test: a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
+    oracle:   { test: a_resume_under_verify_content_over_a_part_replaced_at_its_size_delivers_oracle }
   - id: corrupt_cursor_moved_back
     what: "the stored incremental cursor moved back: the run delivers the source or refuses"
     postgres: { test: a_cursor_moved_back_delivers_or_refuses_postgres }
@@ -688,19 +711,19 @@ scenarios:
 
   - id: corrupt_chunk_task_marked_completed_resume
     what: "an unfinished range-chunk run whose pending task is marked `completed` in chunk_task, continued with `rivet run --resume`: it delivers the source or refuses"
-    postgres: { test: open_defect_run_resume_over_a_task_marked_completed_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_run_resume_over_a_task_marked_completed_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_run_resume_over_a_task_marked_completed_delivers_or_refuses_mssql }
+    postgres: { test: run_resume_over_a_task_marked_completed_delivers_or_refuses_postgres }
+    mysql:    { test: run_resume_over_a_task_marked_completed_delivers_or_refuses_mysql }
+    mssql:    { test: run_resume_over_a_task_marked_completed_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: run_resume_over_a_task_marked_completed_delivers_or_refuses_oracle }
 
   - id: corrupt_chunk_task_bounds_resume
     what: "an unfinished range-chunk run whose pending task has a lowered upper bound (a hole between two tasks), continued with `rivet run --resume`: it delivers the source or refuses"
-    postgres: { test: open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_run_resume_over_edited_task_bounds_delivers_or_refuses_mssql }
+    postgres: { test: run_resume_over_edited_task_bounds_delivers_or_refuses_postgres }
+    mysql:    { test: run_resume_over_edited_task_bounds_delivers_or_refuses_mysql }
+    mssql:    { test: run_resume_over_edited_task_bounds_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: run_resume_over_edited_task_bounds_delivers_or_refuses_oracle }
 
   - id: corrupt_chunk_tasks_deleted_resume
     what: "an unfinished range-chunk run whose chunk_task rows are deleted, chunk_run kept, continued with `rivet run --resume`: it delivers the source or refuses"
@@ -712,19 +735,19 @@ scenarios:
 
   - id: corrupt_committed_part_truncated_resume
     what: "an unfinished range-chunk run one of whose committed parts is cut in half, continued with `rivet run --resume`: it delivers the source or refuses"
-    postgres: { test: open_defect_run_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_run_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_run_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql }
+    postgres: { test: run_resume_over_a_truncated_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: run_resume_over_a_truncated_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: run_resume_over_a_truncated_committed_part_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: run_resume_over_a_truncated_committed_part_delivers_or_refuses_oracle }
 
   - id: corrupt_committed_part_replaced_resume
     what: "an unfinished range-chunk run one of whose committed parts is replaced by its sibling's bytes, continued with `rivet run --resume`: it delivers the source or refuses"
-    postgres: { test: open_defect_run_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_run_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_run_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql }
+    postgres: { test: run_resume_over_a_replaced_committed_part_delivers_or_refuses_postgres }
+    mysql:    { test: run_resume_over_a_replaced_committed_part_delivers_or_refuses_mysql }
+    mssql:    { test: run_resume_over_a_replaced_committed_part_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: run_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle }
 
   - id: kill_full
     what: "the process killed at each named point of a run (`mode: full`; points: after_source_read, after_file_write, after_manifest_update): between the crash and the recovery `state show`, `state chunks` and `state runs` answer and `validate` passes or fails loudly, then a plain run delivers the source and `validate` passes"

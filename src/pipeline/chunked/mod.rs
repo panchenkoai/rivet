@@ -24,6 +24,7 @@ mod detect;
 mod exec;
 pub(crate) mod math;
 mod parallel_checkpoint;
+mod part_keys;
 mod resume_m8;
 mod sequential_checkpoint;
 
@@ -541,8 +542,9 @@ pub(super) fn ensure_chunk_checkpoint_plan(
                 if stored_hash != plan_hash {
                     crate::rivet_bail!(
                         crate::error::codes::STATE_CHUNK_PLAN_CHANGED,
-                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume — \
-                         to abandon the interrupted run and start over: `rivet state reset-chunks -c {config_path} -e {}`",
+                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume. \
+                         To finish it: restore the query and the chunk settings the interrupted run had and run once to finish it. \
+                         To abandon it: `rivet state reset-chunks -c {config_path} -e {}` abandons it and the next run starts over",
                         plan.export_name,
                         plan.export_name
                     );
@@ -552,8 +554,9 @@ pub(super) fn ensure_chunk_checkpoint_plan(
                         crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,
                         "export '{}': the chunk windows stored for interrupted run '{rid}' {why}. \
                          rivet never writes such windows, so the checkpoint was changed outside \
-                         rivet, and resuming it would read keys twice or not at all. To abandon \
-                         the run and start over: `rivet state reset-chunks -c {config_path} -e {}`",
+                         rivet, and resuming it would read keys twice or not at all. `rivet state \
+                         reset-chunks -c {config_path} -e {}` abandons the run; the next run plans the \
+                         export again and reads every key",
                         plan.export_name,
                         plan.export_name
                     );

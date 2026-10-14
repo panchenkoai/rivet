@@ -463,7 +463,15 @@ pub(crate) fn apply_m8_resume_decisions(
             // (the M8 Rewrite semantics): this same run re-exports it.
             let mut stats = M8Stats::default();
             let present = present_basenames(&*dest);
-            rehydrate_and_reset(state, run_id, summary, present.as_ref(), &mut stats)?;
+            let content = super::part_keys::ContentCheck::of(plan, &*dest);
+            rehydrate_and_reset(
+                state,
+                run_id,
+                summary,
+                present.as_ref(),
+                content.as_ref(),
+                &mut stats,
+            )?;
             return Ok(stats);
         }
         Err(e) => {
@@ -514,7 +522,15 @@ pub(crate) fn apply_m8_resume_decisions(
         // `rivet load` inherits (RED-proven: 225000/300000 declared after a crash+resume).
         let mut stats = M8Stats::default();
         let present = present_basenames(&*dest);
-        rehydrate_and_reset(state, run_id, summary, present.as_ref(), &mut stats)?;
+        let content = super::part_keys::ContentCheck::of(plan, &*dest);
+        rehydrate_and_reset(
+            state,
+            run_id,
+            summary,
+            present.as_ref(),
+            content.as_ref(),
+            &mut stats,
+        )?;
         return Ok(stats);
     }
 
@@ -717,6 +733,7 @@ pub(crate) fn apply_m8_resume_decisions(
         run_id,
         summary,
         Some(&listing_basenames(&listing)),
+        super::part_keys::ContentCheck::of(plan, &*dest).as_ref(),
         &mut stats,
     )?;
 
@@ -764,14 +781,20 @@ fn present_basenames(dest: &dyn Destination) -> Option<Listed> {
     }
 }
 
-/// Rehydrate this run's committed parts (probed when `present` is known) and re-export every chunk whose part is gone or unlogged.
+/// Rehydrate this run's committed parts (probed when `present` is known, read back under `content`) and re-export every chunk whose part is gone, unlogged or not its chunk's.
 fn rehydrate_and_reset(
     state: &StateStore,
     run_id: &str,
     summary: &mut RunSummary,
     present: Option<&Listed>,
+    content: Option<&super::part_keys::ContentCheck<'_>>,
     stats: &mut M8Stats,
 ) -> Result<usize> {
+    let checked = match (present, content) {
+        (Some(p), Some(c)) => Some(c.keep_parts_of_their_chunk(state, run_id, p)?),
+        _ => None,
+    };
+    let present = checked.as_ref().or(present);
     let (rehydrated, missing) = rehydrate_manifest_parts_probed(state, run_id, summary, present)?;
     for (idx, name) in missing {
         let Some(idx) = idx else {
