@@ -86,8 +86,8 @@ pub struct TableIntrospection {
 }
 
 impl TableIntrospection {
-    /// The auto-selected keyset key: the first usable single-column unique
-    /// NOT NULL key (PK preferred). `None` when the table has none.
+    /// The auto-selected keyset key: the primary key's column, else the first
+    /// usable single-column unique NOT NULL key by name. `None` when the table has none.
     pub fn auto_keyset_key(&self) -> Option<&str> {
         self.keyset_keys.first().map(String::as_str)
     }
@@ -486,15 +486,18 @@ pub(crate) fn value_within_ceiling(
     Ok(())
 }
 
-/// The keyset keys among a table's single-column unique-index columns, given as (column, is the primary key): the primary key's column first, each column once.
+/// The keyset keys among a table's single-column unique-index columns, given as (column, is the primary key): the primary key's column first, then the rest by name, each column once; the catalog's return order never decides the key.
 pub(crate) fn keyset_keys_primary_first(columns: &[(String, bool)]) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     for primary in [true, false] {
-        for (col, is_primary) in columns {
-            if *is_primary == primary && !keys.contains(col) {
-                keys.push(col.clone());
-            }
-        }
+        let mut class: Vec<&String> = columns
+            .iter()
+            .filter(|(col, is_primary)| *is_primary == primary && !keys.contains(col))
+            .map(|(col, _)| col)
+            .collect();
+        class.sort();
+        class.dedup();
+        keys.extend(class.into_iter().cloned());
     }
     keys
 }
@@ -512,6 +515,17 @@ mod keyset_key_order_tests {
         assert_eq!(keys(&[("email", false), ("id", true)]), ["id", "email"]);
         assert_eq!(keys(&[("id", true), ("email", false)]), ["id", "email"]);
         assert_eq!(keys(&[("a", false), ("b", false)]), ["a", "b"]);
+        assert_eq!(
+            keys(&[("id", false), ("ext_id", false)]),
+            keys(&[("ext_id", false), ("id", false)]),
+            "the catalog's return order never decides the key"
+        );
+        assert_eq!(keys(&[("id", false), ("ext_id", false)]), ["ext_id", "id"]);
+        assert_eq!(
+            keys(&[("b", true), ("a", true), ("z", false)]),
+            ["a", "b", "z"],
+            "each class is ordered by name"
+        );
         assert_eq!(
             keys(&[("id", false), ("id", true), ("id", false)]),
             ["id"],
