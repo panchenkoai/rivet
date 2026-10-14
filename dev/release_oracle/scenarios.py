@@ -49,7 +49,7 @@ from pathlib import Path
 from tempfile import mkdtemp
 
 try:  # importable both as a package module and as a plain sibling file
-    from .core import (HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, SKIP_ALLOWED, self_skipped, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
+    from .core import (GREEN_CELLS, HERE, RAN_LIVE_MODULES, RAN_LIVE_TESTS, ROOT, SKIP_ALLOWED, self_skipped, Ledger, Proc, Status, container_for_port, docker, docker_exec, have,
                        nextest_filter, nextest_outcomes, nextest_panics, nextest_passed, nextest_started, port_of, release_bin_env,
                        rivet, rivet_bin, run, sqlcmd, test_passed)
     from ..pytools.duckcli import ARGV as DUCKDB
@@ -1995,6 +1995,7 @@ def _run_live_modules(led: Ledger, scenario: str, label: str, phase: str,
                         "core.SKIP_ALLOWED with a reason, or bring its infrastructure up", "vacuous skip")
         elif verdict in ("PASS", "LEAK"):
             led.cell_passed(name)
+            GREEN_CELLS.add(name)
             _passed(led, scenario, "batch", "-", "-", f"{label} · {name}{f' (run again with {again[0]})' if name in owed else ''}")
         else:
             why = panics.get(name, "no panic line read")
