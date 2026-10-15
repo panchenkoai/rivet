@@ -920,7 +920,11 @@ fn a_missing_base_refuses_the_compaction_and_keeps_the_buffer() {
 
     let (ok, said) = compact(&scn.rig, &[]);
     assert!(!ok, "a missing base must refuse the merge:\n{said}");
-    assert!(said.contains("the base table does not exist"), "{said}");
+    assert!(
+        said.contains("[RIVET_LOAD_COMPACT_BASE_MISSING]")
+            && said.contains("the base table does not exist"),
+        "refused by code, naming the cause: {said}"
+    );
     assert!(
         !said.contains("Not found: Table"),
         "rivet names the cause, it does not pass BigQuery's error through: {said}"
