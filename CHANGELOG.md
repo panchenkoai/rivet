@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A SQL Server password holding `@` reached the state database.** In the keyword/value URL form
+  (`sqlserver://host;user=sa;password=p@ss;…`) the `@` inside the password was read as the end of a
+  userinfo, so the source key rivet stores beside every cursor kept the password's tail (0.31.0 and
+  earlier). **Now** keyword passwords are masked before anything is cut from the URL. **What to do:**
+  if such a password was in use, the progress stored under the old key is not found and the next run
+  of an incremental export reads its table again; rotate that password, since the state database
+  held part of it.
+
 - **`rivet run` refused a MongoDB collection that does not exist without its code.** `rivet check`
   refused it `RIVET_SOURCE_COLLECTION_NOT_FOUND`; `rivet run` printed the same sentence with no
   `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`

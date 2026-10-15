@@ -1856,6 +1856,22 @@ seeds:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
       oracle:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
+  - name: source-key-keyword-password-at
+    class: "a credential scrubber that cuts at a separator the secret may contain: an `@` inside a keyword/value password reads as the end of a userinfo, and the password's tail lands in persisted state"
+    history: "2026-10-15 - found by the keyword-value credential guard when run_status first stored the source key: `password=p@<secret>` left `<secret>;encrypt=true` in the key, through 0.31.0; fixed by masking keyword passwords before the userinfo is cut"
+    scope: source
+    patch: source-key-keyword-password-at/shared.patch
+    engines:
+      postgres:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      mysql:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      mssql:
+        cells: [lib:a_keyword_password_holding_an_at_sign_stays_out_of_the_source_key]
+      mongo:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      oracle:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"
