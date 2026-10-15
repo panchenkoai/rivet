@@ -359,7 +359,7 @@ scenarios:
 
   - id: refusal_source_cdc_cell_unsupported
     what: "RIVET_SOURCE_CDC_CELL_UNSUPPORTED: a captured cell of a type the stream cannot carry"
-    postgres: { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    postgres: { test: a_cell_the_stream_cannot_carry_is_refused_by_code_postgres }
     mysql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mssql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
     mongo:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
