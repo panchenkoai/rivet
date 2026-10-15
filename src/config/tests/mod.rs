@@ -1,4 +1,5 @@
 mod azure;
+mod codes;
 mod compression;
 mod goldens;
 mod parse_helpers;

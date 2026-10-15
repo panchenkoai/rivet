@@ -29,6 +29,22 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` | usage | 1 | key the keyset on another unique column, or use `mode: full` for this table |
 | `RIVET_CONFIG_CURSOR_COLUMN_CASE` | usage | 1 | spell `cursor_column` exactly as the result set names the column |
 | `RIVET_CONFIG_COLUMN_OVERRIDE_CASE` | usage | 1 | spell the `columns:` key exactly as the result set names the column |
+| `RIVET_CONFIG_FILE_UNREADABLE` | environment | 2 if transient, else 1 | check the config path and its read permission, or run `rivet init` to generate one |
+| `RIVET_CONFIG_YAML_INVALID` | usage | 1 | fix the YAML syntax or the key the message names, moving it to where the message shows |
+| `RIVET_CONFIG_SOURCE_CONNECTION_INVALID` | usage | 1 | give `source:` exactly one connection method (`url_env`, `url`, `url_file` or complete host/user/database fields) and one password setting |
+| `RIVET_CONFIG_SECRET_UNSET` | environment | 2 if transient, else 1 | export the environment variable (or pass the `--param`) the message names, or make the named file readable |
+| `RIVET_CONFIG_EXPORT_SOURCE_INVALID` | usage | 1 | give the export exactly one of `query`, `query_file` (a relative path inside the config directory), `table` (`<name>` or `<schema>.<name>`) or `tables` |
+| `RIVET_CONFIG_MODE_SETTING_INVALID` | usage | 1 | add the setting the export's mode requires, or remove the setting the mode does not take, as the message names |
+| `RIVET_CONFIG_DESTINATION_AUTH_INVALID` | usage | 1 | configure one complete auth mode for the destination (keys, a credentials file, or `allow_anonymous`) and drop the others |
+| `RIVET_CONFIG_DESTINATION_ENDPOINT_UNSAFE` | usage | 1 | drop `endpoint:` to use the provider default, or point it at a loopback emulator with `allow_anonymous: true` |
+| `RIVET_CONFIG_VALUE_OUT_OF_RANGE` | usage | 1 | set the value in the range or form the message names, and set only one of two mutually exclusive sizing knobs |
+| `RIVET_CONFIG_CDC_SHAPE_INVALID` | usage | 1 | list each captured table once, in a shape this source and destination take, with at most one baseline per table |
+| `RIVET_CONFIG_CSV_COMPRESSION_UNSUPPORTED` | usage | 1 | use `format: parquet` for compression, or set `compression: none` / `compression_profile: none` |
+| `RIVET_CONFIG_TLS_VERIFICATION_DOWNGRADE` | usage | 1 | drop the danger knob and trust a private CA with `tls.ca_file`, or omit the explicit `mode:` for a loopback dev container |
+| `RIVET_CONFIG_LOAD_BLOCK_INVALID` | usage | 1 | declare the warehouse in a top-level `load:` block and override only what the export and target take |
+| `RIVET_CONFIG_PATH_UNSAFE` | usage | 1 | use a plain name and a bucket-relative path: no `/`, `\`, `..`, NUL, leading `.` or URI scheme |
+| `RIVET_CONFIG_ROW_HASH_INVALID` | usage | 1 | list each column of one table once under `meta_columns.row_hash`, or use `row_hash: true` |
+| `RIVET_CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN` | usage | 1 | use a bare column key, or qualify it with a table this export captures |
 | `RIVET_TYPE_UNSAFE_MAPPING` | usage | 1 | add a `columns:` override the engine delivers exactly, CAST or drop the column in the export's `query:`, or run without `--strict` to accept it with a warning |
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
