@@ -330,9 +330,50 @@ def tuple_mismatches(ora, source: str, dest: str) -> tuple[int, list[str]]:
     return n, missing
 
 
+def mongo_id_json(v: object) -> str:
+    """One `_id` as canonical extended JSON, an int64 folded to its integer (a relaxed `document` cannot tell int32 from int64)."""
+    from bson import json_util
+    from bson.int64 import Int64
+
+    return json_util.dumps(int(v) if isinstance(v, Int64) else v, json_options=json_util.CANONICAL_JSON_OPTIONS)
+
+
+def mongo_delivered_id(document_id: str, id_column: str) -> str:
+    """The delivered `document._id` in `mongo_id_json` form, or a JSON marker naming both when rivet's `_id` column does not show that value."""
+    from bson import ObjectId, json_util
+
+    v = json_util.loads(document_id)
+    shown = v if isinstance(v, str) else str(v) if isinstance(v, (ObjectId, int)) and not isinstance(v, bool) else None
+    if shown is not None and shown != id_column:
+        return json.dumps({"_id column": id_column, "document._id": mongo_id_json(v)})
+    return mongo_id_json(v)
+
+
+def mongo_mixed_id_source(ora, url: str, database: str, collection: str) -> str | None:
+    """When `collection`'s `_id` holds more than one BSON type (the scanner casts each `_id` to the type it sampled: 'zzz' reads as 0), every `_id` read by pymongo as a `JSON` relation in `mongo_id_json` form; else None."""
+    import pyarrow as pa
+    import pymongo
+
+    with pymongo.MongoClient(url, serverSelectionTimeoutMS=5000) as client:
+        coll = client[database][collection]
+        first = list(coll.aggregate([{"$sort": {"_id": 1}}, {"$limit": 1}, {"$project": {"t": {"$type": "$_id"}}}]))
+        if not first or coll.find_one({"_id": {"$not": {"$type": first[0]["t"]}}}, {"_id": 1}) is None:
+            return None
+        ids = [mongo_id_json(d["_id"]) for d in coll.find({}, {"_id": 1})]
+    ora.db.register("mongo_mixed_ids", pa.table({"_id": pa.array(ids, pa.string())}))
+    return '(SELECT CAST("_id" AS JSON) AS "_id" FROM mongo_mixed_ids)'
+
+
 def mongo_document_columns(ora, source: str, dest: str) -> str:
-    """`dest` (rivet's `_id` + extended-JSON `document`) unpacked into the source's columns and types, so `tuple_mismatches` can compare them."""
+    """`dest` (rivet's `_id` + extended-JSON `document`) unpacked into the source's columns and types, so `tuple_mismatches` can compare them; a `JSON` source `_id` (`mongo_mixed_id_source`) is compared as the document's `_id` in the same form."""
+    import pyarrow as pa
+
     cols = ora.db.sql(f"DESCRIBE SELECT * FROM {source}").fetchall()
+    if [(n, t) for n, t, *_ in cols] == [("_id", "JSON")]:
+        got = ora.db.sql(f"""SELECT CAST(document->'_id' AS VARCHAR), "_id" FROM {dest}""").fetchall()
+        ids = [None if d is None else mongo_delivered_id(d, i) for d, i in got]
+        ora.db.register("mongo_delivered_ids", pa.table({"_id": pa.array(ids, pa.string())}))
+        return '(SELECT CAST("_id" AS JSON) AS "_id" FROM mongo_delivered_ids)'
     proj = []
     for name, typ, *_ in cols:
         if name == "_id":

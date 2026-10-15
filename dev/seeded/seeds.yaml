@@ -17,6 +17,25 @@
 
 seeds:
 
+  - name: keyset-anchor-kept-without-a-part
+    class: a keyset run that stops before its first part keeps its resume anchor, so the run of another mode the refusal names as the remedy is refused as continuing an interrupted run
+    history: "Sweep 14, 2026-10-12: a resumed MongoDB keyset run refused for a mixed-type `_id` left its claim on the cursor row; removing `page_size` (the remedy it names) was refused RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH, exit 5 (v0.31.0)"
+    scope: source
+    patch: keyset-anchor-kept-without-a-part/shared.patch
+    engines:
+      mongo:
+        cells:
+          - removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo
+          - roast_resume_must_not_bypass_heterogeneous_id_guard
+          - "lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"
+      postgres:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
+      mysql:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
+      mssql:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
+      oracle:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
   - name: oracle-cdc-log-gap-uncoded
     class: an Oracle CDC data-loss refusal (the retained redo no longer reaches the checkpoint) stops as a plain error with no RIVET_* code and exit 1, so a scheduler retries it as transient
     history: found 2026-10-14 by the log-gap walk cell on the Mac stand (cycle 1 ended with no RIVET_* code, exit 1), on main through 0.31.0
@@ -2462,3 +2481,30 @@ seeds:
         na: "a MongoDB change row is two text cells, and the MySQL cell fix does not run"
       oracle:
         na: "Oracle has no TIME type, and the MySQL cell fix does not run"
+  - name: empty-table-under-chunk-by-days
+    class: "a planner probe reads an empty result (no row, so min and max are NULL) as an unreadable bound, so an empty table under `chunk_by_days` stops the run instead of exporting zero rows"
+    history: "2026-10-15 - found while coding the src/pipeline error sites: the date planner stopped on `min(...) returned NULL — table may be empty` since date-native chunking (0.2.0-beta.3) through 0.31.0 (by source), exit 5 `RIVET_SOURCE_PROBE_UNREADABLE` once coded, while the same empty table range-chunked on its id exported zero rows with exit 0; fixed by `read_key_span`, the one span reader both chunk planners call"
+    scope: source
+    patch: empty-table-under-chunk-by-days/shared.patch
+    engines:
+      postgres:
+        cells: [stand_empty_table_under_chunk_by_days_postgres]
+      mysql:
+        cells: [stand_empty_table_under_chunk_by_days_mysql]
+      mssql:
+        cells: [stand_empty_table_under_chunk_by_days_mssql]
+      mongo:
+        na: "a Mongo export has no `mode: chunked`"
+      oracle:
+        cells: [stand_empty_table_under_chunk_by_days_oracle]
+
+  - name: load-refusal-not-journaled
+    class: a `rivet load` stop raised before any warehouse write but outside the typed refusal seam reaches the ledger as something other than `refused` (no row, or `failed`), and a state-DB fault wears the missing-spec refusal code
+    history: "found 2026-10-15 while coding the last error sites (#594): a split prefix holding two generations stopped with RIVET_LOAD_SPLIT_GENERATIONS_MIXED and left no load_run row; load_type_reports folded a failed state read into RIVET_LOAD_SPEC_MISSING"
+    scope: state
+    patch: load-refusal-not-journaled/shared.patch
+    engines:
+      sqlite-state:
+        cells: ["lib:a_mixed_split_generation_is_journaled_refused_and_refuses_again", "lib:a_missing_spec_and_an_unreadable_spec_store_are_two_codes"]
+      postgres-state:
+        cells: ["lib:pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"]

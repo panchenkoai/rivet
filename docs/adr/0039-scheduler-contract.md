@@ -258,6 +258,8 @@ A batch export is one task that plans and applies its sealed plan, so a retry re
 
 Orchestration and alerting integrations, including the operators for `load` and `compact`, are open source and live in this repository as a Python package with its own manifest, lock, version line and release tag prefix, published to PyPI as **`airflow-provider-rivet`**. See the amendment in ADR-0026. Two formatters of a notification, one in Rust and one in Python, are pinned by a shared fixture; *rejected: a `rivet notify` subcommand*, because a scheduler's callback may run where the binary is not installed.
 
+*Amended 2026-10-15:* the package moved out of this repository to [`panchenkoai/airflow-provider-rivet`](https://github.com/panchenkoai/airflow-provider-rivet), so the Rust repository does not publish to PyPI. The contract fixtures stay here (`tests/fixtures/scheduler/`); the provider's CI reads them from a pinned rivet checkout (`RIVET_CONTRACT_REF`).
+
 ---
 
 ## Compatibility

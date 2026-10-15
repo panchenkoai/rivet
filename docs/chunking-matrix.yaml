@@ -121,6 +121,14 @@ scenarios:
     mongo:    { na: "no date-window chunking on Mongo" }
     oracle:   { test: chunk_by_days_over_a_region_named_tstz_reads_every_row }
 
+  - id: chunk_by_days_empty_table
+    what: "chunk_by_days over an empty table: exit 0, zero rows, the same _SUCCESS / manifest / journal / file log as the empty table range-chunked on its id"
+    postgres: { test: stand_empty_table_under_chunk_by_days_postgres }
+    mysql:    { test: stand_empty_table_under_chunk_by_days_mysql }
+    mssql:    { test: stand_empty_table_under_chunk_by_days_mssql }
+    mongo:    { na: "no date-window chunking on Mongo" }
+    oracle:   { test: stand_empty_table_under_chunk_by_days_oracle }
+
   - id: snapshot_full
     what: "mode: full — one bounded cursor, one file, re-read each run"
     postgres: { test: full_mode_repeated_run_accumulates_manifest_entries }

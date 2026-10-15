@@ -248,7 +248,7 @@ pub fn rejoin_refusal(said: String) -> String {
 }
 
 /// Every file under `dir`, recursively.
-fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     for e in std::fs::read_dir(dir)
         .expect("read the directory")
