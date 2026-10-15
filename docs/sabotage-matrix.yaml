@@ -352,7 +352,7 @@ scenarios:
   - id: refusal_source_cdc_undecodable
     what: "RIVET_SOURCE_CDC_UNDECODABLE: a change the stream cannot decode"
     postgres: { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
-    mysql:    { gap: "asserted by its code, once, in live_cdc and live_cdc_oracledb; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { test: a_nameless_backlog_is_refused_by_code_mysql }
     mssql:    { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
     mongo:    { na: "raised only by the MySQL (binlog_row_metadata=MINIMAL) and Oracle (a change older than an ALTER) streams; the shared sink site needs an image without names, which no production stream builds" }
     oracle:   { test: a_change_older_than_an_alter_is_refused_by_code_oracle }

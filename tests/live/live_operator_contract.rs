@@ -2500,6 +2500,43 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
     );
 }
 
+/// MySQL: rows logged while the server had `binlog_row_metadata = MINIMAL` and reordered since cannot be named: refused as `RIVET_SOURCE_CDC_UNDECODABLE` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; with the server back on FULL the re-baseline recipe as printed delivers the source.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+fn a_nameless_backlog_is_refused_by_code_mysql() {
+    use mysql::prelude::Queryable as _;
+    let _serial = quiet_window_guard();
+    let (root_url, mut c, t) = crate::live_cdc::row_metadata_fixture("oc_nameless");
+    let table = t.1.clone();
+    let _meta = crate::live_cdc::RowMetadata::set(&root_url, "FULL");
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    let mut rig = Rig::mysql_cdc(&table)
+        .source_url(&root_url)
+        .cdc("initial: snapshot");
+    rig.run_ok();
+    c.query_drop("SET GLOBAL binlog_row_metadata=MINIMAL")
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {table} VALUES (2,'CCC','DDD')"))
+        .unwrap();
+    c.query_drop("SET GLOBAL binlog_row_metadata=FULL").unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+    c.query_drop(format!("INSERT INTO {table} VALUES (3,'EEE','FFF')"))
+        .unwrap();
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_UNDECODABLE", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
+}
+
 /// A source value the output type cannot hold is refused as `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5) on every run of a batch export; emptying the destination changes nothing; each remedy the text names (map the value in the export's `query:`, exclude the column) delivers the source.
 fn an_unrepresentable_value_is_refused_by_code(e: SqlEngine) {
     e.alive();
