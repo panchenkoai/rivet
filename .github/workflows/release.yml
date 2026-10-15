@@ -198,6 +198,10 @@ jobs:
         id: notes
         run: |
           set -euo pipefail
+          if ls changelog.d/*.md 2>/dev/null | grep -v '/README.md$' | grep -q .; then
+            echo "::error::changelog.d/ still holds fragments: run \`python3 dev/pytools/changelog.py assemble\` and commit before tagging."
+            exit 1
+          fi
           VERSION="${RELEASE_TAG#v}"
           awk -v ver="$VERSION" '
             $0 ~ "^## " ver " "    { found = 1; next }

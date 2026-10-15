@@ -121,6 +121,16 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
          WHERE c.TABLE_SCHEMA = N'{schema_lit}' AND c.TABLE_NAME = N'{table_lit}'",
     );
 
+    // The capture instance CDC already reads, newest first; none when CDC is off or the `cdc` schema is absent.
+    let cdc_capture_instance = conn
+        .query_scalar(&format!(
+            "SELECT TOP 1 capture_instance FROM cdc.change_tables \
+             WHERE source_object_id = OBJECT_ID(QUOTENAME(N'{schema_lit}') + N'.' + QUOTENAME(N'{table_lit}')) \
+             ORDER BY create_date DESC, capture_instance"
+        ))
+        .ok()
+        .flatten();
+
     let agg = conn.query_scalar(&columns_sql)?;
     let columns: Vec<ColumnInfo> = agg.as_deref().map(parse_columns_agg).unwrap_or_default();
 
@@ -132,6 +142,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
     }
 
     Ok(TableInfo {
+        cdc_capture_instance,
         density: None,
         schema: schema.to_string(),
         table: table.to_string(),

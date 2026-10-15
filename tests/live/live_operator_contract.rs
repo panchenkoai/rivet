@@ -3264,8 +3264,8 @@ fn the_config_init_writes_runs_cdc_mysql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql (CDC); open defect (init derives the capture instance), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_init_cdc_writes_the_capture_instance_the_catalog_holds_mssql() {
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn init_cdc_writes_the_capture_instance_the_catalog_holds_mssql() {
     let _serial = cross_process_serial("mssql_cdc");
     let table = unique_name("oc_initc");
     let ci = format!("ci_{table}");
