@@ -198,7 +198,8 @@ pub(crate) fn probe_and_synthesize(
         let probe =
             crate::sql::null_key_probe_sql(config.source.source_type, &key, &plan.base_query);
         if src.as_mut().query_scalar(&probe)?.is_some() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::PLAN_CHUNK_KEY_NULL,
                 "export '{}': `--pool --split` over chunk_column '{}' would SILENTLY DROP \
                  NULL-keyed rows — each range sub-export's window excludes NULL, and unlike the \
                  un-split path (which bails) the split has no way to carry them. Fix one of: use a NOT NULL column; add `WHERE {} IS NOT NULL` \
@@ -469,11 +470,14 @@ pub(crate) fn reconstruct_units_from_prefix(
     // finding-2 silent gap, resurrected by one transient cloud error
     // (round-5 lifecycle). Refuse loudly; a resume can be retried.
     let manifests = try_read_unit_manifests(dest_config, family).map_err(|e| {
-        anyhow::anyhow!(
-            "apply --pool --split --resume: cannot LIST the split prefix to reconstruct \
+        crate::error::coded(
+            crate::error::codes::DEST_PREFIX_UNLISTABLE,
+            format!(
+                "apply --pool --split --resume: cannot LIST the split prefix to reconstruct \
              the prior partition ({e:#}) — refusing to re-sample fresh boundaries over an \
              unreadable prefix (that is how a resume silently gaps). Retry when the \
              destination is reachable."
+            ),
         )
     })?;
     Ok(reconstruct_units_from_manifests(manifests, giant))
@@ -636,6 +640,32 @@ fn forget_stale_unit_checkpoints(
 }
 
 /// Replace the dominating `giant` in `effective` with its range units; `None` when it is not splittable.
+/// The refusal of a split export whose destination holds the run-varying placeholder `token`.
+fn unstable_split_prefix(export: &str, token: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::CONFIG_SPLIT_PREFIX_UNSTABLE,
+        format!(
+            "apply --pool --split: export '{export}' writes to a destination with the \
+             run-varying placeholder {token} — a split resume reconstructs its \
+             partition FROM the prefix, so the prefix must be one stable location \
+             across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
+             which are stable) for the split export."
+        ),
+    )
+}
+
+/// The refusal of a user export named like `clash`, a split unit `giant` would synthesize.
+fn reserved_unit_name(clash: &str, giant: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::CONFIG_EXPORT_NAME_RESERVED,
+        format!(
+            "apply --pool --split: the synthesized split unit '{clash}' collides \
+             with an existing export of the same name. Rename that export — a \
+             name of the form '{giant}#<n>' is reserved for split unit names."
+        ),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn realize(
     giant: &str,
@@ -665,14 +695,7 @@ pub(crate) fn realize(
     // the giant and leaves yesterday's markers wedged). Refuse now,
     // before any unit exists (round-5).
     if let Some(token) = split_unsafe_placeholder(&base.destination) {
-        anyhow::bail!(
-            "apply --pool --split: export '{}' writes to a destination with the \
-             run-varying placeholder {token} — a split resume reconstructs its \
-             partition FROM the prefix, so the prefix must be one stable location \
-             across runs. Use a placeholder-free prefix (or {{export}}/{{table}}, \
-             which are stable) for the split export.",
-            base.name
-        );
+        return Err(unstable_split_prefix(&base.name, token));
     }
     let reconstructed = match resume {
         true => reconstruct_units_from_prefix(&base.destination, &base.family(), &base)?,
@@ -743,11 +766,7 @@ pub(crate) fn realize(
             // silently DROPS the pre-existing export's whole table (convergence round-2
             // LOW — `#` is not reserved in export-name validation). Refuse loudly.
             if let Some(clash) = first_name_collision(&units, effective) {
-                anyhow::bail!(
-                    "apply --pool --split: the synthesized split unit '{clash}' collides \
-                     with an existing export of the same name. Rename that export — a \
-                     name of the form '{giant}#<n>' is reserved for split unit names."
-                );
+                return Err(reserved_unit_name(clash, giant));
             }
             effective.extend(units);
             // `items` is rebuilt by the single post-split
@@ -1760,5 +1779,35 @@ mod tests {
         assert!(source_type_supports_split(SourceType::Postgres));
         assert!(source_type_supports_split(SourceType::Mysql));
         assert!(source_type_supports_split(SourceType::Mssql));
+    }
+
+    #[test]
+    fn the_split_refusals_carry_their_codes() {
+        let err = unstable_split_prefix("orders", "{date}");
+        crate::error::assert_coded(&err, "RIVET_CONFIG_SPLIT_PREFIX_UNSTABLE", 1);
+        assert!(format!("{err}").contains("placeholder {date}"), "{err}");
+        let err = reserved_unit_name("orders#1", "orders");
+        crate::error::assert_coded(&err, "RIVET_CONFIG_EXPORT_NAME_RESERVED", 1);
+        assert!(format!("{err}").contains("'orders#<n>'"), "{err}");
+    }
+
+    /// A resume whose prefix cannot be listed (an unreadable directory) refuses by code.
+    #[cfg(unix)]
+    #[test]
+    fn an_unlistable_split_prefix_refuses_the_resume_by_code() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("prefix");
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let dest = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(prefix.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let result = reconstruct_units_from_prefix(&dest, "orders", &sample_export("orders"));
+        std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = result.unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_PREFIX_UNLISTABLE", 1);
     }
 }

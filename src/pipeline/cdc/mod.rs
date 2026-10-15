@@ -111,10 +111,13 @@ pub(crate) fn run_capture(
         RowImage::Partial { why } => {
             return (
                 Vec::new(),
-                Err(anyhow::anyhow!(
-                    "{} cdc: {why}. Capturing under this setting would report success over \
+                Err(crate::error::coded(
+                    crate::error::codes::SOURCE_CDC_PREREQUISITE,
+                    format!(
+                        "{} cdc: {why}. Capturing under this setting would report success over \
                      events that cannot represent the row.",
-                    engine.label()
+                        engine.label()
+                    ),
                 )),
             );
         }
@@ -157,12 +160,14 @@ pub(crate) fn run_capture(
                 Some(missing) => {
                     return (
                         Vec::new(),
-                        Err(anyhow::anyhow!(
-                            "export '{}' table '{}': `load.pk` names `{missing}`, which the table \
+                        Err(crate::error::coded(
+                            crate::error::codes::LOAD_KEY_COLUMN_INVALID,
+                            format!(
+                                "export '{}' table '{}': `load.pk` names `{missing}`, which the table \
                              does not have, so rivet cannot tell an UPDATE that changes the key \
                              from one that does not. Fix `pk:` in the `load:` block.",
-                            cap.export_name,
-                            o.table
+                                cap.export_name, o.table
+                            ),
                         )),
                     );
                 }

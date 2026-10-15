@@ -72,14 +72,7 @@ pub(super) fn run_exports_as_child_processes(
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            return (
-                Err(anyhow::anyhow!(
-                    "failed to resolve rivet executable for child processes: {:#}",
-                    e
-                )),
-                HashMap::new(),
-                String::new(),
-            );
+            return (Err(executable_unresolved(e)), HashMap::new(), String::new());
         }
     };
 
@@ -491,6 +484,17 @@ pub(super) fn representative_error(
     ))
 }
 
+/// The failure of a parent that cannot name its own binary to spawn children from.
+fn executable_unresolved(e: std::io::Error) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::CLI_EXECUTABLE_UNRESOLVED,
+        format!(
+            "failed to resolve rivet executable for child processes: {:#}",
+            e
+        ),
+    )
+}
+
 /// Build the parent's final result from the children's outcomes. When any child
 /// exited with a CLASSIFIED non-generic code, the aggregate error carries a
 /// [`crate::error::PreclassifiedExit`] so `classify_exit` re-derives that SAME
@@ -504,7 +508,10 @@ fn aggregate_child_result(failures: &[String], child_exit_codes: &[i32]) -> anyh
     let msg = failures.join("; ");
     match worst_exit_code(child_exit_codes) {
         Some(code) => Err(anyhow::Error::from(crate::error::PreclassifiedExit(code)).context(msg)),
-        None => Err(anyhow::anyhow!("{}", msg)),
+        None => Err(crate::error::coded(
+            crate::error::codes::RUN_UNITS_FAILED,
+            msg.to_string(),
+        )),
     }
 }
 
@@ -1003,5 +1010,15 @@ mod representative_tests {
             banner.contains("more child failure(s)"),
             "names the tail: {banner}"
         );
+    }
+
+    #[test]
+    fn unclassified_child_failures_and_an_unresolved_executable_carry_their_codes() {
+        use crate::pipeline::parallel_children::{aggregate_child_result, executable_unresolved};
+        let err = aggregate_child_result(&["orders: boom".to_string()], &[]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_RUN_UNITS_FAILED", 1);
+        assert_eq!(format!("{err}"), "orders: boom");
+        let err = executable_unresolved(std::io::Error::other("no such file"));
+        crate::error::assert_coded(&err, "RIVET_CLI_EXECUTABLE_UNRESOLVED", 1);
     }
 }

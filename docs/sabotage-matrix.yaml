@@ -1029,6 +1029,54 @@ scenarios:
     mongo:    { test: a_resume_export_whose_destination_path_is_edited_is_refused_and_walked_out_mongo }
     oracle:   { test: an_incremental_export_whose_destination_path_is_edited_is_refused_and_walked_out_oracle }
 
+  - id: refusal_plan_artifact_stale
+    what: "RIVET_PLAN_ARTIFACT_STALE: a plan artifact older than 24 h, or whose cursor snapshot the state no longer matches, applied without `--force`"
+    postgres: { gap: "asserted by its code offline (apply_cmd: stale_error_without_force_is_rejected, cursor_drift_detected_no_prior_state); the walk needs a plan cell: refuse twice, `rivet plan` again, and `--force` as the second remedy" }
+    mysql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_plan_chunk_key_null
+    what: "RIVET_PLAN_CHUNK_KEY_NULL: a range or date `chunk_column` with NULL values (also a `--pool --split` key), which every window's predicate would drop"
+    postgres: { gap: "asserted by its code offline (detect: null_keyed_rows_in_integer_range_bail_not_silently_dropped); the walk needs a chunked cell with a NULL key: refuse twice, a NOT NULL column, a `WHERE col IS NOT NULL` query, `mode: full`, and one wrong remedy" }
+    mysql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "a document store has no `chunk_column`: a collection is read whole or by `_id` ranges" }
+    oracle:   { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_source_keyset_key_coarse
+    what: "RIVET_SOURCE_KEYSET_KEY_COARSE: a keyset page that ends on the key value it started after (a TIMESTAMP(7..9) key read at microseconds)"
+    postgres: { gap: "asserted by its code offline (keyset: a_coarse_key_an_unreadable_key_and_gone_pages_are_refused_by_code); the walk needs a keyset cell on a sub-microsecond key: refuse twice, a cast in a curated query, a unique integer key, and one wrong remedy" }
+    mysql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "MongoDB pages by `_id` in its own reader; `next_seek` is the SQL keyset's" }
+    oracle:   { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_state_chunk_run_unfinished
+    what: "RIVET_STATE_CHUNK_RUN_UNFINISHED: a plain run that meets an unfinished chunk checkpoint run of its export"
+    postgres: { gap: "asserted by its code offline (chunked: an_unfinished_chunk_run_is_refused_by_code_raced_or_not); the walk needs a chunked cell crashed mid-run: refuse twice, `--resume`, `rivet state reset-chunks`, and one wrong remedy" }
+    mysql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "a document store has no `chunk_column`: a collection is read whole or by `_id` ranges" }
+    oracle:   { na: "the refusal is the planner's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_dest_committed_part_gone
+    what: "RIVET_DEST_COMMITTED_PART_GONE: a part a checkpoint committed is gone from the destination when the run resumes"
+    postgres: { gap: "asserted by its code offline (resume_m8: a_committed_part_gone_without_a_chunk_index_is_refused_by_code; keyset: a_coarse_key_an_unreadable_key_and_gone_pages_are_refused_by_code); the walk needs a resume cell with a committed part deleted between attempts: refuse twice, `rivet state reset` / `reset-chunks`, a fresh prefix, and one wrong remedy" }
+    mysql:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_dest_control_artifact_invalid
+    what: "RIVET_DEST_CONTROL_ARTIFACT_INVALID: a manifest at the prefix that does not parse, or is larger than the control-artifact read cap"
+    postgres: { gap: "asserted by its code offline (validate_manifest: read_capped_boundary_is_exact; repair_cmd: a_missing_or_invalid_report_and_a_prefix_without_a_manifest_are_refused_by_code); the walk needs a cell with a damaged manifest.json: refuse twice, restore it, remove it, and one wrong remedy" }
+    mysql:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
+
   - id: edit_destination_path_cursor_stored_before_destinations_were_recorded
     what: "a cursor (incremental; MongoDB `resume`) whose row holds no destination (`export_state.destination` NULL, as rivet 0.31 and earlier wrote it): a run with the config unchanged continues and records where it delivers, and a destination moved after that is refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH)"
     postgres: { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres }

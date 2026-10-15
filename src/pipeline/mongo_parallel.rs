@@ -35,11 +35,11 @@ pub(crate) fn run_mongo_parallel(
     let parallel = kp.parallel.max(1);
     let url = plan.source.resolve_url()?;
     let collection = crate::sql::strip_select_star_from(&plan.base_query).ok_or_else(|| {
-        anyhow::anyhow!(
+        crate::error::coded(crate::error::codes::CONFIG_MODE_SETTING_INVALID, format!(
             "export '{}': parallel `_id`-range reads need a `table:` shortcut (a bare collection), \
              not a hand-written `query:`.",
             plan.export_name
-        )
+        ))
     })?;
 
     // Boundaries: a short-lived probe connection computes the ranges, then drops
@@ -99,11 +99,14 @@ pub(crate) fn run_mongo_parallel(
             other => unreachable!("mongo parts are recorded under a chunk unit, not {other:?}"),
         },
         |errs| {
-            anyhow::anyhow!(
-                "export '{}': parallel mongo failed on {} range(s): {}",
-                plan.export_name,
-                errs.len(),
-                errs.join("; ")
+            crate::error::coded(
+                crate::error::codes::RUN_UNITS_FAILED,
+                format!(
+                    "export '{}': parallel mongo failed on {} range(s): {}",
+                    plan.export_name,
+                    errs.len(),
+                    errs.join("; ")
+                ),
             )
         },
     );
@@ -150,7 +153,11 @@ fn range_worker_pages(
         if let Err(e) =
             crate::test_hook::maybe_error_at_index("mongo_parallel_worker", worker as i64)
         {
-            anyhow::bail!("range {worker}: {e}");
+            return Err(crate::error::recoded(
+                &e,
+                crate::error::codes::CLI_TEST_FAULT_INJECTED,
+                format!("range {worker}: {e}"),
+            ));
         }
         // run-unique (stamp) + worker-unique (w{worker}) + page-unique.
         let base = format!(

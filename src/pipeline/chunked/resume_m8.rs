@@ -782,6 +782,20 @@ fn present_basenames(dest: &dyn Destination) -> Option<Listed> {
 }
 
 /// Rehydrate this run's committed parts (probed when `present` is known, read back under `content`) and re-export every chunk whose part is gone, unlogged or not its chunk's.
+/// The refusal of a resume whose committed part `name` is gone from the destination and carries no chunk index to re-export.
+fn committed_part_gone(name: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::DEST_COMMITTED_PART_GONE,
+        format!(
+            "resume: committed part '{name}' is GONE from the \
+             destination and carries no chunk index to re-export — \
+             refusing to finalize a manifest naming a deleted file. \
+             Re-run without the checkpoint (`rivet state reset-chunks`) \
+             or into a fresh prefix."
+        ),
+    )
+}
+
 fn rehydrate_and_reset(
     state: &StateStore,
     run_id: &str,
@@ -798,13 +812,7 @@ fn rehydrate_and_reset(
     let (rehydrated, missing) = rehydrate_manifest_parts_probed(state, run_id, summary, present)?;
     for (idx, name) in missing {
         let Some(idx) = idx else {
-            anyhow::bail!(
-                "resume: committed part '{name}' is GONE from the \
-                 destination and carries no chunk index to re-export — \
-                 refusing to finalize a manifest naming a deleted file. \
-                 Re-run without the checkpoint (`rivet state reset-chunks`) \
-                 or into a fresh prefix."
-            );
+            return Err(committed_part_gone(&name));
         };
         let n = state.reset_chunk_task_for_re_export(
             run_id,
@@ -2488,5 +2496,16 @@ pub(crate) mod tests {
         assert_eq!(by_file["part-000001.parquet"].chunk_index, 0);
         assert_eq!(by_file["part-000003.parquet"].chunk_index, 2);
         assert!(!by_file.contains_key("part-000002.parquet"));
+    }
+
+    /// The gone-part refusal carries its code; the resume walk that reaches it is driven by the live suite.
+    #[test]
+    fn a_committed_part_gone_without_a_chunk_index_is_refused_by_code() {
+        let err = committed_part_gone("orders_chunk7.parquet");
+        crate::error::assert_coded(&err, "RIVET_DEST_COMMITTED_PART_GONE", 5);
+        assert!(
+            format!("{err}").contains("'orders_chunk7.parquet'"),
+            "{err}"
+        );
     }
 }

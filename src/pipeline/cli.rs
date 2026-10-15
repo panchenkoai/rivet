@@ -35,7 +35,8 @@ fn require_known_export(config: &Config, config_path: &str, export_name: &str) -
         return Ok(());
     }
     let known: Vec<&str> = config.exports.iter().map(|e| e.name.as_str()).collect();
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::CLI_EXPORT_UNKNOWN,
         "export '{}' is not defined in '{}'.\n  Known exports: {}",
         export_name,
         config_path,
@@ -235,7 +236,8 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
     let config = crate::config::Config::load(config_path)?;
     if !config.exports.iter().any(|e| e.name == export_name) {
         let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_EXPORT_UNKNOWN,
             "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state show -c {}` to see what is currently tracked.",
             export_name,
             config_path,
@@ -248,10 +250,14 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
         );
     }
     let source = config.source.try_state_key().map_err(|e| {
-        anyhow::anyhow!(
-            "export '{export_name}': `state reset` clears the progress this config's source \
+        crate::error::recoded(
+            &e,
+            crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
+            format!(
+                "export '{export_name}': `state reset` clears the progress this config's source \
              holds and no other source's, and the source did not resolve — nothing was \
              reset.\n  {e:#}"
+            ),
         )
     })?;
     let state = StateStore::open(config_path)?;
@@ -289,10 +295,14 @@ pub fn accept_state(
         return Ok(());
     }
     config.source.try_state_key().map_err(|e| {
-        anyhow::anyhow!(
-            "export '{export_name}': `state accept` re-binds the progress this config's source \
+        crate::error::recoded(
+            &e,
+            crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
+            format!(
+                "export '{export_name}': `state accept` re-binds the progress this config's source \
              holds and no other source's, and the source did not resolve — nothing was \
              changed.\n  {e:#}"
+            ),
         )
     })?;
     let config_dir = std::path::Path::new(config_path).parent();
@@ -488,7 +498,8 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
     let config = require_config(config_path)?;
     if !export_is_declared(&config, export_name) {
         let known: Vec<String> = config.exports.iter().map(|e| e.name.clone()).collect();
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_EXPORT_UNKNOWN,
             "export '{}' not found in config '{}'.\n  Known exports: {}\n  Hint: check the spelling, or run `rivet state chunks -c {} -e <name>` to inspect a checkpoint.",
             export_name,
             config_path,
@@ -674,7 +685,8 @@ pub fn show_journal(
     let journals = if let Some(rid) = run_id {
         match state.load_journal(rid)? {
             // The run_id must belong to `-e`, else `-e` was silently ignored.
-            Some(j) if j.export_name != export_name => anyhow::bail!(
+            Some(j) if j.export_name != export_name => crate::rivet_bail!(
+                crate::error::codes::CLI_RUN_ID_EXPORT_MISMATCH,
                 "run_id '{}' belongs to export '{}', not '{}' (the -e/--export you passed). \
                  Pass the matching -e, or omit --run-id to list '{}'s recent runs.",
                 rid,
@@ -1902,5 +1914,20 @@ exports:
         assert!(!export_is_declared(&cfg, "orders#x"));
         assert!(!export_is_declared(&cfg, "orders__2023-01-01"));
         assert!(!export_is_declared(&cfg, "events__"));
+    }
+
+    #[test]
+    fn an_unknown_export_and_a_foreign_run_id_are_refused_by_code() {
+        let (_dir, config_path) = setup_dir();
+        let config = require_config(&config_path).unwrap();
+        let err = require_known_export(&config, &config_path, "nope").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_EXPORT_UNKNOWN", 1);
+
+        let state = StateStore::open(&config_path).unwrap();
+        state
+            .store_journal(&RunJournal::new("orders_r1", "orders"))
+            .unwrap();
+        let err = show_journal(&config_path, "transactions", 5, Some("orders_r1")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_RUN_ID_EXPORT_MISMATCH", 1);
     }
 }

@@ -44,7 +44,8 @@ pub fn generate_chunks_checked(
 ) -> anyhow::Result<Vec<(i64, i64)>> {
     let expected = expected_chunk_count(min, max, chunk_size);
     if expected > MAX_CHUNK_WINDOWS {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::PLAN_CHUNK_KEY_SPARSE,
             "chunk plan would generate {expected} windows (key span {min}..={max} ÷ chunk_size \
              {chunk_size}), past the {MAX_CHUNK_WINDOWS}-window ceiling — the key is extremely \
              sparse. Raise chunk_size:, set an explicit chunk_count:, or use mode: full."
@@ -243,6 +244,7 @@ mod tests {
             msg.contains("chunk_count") || msg.contains("mode: full"),
             "names an escape hatch: {msg}"
         );
+        crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_SPARSE", 1);
         // The ceiling is exceeded by exactly one window past MAX_CHUNK_WINDOWS.
         let just_over = (MAX_CHUNK_WINDOWS as i64).saturating_mul(2);
         assert!(generate_chunks_checked(0, just_over, 1).is_err());

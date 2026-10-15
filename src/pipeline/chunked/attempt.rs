@@ -110,7 +110,12 @@ pub(super) fn run_with_retries<S, T>(
             Err(e) => return Err(e),
         }
     }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("chunk export failed after retries")))
+    Err(last_err.unwrap_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            "chunk export failed after retries",
+        )
+    }))
 }
 
 #[cfg(test)]

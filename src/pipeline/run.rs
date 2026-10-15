@@ -133,9 +133,12 @@ pub(crate) fn run_export_pool(
         },
         |state, _, export| Ok(run(export, state)),
         |export| {
-            let err = anyhow::anyhow!(
-                "export '{}' did not complete: its worker panicked or could not open the state database (the log above names which)",
-                export.name
+            let err = crate::error::coded(
+                crate::error::codes::RUN_UNITS_FAILED,
+                format!(
+                    "export '{}' did not complete: its worker panicked or could not open the state database (the log above names which)",
+                    export.name
+                ),
             );
             let summary = job::synthetic_failed_summary(&export.name, &err);
             Box::new((Err(err), summary))
@@ -2021,10 +2024,13 @@ pub(crate) fn run_pool(
                             )
                         }
                         Err(e) => {
-                            let err = anyhow::anyhow!(
-                                "export '{}': failed to open state database: {:#}",
-                                export.name,
-                                e
+                            let err = crate::error::recoded(
+                                &e,
+                                crate::error::codes::STATE_NOT_WRITABLE,
+                                format!(
+                                    "export '{}': failed to open state database: {:#}",
+                                    export.name, e
+                                ),
                             );
                             let summary = job::synthetic_failed_summary(&export.name, &err);
                             (Err(err), summary)

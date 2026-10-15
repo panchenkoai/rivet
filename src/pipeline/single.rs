@@ -143,7 +143,12 @@ pub(crate) fn run_with_reconnect(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("export failed after retries")))
+    Err(last_err.unwrap_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            "export failed after retries",
+        )
+    }))
 }
 
 /// Roll `summary` back to its state before the first attempt, keeping what spans

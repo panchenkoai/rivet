@@ -127,3 +127,39 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_INTERNAL_VALUE_CONVERTER` | internal | 6 | a value changed between the source and the written part — a bug; report it with the column's type |
 | `RIVET_INTERNAL_SPILL` | internal | 6 | the CDC spill log is inconsistent — a bug or a damaged spill directory; report it and re-run |
 | `RIVET_INTERNAL_TYPE_BUILDER` | internal | 6 | a column builder got a type it cannot build — a bug; report it with the column's type |
+| `RIVET_CLI_EXPORT_UNKNOWN` | usage | 1 | pass `--export` a name declared under `exports:` in this config |
+| `RIVET_CLI_RUN_ID_EXPORT_MISMATCH` | usage | 1 | pass the `--export` the run id belongs to, or omit `--run-id` |
+| `RIVET_CLI_OPTION_UNSUPPORTED` | usage | 1 | drop the option, or give the command the config, export or mode it takes, as the message names |
+| `RIVET_CLI_REPORT_INVALID` | usage | 1 | pass the report `rivet reconcile --report` wrote for this export |
+| `RIVET_CLI_OUTPUT_UNWRITABLE` | environment | 2 if transient, else 1 | check the output path and its directory's write permission |
+| `RIVET_CLI_INPUT_UNREADABLE` | environment | 2 if transient, else 1 | check the path passed to the command and its read permission |
+| `RIVET_CLI_EXECUTABLE_UNRESOLVED` | environment | 2 if transient, else 1 | run rivet from a binary the OS can resolve: not deleted, unmounted or replaced while it runs |
+| `RIVET_CLI_TEST_FAULT_INJECTED` | environment | 2 if transient, else 1 | unset `RIVET_TEST_ERROR_AT`; the fault is rivet's own test hook, not the source |
+| `RIVET_PLAN_NOTHING_TO_PLAN` | usage | 1 | run the CDC streams and backfill recipes with `rivet run`; `rivet plan` plans batch exports only |
+| `RIVET_PLAN_ARTIFACT_STALE` | refusal | 5 | regenerate the plan with `rivet plan`, or pass `--force` to apply it as it is |
+| `RIVET_PLAN_ARTIFACT_NO_CREDENTIALS` | usage | 1 | re-plan from a config that gives the source `url_env:` or `url_file:` |
+| `RIVET_PLAN_PARTITION_TOKEN_UNEXPANDED` | usage | 1 | run the config (`rivet apply <config.yaml>` or `rivet run`), or drop `{partition}` from the destination |
+| `RIVET_PLAN_REJECTED` | usage | 1 | fix the config so the rule the message names passes; `rivet check` reports the same rules |
+| `RIVET_PLAN_CHUNK_KEY_SPARSE` | usage | 1 | set an explicit `chunk_count:` (or a larger `chunk_size:`), page by `chunk_by_key:`, or use `mode: full` |
+| `RIVET_PLAN_CHUNK_KEY_NULL` | refusal | 5 | chunk on a NOT NULL column, drop the NULL rows with `WHERE <column> IS NOT NULL` in the query, or use `mode: full` |
+| `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER` | usage | 1 | use `chunk_by_key:` (keyset), an integer column, or `mode: full` |
+| `RIVET_CONFIG_SETTLE_COLUMN_NOT_TEMPORAL` | usage | 1 | point `settle.column` at a date or timestamp column, or omit it to settle on the cursor |
+| `RIVET_CONFIG_SPLIT_PREFIX_UNSTABLE` | usage | 1 | give the split export a destination without run-varying placeholders (`{export}` and `{table}` are stable) |
+| `RIVET_CONFIG_EXPORT_NAME_RESERVED` | usage | 1 | rename the export: `<name>#<n>` names are reserved for split units |
+| `RIVET_CONFIG_BATCH_MEMORY_EXCEEDED` | usage | 1 | lower `batch_size`, or set `on_batch_memory_exceeded: auto_shrink` |
+| `RIVET_CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH` | usage | 1 | set `table:` to the relation the capture instance emits, or point `capture_instance:` at the table you meant |
+| `RIVET_SOURCE_VALUE_TOO_LARGE` | usage | 1 | raise `tuning.max_value_mb`, or set it to 0 to disable the guard |
+| `RIVET_SOURCE_KEYSET_KEY_COARSE` | refusal | 5 | page on a unique key rivet reads exactly: an integer, text, uuid or date column, or a timestamp at microsecond precision or coarser (cast it in a curated query) |
+| `RIVET_STATE_CHUNK_RUN_MISSING` | usage | 1 | set `chunk_checkpoint: true` and run the export before `rivet reconcile` |
+| `RIVET_STATE_CHUNK_RUN_UNFINISHED` | refusal | 5 | `rivet run … --resume` continues the unfinished chunk run; `rivet state reset-chunks` abandons it |
+| `RIVET_DEST_MANIFEST_MISSING` | usage | 1 | finish the export (a complete run writes `manifest.json` at the prefix) before `rivet repair` |
+| `RIVET_DEST_MANIFEST_NOT_WRITTEN` | environment | 2 if transient, else 1 | restore write access to the destination prefix and run again; until a run completes, no manifest names the parts already there |
+| `RIVET_DEST_OBJECT_NOT_FOUND` | environment | 2 if transient, else 1 | run again: the object vanished between rivet's two reads of it; if it repeats, check what else writes to the prefix |
+| `RIVET_DEST_UPLOAD_CORRUPTED` | environment | 2 if transient, else 1 | run again: the part is uploaded afresh; if it repeats, check the network path and any proxy in front of the destination |
+| `RIVET_DEST_PREFIX_UNLISTABLE` | environment | 2 if transient, else 1 | restore list access to the destination prefix and retry the resume |
+| `RIVET_DEST_COMMITTED_PART_GONE` | refusal | 5 | `rivet state reset -c <config> --export <name>` (keyset) or `rivet state reset-chunks` (range chunks) so the range is re-read, or export into a fresh prefix |
+| `RIVET_DEST_CONTROL_ARTIFACT_INVALID` | refusal | 5 | inspect the manifest at the prefix: one rivet wrote parses and is small; restore or remove it, then run again |
+| `RIVET_DEST_PART_ROWS_MISMATCH` | integrity | 3 | stop and report it: a writer bug or a damaged disk; the part was not committed |
+| `RIVET_RUN_UNITS_FAILED` | environment | 2 if transient, else 1 | fix the first cause the message names and run again; a checkpointed run resumes from where it stopped |
+| `RIVET_RUN_RECONCILE_UNVERIFIED` | environment | 2 if transient, else 1 | run again to obtain the reconcile assurance, or drop `--reconcile`; the export completed |
+| `RIVET_INTERNAL_RUN_INVARIANT` | internal | 6 | a run invariant did not hold — a bug; report it with the message |

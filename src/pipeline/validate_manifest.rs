@@ -134,10 +134,14 @@ impl ValidateDepth {
 /// - otherwise: the full body via [`Destination::read`].
 pub(crate) fn read_capped(dest: &dyn Destination, key: &str, max_bytes: u64) -> Result<Vec<u8>> {
     match dest.head(key)? {
-        None => anyhow::bail!("'{key}' not found at the destination"),
+        None => crate::rivet_bail!(
+            crate::error::codes::DEST_OBJECT_NOT_FOUND,
+            "'{key}' not found at the destination"
+        ),
         Some(meta) => {
             if meta.size_bytes > max_bytes {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::DEST_CONTROL_ARTIFACT_INVALID,
                     "'{key}' is {} bytes, exceeding the {max_bytes}-byte control-artifact \
                      read cap — refusing to load it into memory (possible tampering)",
                     meta.size_bytes
@@ -1751,6 +1755,9 @@ mod tests {
             err.to_string().contains("read cap"),
             "actionable message: {err:#}"
         );
+        crate::error::assert_coded(&err, "RIVET_DEST_CONTROL_ARTIFACT_INVALID", 5);
+        let err = read_capped(&dest, "absent.bin", 8).expect_err("an absent object errors");
+        crate::error::assert_coded(&err, "RIVET_DEST_OBJECT_NOT_FOUND", 1);
     }
 
     #[test]

@@ -892,7 +892,8 @@ fn flush(
         // A PARTIAL image (MySQL `binlog_row_image` other than FULL when WRITTEN, a
         // session override included) names every column but carries only some values.
         if let Some((n, nnames)) = named_image_arity_mismatch(ev) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_PREREQUISITE,
                 "cdc: {}.{}: a row image carries {n} value(s) under {} column \
                      name(s) — a PARTIAL image, which rivet cannot map without \
                      fabricating the missing cells as NULL. On MySQL this is \

@@ -546,9 +546,13 @@ fn resolve_chunked_strategy(
         );
     }
     let url = config.source.resolve_url().map_err(|e| {
-        anyhow::anyhow!(
-            "export '{}': chunked mode needs the source URL for the introspection probe: {e}",
-            export.name
+        crate::error::recoded(
+            &e,
+            crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
+            format!(
+                "export '{}': chunked mode needs the source URL for the introspection probe: {e}",
+                export.name
+            ),
         )
     })?;
     let introspection_result = match probe {
@@ -2572,5 +2576,27 @@ mod tests {
         assert_eq!(planned.mode, ExportMode::Full);
         assert_eq!(planned.chunk_column.as_deref(), Some("stale"));
         assert_eq!(planned.chunk_size, 100_000);
+    }
+
+    /// Past the fast path the introspection probe needs the URL; the error it rebuilds keeps
+    /// the code `resolve_url` gave (the unset variable), not a code of its own.
+    #[test]
+    fn the_rebuilt_probe_url_error_keeps_the_resolve_url_code() {
+        let mut config = minimal_config();
+        config.source.url = None;
+        config.source.url_env = Some("RIVET_TEST_UNSET_SOURCE_URL_VAR".into());
+        let mut export = minimal_export();
+        export.mode = ExportMode::Chunked;
+        export.chunk_column = Some("id".into());
+        export.chunk_size_memory_mb = Some(256);
+        export.table = Some("orders".into());
+        let err =
+            build_plan(&config, &export, Path::new("."), false, false, false, None).unwrap_err();
+        assert!(
+            format!("{err}")
+                .contains("chunked mode needs the source URL for the introspection probe"),
+            "{err:#}"
+        );
+        crate::error::assert_coded(&err, "RIVET_CONFIG_SECRET_UNSET", 1);
     }
 }

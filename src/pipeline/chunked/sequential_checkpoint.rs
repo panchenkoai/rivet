@@ -201,12 +201,18 @@ pub(crate) fn run_chunked_sequential_checkpoint(
             std::thread::sleep(Duration::from_secs(5));
         }
 
-        let start: i64 = sk
-            .parse()
-            .map_err(|_| anyhow::anyhow!("chunk {}: invalid start_key {:?}", chunk_index, sk))?;
-        let end: i64 = ek
-            .parse()
-            .map_err(|_| anyhow::anyhow!("chunk {}: invalid end_key {:?}", chunk_index, ek))?;
+        let start: i64 = sk.parse().map_err(|_| {
+            crate::error::coded(
+                crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,
+                format!("chunk {}: invalid start_key {:?}", chunk_index, sk),
+            )
+        })?;
+        let end: i64 = ek.parse().map_err(|_| {
+            crate::error::coded(
+                crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,
+                format!("chunk {}: invalid end_key {:?}", chunk_index, ek),
+            )
+        })?;
 
         log::info!(
             "export '{}': checkpoint chunk {} ({}..{})",
@@ -231,7 +237,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
         // MID-write instead, after its earlier parts are durable.)
         let chunk_result = match crate::test_hook::maybe_error_at_index("chunk_export", chunk_index)
         {
-            Err(msg) => Err(anyhow::anyhow!(msg)),
+            Err(e) => Err(e),
             Ok(()) => {
                 let r = super::attempt::run_with_retries(
                     plan,
@@ -328,7 +334,8 @@ pub(crate) fn run_chunked_sequential_checkpoint(
 
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
     if pending > 0 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::RUN_UNITS_FAILED,
             "export '{}': chunk checkpoint incomplete ({} tasks not completed); fix errors and `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
             plan.export_name,
             pending,

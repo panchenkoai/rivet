@@ -49,34 +49,22 @@ fn refuse_annotate_scoped_to_export(annotate_waves: bool, has_export: bool) -> b
 ///
 /// Iterates over all matching exports, builds a `PlanArtifact` for each, and
 /// either prints or saves it according to `format`.
-pub fn run_plan_command(
-    config_path: &str,
+/// The exports `rivet plan` plans: `export_name` alone, or every batch export of the config.
+fn plannable_exports<'a>(
+    config: &'a Config,
     export_name: Option<&str>,
-    params: Option<&HashMap<String, String>>,
-    format: PlanOutputFormat,
-    annotate_waves: bool,
-) -> Result<()> {
-    // --annotate-waves packs a SCHEDULE across the whole config: it assigns each
-    // export a wave relative to all the others. Scoped to a single --export it
-    // packs that one export alone → wave 1, silently inverting its place in the
-    // schedule (bug hunt 2026-08-08). The two are a category error; refuse them
-    // together rather than write an incoherent wave.
-    if refuse_annotate_scoped_to_export(annotate_waves, export_name.is_some()) {
-        anyhow::bail!(
-            "--annotate-waves schedules the WHOLE config (each export's wave is relative to              the others) and cannot be scoped to --export: packing one export alone would              rewrite its wave to 1. Drop --export to annotate the whole config, or drop              --annotate-waves to plan just this export."
-        );
-    }
-    let config = Config::load_with_params(config_path, params)?;
-    let config_dir = Path::new(config_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
-
-    let exports: Vec<_> = if let Some(name) = export_name {
+) -> Result<Vec<&'a crate::config::ExportConfig>> {
+    Ok(if let Some(name) = export_name {
         let e = config
             .exports
             .iter()
             .find(|e| e.name == name)
-            .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", name))?;
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::CLI_EXPORT_UNKNOWN,
+                    format!("export '{}' not found in config", name),
+                )
+            })?;
         vec![e]
     } else {
         // The two whole-config skips `run` and `check` already apply: a CDC export
@@ -92,13 +80,40 @@ pub fn run_plan_command(
             }
         }
         if plannable.is_empty() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::PLAN_NOTHING_TO_PLAN,
                 "nothing to plan: every export in the config is a CDC stream or a backfill \
                  recipe (see the skips above) — run them with `rivet run`"
             );
         }
         plannable
-    };
+    })
+}
+
+pub fn run_plan_command(
+    config_path: &str,
+    export_name: Option<&str>,
+    params: Option<&HashMap<String, String>>,
+    format: PlanOutputFormat,
+    annotate_waves: bool,
+) -> Result<()> {
+    // --annotate-waves packs a SCHEDULE across the whole config: it assigns each
+    // export a wave relative to all the others. Scoped to a single --export it
+    // packs that one export alone → wave 1, silently inverting its place in the
+    // schedule (bug hunt 2026-08-08). The two are a category error; refuse them
+    // together rather than write an incoherent wave.
+    if refuse_annotate_scoped_to_export(annotate_waves, export_name.is_some()) {
+        crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
+            "--annotate-waves schedules the WHOLE config (each export's wave is relative to              the others) and cannot be scoped to --export: packing one export alone would              rewrite its wave to 1. Drop --export to annotate the whole config, or drop              --annotate-waves to plan just this export."
+        );
+    }
+    let config = Config::load_with_params(config_path, params)?;
+    let config_dir = Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    let exports = plannable_exports(&config, export_name)?;
 
     let state_path = config_dir.join(".rivet_state.db");
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
@@ -367,7 +382,12 @@ fn build_plan_artifact(
     for d in &validate_diags {
         match d.level {
             DiagnosticLevel::Rejected => {
-                anyhow::bail!("[{}] {}", d.rule, d.message);
+                crate::rivet_bail!(
+                    crate::error::codes::PLAN_REJECTED,
+                    "[{}] {}",
+                    d.rule,
+                    d.message
+                );
             }
             DiagnosticLevel::Warning | DiagnosticLevel::Degraded => {
                 validate_warnings.push(format!("[{}] {}", d.rule, d.message));
@@ -754,8 +774,12 @@ fn emit_artifacts(
                 } else {
                     path.clone()
                 };
-                std::fs::write(&out_path, &json)
-                    .map_err(|e| anyhow::anyhow!("cannot write plan file '{}': {}", out_path, e))?;
+                std::fs::write(&out_path, &json).map_err(|e| {
+                    crate::error::coded(
+                        crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+                        format!("cannot write plan file '{}': {}", out_path, e),
+                    )
+                })?;
                 println!("Plan written to: {}", out_path);
             }
         }
@@ -1087,19 +1111,23 @@ fn write_plan_fields_to_config(
         return Ok(std::collections::HashSet::new());
     }
     let original = std::fs::read_to_string(config_path).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot read config '{}' to record plan fields: {}",
-            config_path,
-            e
+        crate::error::coded(
+            crate::error::codes::CONFIG_FILE_UNREADABLE,
+            format!(
+                "cannot read config '{}' to record plan fields: {}",
+                config_path, e
+            ),
         )
     })?;
     let (updated, written) = apply_field_annotations(&original, fields);
     if updated != original {
         std::fs::write(config_path, updated).map_err(|e| {
-            anyhow::anyhow!(
-                "cannot write plan fields to config '{}': {}",
-                config_path,
-                e
+            crate::error::coded(
+                crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+                format!(
+                    "cannot write plan fields to config '{}': {}",
+                    config_path, e
+                ),
             )
         })?;
     }
@@ -1635,6 +1663,7 @@ mod tests {
         )
         .expect_err("--annotate-waves + --export must refuse");
         let msg = format!("{err:#}");
+        crate::error::assert_coded(&err, "RIVET_CLI_OPTION_UNSUPPORTED", 1);
         assert!(
             msg.contains("--annotate-waves") && msg.contains("--export"),
             "the refusal must name both flags: {msg}"
@@ -2235,6 +2264,31 @@ mod tests {
         assert_eq!(
             out,
             "exports:\n  - name: \"orders\"\n    wave: 2\n    mode: full\n"
+        );
+    }
+
+    #[test]
+    fn a_config_with_nothing_to_plan_and_an_unknown_export_are_refused_by_code() {
+        use crate::pipeline::plan_cmd::plannable_exports;
+        let config = crate::config::Config::from_yaml(
+            "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+             exports:\n\
+             \x20 - name: orders\n    mode: cdc\n    table: orders\n    format: parquet\n\
+             \x20   cdc: { checkpoint: /tmp/ck, backfill: [orders_base] }\n\
+             \x20   destination: { type: local, path: ./out/orders }\n\
+             \x20 - name: orders_base\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/orders_base }\n",
+        )
+        .unwrap();
+        let err = plannable_exports(&config, None).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_PLAN_NOTHING_TO_PLAN", 1);
+        let err = plannable_exports(&config, Some("nope")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_EXPORT_UNKNOWN", 1);
+        assert_eq!(
+            plannable_exports(&config, Some("orders_base"))
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

@@ -358,7 +358,9 @@ const MATRICES: &[(&str, usize)] = &[
     // 87 -> 86 (2026-10-15): the MySQL undecodable (nameless backlog) refusal is walked out of.
     // 82 -> 93 (2026-10-15): the eleven load refusals that gained a registry code each get a
     // `refusal_load_*` row; every one is asserted by its code offline, none is walked by a live cell yet.
-    ("docs/sabotage-matrix.yaml", 93),
+    // 93 -> 99 (2026-10-15): the six pipeline refusals that gained a registry code each get a
+    // `refusal_*` row; every one is asserted by its code offline, none is walked by a live cell yet.
+    ("docs/sabotage-matrix.yaml", 99),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

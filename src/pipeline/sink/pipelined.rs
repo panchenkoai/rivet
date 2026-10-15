@@ -141,16 +141,23 @@ impl PipelinedSink {
     }
 
     fn send(&mut self, msg: SinkMsg) -> Result<()> {
-        match self.tx.as_ref() {
-            // A send error means the worker hit an error and dropped the
-            // receiver. We return a generic abort here; `finish` joins the
-            // worker and surfaces the *real* error, which the caller checks
-            // before the source-side error (see `run_single_export`).
-            Some(tx) => tx
-                .send(msg)
-                .map_err(|_| anyhow::anyhow!("pipelined encode worker stopped")),
-            None => Err(anyhow::anyhow!("pipelined sink already finished")),
+        let Some(tx) = self.tx.as_ref() else {
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                "pipelined sink already finished"
+            );
+        };
+        // A send error means the worker hit an error and dropped the
+        // receiver. We return a generic abort here; `finish` joins the
+        // worker and surfaces the *real* error, which the caller checks
+        // before the source-side error (see `run_single_export`).
+        if tx.send(msg).is_err() {
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                "pipelined encode worker stopped"
+            );
         }
+        Ok(())
     }
 
     /// Close the channel, join the worker, and recover the populated
@@ -158,12 +165,18 @@ impl PipelinedSink {
     pub fn finish(mut self) -> Result<ExportSink> {
         // Drop the sender so the worker's `recv` loop terminates.
         self.tx.take();
-        match self.worker.take() {
-            Some(handle) => match handle.join() {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!("pipelined encode worker panicked")),
-            },
-            None => Err(anyhow::anyhow!("pipelined sink has no worker")),
+        let Some(handle) = self.worker.take() else {
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                "pipelined sink has no worker"
+            );
+        };
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => crate::rivet_bail!(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                "pipelined encode worker panicked"
+            ),
         }
     }
 }
