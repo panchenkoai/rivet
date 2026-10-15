@@ -1,0 +1,13 @@
+diff --git a/src/source/oracle/cdc.rs b/src/source/oracle/cdc.rs
+index c4a2448b..9a933d2c 100644
+--- a/src/source/oracle/cdc.rs
++++ b/src/source/oracle/cdc.rs
+@@ -325,7 +325,7 @@ pub(crate) fn plan_logs(
+             threads.entry(thread).or_default().push(f);
+         }
+     }
+-    let log_gap = crate::source::cdc::checkpoint_identity::log_gap;
++    let log_gap = |why: String| anyhow::Error::msg(why);
+     if threads.is_empty() {
+         return Err(log_gap(format!(
+             "oracle cdc: no redo log covers SCN {start}..{end} — the archived logs the checkpoint \

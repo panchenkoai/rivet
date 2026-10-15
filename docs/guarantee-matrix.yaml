@@ -740,8 +740,8 @@ guarantees:
       contract: { test: contract_decimal_never_maps_to_float, asserts: "{} {} must not become float, got {dt:?}" }
       postgres: { test: golden_decimal_payments_exact_sums_and_decimal128_types, asserts: "SUM(amount)×10² must equal source golden (decoding must stay exact)" }
       mysql: { test: mysql_golden_decimal_payments_exact_sums_and_decimal128_types, asserts: "mysql amount column must not downgrade to {:?}" }
-      mssql: { gap: "no golden decimal cell reads the Arrow type and the exact sums on this engine" }
-      oracle: { gap: "no golden decimal cell reads the Arrow type and the exact sums on this engine" }
+      mssql: { test: a_decimal_column_keeps_its_catalog_precision_and_scale_mssql, asserts: "must reach Parquet as Decimal128({p}, {s}), the type its catalog declares, never a float or text" }
+      oracle: { test: a_decimal_column_keeps_its_catalog_precision_and_scale_oracle, asserts: "must reach Parquet as Decimal128({p}, {s}), the type its catalog declares, never a float or text" }
 
   - id: a_lossy_or_unmapped_type_fails_loud
     stated:

@@ -8,6 +8,10 @@
   change rows; on PostgreSQL the first run died on the busy slot with an uncoded error) (0.31.0 and
   earlier). **Now** a CDC run holds the run lease for its whole stream and a second one is refused
   with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5) before it opens the source. **What to do:** nothing.
+- **`rivet apply --pool` wrote its own lines into a `destination: stdout` export.** The predicted
+  and actual makespan lines (and the wave headers of a multi-wave run) went to stdout, mixed into the
+  exported CSV or JSON bytes (0.31.0 and earlier). **Now** they go to stderr, like every other run
+  line. **What to do:** a script that read the `Pool:` lines from stdout reads them from stderr.
 
 - **A run that died (killed, out of memory, out of disk) stayed `running` in the state forever.**
   Its `run_status` and `export_metrics` rows were closed only by the run itself, or by hand with
@@ -17,6 +21,14 @@
   rows `interrupted` in the same transaction as its own start: while it holds the lease no other
   run of the export can be alive. **What to do:** nothing; `state finish-run` still closes a row by
   hand.
+
+- **An Oracle CDC checkpoint the retained redo no longer reaches was refused without a code.**
+  When the archived logs between the checkpoint and the oldest available log are gone (or a
+  redo sequence is missing), the run stopped with the data-loss text and the re-baseline recipe
+  but as a plain error: exit 1, no `RIVET_*` code, so a scheduler could not tell it from a
+  transient failure and retried it forever (0.31.0 and earlier). **Now** it is refused as
+  `RIVET_SOURCE_CDC_LOG_GAP` (exit 5), like the same loss on PostgreSQL, MySQL and SQL Server.
+  **What to do:** nothing; the recipe in the text re-baselines the stream.
 
 - **`partition_by` refused a PostgreSQL table with a NUMERIC(p,s) column.** Each partition is read
   through a window that wraps the query, and the type hints PostgreSQL needs for NUMERIC precision

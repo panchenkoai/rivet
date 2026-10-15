@@ -928,8 +928,8 @@ pub(crate) fn run_waves(
         if pending.is_empty() {
             continue;
         }
-        if total > 1 {
-            println!("\n  ── wave {label} · {} export(s) ──", pending.len());
+        if let Some(header) = wave_header(&label, total, pending.len()) {
+            eprintln!("{header}");
         }
         // The wave barrier is the loop itself: each strategy below fully drains
         // the wave (the sequential loop, or the blocking child-process join)
@@ -1215,7 +1215,7 @@ pub(super) fn wave_mode_label(peak: usize) -> &'static str {
 /// alone")`, invisible at the default `warn` level (`main.rs`:
 /// `default_filter_or("warn")`). The operator waits out a sequential run
 /// believing they asked for a parallel one; the sibling `--pool` path prints its
-/// schedule with `println!`, so two runners disagreed about the visibility of
+/// schedule on the console, so two runners disagreed about the visibility of
 /// the same fact (round-7 bughunt).
 ///
 /// WARN, per the project rule that a run-start diagnostic telling the operator
@@ -1480,6 +1480,22 @@ fn dominates_as_heavy(predicted_secs: f64, total: f64, m: usize, parallel_safe: 
 
 /// Signed error of the actual makespan against the prediction, in percent (0 when
 /// there was no prediction).
+/// The header of a wave on stderr; `None` when the run has a single export, which has no waves to tell apart.
+fn wave_header(label: &str, total: usize, pending: usize) -> Option<String> {
+    (total > 1).then(|| format!("\n  ── wave {label} · {pending} export(s) ──"))
+}
+
+/// The pool's closing line: the actual makespan (`actual_ms`) against the predicted one, in minutes.
+fn makespan_graded(actual_ms: i64, predicted_secs: f64) -> String {
+    let actual_secs = actual_ms as f64 / 1000.0;
+    format!(
+        "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
+        actual_secs / 60.0,
+        predicted_secs / 60.0,
+        makespan_error_pct(actual_secs, predicted_secs),
+    )
+}
+
 fn makespan_error_pct(actual_secs: f64, predicted_secs: f64) -> f64 {
     if predicted_secs > 0.0 {
         (actual_secs - predicted_secs) / predicted_secs * 100.0
@@ -1853,7 +1869,7 @@ pub(crate) fn run_pool(
     let predicted_secs = super::pool::predicted_makespan_secs(&items, m);
     let floor_secs = super::pool::makespan_floor_secs(&items, m);
     let (measured_n, attempt_n, placeholder_n) = super::pool::classification_counts(&classified);
-    println!(
+    eprintln!(
         "  Pool: {} export(s) × {} slot(s) — predicted makespan ~{:.1} min (floor {:.1}; {} measured, {} estimated)",
         effective.len(),
         m,
@@ -1864,7 +1880,7 @@ pub(crate) fn run_pool(
     );
     // The ONE honesty claim about the wall, from the RECONCILED classification.
     if let Some(hedge) = super::pool::lower_bound_hedge(attempt_n, placeholder_n) {
-        println!("        {hedge}");
+        eprintln!("        {hedge}");
     }
 
     let pending: Vec<&ExportConfig> = effective.iter().collect();
@@ -2046,12 +2062,12 @@ pub(crate) fn run_pool(
         run_harm.close_and_warn(window);
     }
 
-    let actual_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
-    println!(
-        "  Pool: actual makespan {:.1} min vs predicted {:.1} min ({:+.0}%) — the model grades itself every run",
-        actual_secs / 60.0,
-        predicted_secs / 60.0,
-        makespan_error_pct(actual_secs, predicted_secs),
+    eprintln!(
+        "{}",
+        makespan_graded(
+            (finished_at - started_at).num_milliseconds(),
+            predicted_secs
+        )
     );
 
     let mut summaries: Vec<RunSummary> = Vec::new();
@@ -2272,7 +2288,7 @@ mod run_concurrency_tests {
 #[cfg(test)]
 mod pool_decision_tests {
     use super::super::split::unit_failed as split_unit_failed;
-    use super::{RunSummary, dominates_as_heavy, makespan_error_pct};
+    use super::{RunSummary, dominates_as_heavy, makespan_error_pct, makespan_graded, wave_header};
 
     #[test]
     fn a_heavy_export_dominates_only_above_its_fair_share() {
@@ -2299,6 +2315,19 @@ mod pool_decision_tests {
         assert_eq!(makespan_error_pct(150.0, 100.0), 50.0);
         assert_eq!(makespan_error_pct(50.0, 100.0), -50.0);
         assert_eq!(makespan_error_pct(50.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn the_pool_lines_read_minutes_and_a_single_export_has_no_wave_header() {
+        assert_eq!(
+            makespan_graded(150_000, 120.0),
+            "  Pool: actual makespan 2.5 min vs predicted 2.0 min (+25%) — the model grades itself every run"
+        );
+        assert_eq!(wave_header("1", 1, 1), None);
+        assert_eq!(
+            wave_header("2", 3, 2).as_deref(),
+            Some("\n  ── wave 2 · 2 export(s) ──")
+        );
     }
 
     #[test]
@@ -2848,7 +2877,7 @@ mod pool_harm_tests {
     /// each, and the wave loop runs them strictly one after another. The only
     /// thing rivet said about it was an `info` line — and `main.rs` builds its
     /// logger with `default_filter_or("warn")`, so it reached nobody. Meanwhile
-    /// the sibling `--pool` path `println!`s its schedule: two runners, one
+    /// the sibling `--pool` path prints its schedule: two runners, one
     /// fact, opposite visibility.
     ///
     /// Staged from the REAL producer: the widths come from `cost_gate_batches`

@@ -1862,7 +1862,7 @@ def verify_pool_e2e(led: Ledger) -> None:
     dedicated toxiproxy scenario — `apply --pool 2` on a multi-export config
     (one heavy + three parallel_safe) through a BANDWIDTH-CAPPED source link,
     exact per-export rows via independent DuckDB readback, plus the
-    predicted-vs-actual makespan contract on stdout, and the --resume
+    predicted-vs-actual makespan contract on stderr, and the --resume
     defer-not-drop twin. The shared-link cap is the field pathology (60 workers
     splitting one ~0.25 MB/s tunnel), so this is the honest shape to gate the
     LPT model in — not an uncontended localhost.
