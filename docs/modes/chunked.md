@@ -195,6 +195,8 @@ WHERE ordered_at >= '2024-01-01' AND ordered_at < '2025-01-01'
 
 The open-end `< end_date` bound is intentional: it correctly captures all `TIMESTAMP` values within the day, including `23:59:59.999…`.
 
+An empty table plans one window that matches nothing: the run exports zero rows with exit 0, as an empty table range-chunked on an integer key does. A column with a NULL in it is refused (`RIVET_PLAN_CHUNK_KEY_NULL`), because no window would hold those rows.
+
 **When to use date chunking over numeric chunking:**
 
 - The table has no dense numeric PK (UUIDs, composite keys)
