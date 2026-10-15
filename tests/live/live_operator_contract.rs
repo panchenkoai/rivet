@@ -2514,6 +2514,11 @@ fn a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo() {
             "cycle {cycle}: the refusal names the standalone and carries no raw driver dump\n{}",
             text(&out)
         );
+        assert_eq!(
+            std::fs::read(rig.checkpoint()).ok(),
+            None,
+            "cycle {cycle}: the refused stream left no checkpoint"
+        );
     }
 }
 
