@@ -849,19 +849,15 @@ fn mongo_heterogeneous_resume_remedy() {
     m.seed_int_id("t", 100);
     let mut rig = Rig::mongo_batch("t")
         .source_url(&MongoTest::url(MONGO_PORT, &db))
-        .mongo("page_size: 40, resume: true")
-        .oracle_known_defect(
-            "a failed run left: resume-point",
-            "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
-        );
+        .mongo("page_size: 40, resume: true");
     rig.run_ok();
     m.insert_many("t", vec![mongodb::bson::doc! { "_id": "zzz", "v": "s" }]);
     rig.refuses_twice_then(
         &["run"],
         &[],
-        Refused::uncoded_known_defect(1, "the heterogeneous-_id refusal has no registry code"),
+        Refused::by_code("RIVET_SOURCE_KEYSET_KEY_UNORDERED", 5),
         vec![Remedy::new(
-            "Remove `page_size`",
+            "Remove `page_size`, `resume` and `parallel`",
             Then::DeliversTheSource,
             |r| r.rebuilt(|r| r.mongo("")),
         )],
@@ -2199,8 +2195,8 @@ fn doctor_is_not_green_where_the_cdc_run_refuses_wal_level_postgres() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose up -d mongo; open defect (mongo page_size remedy), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo() {
+#[ignore = "live: requires docker compose up -d mongo"]
+fn removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo() {
     mongo_heterogeneous_resume_remedy();
 }
 

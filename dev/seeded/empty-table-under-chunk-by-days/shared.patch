@@ -1,0 +1,14 @@
+--- a/src/pipeline/chunked/detect.rs
++++ b/src/pipeline/chunked/detect.rs
+@@ -320,7 +320,10 @@
+         let Some((min_str, max_str)) =
+             read_key_span(src, base_query, chunk_column, export_name, source_type)?
+         else {
+-            return Ok(vec![EMPTY_WINDOW]);
++            crate::rivet_bail!(
++                crate::error::codes::SOURCE_PROBE_UNREADABLE,
++                "export '{export_name}': min({chunk_column}) returned NULL — table may be empty"
++            );
+         };
+ 
+         let min_date = parse_date_flexible(&min_str).ok_or_else(|| {
