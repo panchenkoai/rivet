@@ -1,0 +1,13 @@
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1098,9 +1098,7 @@
+ /// Whether the stored keyset anchor names a run that recorded a part; an anchor with none has nothing to resume.
+ fn anchor_holds_a_part(state: &StateStore, progress: &ProgressClaim<'_>) -> bool {
+     match progress.resume_run_id() {
+-        Ok(Some(anchor)) => !state
+-            .list_files_for_run(&anchor)
+-            .is_ok_and(|parts| parts.is_empty()),
++        Ok(Some(anchor)) => state.list_files_for_run(&anchor).is_ok(),
+         Ok(None) => false,
+         Err(_) => true,
+     }

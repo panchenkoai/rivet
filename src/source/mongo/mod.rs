@@ -471,8 +471,8 @@ fn seekable_id_span(collection: &str, lo_id: &Bson, hi_id: &Bson) -> Result<()> 
                 crate::error::codes::SOURCE_KEYSET_KEY_UNORDERED,
                 "collection '{collection}' has a NaN `_id`: MongoDB range \
                  operators never match NaN, so keyset paging / parallel \
-                 ranges would silently skip documents. Remove `page_size` \
-                 and `parallel` to use a full ordered scan (a single \
+                 ranges would silently skip documents. Remove `page_size`, \
+                 `resume` and `parallel` to use a full ordered scan (a single \
                  cursor reads every document), or fix the `_id`."
             );
         }
@@ -486,8 +486,8 @@ fn seekable_id_span(collection: &str, lo_id: &Bson, hi_id: &Bson) -> Result<()> 
             "collection '{collection}' has heterogeneous `_id` types \
              ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
              BSON-type-bracketed and would silently skip every `_id` type but \
-             one. Remove `page_size` and `parallel` to use a full ordered scan \
-             (a single cursor crosses BSON types), or normalise `_id` to one type.",
+             one. Remove `page_size`, `resume` and `parallel` to use a full ordered \
+             scan (a single cursor crosses BSON types), or normalise `_id` to one type.",
             lo_id.element_type(),
             hi_id.element_type(),
         );

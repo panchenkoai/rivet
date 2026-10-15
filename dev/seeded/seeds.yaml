@@ -17,6 +17,25 @@
 
 seeds:
 
+  - name: keyset-anchor-kept-without-a-part
+    class: a keyset run that stops before its first part keeps its resume anchor, so the run of another mode the refusal names as the remedy is refused as continuing an interrupted run
+    history: "Sweep 14, 2026-10-12: a resumed MongoDB keyset run refused for a mixed-type `_id` left its claim on the cursor row; removing `page_size` (the remedy it names) was refused RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH, exit 5 (v0.31.0)"
+    scope: source
+    patch: keyset-anchor-kept-without-a-part/shared.patch
+    engines:
+      mongo:
+        cells:
+          - removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo
+          - roast_resume_must_not_bypass_heterogeneous_id_guard
+          - "lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"
+      postgres:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
+      mysql:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
+      mssql:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
+      oracle:
+        cells: ["lib:a_run_that_broke_off_before_its_first_part_releases_its_anchor"]
   - name: oracle-cdc-log-gap-uncoded
     class: an Oracle CDC data-loss refusal (the retained redo no longer reaches the checkpoint) stops as a plain error with no RIVET_* code and exit 1, so a scheduler retries it as transient
     history: found 2026-10-14 by the log-gap walk cell on the Mac stand (cycle 1 ended with no RIVET_* code, exit 1), on main through 0.31.0
