@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`rivet init --mode cdc` on SQL Server named a capture instance that did not exist.** It wrote
+  `capture_instance: <schema>_<table>` by convention, so a table whose CDC was enabled under another
+  instance name got a config that failed on its first run (0.31.0 and earlier). **Now** init reads
+  `cdc.change_tables` and writes the instance it holds (the newest of two); a table without CDC gets
+  the conventional name with the `sp_cdc_enable_table` call that creates it. **What to do:** nothing.
+
 - **A SQL Server password holding `@` reached the state database.** In the keyword/value URL form
   (`sqlserver://host;user=sa;password=p@ss;…`) the `@` inside the password was read as the end of a
   userinfo, so the source key rivet stores beside every cursor kept the password's tail (0.31.0 and

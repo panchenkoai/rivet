@@ -1856,6 +1856,22 @@ seeds:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
       oracle:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
+  - name: init-capture-instance-derived
+    class: "a generated config derives the name of a server object by convention instead of reading the catalog that holds it, so the config names an object that does not exist"
+    history: "2026-10-07 - open defect (`rivet init --mode cdc` on SQL Server wrote `capture_instance: dbo_<table>` whatever cdc.change_tables held) through 0.31.0; fixed by reading cdc.change_tables in mssql::introspect"
+    scope: source
+    patch: init-capture-instance-derived/shared.patch
+    engines:
+      postgres:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+      mysql:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+      mssql:
+        cells: [init_cdc_writes_the_capture_instance_the_catalog_holds_mssql]
+      mongo:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+      oracle:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
   - name: source-key-keyword-password-at
     class: "a credential scrubber that cuts at a separator the secret may contain: an `@` inside a keyword/value password reads as the end of a userinfo, and the password's tail lands in persisted state"
     history: "2026-10-15 - found by the keyword-value credential guard when run_status first stored the source key: `password=p@<secret>` left `<secret>;encrypt=true` in the key, through 0.31.0; fixed by masking keyword passwords before the userinfo is cut"

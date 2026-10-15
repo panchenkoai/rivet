@@ -119,6 +119,7 @@ pub(super) fn introspect(conn: &mut mysql::PooledConn, table: &str) -> Result<Ta
         .collect();
 
     Ok(TableInfo {
+        cdc_capture_instance: None,
         density: None,
         schema: String::new(),
         table: table.to_string(),

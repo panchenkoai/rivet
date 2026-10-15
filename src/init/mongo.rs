@@ -73,6 +73,7 @@ pub(super) fn introspect(session: &MongoSession, collection: &str) -> Result<Tab
         })
         .unwrap_or(0);
     Ok(TableInfo {
+        cdc_capture_instance: None,
         density: None,
         schema: session.db().to_string(),
         table: collection.to_string(),
