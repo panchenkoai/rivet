@@ -8,6 +8,11 @@
   `cdc.change_tables` and writes the instance it holds (the newest of two); a table without CDC gets
   the conventional name with the `sp_cdc_enable_table` call that creates it. **What to do:** nothing.
 
+- **`rivet run` refused a MongoDB collection that does not exist without its code.** `rivet check`
+  refused it `RIVET_SOURCE_COLLECTION_NOT_FOUND`; `rivet run` printed the same sentence with no
+  `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
+  carries the code. **What to do:** nothing.
+
 - **A `cursor_column` spelled in another case than its column failed with the raw database error on
   PostgreSQL and Oracle.** MySQL and SQL Server refused it with `RIVET_CONFIG_CURSOR_COLUMN_CASE`; on
   PostgreSQL and Oracle the quoted name failed the query first, so the run exited 1 with
