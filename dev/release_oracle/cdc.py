@@ -530,6 +530,11 @@ class _Capture:
     bucket: str
     prefix: str
 
+    @property
+    def export(self) -> str:
+        """The config's export name, unique per cell and run."""
+        return scenarios.cell_export(self.yaml)
+
 
 @contextlib.contextmanager
 def cdc_probe(engine: str, url: str, *, config_url: str | None = None,
@@ -551,7 +556,7 @@ def cdc_probe(engine: str, url: str, *, config_url: str | None = None,
         tls = "\n  tls: { accept_invalid_certs: true }" if engine == "mssql" else ""
         (work / "c.yaml").write_text(
             f"source:\n  type: {engine}\n  url: \"{config_url or url}\"{tls}\nexports:\n"
-            f"  - name: orc_cdc_probe\n    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n"
+            f"  - name: {scenarios.cell_export(work / 'c.yaml')}\n    table: orc_cdc_probe\n    mode: cdc\n    format: parquet\n"
             f"    {block}\n    destination:\n      type: local\n      path: ./output/\n")
         yield eng, work, block
     finally:
@@ -579,7 +584,7 @@ def _cdc_write_cfg(
         f"  type: {eng}\n"
         f'  url: "{url}"{tls}\n'
         "exports:\n"
-        f"  - name: {table}\n"
+        f"  - name: {scenarios.cell_export(yaml)}\n"
         f"    table: {table}\n"
         "    mode: cdc\n"
         "    format: parquet\n"
@@ -590,7 +595,7 @@ def _cdc_write_cfg(
     return _Capture(yaml, bkt, pfx)
 
 
-def _runs_seen(export: str = "orc_cdc_probe") -> frozenset[str] | None:
+def _runs_seen(export: str) -> frozenset[str] | None:
     """Run ids already recorded for `export` on the Postgres store, or `None` when
     the run is going to SQLite (fresh per engine, nothing to subtract)."""
     url = os.environ.get("RIVET_STATE_URL", "").strip()
@@ -610,7 +615,7 @@ def _runs_seen(export: str = "orc_cdc_probe") -> frozenset[str] | None:
 
 
 def _state_populated(
-    sdb: Path, export: str = "orc_cdc_probe", before: frozenset[str] | None = None
+    sdb: Path, export: str, before: frozenset[str] | None = None
 ) -> bool:
     """Did the run populate the state metabase — every recorded run a success?
 
@@ -720,7 +725,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         # 1. clean capture: anchor (A) → changes → capture (B)
         rivet("run", "-c", str(cap.yaml))
         spec.changes(url)
-        before = _runs_seen()  # the key set this cell will subtract, see _state_populated
+        before = _runs_seen(cap.export)  # the key set this cell will subtract, see _state_populated
         rivet("run", "-c", str(cap.yaml))
         n = scenarios.store_readback("s3", cap.bucket, cap.prefix, work)  # INDEPENDENT (DuckDB)
         # Per-column null profile, independent of rivet: the change set writes typed
@@ -731,7 +736,7 @@ def verify_cdc_e2e(led: Ledger) -> None:
         cdc_null, _cdc_cols = scenarios.duckdb_allnull_cloud("s3", cap.bucket, cap.prefix, work)
         vout = rivet("validate", "-c", str(cap.yaml)).out
         vp = "passed" in vout.lower()
-        spop = _state_populated(work / ".rivet_state.db", before=before)
+        spop = _state_populated(work / ".rivet_state.db", cap.export, before=before)
 
         # 2. crash-recovery: an extra row (id=4) + crash at cdc_after_flush_before_ack →
         #    anchor held → recovery re-reads it (at-least-once, no loss).

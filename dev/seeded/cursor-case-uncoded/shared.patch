@@ -1,0 +1,15 @@
+--- a/src/pipeline/single.rs
++++ b/src/pipeline/single.rs
+@@ -295,10 +295,8 @@
+         return err;
+     };
+     let names: Vec<&str> = columns.iter().map(|c| c.column_name.as_str()).collect();
+-    match crate::types::refuse_cursor_case_miss(cursor, &names) {
+-        Err(refusal) => refusal,
+-        Ok(()) => err,
+-    }
++    let _ = crate::types::refuse_cursor_case_miss(cursor, &names);
++    err
+ }
+ 
+ /// `err` as `RIVET_STATE_CURSOR_INCOMPARABLE` when the source refused to convert a value while a stored cursor was compared; any other error unchanged.

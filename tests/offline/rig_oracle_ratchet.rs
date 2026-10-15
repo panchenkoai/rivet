@@ -173,7 +173,8 @@ fn failed_run_leftover_declarations_never_grow() {
 // 5 -> 4 (2026-10-08): `--resume` over a complete prefix is refused as RIVET_DEST_ALREADY_COMPLETE.
 // 5 -> 4 (2026-10-08): the corrupt CDC checkpoint is refused by code (#497).
 // 4 -> 3 (2026-10-08): the bounded-drain refusal on a PostgreSQL standby carries RIVET_SOURCE_CDC_PREREQUISITE.
-const UNCODED_REFUSAL_CEILING: usize = 3; // ratchet-pin: uncoded-refusals
+// 3 -> 2 (2026-10-15): a run beside a held run lease is refused as RIVET_STATE_RUN_IN_PROGRESS (#538).
+const UNCODED_REFUSAL_CEILING: usize = 2; // ratchet-pin: uncoded-refusals
 
 #[test]
 fn uncoded_refusals_the_cells_accept_never_grow() {

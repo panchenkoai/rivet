@@ -43,11 +43,11 @@ from pathlib import Path
 
 try:
     from .core import Ledger, Status, have, rivet, run
-    from .scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, Scope, work_dir
+    from .scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, Scope, cell_export, work_dir
     from ..pytools.duckcli import ARGV as DUCKDB
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, Status, have, rivet, run  # type: ignore
-    from scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
+    from scenarios import NO_TIMEOUT, _duckdb_list, _failed, _passed, _skipped, Scope, cell_export, work_dir  # type: ignore
     DUCKDB = [__import__("sys").executable, str(__import__("pathlib").Path(__file__).resolve().parents[1] / "pytools" / "duckcli.py")]
 
 __all__ = ["verify_row_hash", "canonical_image", "row_hash_of"]
@@ -110,7 +110,7 @@ def _export(engine: str, url: str, table: str, dest: Path, row_hash: str) -> boo
         f"  type: {engine}\n"
         f"  url_env: ORACLE_URL{tls}\n"
         f"exports:\n"
-        f"  - name: rh_probe\n"
+        f"  - name: {cell_export(yaml_path)}\n"
         f"    table: {table}\n"
         f"    mode: full\n"
         f"    format: parquet\n"

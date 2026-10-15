@@ -335,6 +335,27 @@ fn cursor_write_fails(engine: SqlEngine) {
     );
 }
 
+/// 2026-10-14 sweep P6: a `cursor_column` spelled in another case than the column is refused by code, and the spelling the refusal names delivers.
+fn cursor_column_in_another_case(engine: SqlEngine) {
+    let (table, _guard) = id_v_table(engine, "oc_cursorcase", ROWS);
+    let mut rig = engine
+        .rig(&table)
+        .mode("incremental")
+        .export_line("cursor_column: V");
+    rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_CONFIG_CURSOR_COLUMN_CASE", 1),
+        vec![Remedy::new(
+            "Set `cursor_column: v`.",
+            Then::DeliversTheSource,
+            |r| {
+                r.replace_export_line("cursor_column", "cursor_column: v");
+            },
+        )],
+    );
+}
+
 /// RESULTS 4: a second `full` run beside a live one is refused, or the prefix still holds each key once.
 fn concurrent_full_runs(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_twofull", 200);
@@ -901,6 +922,7 @@ fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
     for id in 1..=5 {
         s.insert(id);
     }
+    s.settle();
     let opened = |r: &Rig| {
         r.state_count(
             "SELECT count(*) FROM run_status WHERE export_name = '{export}' AND status = 'running'",
@@ -1790,6 +1812,31 @@ fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_oracle() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn a_cursor_column_in_another_case_is_refused_by_code_postgres() {
+    cursor_column_in_another_case(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_cursor_column_in_another_case_is_refused_by_code_mysql() {
+    cursor_column_in_another_case(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_column_in_another_case_is_refused_by_code_mssql() {
+    cursor_column_in_another_case(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_column_in_another_case_is_refused_by_code_oracle() {
+    cursor_column_in_another_case(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn a_second_concurrent_full_run_does_not_double_the_prefix_postgres() {
     concurrent_full_runs(SqlEngine::Pg);
 }
@@ -2495,6 +2542,28 @@ fn plan_refuses_a_collection_that_does_not_exist_mongo() {
     plan_on_an_unreadable_source(Rig::mongo_batch("absent").source_url(&url), 1);
 }
 
+/// 2026-10-14 sweep P6: a `mode: cdc` export over a standalone MongoDB is refused by code, twice, before any checkpoint.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_cdcstand", 3);
+    let rig = Rig::mongo_cdc("t").source_url(&url);
+    for cycle in 1..=2 {
+        let out = rig.run();
+        assert_refused(&out, Refused::by_code("RIVET_SOURCE_CDC_PREREQUISITE", 1));
+        assert!(
+            text(&out).contains("standalone") && !text(&out).contains("RawDocumentBuf"),
+            "cycle {cycle}: the refusal names the standalone and carries no raw driver dump\n{}",
+            text(&out)
+        );
+        assert_eq!(
+            std::fs::read(rig.checkpoint()).ok(),
+            None,
+            "cycle {cycle}: the refused stream left no checkpoint"
+        );
+    }
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mongo"]
 fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
@@ -2512,9 +2581,13 @@ fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
         Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
     );
     assert!(
-        !run.status.success() && text(&run).contains(refusal),
-        "fixture: `run` refuses the absent collection\n{}",
+        text(&run).contains(refusal),
+        "`run` refuses the absent collection\n{}",
         text(&run)
+    );
+    assert_refused(
+        &run,
+        Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
     );
     let present = Rig::mongo_batch("t").source_url(&url);
     assert!(
@@ -2768,6 +2841,115 @@ fn a_cell_the_stream_cannot_carry_is_refused_by_code_postgres() {
                 },
             ),
         ],
+    );
+}
+
+/// The walk out of a refused captured cell on an engine whose stream keeps no server-side position: `s` is baselined with one drained change, `hostile` writes the cell, the checkpoint deleted alone is refused under the baseline, each of `named` delivers as printed, and `leave_out` (the column dropped at the source, last since it cannot be undone) with the re-baseline recipe delivers the source.
+fn a_captured_cell_is_refused_by_code_and_walked_out(
+    mut s: CdcScenario,
+    hostile: &str,
+    code: Refused<'static>,
+    named: Vec<Remedy<'static>>,
+    leave_out: impl FnOnce() + 'static,
+) {
+    s.insert(1);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(2);
+    s.settle();
+    s.rig.run_ok();
+    s.sql(hostile);
+    s.settle();
+    let mut remedies = vec![deletes_only_the_checkpoint(Then::Refuses(
+        CHECKPOINT_INVALID,
+    ))];
+    remedies.extend(named);
+    remedies.push(Remedy::new(
+        "leave the column out of the capture",
+        Then::DeliversTheSource,
+        move |r| {
+            leave_out();
+            apply_rebaseline_remedy(r, true)
+        },
+    ));
+    s.rig
+        .refuses_twice_and_walks_out(&["run"], &[], code, remedies);
+}
+
+/// `ALTER TABLE .. DROP COLUMN` on the MySQL CDC instance, for a remedy closure.
+fn mysql_cdc_drop_column(table: &str, column: &str) {
+    use mysql::prelude::Queryable as _;
+    cdc_conn()
+        .query_drop(format!("ALTER TABLE {table} DROP COLUMN {column}"))
+        .expect("leave the column out at the source");
+}
+
+/// MySQL: a `BIT(64)` with bit 63 set, past the stream's Int64 column, is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; "map the column to decimal(20,0)" (a `columns:` override) delivers the stream as it stands, and the column dropped at the source with the re-baseline recipe delivers the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_cell_the_stream_cannot_carry_is_refused_by_code_mysql() {
+    let s = CdcScenario::mysql_with(
+        "oc_bit",
+        "id BIGINT PRIMARY KEY, v BIGINT, b BIT(64)",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    let table = s.table.clone();
+    let hostile = format!("INSERT INTO {table} VALUES (3, 3, b'1{}')", "0".repeat(63));
+    a_captured_cell_is_refused_by_code_and_walked_out(
+        s,
+        &hostile,
+        Refused::by_code("RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5),
+        vec![Remedy::new(
+            "map the column to decimal(20,0)",
+            Then::DeliversTheSource,
+            |r| r.rebuilt(|rig| rig.export_line("columns: { b: \"decimal(20,0)\" }")),
+        )],
+        move || mysql_cdc_drop_column(&table, "b"),
+    );
+}
+
+/// MySQL: a `TIME` past 24 hours (`800:00:00`), a duration no Parquet TIME holds, is refused as `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the column declared `string` in `columns:` carries it as text, and the column left out of the capture with the re-baseline recipe delivers the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_time_past_a_day_in_a_stream_is_refused_by_code_and_both_remedies_deliver_mysql() {
+    let s = CdcScenario::mysql_with(
+        "oc_time",
+        "id BIGINT PRIMARY KEY, v BIGINT, t TIME",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    let table = s.table.clone();
+    let hostile = format!("INSERT INTO {table} VALUES (3, 3, '800:00:00')");
+    a_captured_cell_is_refused_by_code_and_walked_out(
+        s,
+        &hostile,
+        Refused::by_code("RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5),
+        vec![Remedy::new(
+            "declare the column `string` in `columns:`",
+            Then::DeliversTheSource,
+            |r| r.rebuilt(|rig| rig.export_line("columns: { t: string }")),
+        )],
+        move || mysql_cdc_drop_column(&table, "t"),
+    );
+}
+
+/// SQL Server: a `MONEY` past the f64-exact range (1e12, which tiberius delivers rounded) is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the column dropped at the source and the re-baseline recipe deliver the source.
+#[test]
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_cell_the_stream_cannot_carry_is_refused_by_code_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let s = CdcScenario::mssql_with(
+        "oc_money",
+        "id BIGINT PRIMARY KEY, v BIGINT, m MONEY",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    let table = s.table.clone();
+    let hostile = format!("INSERT INTO dbo.{table} VALUES (3, 3, 1000000000000.0)");
+    a_captured_cell_is_refused_by_code_and_walked_out(
+        s,
+        &hostile,
+        Refused::by_code("RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5),
+        vec![],
+        move || mssql_cdc_exec(&format!("ALTER TABLE dbo.{table} DROP COLUMN m")),
     );
 }
 

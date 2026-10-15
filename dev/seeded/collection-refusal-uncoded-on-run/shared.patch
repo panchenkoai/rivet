@@ -1,0 +1,12 @@
+--- a/src/source/mongo/mod.rs
++++ b/src/source/mongo/mod.rs
+@@ -656,7 +656,8 @@
+                 .filter(doc! { "name": coll_name })
+                 .into_future(),
+         );
+-        refuse_a_missing_collection(self.session.db(), coll_name, listed.ok())?;
++        refuse_a_missing_collection(self.session.db(), coll_name, listed.ok())
++            .map_err(|e| anyhow::anyhow!("{e}"))?;
+         let schema = blob_schema();
+         sink.on_schema(schema.clone())?;
+ 

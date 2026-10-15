@@ -1824,6 +1824,38 @@ seeds:
         na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
       oracle:
         na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
+  - name: collection-refusal-uncoded-on-run
+    class: "one refusal is raised by two paths (the preflight and the export), and only one of them carries the code"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6): `check` refused a missing MongoDB collection RIVET_SOURCE_COLLECTION_NOT_FOUND, `run` printed the same sentence with no code, through 0.31.0; fixed by one `refuse_a_missing_collection` for both"
+    scope: source
+    patch: collection-refusal-uncoded-on-run/shared.patch
+    engines:
+      postgres:
+        na: "a missing SQL table fails the query, read by the engine; the absent-collection guard is MongoDB's"
+      mysql:
+        na: "a missing SQL table fails the query, read by the engine; the absent-collection guard is MongoDB's"
+      mssql:
+        na: "a missing SQL table fails the query, read by the engine; the absent-collection guard is MongoDB's"
+      mongo:
+        cells: [check_refuses_a_collection_that_does_not_exist_as_run_does_mongo]
+      oracle:
+        na: "a missing SQL table fails the query, read by the engine; the absent-collection guard is MongoDB's"
+  - name: cursor-case-uncoded
+    class: "a refusal the product raises from the result set is never reached on an engine where the same config fails the query first, so that engine exits with the raw database error instead of the code"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6): `cursor_column` in another case was RIVET_CONFIG_CURSOR_COLUMN_CASE on MySQL and SQL Server but a raw 42703 / ORA-00904 on PostgreSQL and Oracle, through 0.31.0; fixed by `refuse_a_cursor_case_miss`"
+    scope: source
+    patch: cursor-case-uncoded/shared.patch
+    engines:
+      postgres:
+        cells: [a_cursor_column_in_another_case_is_refused_by_code_postgres]
+      mysql:
+        na: "the query runs here, since the engine matches a quoted identifier whatever its case, and the sink's schema check refuses before a byte is written; the seed removes only the probe after a failed query"
+      mssql:
+        na: "the query runs here, since the engine matches a quoted identifier whatever its case, and the sink's schema check refuses before a byte is written; the seed removes only the probe after a failed query"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no cursor column"
+      oracle:
+        cells: [a_cursor_column_in_another_case_is_refused_by_code_oracle]
   - name: cdc-run-without-lease
     class: "a `mode: cdc` run takes no run lease, so a second run beside a live stream reads and delivers the same changes again"
     history: "2026-10-14 - found by the by-hand CLI sweep (P2): duplicates on MySQL, SQL Server, Oracle, MongoDB CDC, an uncoded slot error on PostgreSQL, through 0.31.0; fixed by `cdc_run_lease`"
@@ -1840,6 +1872,22 @@ seeds:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
       oracle:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
+  - name: mongo-standalone-uncoded
+    class: "a server error that names a missing deployment prerequisite is passed up as the driver's raw dump instead of the coded prerequisite refusal"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6, row 808): `mode: cdc` on a standalone MongoDB exited 1 with `Error code 40573 … RawDocumentBuf { data: … }`, while `doctor` named it plainly, through 0.31.0; fixed by `names_standalone` in diagnose_stream_error"
+    scope: source
+    patch: mongo-standalone-uncoded/shared.patch
+    engines:
+      postgres:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mysql:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mssql:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mongo:
+        cells: [a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo]
+      oracle:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"
@@ -2318,3 +2366,19 @@ seeds:
         na: 'a bounded run ends at the open-time bound (idle_poll_stops / past_time_bound in src/source/mongo/cdc.rs) and every later pull stops there too, so a second pass yields nothing; the single-pass defect has no effect'
       oracle:
         na: '`exhausted` is set once (src/source/oracle/cdc.rs:1434) and never cleared, and the first pass mines every window to the frontier, so a second pass yields nothing; the single-pass defect has no effect'
+  - name: mysql-cdc-time-remedy-names-the-batch-cast
+    class: "a refusal on the CDC path prints the batch path's remedy (a cast in the export's query), which a stream has no seam for, and the check runs by the column's native type, so the override remedy the stream does have is blocked"
+    history: "2026-10-15 - found by the first walk of the MySQL TIME-past-a-day cell on a stream: `RIVET_SOURCE_VALUE_UNREPRESENTABLE` named `Cast it in a query, e.g. TIME_TO_SEC(col)` and a `columns: { t: string }` override was still refused, through 0.31.0; fixed by the CDC wording of the TimeOfDay fix and `MysqlCellFix::applies_to`"
+    scope: source
+    patch: mysql-cdc-time-remedy-names-the-batch-cast/shared.patch
+    engines:
+      postgres:
+        na: "a PostgreSQL `time` is a time of day, never a duration past it, and the MySQL cell fix does not run"
+      mysql:
+        cells: [a_time_past_a_day_in_a_stream_is_refused_by_code_and_both_remedies_deliver_mysql]
+      mssql:
+        na: "a SQL Server `time` is a time of day, never a duration past it, and the MySQL cell fix does not run"
+      mongo:
+        na: "a MongoDB change row is two text cells, and the MySQL cell fix does not run"
+      oracle:
+        na: "Oracle has no TIME type, and the MySQL cell fix does not run"
