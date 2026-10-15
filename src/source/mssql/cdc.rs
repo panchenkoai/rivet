@@ -443,15 +443,21 @@ pub(crate) fn source_object_of_capture_instance(
                 .await
         })
         .map_err(|e| {
-            anyhow::anyhow!(
-                "sqlserver cdc: reading cdc.change_tables for capture instance \
+            crate::error::coded(
+                crate::error::codes::SOURCE_QUERY_FAILED,
+                format!(
+                    "sqlserver cdc: reading cdc.change_tables for capture instance \
                  '{capture_instance}' (the login needs SELECT on the cdc schema): {e}"
+                ),
             )
         })?;
     let row = rt.block_on(async { rows.into_row().await }).map_err(|e| {
-        anyhow::anyhow!(
-            "sqlserver cdc: reading the cdc.change_tables row for capture \
+        crate::error::coded(
+            crate::error::codes::SOURCE_QUERY_FAILED,
+            format!(
+                "sqlserver cdc: reading the cdc.change_tables row for capture \
                  instance '{capture_instance}': {e}"
+            ),
         )
     })?;
     // A FOURTH outcome the first cut folded back into "no such instance", making
@@ -518,7 +524,8 @@ fn classify_source_object(
         // Refusing is still right — resolution is what stops a fabricated snapshot
         // baseline, and "we cannot read the names" is not "the configured string is
         // fine". Only the diagnosis changes.
-        Some(_) => anyhow::bail!(
+        Some(_) => crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
             "sqlserver cdc: cdc.change_tables has a row for capture instance \
              '{capture_instance}', but its source object's schema and name read back \
              as NULL, so rivet cannot tell which relation it captures. Two causes, \
@@ -591,7 +598,8 @@ impl MssqlChangeStream {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
         {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "invalid CDC capture instance name: {:?}",
                 cfg.capture_instance
             );
@@ -601,7 +609,9 @@ impl MssqlChangeStream {
         if let Some(lsn) = &cfg.from_lsn
             && (lsn.is_empty() || lsn.len() % 2 != 0 || !lsn.bytes().all(|b| b.is_ascii_hexdigit()))
         {
-            anyhow::bail!("mssql cdc: malformed resume LSN {lsn:?}");
+            return Err(crate::source::cdc::checkpoint_identity::checkpoint_invalid(
+                format!("mssql cdc: malformed resume LSN {lsn:?}"),
+            ));
         }
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -672,7 +682,8 @@ impl MssqlChangeStream {
                 )
             })
         {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH,
                 "sqlserver cdc: capture instance '{}' emits changes for `{}.{}` (from \
                  cdc.change_tables), but no configured table matches it — the config asks for \
                  {:?}. Routing is byte-exact while SQL Server's collation is not, so every \
@@ -712,7 +723,10 @@ impl MssqlChangeStream {
                     || hex.len() % 2 != 0
                     || !hex.bytes().all(|b| b.is_ascii_hexdigit()))
             {
-                anyhow::bail!("mssql cdc: malformed open-time max LSN {hex:?}");
+                crate::rivet_bail!(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                    "mssql cdc: malformed open-time max LSN {hex:?}"
+                );
             }
             max
         } else {
@@ -1167,7 +1181,8 @@ pub(crate) fn pin_checkpoint_at_max_lsn(
     let mut src = crate::source::mssql::MssqlSource::connect_with_tls(url, tls)?;
     let probe = src.cdc_health(None)?;
     if probe_max_lsn(&probe).is_none() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
             "mssql cdc initial snapshot: sys.fn_cdc_get_max_lsn() is NULL — enable CDC first \
              (EXEC sys.sp_cdc_enable_db) so the anchor exists before the snapshot"
         );
@@ -1204,7 +1219,10 @@ pub(crate) fn pin_checkpoint_at_max_lsn(
         Ok::<_, anyhow::Error>((identity, anchor))
     })?;
     let anchor = anchor.ok_or_else(|| {
-        anyhow::anyhow!("mssql cdc initial snapshot: the server returned no anchor LSN")
+        crate::error::coded(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+            "mssql cdc initial snapshot: the server returned no anchor LSN".to_string(),
+        )
     })?;
     with_identity(
         &Position::new(serde_json::json!({ "lsn": anchor })),

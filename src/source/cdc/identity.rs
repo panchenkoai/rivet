@@ -157,7 +157,8 @@ pub(crate) fn resolve_captured_table(
     // purpose: the engine's own classifier owns "this is a view" and says what to do
     // about it, which is more specific than anything this function knows.)
     if live.is_empty() && distinct.len() > 1 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
             "cdc: `{configured}` matches {} relations and NONE of them can carry a change \
              event under that name{note}. Qualify it (`schema.table`) to say which one \
              you mean — that resolves to a single relation, and the engine then names \
@@ -170,7 +171,8 @@ pub(crate) fn resolve_captured_table(
     let distinct: Vec<&CatalogMatch> = if live.is_empty() { distinct } else { live };
 
     match distinct.as_slice() {
-        [] => anyhow::bail!(
+        [] => crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
             "cdc: `{configured}` matches no relation the source reports. Capture would \
              open a stream and route nothing — every event dropped by the routing \
              filter, silently. Check the name, and qualify it (`schema.table`) if it \
@@ -202,7 +204,8 @@ pub(crate) fn resolve_captured_table(
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
                 "cdc: `{configured}` could mean {} different relations ({listing}) — the \
                  engine's own parser and rivet's byte-exact routing do not agree on one, \
                  or more than one schema holds the name. All of them would land in this \
@@ -573,5 +576,32 @@ mod tests {
             "shopdb",
             "my.other"
         ));
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    fn rel(schema: &str, table: &str, kind: &str) -> CatalogMatch {
+        CatalogMatch {
+            schema: schema.into(),
+            table: table.into(),
+            kind: kind.into(),
+            capturable: kind == "BASE TABLE",
+        }
+    }
+
+    /// No match, two live matches, and two inert matches: three messages, one code (usage, exit 1).
+    #[test]
+    fn a_cdc_table_that_names_no_single_base_table_is_refused_by_code() {
+        for matches in [
+            vec![],
+            vec![rel("a", "t", "BASE TABLE"), rel("b", "t", "BASE TABLE")],
+            vec![rel("a", "t", "VIEW"), rel("b", "t", "VIEW")],
+        ] {
+            let err = resolve_captured_table("t", &matches).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNRESOLVED", 1);
+        }
     }
 }

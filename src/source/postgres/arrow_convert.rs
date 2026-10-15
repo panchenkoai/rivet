@@ -460,12 +460,12 @@ pub(super) fn pg_columns_to_schema(
         }
     }
     if !errors.is_empty() {
-        anyhow::bail!(
+        return Err(crate::source::unsafe_mapping_refusal(format!(
             "{} column(s) have no safe Rivet mapping — add column overrides in rivet.yaml:\n\
              columns:\n{}",
             errors.len(),
             errors.join("\n")
-        );
+        )));
     }
     Ok(Schema::new(fields))
 }
@@ -594,7 +594,8 @@ pub(super) fn rows_to_record_batch_typed(
         // `RecordBatch::try_new` type-mismatch — it should never fire for
         // correct code.
         if arr.data_type() != target_type {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
                 "column '{name}' (PG wire type {pg_type:?}): the value converter produced \
                  {:?} but the resolved column type is {target_type:?} — a column override \
                  retyped it to something the converter cannot build; remove the override \
@@ -948,7 +949,8 @@ fn build_array(
         // → text) alongside the natural text/json/enum/interval columns.
         DataType::Utf8 => build_pg_text_array(pg_type, col_idx, rows, column, max_value_bytes),
         DataType::List(_) => build_pg_list_array(target_type, col_idx, rows),
-        other => anyhow::bail!(
+        other => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_TYPE_BUILDER,
             "no PostgreSQL value converter for target Arrow type {other:?} \
              (wire type {pg_type:?}, column index {col_idx})"
         ),
@@ -1034,7 +1036,8 @@ fn build_pg_text_array(
                 }
             }
         }
-        _ => anyhow::bail!(
+        _ => crate::rivet_bail!(
+            crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
             "no text rendering for PostgreSQL wire type {pg_type:?} (column index \
              {col_idx}); a `string` override is supported only for \
              text/json/enum/interval/numeric/uuid columns"
@@ -1053,12 +1056,15 @@ fn pg_array_decode_error(rows: &[Row], col_idx: usize, e: &postgres::Error) -> a
         .and_then(|r| r.columns().get(col_idx))
         .map(|c| c.name())
         .unwrap_or("?");
-    anyhow::anyhow!(
-        "column '{col}': a PostgreSQL array value could not be decoded as a one-dimensional \
+    crate::error::coded(
+        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+        format!(
+            "column '{col}': a PostgreSQL array value could not be decoded as a one-dimensional \
          Arrow List ({e}). The usual cause is a MULTI-dimensional (nested) array value — an \
          `integer[]` column may legally hold 2-D+ matrices, but Arrow's List is one-dimensional \
          and has no flat mapping. Cast the column to text in the export query (e.g. `{col}::text`) \
          to export the array literal, or flatten it to a 1-D array."
+        ),
     )
 }
 
@@ -1155,7 +1161,8 @@ fn build_pg_list_array(
                 .first()
                 .and_then(|r| r.columns().get(col_idx))
                 .map_or("?", |c| c.name());
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
                 "column '{col}': PG array column has element type {other:?} which the list \
                  builder cannot decode (temporal/uuid/bytea array elements are not yet \
                  supported) — it would export as 100% NULL. Cast the column to text[] in the \
@@ -1184,8 +1191,11 @@ fn pg_numeric_optional_plain(row: &Row, col_idx: usize) -> Result<Option<String>
                 let t = plain.trim();
                 Ok((!t.is_empty()).then(|| t.to_string()))
             }
-            None => Err(anyhow::anyhow!(
-                "PostgreSQL NUMERIC: unsupported NaN/infinity payload (column idx {col_idx})",
+            None => Err(crate::error::coded(
+                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                format!(
+                    "PostgreSQL NUMERIC: unsupported NaN/infinity payload (column idx {col_idx})",
+                ),
             )),
         },
         Ok(None) => Ok(None),
@@ -1232,7 +1242,12 @@ fn pg_numeric_optional_scaled_i128(row: &Row, col_idx: usize, scale: i8) -> Resu
     match pg_numeric_optional_plain(row, col_idx)? {
         Some(t) => crate::types::decimal::decimal_str_to_scaled_i128(&t, scale)
             .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("cannot parse DECIMAL {t:?} as decimal(scale={scale})")),
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                    format!("cannot parse DECIMAL {t:?} as decimal(scale={scale})"),
+                )
+            }),
         None => Ok(None),
     }
 }
@@ -1269,7 +1284,10 @@ fn pg_numeric_to_decimal256(
         match pg_numeric_optional_plain(row, col_idx)? {
             Some(t) => {
                 let v = decimal_str_to_scaled_i256(&t, scale).ok_or_else(|| {
-                    anyhow::anyhow!("cannot parse DECIMAL {t:?} as decimal({precision},{scale})")
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        format!("cannot parse DECIMAL {t:?} as decimal({precision},{scale})"),
+                    )
                 })?;
                 b.append_value(v);
             }

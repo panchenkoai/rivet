@@ -214,6 +214,28 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+/// The spill directory's filesystem refused `flock`, the sweep's liveness signal.
+fn flock_refusal(path: &std::path::Path, err: std::io::Error) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::SOURCE_CDC_SPILL_UNLOCKABLE,
+        format!(
+            "cdc spill: this filesystem refused flock on {} ({err}) — the lock is \
+             the crash-liveness signal spills depend on. Point RIVET_CDC_SPILL_DIR \
+             at a local filesystem (flock-capable), or raise the rollover memory \
+             cap so this transaction stays in memory.",
+            path.display()
+        ),
+    )
+}
+
+/// The spill log could not be flushed to disk before being read back.
+fn flush_refusal(err: std::io::Error) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::SOURCE_CDC_SPILL_UNWRITABLE,
+        format!("cdc spill: flushing the log before reading it back: {err}"),
+    )
+}
+
 impl SpillFile {
     /// Create one in `dir`, named for the caller so a leaked file says who left it.
     ///
@@ -280,14 +302,7 @@ impl SpillFile {
                 // continuing would leave a spill the sweep could later mistake
                 // for an orphan mid-write. (Round-5: the old text asserted an
                 // impossible live neighbour, for a case that cannot reach here.)
-                anyhow::bail!(
-                    "cdc spill: this filesystem refused flock on {} ({}) — the lock is \
-                     the crash-liveness signal spills depend on. Point RIVET_CDC_SPILL_DIR \
-                     at a local filesystem (flock-capable), or raise the rollover memory \
-                     cap so this transaction stays in memory.",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                );
+                return Err(flock_refusal(&path, std::io::Error::last_os_error()));
             }
         }
         Ok(Self {
@@ -301,15 +316,20 @@ impl SpillFile {
     /// Append one record.
     pub(crate) fn push(&mut self, record: &[u8]) -> Result<()> {
         let len = u32::try_from(record.len()).map_err(|_| {
-            anyhow::anyhow!(
-                "cdc spill: a single record is {} bytes, past the 4 GiB frame limit",
-                record.len()
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SPILL,
+                format!(
+                    "cdc spill: a single record is {} bytes, past the 4 GiB frame limit",
+                    record.len()
+                ),
             )
         })?;
-        let w = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("cdc spill: pushed after the log was sealed"))?;
+        let w = self.writer.as_mut().ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SPILL,
+                "cdc spill: pushed after the log was sealed".to_string(),
+            )
+        })?;
         w.write_all(&len.to_be_bytes())?;
         w.write_all(record)?;
         self.records += 1;
@@ -343,9 +363,7 @@ impl SpillFile {
                 "cdc spill: sealed twice"
             );
         };
-        let mut file = w.into_inner().map_err(|e| {
-            anyhow::anyhow!("cdc spill: flushing the log before reading it back: {e}")
-        })?;
+        let mut file = w.into_inner().map_err(|e| flush_refusal(e.into_error()))?;
         file.flush()?;
         file.rewind()?;
         Ok(SpillReader {
@@ -426,11 +444,14 @@ impl SpillReader {
     fn read_one(&mut self, i: usize) -> Result<Vec<u8>> {
         let mut len = [0u8; 4];
         self.reader.read_exact(&mut len).map_err(|e| {
-            anyhow::anyhow!(
-                "cdc spill: record {i} of {} has no length prefix — the log is \
+            anyhow::Error::new(crate::error::CodedError::new(
+                crate::error::codes::INTERNAL_SPILL,
+                format!(
+                    "cdc spill: record {i} of {} has no length prefix — the log is \
                  truncated, and a torn transaction is worse than none: {e}",
-                self.total
-            )
+                    self.total
+                ),
+            ))
         })?;
         let len = u32::from_be_bytes(len) as usize;
         // Bounded pre-allocation: one corrupt length prefix can declare up to
@@ -441,14 +462,18 @@ impl SpillReader {
         let got = std::io::Read::take(&mut self.reader, len as u64)
             .read_to_end(&mut buf)
             .map_err(|e| {
-                anyhow::anyhow!(
-                    "cdc spill: record {i} of {} declares {len} bytes the log does not \
+                anyhow::Error::new(crate::error::CodedError::new(
+                    crate::error::codes::INTERNAL_SPILL,
+                    format!(
+                        "cdc spill: record {i} of {} declares {len} bytes the log does not \
                      hold — truncated: {e}",
-                    self.total
-                )
+                        self.total
+                    ),
+                ))
             })?;
         if got != len {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SPILL,
                 "cdc spill: record {i} of {} declares {len} bytes the log does not \
                  hold — truncated at {got}",
                 self.total
@@ -1261,11 +1286,14 @@ impl<'a> Cur<'a> {
             .checked_add(n)
             .filter(|e| *e <= self.b.len())
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "cdc spill: a frame asks for {n} bytes at offset {} of {} — truncated",
-                    self.at,
-                    self.b.len()
-                )
+                anyhow::Error::new(crate::error::CodedError::new(
+                    crate::error::codes::INTERNAL_SPILL,
+                    format!(
+                        "cdc spill: a frame asks for {n} bytes at offset {} of {} — truncated",
+                        self.at,
+                        self.b.len()
+                    ),
+                ))
             })?;
         let out = &self.b[self.at..end];
         self.at = end;
@@ -1279,7 +1307,10 @@ impl<'a> Cur<'a> {
     fn len(&mut self) -> Result<usize> {
         let raw = u64::from_be_bytes(self.take(8)?.try_into().expect("8 bytes"));
         usize::try_from(raw).map_err(|_| {
-            anyhow::anyhow!("cdc spill: a frame declares {raw} bytes, past this platform's usize")
+            anyhow::Error::new(crate::error::CodedError::new(
+                crate::error::codes::INTERNAL_SPILL,
+                format!("cdc spill: a frame declares {raw} bytes, past this platform's usize"),
+            ))
         })
     }
 
@@ -1290,7 +1321,12 @@ impl<'a> Cur<'a> {
 
     fn string(&mut self) -> Result<String> {
         let b = self.bytes()?;
-        String::from_utf8(b).map_err(|e| anyhow::anyhow!("cdc spill: not utf-8: {e}"))
+        String::from_utf8(b).map_err(|e| {
+            anyhow::Error::new(crate::error::CodedError::new(
+                crate::error::codes::INTERNAL_SPILL,
+                format!("cdc spill: not utf-8: {e}"),
+            ))
+        })
     }
 }
 
@@ -1357,7 +1393,8 @@ fn get_value_at(c: &mut Cur<'_>, depth: u32) -> Result<RivetValue> {
     if depth > MAX_VALUE_DEPTH {
         // Refuse, never recurse on: past the cap this is a corrupt frame, and a
         // stack overflow is a crash no `Result` can report.
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SPILL,
             "cdc spill: value nesting deeper than {MAX_VALUE_DEPTH} — the frame is corrupt"
         );
     }
@@ -1374,7 +1411,10 @@ fn get_value_at(c: &mut Cur<'_>, depth: u32) -> Result<RivetValue> {
             RivetValue::DateTime(
                 chrono::DateTime::from_timestamp(secs, nanos)
                     .ok_or_else(|| {
-                        anyhow::anyhow!("cdc spill: {secs}s + {nanos}ns is not a date-time")
+                        anyhow::Error::new(crate::error::CodedError::new(
+                            crate::error::codes::INTERNAL_SPILL,
+                            format!("cdc spill: {secs}s + {nanos}ns is not a date-time"),
+                        ))
                     })?
                     .naive_utc(),
             )
@@ -1509,10 +1549,12 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
     };
     let schema = c.string()?;
     let table = c.string()?;
-    let position = Position::new(
-        serde_json::from_str(&c.string()?)
-            .map_err(|e| anyhow::anyhow!("cdc spill: the position is not json: {e}"))?,
-    );
+    let position = Position::new(serde_json::from_str(&c.string()?).map_err(|e| {
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::INTERNAL_SPILL,
+            format!("cdc spill: the position is not json: {e}"),
+        ))
+    })?);
     let committed = c.u8()? != 0;
     let seq = u64::from_be_bytes(c.take(8)?.try_into().expect("8"));
     let poison = if c.u8()? == 0 {
@@ -1538,7 +1580,8 @@ pub(crate) fn decode_event(rec: &[u8]) -> Result<ChangeEvent> {
     // while the writer wrote more means the two disagree about the layout, and
     // accepting it delivers a silently truncated event.
     if c.at != rec.len() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SPILL,
             "cdc spill: {} trailing byte(s) after a complete event — the frame and \
              this build disagree about the layout",
             rec.len() - c.at
@@ -2349,5 +2392,31 @@ mod event_cost {
             "the memory estimate is {ratio:.2}x the real cost. A budget that does \
              not track what it budgets is not a budget."
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// The two environment refusals of the spill directory, driven through their builders (an
+    /// `flock`-refusing or full filesystem cannot be staged offline), and a corrupt frame.
+    #[cfg(unix)]
+    #[test]
+    fn spill_refusals_carry_their_codes() {
+        let err = flock_refusal(
+            std::path::Path::new("/spills/tx.spill"),
+            std::io::Error::from_raw_os_error(libc::ENOLCK),
+        );
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_SPILL_UNLOCKABLE", 1);
+        assert!(
+            err.to_string()
+                .starts_with("cdc spill: this filesystem refused flock on /spills/tx.spill ("),
+            "{err}"
+        );
+        let err = flush_refusal(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_SPILL_UNWRITABLE", 1);
+        let err = decode_event(&[9u8; 3]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_SPILL", 6);
     }
 }

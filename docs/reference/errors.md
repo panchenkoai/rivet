@@ -163,3 +163,16 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_RUN_UNITS_FAILED` | environment | 2 if transient, else 1 | fix the first cause the message names and run again; a checkpointed run resumes from where it stopped |
 | `RIVET_RUN_RECONCILE_UNVERIFIED` | environment | 2 if transient, else 1 | run again to obtain the reconcile assurance, or drop `--reconcile`; the export completed |
 | `RIVET_INTERNAL_RUN_INVARIANT` | internal | 6 | a run invariant did not hold — a bug; report it with the message |
+| `RIVET_CONFIG_SOURCE_URL_INVALID` | usage | 1 | write the source URL in the form the message shows (`<scheme>://user:password@host:port/<database or service>`) |
+| `RIVET_CONFIG_SOURCE_OPTION_UNSUPPORTED` | usage | 1 | remove the setting the message names: this source type does not support it |
+| `RIVET_CONFIG_SOURCE_FEATURE_MISSING` | usage | 1 | run a rivet built with the feature the message names (the release binaries include it) |
+| `RIVET_SOURCE_CDC_TABLE_UNRESOLVED` | usage | 1 | set `table:` to the one base table the capture follows, qualified `schema.table` as the catalog spells it, as the message explains |
+| `RIVET_SOURCE_CDC_TABLE_UNSUPPORTED` | usage | 1 | export the table in batch (`mode: full`), or capture a table the message's supported list covers |
+| `RIVET_SOURCE_CDC_TRANSACTION_TOO_LARGE` | usage | 1 | split the source transaction, or raise RIVET_CDC_MAX_TX_ROWS / RIVET_CDC_MAX_TX_BYTES when a transaction this large is expected |
+| `RIVET_SOURCE_QUERY_COLUMN_UNREFERENCEABLE` | usage | 1 | give the column an alias in the export's `query:` (e.g. `... AS row_id`) |
+| `RIVET_SOURCE_CONNECT_FAILED` | environment | 2 if transient, else 1 | check the host, port, credentials and TLS settings in the source URL; the driver's own words follow the colon |
+| `RIVET_SOURCE_QUERY_FAILED` | environment | 2 if transient, else 1 | fix what the server's words name (the statement, the login's rights on the object, or the session), then run again |
+| `RIVET_SOURCE_CDC_SPILL_UNLOCKABLE` | environment | 2 if transient, else 1 | point RIVET_CDC_SPILL_DIR at a local, flock-capable filesystem, or raise the rollover memory cap so the transaction stays in memory |
+| `RIVET_SOURCE_CDC_SPILL_UNWRITABLE` | environment | 2 if transient, else 1 | free space on the spill directory's filesystem (RIVET_CDC_SPILL_DIR, else beside the checkpoint) and check its write permission, then re-run |
+| `RIVET_INTERNAL_SOURCE_INVARIANT` | internal | 6 | a source reader invariant did not hold — a bug; report it with the message |
+| `RIVET_SOURCE_KEYSET_KEY_UNORDERED` | refusal | 5 | remove `page_size` and `parallel` so the collection is read in one ordered scan, or fix the `_id` values the message names |

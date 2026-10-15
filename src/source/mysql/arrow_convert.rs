@@ -290,12 +290,12 @@ pub(super) fn mysql_schema_and_arrow_types(
     }
 
     if !errors.is_empty() {
-        anyhow::bail!(
+        return Err(crate::source::unsafe_mapping_refusal(format!(
             "{} column(s) have no safe Rivet mapping — add column overrides in rivet.yaml:\n\
              columns:\n{}",
             errors.len(),
             errors.join("\n")
-        );
+        )));
     }
     Ok((Schema::new(fields), arrow_types))
 }
@@ -541,7 +541,12 @@ fn narrow<T>(v: i128, column_type: &str) -> Result<T>
 where
     T: TryFrom<i128>,
 {
-    T::try_from(v).map_err(|_| anyhow::anyhow!("value {v} overflows {column_type} column"))
+    T::try_from(v).map_err(|_| {
+        crate::error::coded(
+            crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+            format!("value {v} overflows {column_type} column"),
+        )
+    })
 }
 
 /// Interpret raw big-endian bytes from a MySQL BIT column as an unsigned integer.
@@ -960,7 +965,8 @@ fn build_array(
         // `mysql_schema_and_arrow_types` already proved every column resolves to
         // a supported Arrow type, so an unhandled type here is a should-never-
         // happen — writing a null array silently hid it. Surface it.
-        _ => anyhow::bail!(
+        _ => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_TYPE_BUILDER,
             "no value converter for MySQL column → Arrow {:?} (column index {col_idx}); \
              this Arrow type has no builder — report it as a type-support gap",
             arrow_type,
@@ -991,11 +997,9 @@ fn mysql_decimal_to_decimal128(
                 match decimal_str_to_scaled_i128(s, scale) {
                     Some(v) => b.append_value(v),
                     None => {
-                        return Err(anyhow::anyhow!(
-                            "cannot parse '{}' as decimal({},{})",
-                            s,
-                            precision,
-                            scale
+                        return Err(crate::error::coded(
+                            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                            format!("cannot parse '{}' as decimal({},{})", s, precision, scale),
                         ));
                     }
                 }
@@ -1003,22 +1007,24 @@ fn mysql_decimal_to_decimal128(
             Some(Value::Int(v)) => match scale_int_to_i128(*v as i128, scale) {
                 Some(scaled) => b.append_value(scaled),
                 None => {
-                    return Err(anyhow::anyhow!(
-                        "decimal({},{}) overflow scaling integer {}",
-                        precision,
-                        scale,
-                        v
+                    return Err(crate::error::coded(
+                        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        format!(
+                            "decimal({},{}) overflow scaling integer {}",
+                            precision, scale, v
+                        ),
                     ));
                 }
             },
             Some(Value::UInt(v)) => match scale_int_to_i128(*v as i128, scale) {
                 Some(scaled) => b.append_value(scaled),
                 None => {
-                    return Err(anyhow::anyhow!(
-                        "decimal({},{}) overflow scaling unsigned integer {}",
-                        precision,
-                        scale,
-                        v
+                    return Err(crate::error::coded(
+                        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        format!(
+                            "decimal({},{}) overflow scaling unsigned integer {}",
+                            precision, scale, v
+                        ),
                     ));
                 }
             },
@@ -1062,11 +1068,9 @@ fn mysql_decimal_to_decimal256(
                 match decimal_str_to_scaled_i256(s, scale) {
                     Some(v) => b.append_value(v),
                     None => {
-                        return Err(anyhow::anyhow!(
-                            "cannot parse '{}' as decimal({},{})",
-                            s,
-                            precision,
-                            scale
+                        return Err(crate::error::coded(
+                            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                            format!("cannot parse '{}' as decimal({},{})", s, precision, scale),
                         ));
                     }
                 }
@@ -1074,22 +1078,24 @@ fn mysql_decimal_to_decimal256(
             Some(Value::Int(v)) => match scale_int_to_i256(*v as i128, scale) {
                 Some(scaled) => b.append_value(scaled),
                 None => {
-                    return Err(anyhow::anyhow!(
-                        "decimal({},{}) overflow scaling integer {}",
-                        precision,
-                        scale,
-                        v
+                    return Err(crate::error::coded(
+                        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        format!(
+                            "decimal({},{}) overflow scaling integer {}",
+                            precision, scale, v
+                        ),
                     ));
                 }
             },
             Some(Value::UInt(v)) => match scale_int_to_i256(*v as i128, scale) {
                 Some(scaled) => b.append_value(scaled),
                 None => {
-                    return Err(anyhow::anyhow!(
-                        "decimal({},{}) overflow scaling unsigned integer {}",
-                        precision,
-                        scale,
-                        v
+                    return Err(crate::error::coded(
+                        crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        format!(
+                            "decimal({},{}) overflow scaling unsigned integer {}",
+                            precision, scale, v
+                        ),
                     ));
                 }
             },
@@ -2481,5 +2487,15 @@ mod roast_mysql_bit_decode_tests {
              atoi-first Int64 path reads bytes [0x31, 0x32] as ASCII \"12\" and \
              yields the wrong value 12"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    /// A value past the declared column width is an override mismatch (exit 1).
+    #[test]
+    fn a_value_overflowing_its_declared_width_is_refused_by_code() {
+        let err = super::narrow::<i32>(1 << 40, "INT").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH", 1);
     }
 }

@@ -135,8 +135,10 @@ impl MongoSession {
                     opts.tls = Some(tls_to_mongo(cfg));
                 }
                 let db = opts.default_database.clone().ok_or_else(|| {
-                    anyhow::anyhow!(
+                    crate::error::coded(
+                        crate::error::codes::CONFIG_SOURCE_URL_INVALID,
                         "mongodb url must include a database: mongodb://user:pass@host:port/<db>"
+                            .to_string(),
                     )
                 })?;
                 let client = Client::with_options(opts)?;
@@ -289,36 +291,7 @@ impl MongoSource {
         if let Some((lo, hi)) = self.id_span(collection)?
             && let (Some(lo_id), Some(hi_id)) = (lo.get("_id"), hi.get("_id"))
         {
-            // NaN never matches $gt/$gte/$lt against a non-NaN operand: a keyset
-            // page boundary landing ON the NaN row drops the whole remaining
-            // collection, and every parallel range excludes it. NaN sorts FIRST
-            // in the numeric band, so the min probe always sees it (the max
-            // probe covers the all-NaN corner).
-            for id in [lo_id, hi_id] {
-                if is_id_nan(id) {
-                    anyhow::bail!(
-                        "collection '{collection}' has a NaN `_id`: MongoDB range \
-                         operators never match NaN, so keyset paging / parallel \
-                         ranges would silently skip documents. Remove `page_size` \
-                         and `parallel` to use a full ordered scan (a single \
-                         cursor reads every document), or fix the `_id`."
-                    );
-                }
-            }
-            // Unknown band is refused too (see `id_types_collide`): if we cannot
-            // place the type we cannot promise the seek crosses it — loud beats a
-            // silent gap.
-            if id_types_collide(lo_id, hi_id) {
-                anyhow::bail!(
-                    "collection '{collection}' has heterogeneous `_id` types \
-                     ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
-                     BSON-type-bracketed and would silently skip every `_id` type but \
-                     one. Remove `page_size` and `parallel` to use a full ordered scan \
-                     (a single cursor crosses BSON types), or normalise `_id` to one type.",
-                    lo_id.element_type(),
-                    hi_id.element_type(),
-                );
-            }
+            seekable_id_span(collection, lo_id, hi_id)?;
         }
         Ok(())
     }
@@ -482,6 +455,43 @@ fn id_to_string(id: Option<&Bson>) -> String {
 /// [`id_bracket`] but slipped past a Double-only check and was silently dropped.
 /// A finite decimal renders as digits/sign/`.`/`E`, so a lowercased `"nan"`
 /// substring is an unambiguous NaN test (covers `NaN`, `-NaN`, signaling `sNaN`).
+/// Refuse an `_id` span a `$gt` seek cannot page over: a NaN at either end, or two BSON type brackets.
+fn seekable_id_span(collection: &str, lo_id: &Bson, hi_id: &Bson) -> Result<()> {
+    // NaN never matches $gt/$gte/$lt against a non-NaN operand: a keyset
+    // page boundary landing ON the NaN row drops the whole remaining
+    // collection, and every parallel range excludes it. NaN sorts FIRST
+    // in the numeric band, so the min probe always sees it (the max
+    // probe covers the all-NaN corner).
+    for id in [lo_id, hi_id] {
+        if is_id_nan(id) {
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_KEYSET_KEY_UNORDERED,
+                "collection '{collection}' has a NaN `_id`: MongoDB range \
+                 operators never match NaN, so keyset paging / parallel \
+                 ranges would silently skip documents. Remove `page_size` \
+                 and `parallel` to use a full ordered scan (a single \
+                 cursor reads every document), or fix the `_id`."
+            );
+        }
+    }
+    // Unknown band is refused too (see `id_types_collide`): if we cannot
+    // place the type we cannot promise the seek crosses it — loud beats a
+    // silent gap.
+    if id_types_collide(lo_id, hi_id) {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_KEYSET_KEY_UNORDERED,
+            "collection '{collection}' has heterogeneous `_id` types \
+             ({:?} … {:?}): MongoDB keyset paging seeks with `$gt`, which is \
+             BSON-type-bracketed and would silently skip every `_id` type but \
+             one. Remove `page_size` and `parallel` to use a full ordered scan \
+             (a single cursor crosses BSON types), or normalise `_id` to one type.",
+            lo_id.element_type(),
+            hi_id.element_type(),
+        );
+    }
+    Ok(())
+}
+
 fn is_id_nan(id: &Bson) -> bool {
     match id {
         Bson::Double(f) => f.is_nan(),
@@ -575,7 +585,10 @@ fn decode_id_cursor(token: &str) -> Result<Bson> {
         return Ok(id.clone());
     }
     ObjectId::parse_str(token).map(Bson::ObjectId).map_err(|_| {
-        anyhow::anyhow!("MongoDB keyset cursor '{token}' is neither a typed token nor ObjectId hex")
+        crate::error::coded(
+            crate::error::codes::STATE_CURSOR_INCOMPARABLE,
+            format!("MongoDB keyset cursor '{token}' is neither a typed token nor ObjectId hex"),
+        )
     })
 }
 
@@ -583,14 +596,27 @@ fn hex_to_bytes(s: &str) -> Result<Vec<u8>> {
     // The 2-byte slices below index by BYTE; a multi-byte char boundary would
     // panic. A corrupted / foreign token is an error, never a panic.
     if !s.is_ascii() {
-        anyhow::bail!("invalid hex cursor token (non-ASCII)");
+        crate::rivet_bail!(
+            crate::error::codes::STATE_CURSOR_INCOMPARABLE,
+            "invalid hex cursor token (non-ASCII)"
+        );
     }
     if !s.len().is_multiple_of(2) {
-        anyhow::bail!("odd-length hex cursor token");
+        crate::rivet_bail!(
+            crate::error::codes::STATE_CURSOR_INCOMPARABLE,
+            "odd-length hex cursor token"
+        );
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!(e)))
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::STATE_CURSOR_INCOMPARABLE,
+                    e.to_string(),
+                )
+            })
+        })
         .collect()
 }
 
@@ -643,11 +669,14 @@ impl Source for MongoSource {
         // shortcut (ADR-0027). `None` ⇒ a hand-written `query:` or a
         // filtered/wrapped form, which has no MongoDB equivalent.
         let coll_name = request.base_relation.ok_or_else(|| {
-            anyhow::anyhow!(
-                "MongoDB source supports only `table: <collection>` with `mode: full` — a \
+            crate::error::coded(
+                crate::error::codes::CONFIG_SOURCE_OPTION_UNSUPPORTED,
+                format!(
+                    "MongoDB source supports only `table: <collection>` with `mode: full` — a \
                  hand-written `query:` or a filtered/wrapped form has no MongoDB equivalent. \
                  Got query: {}",
-                request.query
+                    request.query
+                ),
             )
         })?;
         let db = self.session.client().database(self.session.db());
@@ -1377,5 +1406,30 @@ mod tests {
         assert_eq!(harm.get("mongo_op_query"), Some(&3));
         assert!(!harm.contains_key("mongo_wt_cache_bytes_read"));
         assert!(!harm.contains_key("mongo_docs_scanned"));
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// A NaN or two-bracket `_id` span is a refusal (exit 5); a cursor token the state holds
+    /// that no longer decodes is the stored-cursor refusal.
+    #[test]
+    fn an_unseekable_id_span_and_an_undecodable_cursor_token_are_refused_by_code() {
+        let (nan, one, text) = (
+            Bson::Double(f64::NAN),
+            Bson::Int32(1),
+            Bson::String("1".into()),
+        );
+        let err = seekable_id_span("c", &nan, &one).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_KEYSET_KEY_UNORDERED", 5);
+        let err = seekable_id_span("c", &one, &text).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_KEYSET_KEY_UNORDERED", 5);
+        assert!(seekable_id_span("c", &one, &Bson::Int64(2)).is_ok());
+        for token in ["€€", "abc", "zz"] {
+            let err = decode_id_cursor(token).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_STATE_CURSOR_INCOMPARABLE", 5);
+        }
     }
 }

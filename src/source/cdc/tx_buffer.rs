@@ -80,7 +80,8 @@ pub(crate) fn check_tx_buffer_caps(
     let Terms { tag, subject, .. } = terms(engine);
     let (row_cap, byte_cap) = caps;
     if rows > row_cap {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TRANSACTION_TOO_LARGE,
             "{tag} cdc: {subject} has more than {row_cap} rows — it must be \
              buffered whole (a transaction is never split across parts, which is what \
              makes a crash resume transaction-atomic), so this would exhaust memory. \
@@ -89,7 +90,8 @@ pub(crate) fn check_tx_buffer_caps(
         );
     }
     if bytes > byte_cap {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TRANSACTION_TOO_LARGE,
             // Resident cost, not payload: ~2.8M narrow rows cross 2 GiB with no large
             // value anywhere, so the message must not send anyone hunting big cells.
             "{tag} cdc: {subject} needs more than {byte_cap} bytes of buffer \
@@ -631,5 +633,21 @@ mod tests {
         assert!(tail.is_none(), "the finished tail is dropped at once");
         assert_eq!(files(), 0, "and its file with it");
         assert!(replay(&mut tail, decode_event).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+    use crate::source::cdc::CdcEngine;
+
+    /// Past the row cap or the byte cap: one code, usage, exit 1; under both: fine.
+    #[test]
+    fn a_transaction_past_the_buffer_caps_is_refused_by_code() {
+        let err = check_tx_buffer_caps(CdcEngine::Postgres, 11, 0, (10, 1 << 30)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TRANSACTION_TOO_LARGE", 1);
+        let err = check_tx_buffer_caps(CdcEngine::Mysql, 1, 2048, (10, 1024)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TRANSACTION_TOO_LARGE", 1);
+        assert!(check_tx_buffer_caps(CdcEngine::Mysql, 1, 1, (10, 1024)).is_ok());
     }
 }

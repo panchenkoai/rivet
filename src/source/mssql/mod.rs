@@ -229,12 +229,23 @@ pub(crate) fn tiberius_config(
 /// Open TCP to `config`'s address and log in; a refused or unresolvable address names `at`.
 pub(crate) async fn dial(config: Config, at: &str) -> Result<MssqlClient> {
     let tcp = TcpStream::connect(config.get_addr()).await.map_err(|e| {
-        crate::source::describe_connect_error(at, anyhow::anyhow!("mssql: TCP connect failed: {e}"))
+        crate::source::describe_connect_error(
+            at,
+            crate::error::coded(
+                crate::error::codes::SOURCE_CONNECT_FAILED,
+                format!("mssql: TCP connect failed: {e}"),
+            ),
+        )
     })?;
     tcp.set_nodelay(true).ok();
     Client::connect(config, tcp.compat_write())
         .await
-        .map_err(|e| anyhow::anyhow!("mssql: login failed: {e}"))
+        .map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::SOURCE_CONNECT_FAILED,
+                format!("mssql: login failed: {e}"),
+            )
+        })
 }
 
 /// Does this TLS posture mean "encrypt, but do NOT verify the certificate"?
@@ -255,12 +266,20 @@ pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
     let rest = url
         .strip_prefix("sqlserver://")
         .or_else(|| url.strip_prefix("mssql://"))
-        .ok_or_else(|| anyhow::anyhow!("mssql url must start with sqlserver:// — got {url}"))?;
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+                format!("mssql url must start with sqlserver:// — got {url}"),
+            )
+        })?;
     // userinfo @ host:port / db   (rsplit the last '@' so a '@' in a password
     // is tolerated; '/' splits host from db).
-    let (userinfo, hostpart) = rest
-        .rsplit_once('@')
-        .ok_or_else(|| anyhow::anyhow!("mssql url missing user@host: {url}"))?;
+    let (userinfo, hostpart) = rest.rsplit_once('@').ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            format!("mssql url missing user@host: {url}"),
+        )
+    })?;
     // Percent-DECODE the userinfo. `build_url_from_fields` (config/source.rs)
     // percent-ENCODES user/password for every engine so a credential's
     // `/ @ : ? #` can't break URL parsing or defeat redaction. PG/MySQL/Mongo
@@ -280,13 +299,20 @@ pub(crate) fn parse_mssql_url(url: &str) -> Result<MssqlUrl> {
     let (host, port) = match hostport.rsplit_once(':') {
         Some((h, p)) => (
             h.to_string(),
-            p.parse::<u16>()
-                .map_err(|_| anyhow::anyhow!("mssql url port not a number: {p}"))?,
+            p.parse::<u16>().map_err(|_| {
+                crate::error::coded(
+                    crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+                    format!("mssql url port not a number: {p}"),
+                )
+            })?,
         ),
         None => (hostport.to_string(), 1433),
     };
     if database.is_empty() {
-        anyhow::bail!("mssql url must include a database: sqlserver://user:pass@host:port/<db>");
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            "mssql url must include a database: sqlserver://user:pass@host:port/<db>"
+        );
     }
     Ok(MssqlUrl {
         host,
@@ -321,7 +347,12 @@ impl MssqlSource {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| anyhow::anyhow!("mssql: tokio runtime build failed: {e}"))?;
+            .map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                    format!("mssql: tokio runtime build failed: {e}"),
+                )
+            })?;
 
         let client = rt.block_on(dial(config, url))?;
 
@@ -366,15 +397,24 @@ impl MssqlSource {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("mssql: reading the database isolation options failed: {e}")
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: reading the database isolation options failed: {e}"),
+                    )
                 })?
                 .into_row()
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("mssql: reading the database isolation options failed: {e}")
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: reading the database isolation options failed: {e}"),
+                    )
                 })?
                 .ok_or_else(|| {
-                    anyhow::anyhow!("mssql: sys.databases has no row for the current database")
+                    crate::error::coded(
+                        crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                        "mssql: sys.databases has no row for the current database".to_string(),
+                    )
                 })?;
             Ok::<_, anyhow::Error>((
                 row.get::<&str, _>(0).unwrap_or_default().to_string(),
@@ -455,10 +495,20 @@ impl MssqlSource {
             client
                 .query(sql.as_str(), &[])
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: sys.columns probe failed: {e}"))?
+                .map_err(|e| {
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: sys.columns probe failed: {e}"),
+                    )
+                })?
                 .into_first_result()
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: reading sys.columns rows failed: {e}"))
+                .map_err(|e| {
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: reading sys.columns rows failed: {e}"),
+                    )
+                })
         })?;
 
         let mut map = HashMap::new();
@@ -581,19 +631,19 @@ impl Source for MssqlSource {
             if lock_timeout_ms > 0 {
                 session_set(client, &format!("SET LOCK_TIMEOUT {lock_timeout_ms}"))
                     .await
-                    .map_err(|e| anyhow::anyhow!("mssql: SET LOCK_TIMEOUT failed: {e}"))?;
+                    .map_err(|e| crate::error::coded(crate::error::codes::SOURCE_QUERY_FAILED, format!("mssql: SET LOCK_TIMEOUT failed: {e}")))?;
             }
             if snapshot_read {
                 session_set(client, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
                     .await
-                    .map_err(|e| anyhow::anyhow!("mssql: SET TRANSACTION ISOLATION LEVEL SNAPSHOT failed: {e}"))?;
+                    .map_err(|e| crate::error::coded(crate::error::codes::SOURCE_QUERY_FAILED, format!("mssql: SET TRANSACTION ISOLATION LEVEL SNAPSHOT failed: {e}")))?;
             }
 
             let started = std::time::Instant::now();
             let mut stream = client
                 .query(sql.as_str(), &[])
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: query failed: {e}"))?;
+                .map_err(|e| crate::error::coded(crate::error::codes::SOURCE_QUERY_FAILED, format!("mssql: query failed: {e}")))?;
 
             let mut columns: Vec<tiberius::Column> = Vec::new();
             let mut buf: Vec<tiberius::Row> = Vec::with_capacity(ctl.target());
@@ -606,7 +656,7 @@ impl Source for MssqlSource {
             while let Some(item) = stream
                 .try_next()
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: streaming rows failed: {e}"))?
+                .map_err(|e| crate::error::coded(crate::error::codes::SOURCE_QUERY_FAILED, format!("mssql: streaming rows failed: {e}")))?
             {
                 if let Some(budget) = stmt_timeout
                     && started.elapsed() > budget
@@ -712,7 +762,7 @@ impl Source for MssqlSource {
             if snapshot_read {
                 session_set(client, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
                     .await
-                    .map_err(|e| anyhow::anyhow!("mssql: resetting the isolation level failed: {e}"))?;
+                    .map_err(|e| crate::error::coded(crate::error::codes::SOURCE_QUERY_FAILED, format!("mssql: resetting the isolation level failed: {e}")))?;
             }
             Ok::<_, anyhow::Error>(())
         })?;
@@ -738,10 +788,20 @@ impl Source for MssqlSource {
             let row = client
                 .query(sql, &[])
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: scalar query failed: {e}"))?
+                .map_err(|e| {
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: scalar query failed: {e}"),
+                    )
+                })?
                 .into_row()
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: reading scalar row failed: {e}"))?;
+                .map_err(|e| {
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: reading scalar row failed: {e}"),
+                    )
+                })?;
             Ok(row.and_then(|r| scalar_to_string(&r)))
         })
     }
@@ -760,14 +820,21 @@ impl Source for MssqlSource {
         let overrides = column_overrides.clone();
         let Self { rt, client, .. } = self;
         rt.block_on(async {
-            let mut stream = client
-                .query(wrapped.as_str(), &[])
-                .await
-                .map_err(|e| anyhow::anyhow!("mssql: type-probe query failed: {e}"))?;
+            let mut stream = client.query(wrapped.as_str(), &[]).await.map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::SOURCE_QUERY_FAILED,
+                    format!("mssql: type-probe query failed: {e}"),
+                )
+            })?;
             let columns = stream
                 .columns()
                 .await
-                .map_err(|e| anyhow::anyhow!("mssql: type-probe metadata failed: {e}"))?
+                .map_err(|e| {
+                    crate::error::coded(
+                        crate::error::codes::SOURCE_QUERY_FAILED,
+                        format!("mssql: type-probe metadata failed: {e}"),
+                    )
+                })?
                 .map(<[_]>::to_vec)
                 .unwrap_or_default();
             // Drain so the connection is reusable.
@@ -1499,5 +1566,22 @@ mod key_probe_sql_tests {
         );
         assert!(!sql.contains("GROUP BY c.name"), "{sql}");
         assert!(!sql.contains("TOP 1"), "{sql}");
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    /// Every malformed SQL Server URL: one code, usage, exit 1.
+    #[test]
+    fn a_malformed_mssql_url_is_refused_by_code() {
+        for url in [
+            "foo://u:p@h/db",
+            "sqlserver://h/db",
+            "sqlserver://u:p@h:zz/db",
+            "sqlserver://u:p@h",
+        ] {
+            let err = super::parse_mssql_url(url).err().expect(url);
+            crate::error::assert_coded(&err, "RIVET_CONFIG_SOURCE_URL_INVALID", 1);
+        }
     }
 }

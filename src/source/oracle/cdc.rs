@@ -549,7 +549,12 @@ fn rows(conn: &Connection, sql: &str) -> Result<Vec<Vec<Option<String>>>> {
 fn scn(conn: &Connection, sql: &str) -> Result<u64> {
     scalar(conn, sql)?
         .and_then(|s| s.parse().ok())
-        .ok_or_else(|| anyhow::anyhow!("oracle cdc: could not read an SCN from `{sql}`"))
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                format!("oracle cdc: could not read an SCN from `{sql}`"),
+            )
+        })
 }
 
 /// The connection's container: `(CON_ID, name, DBID)`, name and DBID empty on a non-CDB.
@@ -574,6 +579,33 @@ fn container(conn: &Connection) -> Result<(String, String, String)> {
 }
 
 /// Resolve and vet every configured table in the PDB: types, name lengths, identity columns.
+/// Refuse a table LogMiner cannot mine whole: a name past its limit, a column type it never decodes, or more columns than the preview mines.
+fn mineable(o: &str, t: &str, refused: &[String], columns: usize) -> Result<()> {
+    if o.len() > MAX_MINED_NAME || t.len() > MAX_MINED_NAME {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED,
+            "oracle cdc: `{o}.{t}` has a name over {MAX_MINED_NAME} bytes, which LogMiner \
+             reports as UNSUPPORTED and never decodes"
+        )
+    }
+    if !refused.is_empty() {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED,
+            "oracle cdc: `{o}.{t}` cannot be captured in this preview: {}. Supported: NUMBER, \
+             FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP (any zone form), VARCHAR2, NVARCHAR2, \
+             CHAR, NCHAR, RAW. Export the table in batch, or capture a table without them.",
+            refused.join(", ")
+        )
+    }
+    if columns > MAX_COLUMNS {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED,
+            "oracle cdc: `{o}.{t}` has {columns} columns; the preview mines at most {MAX_COLUMNS}"
+        )
+    }
+    Ok(())
+}
+
 fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captured>> {
     let major: u32 = scalar(
         conn,
@@ -594,11 +626,13 @@ fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captur
                   ORDER BY column_id"
             ),
         )?;
-        anyhow::ensure!(
-            !cols.is_empty(),
-            "oracle cdc: table `{cfg}` not found or not readable — Oracle stores unquoted names \
+        if cols.is_empty() {
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_PREREQUISITE,
+                "oracle cdc: table `{cfg}` not found or not readable — Oracle stores unquoted names \
              upper-case; check the spelling and that the capture user can SELECT it"
-        );
+            )
+        }
         let cell = |r: &Vec<Option<String>>, i: usize| r[i].clone().unwrap_or_default();
         let (o, t) = (cell(&cols[0], 0), cell(&cols[0], 1));
         let mut refused = Vec::new();
@@ -621,23 +655,7 @@ fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captur
                 None => refused.push(format!("{name} {ty}")),
             }
         }
-        anyhow::ensure!(
-            o.len() <= MAX_MINED_NAME && t.len() <= MAX_MINED_NAME,
-            "oracle cdc: `{o}.{t}` has a name over {MAX_MINED_NAME} bytes, which LogMiner \
-             reports as UNSUPPORTED and never decodes"
-        );
-        anyhow::ensure!(
-            refused.is_empty(),
-            "oracle cdc: `{o}.{t}` cannot be captured in this preview: {}. Supported: NUMBER, \
-             FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP (any zone form), VARCHAR2, NVARCHAR2, \
-             CHAR, NCHAR, RAW. Export the table in batch, or capture a table without them.",
-            refused.join(", ")
-        );
-        anyhow::ensure!(
-            columns.len() <= MAX_COLUMNS,
-            "oracle cdc: `{o}.{t}` has {} columns; the preview mines at most {MAX_COLUMNS}",
-            columns.len()
-        );
+        mineable(&o, &t, &refused, columns.len())?;
         let (ev_schema, ev_table) = event_spelling(cfg);
         let names: Arc<[String]> = columns.iter().map(|(n, _)| n.clone()).collect();
         let rowid_stable = scalar(
@@ -724,19 +742,23 @@ fn root_identity(conn: &Connection, con_name: String, con_dbid: String) -> Resul
     )?;
     let r = r.into_iter().next().unwrap_or_default();
     let cell = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
-    anyhow::ensure!(
-        cell(3) == "ARCHIVELOG",
-        "oracle cdc: the database runs in {} mode; LogMiner capture needs ARCHIVELOG so redo \
+    if cell(3) != "ARCHIVELOG" {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            "oracle cdc: the database runs in {} mode; LogMiner capture needs ARCHIVELOG so redo \
          survives a log switch. As SYSDBA: SHUTDOWN IMMEDIATE; STARTUP MOUNT; ALTER DATABASE \
          ARCHIVELOG; ALTER DATABASE OPEN;",
-        cell(3)
-    );
-    anyhow::ensure!(
-        cell(4) == "YES" || cell(4) == "IMPLICIT",
-        "oracle cdc: minimal supplemental logging is off, so LogMiner cannot decode DML. As a \
+            cell(3)
+        )
+    }
+    if cell(4) != "YES" && cell(4) != "IMPLICIT" {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            "oracle cdc: minimal supplemental logging is off, so LogMiner cannot decode DML. As a \
          DBA in CDB$ROOT: ALTER DATABASE ADD SUPPLEMENTAL LOG DATA; (redo written before it \
          stays undecodable)"
-    );
+        )
+    }
     Ok(OraIdentity {
         dbid: cell(0),
         db_unique_name: cell(1),
@@ -765,7 +787,12 @@ fn low_water_here(conn: &Connection) -> Result<u64> {
     current
         .zip(starts)
         .map(|(current, starts)| low_water_of(current, &starts))
-        .ok_or_else(|| anyhow::anyhow!("oracle cdc: could not read the low-water SCN"))
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                "oracle cdc: could not read the low-water SCN".to_string(),
+            )
+        })
 }
 
 /// The oldest open transaction's start SCN, or `current`; a `START_SCN` of 0 is a transaction
@@ -993,15 +1020,18 @@ impl OracleChangeStream {
         tables: &[String],
     ) -> Result<Self> {
         let checkpoint = checkpoint.ok_or_else(|| {
-            anyhow::anyhow!(
+            crate::error::coded(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "oracle cdc: a checkpoint is required — the anchor is client-side, so without \
-                 one every run would start at the current SCN and capture nothing"
+                 one every run would start at the current SCN and capture nothing",
             )
         })?;
-        anyhow::ensure!(
-            !tables.is_empty(),
-            "oracle cdc: name the tables to capture (`table:` / `tables:`, or `--table`)"
-        );
+        if tables.is_empty() {
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
+                "oracle cdc: name the tables to capture (`table:` / `tables:`, or `--table`)"
+            )
+        }
         let conn = connect(url, tls)?;
         for sql in SIGNED_YEAR_PIN {
             conn.execute(sql, &[]).ora()?;
@@ -1128,7 +1158,10 @@ impl OracleChangeStream {
             .iter()
             .find(|t| t.owner == owner && t.table == table)
             .ok_or_else(|| {
-                anyhow::anyhow!("oracle cdc: mined a row of unexpected `{owner}.{table}`")
+                crate::error::coded(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                    format!("oracle cdc: mined a row of unexpected `{owner}.{table}`"),
+                )
             })?;
         let op = match op.as_str() {
             "INSERT" => ChangeOp::Insert,
@@ -1142,19 +1175,23 @@ impl OracleChangeStream {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             let (b, a) = image_sides(op, present).ok_or_else(|| {
-                anyhow::anyhow!(
+                crate::source::cdc::checkpoint_identity::undecodable(format!(
                     "oracle cdc: a {op:?} of `{owner}.{table}` carries no value for {name} — its \
                      redo was written without ALL COLUMNS supplemental logging (enabled later, \
                      or dropped since). Writing NULL would be a silent wrong value. {}",
                     crate::source::cdc::checkpoint_identity::RECOVER
-                )
+                ))
             })?;
             let value = |side: Side| -> Result<RivetValue> {
                 let raw = text(value_slot(j, side))?;
                 match raw {
                     None => Ok(RivetValue::Null),
-                    Some(s) => decode(*kind, &s)
-                        .map_err(|e| anyhow::anyhow!("oracle cdc: `{owner}.{table}`.{name}: {e}")),
+                    Some(s) => decode(*kind, &s).map_err(|e| {
+                        crate::error::coded(
+                            crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+                            format!("oracle cdc: `{owner}.{table}`.{name}: {e}"),
+                        )
+                    }),
                 }
             };
             if let Some(side) = b {
@@ -2278,5 +2315,22 @@ mod renderer_twins {
                 "{mined}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// A name past LogMiner's limit, an unmined column type, or too many columns: one code, usage, exit 1.
+    #[test]
+    fn a_table_logminer_cannot_mine_is_refused_by_code() {
+        let err = mineable("O", "T", &["C BLOB".into()], 1).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED", 1);
+        let err = mineable(&"O".repeat(MAX_MINED_NAME + 1), "T", &[], 1).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED", 1);
+        let err = mineable("O", "T", &[], MAX_COLUMNS + 1).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED", 1);
+        assert!(mineable("O", "T", &[], 1).is_ok());
     }
 }

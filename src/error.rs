@@ -1311,6 +1311,72 @@ pub mod codes {
         "a run invariant did not hold — a bug; report it with the message",
     );
 
+    /// A source URL rivet cannot parse into scheme, credentials, host, port and database.
+    pub const CONFIG_SOURCE_URL_INVALID: Code = usage(
+        "RIVET_CONFIG_SOURCE_URL_INVALID",
+        "write the source URL in the form the message shows (`<scheme>://user:password@host:port/<database or service>`)",
+    );
+    /// A setting the configured source type does not support (an Oracle `tls.ca_file`, a MongoDB `query:`).
+    pub const CONFIG_SOURCE_OPTION_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_SOURCE_OPTION_UNSUPPORTED",
+        "remove the setting the message names: this source type does not support it",
+    );
+    /// A `source.type` this binary was built without.
+    pub const CONFIG_SOURCE_FEATURE_MISSING: Code = usage(
+        "RIVET_CONFIG_SOURCE_FEATURE_MISSING",
+        "run a rivet built with the feature the message names (the release binaries include it)",
+    );
+    /// A CDC `table:` that does not name exactly one base table the engine's log can route changes to.
+    pub const SOURCE_CDC_TABLE_UNRESOLVED: Code = usage(
+        "RIVET_SOURCE_CDC_TABLE_UNRESOLVED",
+        "set `table:` to the one base table the capture follows, qualified `schema.table` as the catalog spells it, as the message explains",
+    );
+    /// A table the CDC reader cannot decode as a whole (Oracle: a column type, name length or width LogMiner does not mine).
+    pub const SOURCE_CDC_TABLE_UNSUPPORTED: Code = usage(
+        "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED",
+        "export the table in batch (`mode: full`), or capture a table the message's supported list covers",
+    );
+    /// One source transaction larger than the in-memory buffer cap.
+    pub const SOURCE_CDC_TRANSACTION_TOO_LARGE: Code = usage(
+        "RIVET_SOURCE_CDC_TRANSACTION_TOO_LARGE",
+        "split the source transaction, or raise RIVET_CDC_MAX_TX_ROWS / RIVET_CDC_MAX_TX_BYTES when a transaction this large is expected",
+    );
+    /// A query column that must be re-read through a conversion but whose name an outer query cannot reference.
+    pub const SOURCE_QUERY_COLUMN_UNREFERENCEABLE: Code = usage(
+        "RIVET_SOURCE_QUERY_COLUMN_UNREFERENCEABLE",
+        "give the column an alias in the export's `query:` (e.g. `... AS row_id`)",
+    );
+    /// The connection to the source could not be opened: no route, a refused login, a failed handshake.
+    pub const SOURCE_CONNECT_FAILED: Code = environment(
+        "RIVET_SOURCE_CONNECT_FAILED",
+        "check the host, port, credentials and TLS settings in the source URL; the driver's own words follow the colon",
+    );
+    /// A statement the source refused or a session that broke under it; the server's words are kept.
+    pub const SOURCE_QUERY_FAILED: Code = environment(
+        "RIVET_SOURCE_QUERY_FAILED",
+        "fix what the server's words name (the statement, the login's rights on the object, or the session), then run again",
+    );
+    /// The spill directory's filesystem refused `flock`, which the spill sweep relies on.
+    pub const SOURCE_CDC_SPILL_UNLOCKABLE: Code = environment(
+        "RIVET_SOURCE_CDC_SPILL_UNLOCKABLE",
+        "point RIVET_CDC_SPILL_DIR at a local, flock-capable filesystem, or raise the rollover memory cap so the transaction stays in memory",
+    );
+    /// A spill log could not be flushed to disk.
+    pub const SOURCE_CDC_SPILL_UNWRITABLE: Code = environment(
+        "RIVET_SOURCE_CDC_SPILL_UNWRITABLE",
+        "free space on the spill directory's filesystem (RIVET_CDC_SPILL_DIR, else beside the checkpoint) and check its write permission, then re-run",
+    );
+    /// A source reader invariant did not hold: a driver answer, a log message or a position in a shape rivet never produces.
+    pub const INTERNAL_SOURCE_INVARIANT: Code = internal(
+        "RIVET_INTERNAL_SOURCE_INVARIANT",
+        "a source reader invariant did not hold — a bug; report it with the message",
+    );
+    /// A MongoDB `_id` set a type-bracketed `$gt` seek cannot page over (NaN, or more than one BSON type).
+    pub const SOURCE_KEYSET_KEY_UNORDERED: Code = refusal(
+        "RIVET_SOURCE_KEYSET_KEY_UNORDERED",
+        "remove `page_size` and `parallel` so the collection is read in one ordered scan, or fix the `_id` values the message names",
+    );
+
     /// Every registered code: the docs page and the guard tests read this one list.
     pub const ALL: &[Code] = &[
         CONFIG_NO_EXPORTS,
@@ -1461,6 +1527,19 @@ pub mod codes {
         RUN_UNITS_FAILED,
         RUN_RECONCILE_UNVERIFIED,
         INTERNAL_RUN_INVARIANT,
+        CONFIG_SOURCE_URL_INVALID,
+        CONFIG_SOURCE_OPTION_UNSUPPORTED,
+        CONFIG_SOURCE_FEATURE_MISSING,
+        SOURCE_CDC_TABLE_UNRESOLVED,
+        SOURCE_CDC_TABLE_UNSUPPORTED,
+        SOURCE_CDC_TRANSACTION_TOO_LARGE,
+        SOURCE_QUERY_COLUMN_UNREFERENCEABLE,
+        SOURCE_CONNECT_FAILED,
+        SOURCE_QUERY_FAILED,
+        SOURCE_CDC_SPILL_UNLOCKABLE,
+        SOURCE_CDC_SPILL_UNWRITABLE,
+        INTERNAL_SOURCE_INVARIANT,
+        SOURCE_KEYSET_KEY_UNORDERED,
     ];
 }
 

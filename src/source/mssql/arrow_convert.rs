@@ -287,11 +287,11 @@ pub(super) fn mssql_columns_to_schema(
     }
 
     if !errors.is_empty() {
-        anyhow::bail!(
+        return Err(crate::source::unsafe_mapping_refusal(format!(
             "SQL Server export: {} column(s) have no safe type mapping:\n{}",
             errors.len(),
             errors.join("\n")
-        );
+        )));
     }
     Ok((Schema::new(fields), decoders))
 }
@@ -452,7 +452,8 @@ fn build_array(
                     | Some(ColumnData::Guid(None))
                     | Some(ColumnData::Numeric(None))
                     | None => b.append_null(),
-                    Some(other) => anyhow::bail!(
+                    Some(other) => crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_TYPE_BUILDER,
                         "mssql column {idx}: expected {} but row carried {other:?}",
                         stringify!($builder)
                     ),
@@ -487,7 +488,8 @@ fn build_array(
                     | Some(ColumnData::Guid(None))
                     | Some(ColumnData::Numeric(None))
                     | None => b.append_null(),
-                    Some(other) => anyhow::bail!(
+                    Some(other) => crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_TYPE_BUILDER,
                         "mssql column {idx}: expected Int16Builder but row carried {other:?}"
                     ),
                 }
@@ -531,7 +533,8 @@ fn build_array(
                         value_within_ceiling(column, s.len(), max_value_bytes)?;
                         b.append_value(s.as_ref());
                     }
-                    Some(other) if !is_null_cell(other) => anyhow::bail!(
+                    Some(other) if !is_null_cell(other) => crate::rivet_bail!(
+                        crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
                         "column `{column}` is declared text (`columns: {column}: string`) but SQL \
                          Server sends it as {} — rivet does not convert it, and writing it as NULL \
                          would lose every value. Remove the `string` override: rivet reads this \
@@ -589,7 +592,10 @@ fn build_array(
                             + UNIX_EPOCH_DAY,
                     ),
                     Ok(None) => b.append_null(),
-                    Err(e) => anyhow::bail!("mssql date column {idx} row {r}: {e}"),
+                    Err(e) => crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_TYPE_BUILDER,
+                        "mssql date column {idx} row {r}: {e}"
+                    ),
                 }
             }
             Arc::new(b.finish())
@@ -605,7 +611,10 @@ fn build_array(
                     Ok(v) => v.map(|dt| naive_micros(dt, legacy)),
                     Err(_) => match row.try_get::<chrono::DateTime<chrono::FixedOffset>, _>(idx) {
                         Ok(v) => v.map(|dt| dt.timestamp_micros()),
-                        Err(e) => anyhow::bail!("mssql timestamp column {idx} row {r}: {e}"),
+                        Err(e) => crate::rivet_bail!(
+                            crate::error::codes::INTERNAL_TYPE_BUILDER,
+                            "mssql timestamp column {idx} row {r}: {e}"
+                        ),
                     },
                 };
                 match micros {
@@ -635,7 +644,10 @@ fn build_array(
                         None => b.append_null(),
                     },
                     Ok(None) => b.append_null(),
-                    Err(e) => anyhow::bail!("mssql datetime column {idx} row {r}: {e}"),
+                    Err(e) => crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_TYPE_BUILDER,
+                        "mssql datetime column {idx} row {r}: {e}"
+                    ),
                 }
             }
             let arr = b.finish();
@@ -654,12 +666,18 @@ fn build_array(
                             + (t.nanosecond() as i64 / 1000),
                     ),
                     Ok(None) => b.append_null(),
-                    Err(e) => anyhow::bail!("mssql time column {idx} row {r}: {e}"),
+                    Err(e) => crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_TYPE_BUILDER,
+                        "mssql time column {idx} row {r}: {e}"
+                    ),
                 }
             }
             Arc::new(b.finish())
         }
-        other => anyhow::bail!("mssql: no array builder for Arrow type {other:?} (column {idx})"),
+        other => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_TYPE_BUILDER,
+            "mssql: no array builder for Arrow type {other:?} (column {idx})"
+        ),
     };
     Ok(arr)
 }
@@ -730,7 +748,10 @@ fn binary_cell<'a>(c: Option<&'a ColumnData<'_>>, column: &str) -> Result<Option
 /// Non-finite input is a loud error, never a silent NULL.
 fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
     if !v.is_finite() {
-        anyhow::bail!("non-finite money value {v:?}");
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+            "non-finite money value {v:?}"
+        );
     }
     // Round-2 audit #18: tiberius decodes MONEY as an f64. Above 2^53 the scaled
     // integer (value·10^scale) is no longer integer-exact in f64, so a value this
@@ -741,7 +762,8 @@ fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
     // `Exact` label honest: every MONEY rivet DOES export is exactly representable.
     let scaled_abs = v.abs() * 10f64.powi(scale as i32);
     if scaled_abs >= 9_007_199_254_740_992.0 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
             "mssql money value {v} exceeds the range representable without precision loss \
              (|value| ≥ 2^53 ÷ 10^{scale} ≈ {:.3e}). tiberius decodes MONEY as f64, so this \
              value was already rounded before rivet read it — it cannot be recovered here. \
@@ -752,8 +774,12 @@ fn f64_to_scaled_i128(v: f64, scale: u8) -> Result<i128> {
         );
     }
     let txt = format!("{v:.prec$}", prec = scale as usize);
-    crate::types::decimal::decimal_str_to_scaled_i128(&txt, scale as i8)
-        .ok_or_else(|| anyhow::anyhow!("money render {txt:?} did not parse"))
+    crate::types::decimal::decimal_str_to_scaled_i128(&txt, scale as i8).ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_VALUE_CONVERTER,
+            format!("money render {txt:?} did not parse"),
+        )
+    })
 }
 
 /// Rescale an unscaled decimal from `from_scale` to `to_scale` (Arrow's fixed
@@ -768,16 +794,20 @@ fn rescale_i128(value: i128, from_scale: u8, to_scale: u8) -> Result<i128> {
         Ordering::Greater => {
             let factor = 10i128.pow((to_scale - from_scale) as u32);
             value.checked_mul(factor).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "mssql decimal overflow: unscaled value {value} at scale {from_scale} \
+                crate::error::coded(
+                    crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                    format!(
+                        "mssql decimal overflow: unscaled value {value} at scale {from_scale} \
                      does not fit i128 when rescaled to {to_scale}"
+                    ),
                 )
             })
         }
         Ordering::Less => {
             let factor = 10i128.pow((from_scale - to_scale) as u32);
             if value % factor != 0 {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
                     "mssql decimal rescale is lossy: unscaled value {value} at scale \
                      {from_scale} does not fit column scale {to_scale} (non-zero digits \
                      would be dropped). The column's declared scale was likely lost — \
@@ -1462,5 +1492,24 @@ mod renderer_twins {
             cell_text(&ColumnData::Guid(Some(g))),
             Some(uuid36(g.as_bytes()))
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// A MONEY the driver already rounded or a non-finite one is unrepresentable (exit 5); a
+    /// decimal whose declared scale was lost is an override mismatch (exit 1).
+    #[test]
+    fn money_and_decimal_refusals_carry_their_codes() {
+        for v in [f64::NAN, 1e20] {
+            let err = f64_to_scaled_i128(v, 4).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+        }
+        let err = rescale_i128(123, 2, 0).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH", 1);
+        let err = rescale_i128(i128::MAX, 0, 2).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
     }
 }

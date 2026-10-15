@@ -180,11 +180,11 @@ pub(super) fn oracle_schema(
         }
     }
     if !errors.is_empty() {
-        anyhow::bail!(
+        return Err(crate::source::unsafe_mapping_refusal(format!(
             "Oracle export: {} column(s) have no safe type mapping:\n{}",
             errors.len(),
             errors.join("\n")
-        );
+        )));
     }
     Ok(Schema::new(fields))
 }
@@ -239,15 +239,26 @@ pub(super) fn chrono_year(oracle: i32) -> i32 {
 /// An Oracle timestamp's fields as a proleptic-Gregorian date-time, read as UTC.
 fn timestamp_datetime(t: &OracleTimestamp) -> Result<chrono::NaiveDateTime> {
     let year = chrono_year(t.year() as i32);
-    let date = chrono::NaiveDate::from_ymd_opt(year, t.month() as u32, t.day() as u32)
-        .ok_or_else(|| anyhow::anyhow!("oracle: invalid date {t}"))?;
+    let date = chrono::NaiveDate::from_ymd_opt(year, t.month() as u32, t.day() as u32).ok_or_else(
+        || {
+            crate::error::coded(
+                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                format!("oracle: invalid date {t}"),
+            )
+        },
+    )?;
     let time = chrono::NaiveTime::from_hms_nano_opt(
         t.hour() as u32,
         t.minute() as u32,
         t.second() as u32,
         t.nanoseconds(),
     )
-    .ok_or_else(|| anyhow::anyhow!("oracle: invalid time {t}"))?;
+    .ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+            format!("oracle: invalid time {t}"),
+        )
+    })?;
     Ok(date.and_time(time))
 }
 
@@ -262,9 +273,12 @@ fn timestamp_nanos(t: &OracleTimestamp, name: &str) -> Result<i64> {
         .and_utc()
         .timestamp_nanos_opt()
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "oracle: column {name} = {t} is outside the nanosecond timestamp range \
+            crate::error::coded(
+                crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+                format!(
+                    "oracle: column {name} = {t} is outside the nanosecond timestamp range \
                  (1677-09-21..2262-04-11); declare it `timestamp` (microseconds) instead"
+                ),
             )
         })
 }
@@ -272,11 +286,13 @@ fn timestamp_nanos(t: &OracleTimestamp, name: &str) -> Result<i64> {
 /// Days since the Unix epoch, or an error naming `name` when the value has a time of day.
 fn date_days(t: &OracleTimestamp, name: &str) -> Result<i32> {
     let dt = timestamp_datetime(t)?;
-    anyhow::ensure!(
-        dt.time() == chrono::NaiveTime::MIN,
-        "oracle: column {name} = {t} has a time of day, which a `date` override would drop; \
+    if dt.time() != chrono::NaiveTime::MIN {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH,
+            "oracle: column {name} = {t} has a time of day, which a `date` override would drop; \
          declare it `timestamp`, or select TRUNC({name}) in a `query:`"
-    );
+        )
+    }
     i32::try_from(dt.and_utc().timestamp() / 86_400).map_err(Into::into)
 }
 
@@ -364,7 +380,10 @@ fn build_column(
                 match number(r)? {
                     Some(text) => {
                         b.append_value(decimal_str_to_scaled_i128(&text, *s).ok_or_else(|| {
-                            anyhow::anyhow!("oracle: {name} = {text} does not fit decimal({p},{s})")
+                            crate::error::coded(
+                                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                                format!("oracle: {name} = {text} does not fit decimal({p},{s})"),
+                            )
                         })?)
                     }
                     None => b.append_null(),
@@ -431,11 +450,11 @@ fn build_column(
             for r in rows {
                 match r.get::<Option<Vec<u8>>>(idx).ora()? {
                     Some(v) => b.append_value(&v).map_err(|_| {
-                        anyhow::anyhow!(
+                        crate::error::coded(crate::error::codes::SOURCE_OVERRIDE_WIRE_MISMATCH, format!(
                             "oracle: column {name} holds a {}-byte value; a `uuid` override needs \
                              exactly {width} bytes (RAW({width}))",
                             v.len()
-                        )
+                        ))
                     })?,
                     None => b.append_null(),
                 }
@@ -487,7 +506,10 @@ fn build_column(
             }
             Arc::new(b.finish())
         }
-        other => anyhow::bail!("oracle: column {name}: no row decoder for Arrow {other:?}"),
+        other => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_TYPE_BUILDER,
+            "oracle: column {name}: no row decoder for Arrow {other:?}"
+        ),
     })
 }
 
