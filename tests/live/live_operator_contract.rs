@@ -2869,6 +2869,113 @@ fn an_unrepresentable_value_is_refused_by_code_mysql() {
     an_unrepresentable_value_is_refused_by_code(SqlEngine::Mysql);
 }
 
+/// The column type, a plain value, a value the reader refuses as `RIVET_SOURCE_VALUE_UNREPRESENTABLE`, and the export line that makes it unreadable, on `e`.
+fn worker_refusal_fixture(
+    e: SqlEngine,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    match e {
+        SqlEngine::Pg => ("TIMESTAMP", "'2024-01-01 00:00:00'", "'infinity'", ""),
+        SqlEngine::Mysql => ("TIME(6)", "'12:00:00'", "'838:59:59'", ""),
+        SqlEngine::Mssql => ("MONEY", "1.00", "900000000000000.00", ""),
+        #[cfg(feature = "oracle")]
+        SqlEngine::Oracle => (
+            "NUMBER(10, 4)",
+            "1.5",
+            "1.2345",
+            "columns: { t: \"decimal(10,2)\" }",
+        ),
+    }
+}
+
+/// A coded refusal met by one parallel worker exits as the same refusal does with one worker: its code and exit 5, on the keyset (`chunk_by_key`) and the range-chunk (`chunk_column`) fan-outs; the parallel run still names its runner's failure line.
+fn a_refusal_in_one_worker_exits_as_with_one_worker(e: SqlEngine) {
+    const N: i64 = 2000;
+    let (table, _guard) = range_table(e, "oc_wref", N);
+    let (col_type, plain, hostile, line) = worker_refusal_fixture(e);
+    let (id, t) = (e.col("id"), e.col("t"));
+    e.exec(&format!("ALTER TABLE {table} ADD {t} {col_type}"));
+    e.exec(&format!("UPDATE {table} SET {t} = {plain}"));
+    e.exec(&format!(
+        "UPDATE {table} SET {t} = {hostile} WHERE {id} = {}",
+        N - 50
+    ));
+    let refused = Refused::by_code("RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+    for (key, fan_out) in [
+        ("chunk_by_key", "parallel keyset failed on"),
+        ("chunk_column", "chunks failed:"),
+    ] {
+        for parallel in [1, 4] {
+            let mut rig = e
+                .rig(&table)
+                .mode("chunked")
+                .export_line(&format!("{key}: id"))
+                .export_line("chunk_size: 200")
+                .export_line(&format!("parallel: {parallel}"))
+                .a_failed_run_may_leave(
+                    &[
+                        Leftover::OrphanPart,
+                        Leftover::FileLog,
+                        Leftover::ObservedSchema,
+                    ],
+                    "the value is met near the end of the key range: the pages and chunks read before it were written, and their parts, file_log rows and observed schema stay as the record of what the run wrote",
+                );
+            if !line.is_empty() {
+                rig = rig.export_line(line);
+            }
+            let out = rig.run();
+            assert_refused(&out, refused);
+            assert_eq!(
+                text(&out).contains(fan_out),
+                parallel > 1,
+                "{key}, parallel {parallel}: the runner that met the value is the one asked for"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_refusal_in_one_worker_exits_as_with_one_worker_postgres() {
+    a_refusal_in_one_worker_exits_as_with_one_worker(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_refusal_in_one_worker_exits_as_with_one_worker_mysql() {
+    a_refusal_in_one_worker_exits_as_with_one_worker(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_refusal_in_one_worker_exits_as_with_one_worker_mssql() {
+    a_refusal_in_one_worker_exits_as_with_one_worker(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_refusal_in_one_worker_exits_as_with_one_worker_oracle() {
+    a_refusal_in_one_worker_exits_as_with_one_worker(SqlEngine::Oracle);
+}
+
+/// MongoDB: a coded failure in one `_id`-range worker (the test hook's `RIVET_CLI_TEST_FAULT_INJECTED`) is the run's code and exit, not the aggregate's `RIVET_RUN_UNITS_FAILED`; the run still names its runner's failure line.
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_coded_failure_in_one_worker_keeps_its_code_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_wref", 4000);
+    let rig = Rig::mongo_batch("t")
+        .source_url(&url)
+        .mongo("page_size: 500")
+        .export_line("parallel: 4");
+    let out = rig.run_with_env("RIVET_TEST_ERROR_AT", "mongo_parallel_worker:2");
+    assert_refused(&out, Refused::by_code("RIVET_CLI_TEST_FAULT_INJECTED", 1));
+    assert!(
+        text(&out).contains("parallel mongo failed on 1 range(s)"),
+        "the parallel runner met the fault: {}",
+        text(&out)
+    );
+}
+
 /// A captured cell the stream cannot carry (`NaN` into a NUMERIC column) is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone meets the cell again; "leave the column out of the capture" (the column dropped at the source) and the re-baseline recipe as printed deliver the source.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc postgres-cdc"]

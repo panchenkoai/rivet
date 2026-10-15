@@ -17,6 +17,27 @@
 
 seeds:
 
+  - name: worker-error-loses-its-class
+    class: a coded failure in one parallel worker reaches the run as text only (FanIn kept strings), so the run prints RIVET_RUN_UNITS_FAILED and exits 1 or 2 instead of the worker's own code and class
+    history: found 2026-10-15 reading FanIn::fail against the owner's "exit follows code class" rule; a PostgreSQL `infinity` met by a parallel keyset worker exited [RIVET_RUN_UNITS_FAILED] 1 where one worker exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0
+    scope: source
+    patch: worker-error-loses-its-class/shared.patch
+    engines:
+      postgres:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_postgres]
+      mysql:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_mysql]
+      mssql:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_mssql]
+      oracle:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_oracle]
+      mongo:
+        cells: [a_coded_failure_in_one_worker_keeps_its_code_mongo]
+      lib:
+        cells:
+          - "lib:a_coded_refusal_in_one_worker_decides_the_runs_exit_and_code"
+          - "lib:the_most_stop_worthy_coded_unit_failure_decides"
+
   - name: oracle-cdc-log-gap-uncoded
     class: an Oracle CDC data-loss refusal (the retained redo no longer reaches the checkpoint) stops as a plain error with no RIVET_* code and exit 1, so a scheduler retries it as transient
     history: found 2026-10-14 by the log-gap walk cell on the Mac stand (cycle 1 ended with no RIVET_* code, exit 1), on main through 0.31.0

@@ -318,6 +318,16 @@ scenarios:
     mongo_parallel: { test: mongo_parallel_worker_error_still_counts_the_durable_parts }
     cdc:            { na: "no retry loop consumes it — run_cdc_export is never wrapped by decide_export_retry; the durable count still reaches the metrics row from the returned manifests (run_cdc_export), and the producer is pinned by a_failed_drain_still_reports_the_parts_it_made_durable (sink.rs)" }
 
+  - id: worker_failure_keeps_its_class
+    what: "a coded stop met by ONE parallel worker (a refusal, an integrity or internal stop, a coded usage or environment failure) exits with that stop's RIVET_* code and exit class, as the same export does with one worker, not as the aggregate RIVET_RUN_UNITS_FAILED. FanIn kept each worker's failure as a string until 2026-10-15, so a PostgreSQL `infinity` met by a parallel keyset worker exited [RIVET_RUN_UNITS_FAILED] 1 where one worker exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5 (exit 2 when a sibling worker's text read as transient). Now FanIn keeps every unit failure typed and its drain raises the most stop-worthy coded one under the runner's failure line (fan_in::unit_failures, error::worst_typed_failure_idx)."
+    single:         { na: "one unit and no worker: the stop is the run's error as raised" }
+    # The test runs both shapes on each engine: chunk_by_key (keyset) and chunk_column (range), each with parallel 1 and 4.
+    chunked:        { test: a_refusal_in_one_worker_exits_as_with_one_worker_postgres }
+    chunked_checkpoint: { gap: "its workers record a failed chunk in chunk_task, not in FanIn, and the run stops with the checkpoint's incomplete-run RIVET_RUN_UNITS_FAILED; the sequential checkpoint runner does the same, so a coded refusal in a checkpointed chunk exits 1 on both (a separate defect, reported 2026-10-15)" }
+    keyset:         { test: a_refusal_in_one_worker_exits_as_with_one_worker_postgres }
+    mongo_parallel: { test: a_coded_failure_in_one_worker_keeps_its_code_mongo }
+    cdc:            { na: "one capture loop per export; no worker fan-out through FanIn" }
+
   - id: guard_manifest_mode
     what: "cross-shape manifest guard — a batch export must REFUSE to overwrite a prior CDC manifest at the same prefix (and vice versa), or the two silently destroy each other's audit trail. HISTORY: round-11 found the TWO chunk-checkpoint runners bypassed the per-runner call (a chunked-checkpoint export clobbered a CDC prefix silently). Since 0.24.4 the guard is welded into RunnerFrame::open — the ONLY door to a batch destination (runner_frame_gate source-lint makes a bypass a diff-time failure) — so the feature moved from the per-runner class to the shared-seam class. The live cells below stay as belt-and-suspenders end-to-end proofs; the LOAD-BEARING guarantees are the frame's unit (open_refuses_a_cdc_prefix_before_any_part, RED-proven against a guard-less frame) and the lint (RED-proven against an injected bare create_destination)."
     single:         { test: cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused }

@@ -27,7 +27,7 @@ pub(crate) struct FanIn {
     parts: Mutex<Vec<(UnitId, PartRecord)>>,
     observed: Mutex<Observations>,
     committed: Mutex<Vec<(UnitId, UnitChecksums)>>,
-    errors: Mutex<Vec<String>>,
+    errors: Mutex<Vec<(String, anyhow::Error)>>,
     finished: AtomicUsize,
 }
 
@@ -60,16 +60,16 @@ impl FanIn {
         locked(&self.committed).push((unit, c));
     }
 
-    /// A unit failed; the run fails after the drain.
-    pub(crate) fn fail(&self, label: &str, msg: impl std::fmt::Display) {
-        log::error!("{label} failed: {msg}");
-        locked(&self.errors).push(format!("{label}: {msg}"));
+    /// A unit failed; the run fails after the drain, kept typed so its code and class survive.
+    pub(crate) fn fail(&self, label: &str, err: anyhow::Error) {
+        log::error!("{label} failed: {err:#}");
+        locked(&self.errors).push((label.to_string(), err));
     }
 
     /// Record `result`'s error as a unit failure instead of dropping it.
     pub(crate) fn fail_on_err<T>(&self, label: &str, result: anyhow::Result<T>) {
         if let Err(e) = result {
-            self.fail(label, format!("{e:#}"));
+            self.fail(label, e);
         }
     }
 
@@ -84,10 +84,13 @@ impl FanIn {
             let _finished = WorkerFinished::new(&self.finished);
             match catch_unwind(AssertUnwindSafe(body)) {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => self.fail(&label, format!("{e:#}")),
+                Ok(Err(e)) => self.fail(&label, e),
                 Err(payload) => self.fail(
                     &label,
-                    format!("worker panicked: {}", panic_text(&*payload)),
+                    crate::error::coded(
+                        crate::error::codes::INTERNAL_RUN_INVARIANT,
+                        format!("worker panicked: {}", panic_text(&*payload)),
+                    ),
                 ),
             }
         });
@@ -96,7 +99,8 @@ impl FanIn {
     /// Drain on the parent, in this order: governor log, observations, every durable part
     /// (`record_part`, `file_log` per ADR-0017), every committed unit's checksums, then the
     /// bail if any unit failed — so nothing a worker made durable is lost to an error — and
-    /// only on a clean drain the `validate` verdict.
+    /// only on a clean drain the `validate` verdict. The bail is [`unit_failures`]: `on_err`'s
+    /// message over the most stop-worthy coded unit failure, units in label order.
     pub(crate) fn finish(
         self,
         plan: &ResolvedRunPlan,
@@ -118,14 +122,36 @@ impl FanIn {
             kind,
             inner(self.committed),
         );
-        let errors = inner(self.errors);
+        let mut errors = inner(self.errors);
         if errors.is_empty() {
             mark_validated(plan, summary);
-            Ok(())
-        } else {
-            Err(on_err(&errors))
+            return Ok(());
         }
+        errors.sort_by(|a, b| a.0.cmp(&b.0));
+        Err(unit_failures(errors, on_err))
     }
+}
+
+/// `on_err` over every unit's `label: cause`; under it the worst coded unit failure, whose line is its label alone and last, so the run exits and is coded as that unit.
+fn unit_failures(
+    errors: Vec<(String, anyhow::Error)>,
+    on_err: impl FnOnce(&[String]) -> anyhow::Error,
+) -> anyhow::Error {
+    let (labels, mut causes): (Vec<String>, Vec<anyhow::Error>) = errors.into_iter().unzip();
+    let worst = crate::error::worst_typed_failure_idx(&causes);
+    let mut lines: Vec<String> = labels
+        .iter()
+        .zip(&causes)
+        .enumerate()
+        .filter(|(j, _)| Some(*j) != worst)
+        .map(|(_, (label, e))| format!("{label}: {e:#}"))
+        .collect();
+    let Some(i) = worst else {
+        return on_err(&lines);
+    };
+    lines.push(labels[i].clone());
+    let message = format!("{:#}", on_err(&lines));
+    causes.swap_remove(i).context(message)
 }
 
 /// Commit one unit inline: observations, every durable part, then — only if `outcome` is
@@ -253,10 +279,103 @@ mod tests {
         let fan = FanIn::default();
         fan.fail_on_err("chunk 2 state", Ok(()));
         fan.fail_on_err::<()>("chunk 3 state", Err(anyhow::anyhow!("database is locked")));
+        let errors: Vec<String> = inner(fan.errors)
+            .iter()
+            .map(|(label, e)| format!("{label}: {e:#}"))
+            .collect();
         assert_eq!(
-            inner(fan.errors),
+            errors,
             vec!["chunk 3 state: database is locked".to_string()]
         );
+    }
+
+    /// One worker refuses by code, another fails untyped: the run exits by the refusal's class and prints its code.
+    #[test]
+    fn a_coded_refusal_in_one_worker_decides_the_runs_exit_and_code() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let fan = FanIn::default();
+        std::thread::scope(|s| {
+            fan.spawn(s, "range 1".into(), || {
+                Err(crate::error::coded(
+                    crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                    "pg: timestamp infinity has no reading",
+                ))
+            });
+            fan.spawn(s, "range 0".into(), || anyhow::bail!("connection refused"));
+        });
+        let err = fan
+            .finish(&plan, &mut summary, None, None, chunk_kind, |errs| {
+                crate::error::coded(crate::error::codes::RUN_UNITS_FAILED, errs.join("; "))
+            })
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+        assert_eq!(
+            format!("{err:#}"),
+            "range 0: connection refused; range 1: pg: timestamp infinity has no reading",
+            "every unit's cause, once, in label order"
+        );
+    }
+
+    /// One coded unit failure reads as the aggregate always did: the runner's line, then the unit's cause.
+    #[test]
+    fn one_coded_unit_failure_keeps_the_aggregate_text() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let fan = FanIn::default();
+        fan.fail(
+            "range 3",
+            crate::error::coded(
+                crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE,
+                "page 2: t",
+            ),
+        );
+        let err = fan
+            .finish(&plan, &mut summary, None, None, chunk_kind, bail)
+            .unwrap_err();
+        assert_eq!(format!("{err:#}"), "failed: range 3: page 2: t");
+        crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+    }
+
+    /// Of an integrity, an internal and a refusal failure the integrity one decides, as for child exports.
+    #[test]
+    fn the_most_stop_worthy_coded_unit_failure_decides() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let fan = FanIn::default();
+        fan.fail(
+            "chunk 0",
+            crate::error::coded(crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE, "r"),
+        );
+        fan.fail(
+            "chunk 1",
+            crate::error::coded(crate::error::codes::DEST_PART_ROWS_MISMATCH, "i"),
+        );
+        fan.fail(
+            "chunk 2",
+            crate::error::coded(crate::error::codes::INTERNAL_RUN_INVARIANT, "x"),
+        );
+        let err = fan
+            .finish(&plan, &mut summary, None, None, chunk_kind, bail)
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_PART_ROWS_MISMATCH", 3);
+    }
+
+    /// Untyped unit failures keep the caller's aggregate: its code, its class, its text in label order.
+    #[test]
+    fn untyped_unit_failures_keep_the_callers_aggregate() {
+        let plan = test_plan();
+        let mut summary = test_summary(&plan);
+        let fan = FanIn::default();
+        fan.fail("chunk 1", anyhow::anyhow!("bang"));
+        fan.fail("chunk 0", anyhow::anyhow!("boom"));
+        let err = fan
+            .finish(&plan, &mut summary, None, None, chunk_kind, |errs| {
+                crate::error::coded(crate::error::codes::RUN_UNITS_FAILED, errs.join("; "))
+            })
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_RUN_UNITS_FAILED", 1);
+        assert_eq!(format!("{err:#}"), "chunk 0: boom; chunk 1: bang");
     }
 
     #[test]
@@ -280,7 +399,11 @@ mod tests {
         let err = fan
             .finish(&plan, &mut summary, None, None, chunk_kind, bail)
             .unwrap_err();
-        assert_eq!(err.to_string(), "failed: range 1: worker panicked: kaput");
+        assert_eq!(
+            format!("{err:#}"),
+            "failed: range 1: worker panicked: kaput"
+        );
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_RUN_INVARIANT", 6);
         assert_eq!(
             summary.files_committed, 1,
             "a part written before the panic is still counted"
@@ -295,7 +418,7 @@ mod tests {
         let mut o = Observations::default();
         o.column_max_bytes.insert("name".into(), 42);
         fan.observe(o);
-        fan.fail("chunk 3", "boom");
+        fan.fail("chunk 3", anyhow::anyhow!("boom"));
         assert!(
             fan.finish(&plan, &mut summary, None, None, chunk_kind, bail)
                 .is_err()
@@ -330,7 +453,7 @@ mod tests {
         let mut summary = test_summary(&plan);
         let fan = FanIn::default();
         fan.part(UnitId::Chunk(0), synthetic_parts(1).remove(0));
-        fan.fail("chunk 1", "part validation failed");
+        fan.fail("chunk 1", anyhow::anyhow!("part validation failed"));
         assert!(
             fan.finish(&plan, &mut summary, None, None, chunk_kind, bail)
                 .is_err()
