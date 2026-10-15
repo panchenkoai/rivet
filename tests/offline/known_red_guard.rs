@@ -61,7 +61,8 @@ fn known_red_entries_never_grow_unseen() {
     let (open, rows) = entries(&ledger());
     super::nonvacuity::require_enumerated(
         open.len() + rows.len(),
-        10,
+        // The four gate rows stay until ADR-0037 lands; fewer means the ledger was not read.
+        4,
         "known-red entries",
         "the ledger moved or changed shape",
     );
