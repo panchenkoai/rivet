@@ -40,8 +40,10 @@ workflow enforces on the PR itself:
   `Claude-Session` trailer, and never put fix/close/resolve before `#N` (write `see #N`);
 - a raised ratchet pin (any line or block marked `ratchet-pin:`) is named in a
   `## Ratchets raised` section of the PR body; lowering one needs nothing;
-- a change under `src/` adds an entry under `## Unreleased` in CHANGELOG.md, or the
-  PR body says `No user-visible change`.
+- a change under `src/` adds a changelog fragment, one file under `changelog.d/` in the
+  CHANGELOG entry format (see `changelog.d/README.md`), or the PR body says
+  `No user-visible change`. Fragments keep open pull requests from conflicting on the top
+  of CHANGELOG.md; `dev/pytools/changelog.py assemble` folds them in before a release.
 
 Live runs (`make test-live`, `make live`, the type matrices, the soak) wait for one of
 `LIVE_SLOTS` (default 2) machine-wide slots; the release gate takes all of them.

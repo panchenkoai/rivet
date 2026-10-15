@@ -356,7 +356,7 @@ scenarios:
     what: "RESULTS 19: the config `rivet init --mode cdc` writes runs as written (SQL Server: with the capture instance the catalog holds)"
     postgres: { test: the_config_init_writes_runs_cdc_postgres }
     mysql:    { test: the_config_init_writes_runs_cdc_mysql }
-    mssql:    { test: open_defect_init_cdc_writes_the_capture_instance_the_catalog_holds_mssql }
+    mssql:    { test: init_cdc_writes_the_capture_instance_the_catalog_holds_mssql }
     mongo:    { test: the_config_init_writes_runs_cdc_mongo }
     oracle:   { test: a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet }
 

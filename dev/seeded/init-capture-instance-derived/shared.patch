@@ -1,0 +1,11 @@
+--- a/src/init/yaml_scaffold.rs
++++ b/src/init/yaml_scaffold.rs
+@@ -1208,7 +1208,7 @@
+             "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
+             ident.to_lowercase()
+         )),
+-        "mssql" => lines.push(match &info.cdc_capture_instance {
++        "mssql" => lines.push(match &None::<String> {
+             Some(ci) => format!(
+                 "      capture_instance: {ci}  # the instance cdc.change_tables holds for this table; needs SQL Server Agent"
+             ),

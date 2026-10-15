@@ -65,6 +65,13 @@ EMPTY_PREFIX = ("control of 52f26e45: an empty prefix of an EXISTING bucket stil
 SQLITE_AS_BEFORE = ("edited by 17747ef2, not written for it: the commit lifted the cell's restriction to the SQLite "
                     "state; this stage runs the SQLite state only, where the cell is the test it was before the fix")
 
+SESSION_PIN_CDC = ("edited by 801df12f, not written for it: only its comment changed; v0.31.0's CDC reader pinned the "
+                   "same formats with a session SET (READER_SESSION_PIN), and the defect #525 fixed is graded by the "
+                   "two pooler cells, red on v0.31.0")
+SESSION_PIN_CHUNKS = ("control of 801df12f: v0.31.0 pinned TimeZone with a session SET on every direct connection; the "
+                      "fix moves the pin into each read transaction and this cell holds the planner probe to it, so a "
+                      "direct connection reads alike on both")
+
 #: Fix cells allowed to pass on the previous release, each with its reason. Shrink-only.
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
     "a_crashed_keyset_incremental_run_is_resumed_not_reread_postgres": UNTRIAGED,
@@ -132,6 +139,9 @@ GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-re
     "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql": SQLITE_AS_BEFORE,
     "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql": SQLITE_AS_BEFORE,
     "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle": SQLITE_AS_BEFORE,
+    "pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch": SESSION_PIN_CDC,
+    "pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch": SESSION_PIN_CDC,
+    "pg_chunks_on_a_day_the_query_computes_read_each_row_once_in_an_odd_session": SESSION_PIN_CHUNKS,
 }  # ratchet-pin: end
 
 

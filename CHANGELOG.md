@@ -2,15 +2,11 @@
 
 ## Unreleased
 
-- **Two exports of one name on a shared state refused each other even when they read different
-  sources.** Since every run took the export's run lease (keyed by the export name), the
-  shared-state deployment the state docs describe (several configs, one export name, one PostgreSQL
-  state, different sources) ran one export at a time and refused the rest with
-  `RIVET_STATE_RUN_IN_PROGRESS`. **Now** the run lease is keyed by the export and its source, as the
-  cursor is: runs of one name on different sources run side by side, a second run on the same source
-  is still refused. A run under its lease closes only its own source's dead `running` rows; state
-  schema v36 records the source on each `run_status` row (rows from before v36 have none and are
-  closed by any run of the export). **What to do:** nothing.
+- **`rivet init --mode cdc` on SQL Server named a capture instance that did not exist.** It wrote
+  `capture_instance: <schema>_<table>` by convention, so a table whose CDC was enabled under another
+  instance name got a config that failed on its first run (0.31.0 and earlier). **Now** init reads
+  `cdc.change_tables` and writes the instance it holds (the newest of two); a table without CDC gets
+  the conventional name with the `sp_cdc_enable_table` call that creates it. **What to do:** nothing.
 
 - **A SQL Server password holding `@` reached the state database.** In the keyword/value URL form
   (`sqlserver://host;user=sa;password=p@ss;…`) the `@` inside the password was read as the end of a
