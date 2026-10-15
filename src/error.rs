@@ -1346,6 +1346,11 @@ pub mod codes {
         "RIVET_SOURCE_QUERY_COLUMN_UNREFERENCEABLE",
         "give the column an alias in the export's `query:` (e.g. `... AS row_id`)",
     );
+    /// The async runtime a driver runs on could not be built: the process is out of descriptors or threads.
+    pub const SOURCE_RUNTIME_UNAVAILABLE: Code = environment(
+        "RIVET_SOURCE_RUNTIME_UNAVAILABLE",
+        "the process could not start the async runtime its driver needs (out of file descriptors or threads): raise the open-files limit (`ulimit -n`) or lower parallelism, then rerun",
+    );
     /// The connection to the source could not be opened: no route, a refused login, a failed handshake.
     pub const SOURCE_CONNECT_FAILED: Code = environment(
         "RIVET_SOURCE_CONNECT_FAILED",
@@ -1534,6 +1539,7 @@ pub mod codes {
         SOURCE_CDC_TABLE_UNSUPPORTED,
         SOURCE_CDC_TRANSACTION_TOO_LARGE,
         SOURCE_QUERY_COLUMN_UNREFERENCEABLE,
+        SOURCE_RUNTIME_UNAVAILABLE,
         SOURCE_CONNECT_FAILED,
         SOURCE_QUERY_FAILED,
         SOURCE_CDC_SPILL_UNLOCKABLE,
