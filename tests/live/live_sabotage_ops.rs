@@ -111,10 +111,7 @@ fn a_lease_nobody_can_see_dead(engine: SqlEngine, holder_sql: &str) {
     rig.refuses_twice_then(
         &["run"],
         &[],
-        Refused::uncoded_known_defect(
-            1,
-            "RIVET_STATE_RUN_IN_PROGRESS: a run beside a held run lease is refused with no code (the run-beside-a-run row of docs/operator-contract-matrix.yaml)",
-        ),
+        Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5),
         vec![Remedy::new(
             "wait for it to finish",
             Then::DeliversTheSource,
