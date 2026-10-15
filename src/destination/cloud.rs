@@ -257,13 +257,7 @@ fn listing_says_container_absent<B: CloudBackend>(
 
 /// The opendal kind of one error in a chain: an opendal error itself, or the one an `io::Error` from opendal's std writer wraps.
 fn opendal_kind(e: &(dyn std::error::Error + 'static)) -> Option<opendal::ErrorKind> {
-    e.downcast_ref::<opendal::Error>()
-        .or_else(|| {
-            e.downcast_ref::<std::io::Error>()?
-                .get_ref()?
-                .downcast_ref::<opendal::Error>()
-        })
-        .map(opendal::Error::kind)
+    crate::error::retry::opendal_error(e).map(opendal::Error::kind)
 }
 
 /// Whether a failed write may have hit an absent container: some error in its chain has a kind the backend's listing answers an absent container with.
@@ -364,11 +358,18 @@ impl<B: CloudBackend> CloudDestination<B> {
         })
     }
 
-    /// Fail when the bucket or container itself is absent, which a 404 on a key cannot tell from an absent key.
+    /// Fail when the bucket or container itself is absent, which a 404 on a key cannot tell from an absent key; asked once per destination.
     fn require_container(&self) -> Result<()> {
         if self.container_answered.get().is_some() {
             return Ok(());
         }
+        self.refuse_an_absent_container()?;
+        let _ = self.container_answered.set(());
+        Ok(())
+    }
+
+    /// Ask the store now whether the bucket or container exists, whatever it answered before.
+    fn refuse_an_absent_container(&self) -> Result<()> {
         let first_page = self
             .op
             .lister_options(
@@ -389,7 +390,6 @@ impl<B: CloudBackend> CloudDestination<B> {
                 container_absent_message(B::SCHEME, &self.container)
             );
         }
-        let _ = self.container_answered.set(());
         Ok(())
     }
 
@@ -403,12 +403,67 @@ impl<B: CloudBackend> CloudDestination<B> {
 }
 
 impl<B: CloudBackend> CloudDestination<B> {
-    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the write failed with a kind the backend reports an absent container by and the bucket itself is absent; any other error unchanged.
+    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the operation failed with a kind the backend reports an absent container by and the bucket itself is absent now (it may have gone since it last answered); any other error unchanged.
     fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
-        match write_error_may_mean_absent_container::<B>(&err).then(|| self.require_container()) {
+        match write_error_may_mean_absent_container::<B>(&err)
+            .then(|| self.refuse_an_absent_container())
+        {
             Some(Err(absent)) => absent,
             _ => err,
         }
+    }
+
+    /// Every object under `prefix`, keys relative to the configured prefix.
+    fn list_under(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
+        let full = format!("{}{}", self.prefix, prefix);
+        // opendal expects a trailing `/` for directory listings. For a
+        // bucket/container root the empty string is fine; for any non-empty
+        // prefix we add `/` if the caller didn't.
+        let listed = if full.is_empty() || full.ends_with('/') {
+            self.op.list_options(
+                &full,
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
+        } else {
+            self.op.list_options(
+                &format!("{}/", full),
+                opendal::options::ListOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )?
+        };
+        let mut out = Vec::with_capacity(listed.len());
+        for entry in listed {
+            if entry.metadata().mode() != opendal::EntryMode::FILE {
+                continue;
+            }
+            // entry.path() returns a bucket-root-absolute key; strip our
+            // configured prefix so the returned `key` is comparable to
+            // values the caller passed to `write`.
+            let abs = entry.path().to_string();
+            let rel = abs
+                .strip_prefix(self.prefix.as_str())
+                .unwrap_or(abs.as_str())
+                .to_string();
+            out.push(super::ObjectMeta {
+                key: rel,
+                size_bytes: entry.metadata().content_length(),
+                // Dropped for a backend whose listing aliases something else into
+                // this field — see `LIST_MD5_IS_TRUSTWORTHY`. Size-only is the
+                // honest degrade; a wrong digest is worse than no digest, because
+                // the consumers treat a mismatch as corruption.
+                content_md5: if B::LIST_MD5_IS_TRUSTWORTHY {
+                    entry.metadata().content_md5().map(str::to_string)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(out)
     }
 
     /// Upload one local part to `remote_key` under the prefix.
@@ -484,61 +539,38 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     // `write`'s `remote_key` argument.
 
     fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, prefix);
-        // opendal expects a trailing `/` for directory listings. For a
-        // bucket/container root the empty string is fine; for any non-empty
-        // prefix we add `/` if the caller didn't.
-        let listed = if full.is_empty() || full.ends_with('/') {
-            self.op.list_options(
-                &full,
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        } else {
-            self.op.list_options(
-                &format!("{}/", full),
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        };
-        let mut out = Vec::with_capacity(listed.len());
-        for entry in listed {
-            if entry.metadata().mode() != opendal::EntryMode::FILE {
-                continue;
-            }
-            // entry.path() returns a bucket-root-absolute key; strip our
-            // configured prefix so the returned `key` is comparable to
-            // values the caller passed to `write`.
-            let abs = entry.path().to_string();
-            let rel = abs
-                .strip_prefix(self.prefix.as_str())
-                .unwrap_or(abs.as_str())
-                .to_string();
-            out.push(super::ObjectMeta {
-                key: rel,
-                size_bytes: entry.metadata().content_length(),
-                // Dropped for a backend whose listing aliases something else into
-                // this field — see `LIST_MD5_IS_TRUSTWORTHY`. Size-only is the
-                // honest degrade; a wrong digest is worse than no digest, because
-                // the consumers treat a mismatch as corruption.
-                content_md5: if B::LIST_MD5_IS_TRUSTWORTHY {
-                    entry.metadata().content_md5().map(str::to_string)
-                } else {
-                    None
-                },
-            });
-        }
-        Ok(out)
+        self.list_under(prefix)
+            .map_err(|e| self.absent_container_or(e))
     }
 
     fn read(&self, key: &str) -> Result<Vec<u8>> {
         let full = format!("{}{}", self.prefix, key);
-        let buf = self.op.read(&full)?;
+        let buf = self
+            .op
+            .read(&full)
+            .map_err(|e| self.absent_container_or(e.into()))?;
         Ok(buf.to_vec())
+    }
+
+    fn remove(&self, key: &str) -> Result<()> {
+        self.op
+            .delete(&format!("{}{}", self.prefix, key))
+            .map_err(|e| self.absent_container_or(e.into()))
+    }
+
+    fn r#move(&self, from: &str, to: &str) -> Result<()> {
+        // Object stores are not POSIX — no native rename. opendal 0.55
+        // returns `Unsupported` for `rename` on S3 / GCS / Azure Blob, so we
+        // do it ourselves: server-side copy + delete. ADR-0012 M9
+        // best-effort: a partial copy-ok / delete-fail leaves the source
+        // reachable at both paths and re-trips M9 on the next resume —
+        // a clutter problem, not a correctness one.
+        let from_full = format!("{}{}", self.prefix, from);
+        let to_full = format!("{}{}", self.prefix, to);
+        self.op
+            .copy(&from_full, &to_full)
+            .and_then(|()| self.op.delete(&from_full))
+            .map_err(|e| self.absent_container_or(e.into()))
     }
 
     fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
@@ -558,25 +590,6 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
             }
             Err(e) => Err(e.into()),
         }
-    }
-
-    fn remove(&self, key: &str) -> Result<()> {
-        self.op.delete(&format!("{}{}", self.prefix, key))?;
-        Ok(())
-    }
-
-    fn r#move(&self, from: &str, to: &str) -> Result<()> {
-        // Object stores are not POSIX — no native rename. opendal 0.55
-        // returns `Unsupported` for `rename` on S3 / GCS / Azure Blob, so we
-        // do it ourselves: server-side copy + delete. ADR-0012 M9
-        // best-effort: a partial copy-ok / delete-fail leaves the source
-        // reachable at both paths and re-trips M9 on the next resume —
-        // a clutter problem, not a correctness one.
-        let from_full = format!("{}{}", self.prefix, from);
-        let to_full = format!("{}{}", self.prefix, to);
-        self.op.copy(&from_full, &to_full)?;
-        self.op.delete(&from_full)?;
-        Ok(())
     }
 }
 
@@ -839,7 +852,17 @@ mod tests {
         stat_status: u16,
         list_status: u16,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        stub_store_answering(stat_status, &[list_status])
+    }
+
+    /// A store answering `stat_status` to every key and `list_statuses` to listings in order, the last one from then on.
+    fn stub_store_answering(
+        stat_status: u16,
+        list_statuses: &[u16],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
+        let mut list_statuses: std::collections::VecDeque<u16> =
+            list_statuses.iter().copied().collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let listings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -854,7 +877,11 @@ mod tests {
                 let is_listing = target.contains("/o?") && !target.starts_with("/upload/");
                 let (status, body) = if is_listing {
                     seen.lock().unwrap().push(target.to_string());
-                    (list_status, "{}")
+                    let status = list_statuses.front().copied().unwrap_or(stat_status);
+                    if list_statuses.len() > 1 {
+                        list_statuses.pop_front();
+                    }
+                    (status, "{}")
                 } else {
                     (stat_status, "{}")
                 };
@@ -918,6 +945,52 @@ mod tests {
         assert!(
             listings.lock().unwrap().is_empty(),
             "only a 404 asks about the bucket"
+        );
+    }
+
+    /// A container that answered once may be gone by the next failed operation: the write, listing, read and delete ask again and refuse by code.
+    #[test]
+    fn an_operation_that_fails_after_the_container_once_answered_asks_the_store_again() {
+        use crate::destination::Destination;
+        let part = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(part.path(), b"bytes").unwrap();
+        let (endpoint, listings) = stub_store_answering(404, &[200, 404]);
+        let dest = stub_destination(&endpoint);
+        assert_eq!(
+            dest.head("manifest.json").unwrap(),
+            None,
+            "the container answered"
+        );
+        assert_eq!(listings.lock().unwrap().len(), 1);
+        for (what, err) in [
+            (
+                "write",
+                dest.write(part.path(), "part.parquet")
+                    .map(|_| ())
+                    .unwrap_err(),
+            ),
+            ("list", dest.list_prefix("").map(|_| ()).unwrap_err()),
+            ("read", dest.read("part.parquet").map(|_| ()).unwrap_err()),
+        ] {
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_DEST_CONTAINER_NOT_FOUND"),
+                "{what}: {err:#}"
+            );
+            assert_eq!(
+                crate::error::retry::classify_error(&err),
+                crate::error::retry::RetryClass::Permanent,
+                "{what}"
+            );
+        }
+        assert_eq!(
+            listings.lock().unwrap().len(),
+            1 + 1 + 2 + 1,
+            "the write and the read each asked again; the listing failed and asked again"
+        );
+        assert!(
+            dest.remove("part.parquet").is_ok(),
+            "a delete the store answers 404 is complete by opendal's contract: nothing to classify"
         );
     }
 
