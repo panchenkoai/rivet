@@ -158,23 +158,19 @@ pub(crate) use crate::config::resolve::format_bytes;
 ///
 /// Hints emitted by `pipeline::chunked` always follow the pattern
 /// `<cause>; <connector> \`rivet …\` …`, so we cut at the first `; ` whose
-/// remainder contains a backtick-quoted `rivet` invocation.
+/// remainder contains a backtick-quoted `rivet` invocation: the first `; ` that
+/// ends before the LAST such invocation, found in one pass each way.
 ///
 /// Used by both the per-export card renderer (`parent_ui`) and the run
 /// aggregator (`aggregate`) so the long inline command doesn't wrap, distort
 /// the in-place card layout, and doesn't repeat the consolidated recovery
 /// block printed by the aggregator.
 pub(crate) fn strip_chunked_recovery_hint(msg: &str) -> (&str, bool) {
-    let mut pos = 0;
-    while let Some(off) = msg[pos..].find("; ") {
-        let abs = pos + off;
-        let tail = &msg[abs + 2..];
-        if tail.contains("`rivet ") {
-            return (&msg[..abs], true);
-        }
-        pos = abs + 2;
+    let cut = msg.rfind("`rivet ").and_then(|last| msg[..last].find("; "));
+    match cut {
+        Some(at) => (&msg[..at], true),
+        None => (msg, false),
     }
-    (msg, false)
 }
 
 /// Truncate `s` to at most `max_chars` Unicode characters, appending `…`
@@ -237,6 +233,89 @@ mod tests {
         let (cause, hinted) = strip_chunked_recovery_hint(m);
         assert!(!hinted);
         assert_eq!(cause, m);
+    }
+
+    /// The hint stripper as it read the text through 0.31.0: the tail re-read from every `; `.
+    fn reference_strip_hint(msg: &str) -> (&str, bool) {
+        let mut pos = 0;
+        while let Some(off) = msg[pos..].find("; ") {
+            let abs = pos + off;
+            if msg[abs + 2..].contains("`rivet ") {
+                return (&msg[..abs], true);
+            }
+            pos = abs + 2;
+        }
+        (msg, false)
+    }
+
+    /// Wall-clock ceiling for one hostile megabyte: one pass needs milliseconds, the quadratic one minutes.
+    const HOSTILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `(cause length, hinted)` of `input` on a watchdog thread, so an overrun fails the test instead of hanging it.
+    fn strip_in_budget(label: &str, input: String) -> (usize, bool) {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (cause, hinted) = strip_chunked_recovery_hint(&input);
+            let _ = done.send((cause.len(), hinted));
+        });
+        result
+            .recv_timeout(HOSTILE_BUDGET)
+            .unwrap_or_else(|why| panic!("SCAN NOT LINEAR: {label}: {why} in {HOSTILE_BUDGET:?}"))
+    }
+
+    /// One megabyte of each hostile shape of error text is read in one pass: the exact cut, inside the budget.
+    #[test]
+    fn the_hint_stripper_is_linear_on_a_hostile_megabyte() {
+        const MB: usize = 1 << 20;
+        let seps = "; ".repeat(MB / 2);
+        let spaced = "x".repeat(62) + "; ";
+        let spaced = spaced.repeat(MB / 64);
+        let cases = [
+            ("a megabyte of `; `", seps.clone(), (seps.len(), false)),
+            (
+                "a megabyte of `; ` then a hint",
+                seps.clone() + "use `rivet run`",
+                (0, true),
+            ),
+            ("`; ` every 64 bytes", spaced.clone(), (spaced.len(), false)),
+            (
+                "`; ` every 64 bytes then a hint",
+                spaced.clone() + "`rivet run`",
+                (62, true),
+            ),
+            (
+                "a megabyte of hints",
+                "`rivet ".repeat(MB / 7),
+                (MB / 7 * 7, false),
+            ),
+            (
+                "a megabyte cause then a hint",
+                "e".repeat(MB) + "; use `rivet run`",
+                (MB, true),
+            ),
+        ];
+        for (label, input, want) in cases {
+            assert_eq!(strip_in_budget(label, input), want, "{label}");
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 4096, ..Default::default()
+        })]
+
+        /// Any text of separators, backticks, `rivet` and multi-byte characters is cut exactly where the re-reading stripper cut it.
+        #[test]
+        fn the_hint_stripper_matches_its_reference_on_any_text(text in "(; |`rivet |`|;| |rivet|a|é|—){0,24}") {
+            proptest::prop_assert_eq!(strip_chunked_recovery_hint(&text), reference_strip_hint(&text), "{:?}", text);
+        }
+
+        /// Arbitrary UTF-8 is cut or returned whole, never a panic.
+        #[test]
+        fn any_utf8_error_text_is_stripped_without_a_panic(text in "\\PC{0,64}") {
+            let (cause, hinted) = strip_chunked_recovery_hint(&text);
+            proptest::prop_assert!(text.starts_with(cause) && (hinted || cause == text));
+        }
     }
 
     #[test]
