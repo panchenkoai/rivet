@@ -282,6 +282,25 @@ pub(crate) fn run_export(
     )
 }
 
+/// `err` as `RIVET_CONFIG_CURSOR_COLUMN_CASE` when the base query names the cursor column only in another case; any other error unchanged.
+fn refuse_a_cursor_case_miss(
+    err: anyhow::Error,
+    src: &mut dyn Source,
+    plan: &ResolvedRunPlan,
+) -> anyhow::Error {
+    let Some(cursor) = plan.strategy.cursor_extract_column() else {
+        return err;
+    };
+    let Ok(columns) = src.type_mappings(&plan.base_query, &plan.column_overrides) else {
+        return err;
+    };
+    let names: Vec<&str> = columns.iter().map(|c| c.column_name.as_str()).collect();
+    match crate::types::refuse_cursor_case_miss(cursor, &names) {
+        Err(refusal) => refusal,
+        Ok(()) => err,
+    }
+}
+
 /// `err` as `RIVET_STATE_CURSOR_INCOMPARABLE` when the source refused to convert a value while a stored cursor was compared; any other error unchanged.
 fn refuse_an_incomparable_cursor(
     err: anyhow::Error,
@@ -362,11 +381,12 @@ pub(super) fn run_single_export(
         let mut psink = super::sink::PipelinedSink::spawn(plan)?;
         let export_result = src.export(&request, &mut psink);
         let sink = psink.finish()?;
-        export_result.map_err(refuse)?;
+        export_result.map_err(|e| refuse_a_cursor_case_miss(refuse(e), src, plan))?;
         sink
     } else {
         let mut sink = ExportSink::new(plan)?;
-        src.export(&request, &mut sink).map_err(refuse)?;
+        let export_result = src.export(&request, &mut sink);
+        export_result.map_err(|e| refuse_a_cursor_case_miss(refuse(e), src, plan))?;
         sink
     };
 
