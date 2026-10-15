@@ -119,10 +119,13 @@ impl MongoSession {
         // Small multi-thread runtime (not current-thread): the driver spawns
         // background SDAM/heartbeat tasks that must make progress independently
         // of our `block_on` calls, or connection monitoring starves.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()?;
+        let rt = crate::source::driver_runtime(
+            "mongodb",
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build(),
+        )?;
         let (client, db) = rt
             .block_on(async {
                 let mut opts = ClientOptions::parse(url).await?;

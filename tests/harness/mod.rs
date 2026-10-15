@@ -87,6 +87,12 @@ static MY_CLIENT: LazyLock<[&str; 6]> =
 static MY_SCHEMA_QUAL: LazyLock<String> =
     LazyLock::new(|| format!("table_schema='{}' AND ", stand_bench_db()));
 
+/// The PostgreSQL soak lane's slot, named for this process so the stand sweep drops it once the
+/// process is gone (a fixed name was never swept and pinned the CDC stand's WAL past 1 GiB).
+fn soak_slot() -> String {
+    format!("rivet_matrix_soak_{}_0", std::process::id())
+}
+
 /// The resolved `(engine, mode)` target — the single home for per-engine truth
 /// (batch vs the CDC-enabled instance, its container, seed flags, CDC config
 /// field, query dialect). Every access reads from here. See CONTEXT.md "Lane".
@@ -98,7 +104,7 @@ struct Lane {
     client: &'static [&'static str],
     seed_target: Option<&'static str>,
     seed_url_flag: &'static str,
-    /// Extra export-YAML line(s) a CDC run needs (`slot:` / `server_id:`).
+    /// Extra export-YAML line(s) a CDC run needs (`slot:` / `server_id:`); `{soak_slot}` is [`soak_slot`].
     cdc_field: &'static str,
     /// `information_schema` WHERE prefix that qualifies the schema.
     schema_qual: &'static str,
@@ -131,7 +137,7 @@ impl Lane {
                 client: &*PG_CLIENT,
                 seed_target: Some("postgres"),
                 seed_url_flag: "--pg-url",
-                cdc_field: "      slot: rivet_matrix_soak\n",
+                cdc_field: "      slot: {soak_slot}\n",
                 schema_qual: "",
                 sep: '|',
             },
@@ -1220,10 +1226,11 @@ impl Verification {
             std::env::temp_dir().join(format!("ckpt-{}", prefix.replace('/', "_"))),
         );
         if self.engine == Engine::Postgres {
-            let _ = self.source_raw(
+            let _ = self.source_raw(&format!(
                 "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots \
-                 WHERE slot_name = 'rivet_matrix_soak'",
-            );
+                 WHERE slot_name = '{}'",
+                soak_slot()
+            ));
         }
     }
 
@@ -1717,7 +1724,7 @@ impl Verification {
                         "    cdc:\n      until_current: true\n      checkpoint: {}\n{}{}",
                         ckpt.display(),
                         initial,
-                        lane.cdc_field
+                        lane.cdc_field.replace("{soak_slot}", &soak_slot())
                     ),
                 )
             }
