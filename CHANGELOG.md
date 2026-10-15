@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`mode: cdc` on a standalone MongoDB failed with the driver's raw dump.** The run exited 1 with
+  `Error code 40573 … RawDocumentBuf { data: "7d00…" }` and no `RIVET_*` code (0.31.0 and earlier).
+  **Now** it is refused `RIVET_SOURCE_CDC_PREREQUISITE`, naming the standalone and the ways out (a
+  replica-set member, a one-member replica set, or `mode: full`). **What to do:** nothing.
+
 - **`rivet run` refused a MongoDB collection that does not exist without its code.** `rivet check`
   refused it `RIVET_SOURCE_COLLECTION_NOT_FOUND`; `rivet run` printed the same sentence with no
   `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
