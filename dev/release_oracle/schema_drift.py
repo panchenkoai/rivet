@@ -29,10 +29,10 @@ from pathlib import Path
 
 try:
     from .core import Ledger, have, rivet, run
-    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir
+    from .scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, cell_export, work_dir
 except ImportError:  # pragma: no cover - depends on how the driver is invoked
     from core import Ledger, have, rivet, run  # type: ignore
-    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, work_dir  # type: ignore
+    from scenarios import NO_TIMEOUT, _failed, _passed, _skipped, Scope, cell_export, work_dir  # type: ignore
 
 __all__ = ["verify_schema_fingerprint_moves_with_the_schema"]
 
@@ -85,7 +85,7 @@ def verify_schema_fingerprint_moves_with_the_schema(
     cfg.write_text(
         "source:\n  type: postgres\n  url_env: ORACLE_URL\n"
         "exports:\n"
-        "  - name: sf_probe\n"
+        f"  - name: {cell_export(work)}\n"
         "    table: public.sf_probe\n"
         "    mode: full\n"
         "    format: parquet\n"
