@@ -368,9 +368,6 @@ pub(super) fn refuse_a_cursor_past_the_manifest(
 
 /// Whether `stored` orders after `high`: as numbers when both are, else as text of one length; `None` when they cannot be ordered.
 pub(crate) fn cursor_is_past(stored: &str, high: &str) -> Option<bool> {
-    if stored == high {
-        return Some(false);
-    }
     if let (Ok(a), Ok(b)) = (stored.parse::<i128>(), high.parse::<i128>()) {
         return Some(a > b);
     }
@@ -1018,6 +1015,8 @@ mod tests {
         // below / equal / above, as numbers (a text order would put "9" past "10")
         assert_eq!(cursor_is_past("9", "10"), Some(false));
         assert_eq!(cursor_is_past("40", "40"), Some(false));
+        assert_eq!(cursor_is_past("040", "40"), Some(false));
+        assert_eq!(cursor_is_past("12.50", "12.5"), Some(false));
         assert_eq!(cursor_is_past("42", "40"), Some(true));
         assert_eq!(cursor_is_past("18446744073709551615", "40"), Some(true));
         assert_eq!(cursor_is_past("12.5", "12.75"), Some(false));
@@ -1028,6 +1027,10 @@ mod tests {
         );
         assert_eq!(
             cursor_is_past("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"),
+            Some(false)
+        );
+        assert_eq!(
+            cursor_is_past("2026-01-31T23:59:59Z", "2026-01-31T23:59:59Z"),
             Some(false)
         );
         // two renderings cannot be ordered: the run proceeds

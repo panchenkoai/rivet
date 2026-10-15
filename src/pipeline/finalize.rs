@@ -945,11 +945,13 @@ pub(super) fn last_success_cursor_high(
     if !d.capabilities().commit_protocol.leaves_objects_at_rest() {
         return None;
     }
-    let meta = d.head(MANIFEST_FILENAME).ok()??;
-    if meta.size_bytes > super::validate_manifest::MANIFEST_MAX_BYTES {
-        return None;
-    }
-    let m: RunManifest = serde_json::from_slice(&d.read(MANIFEST_FILENAME).ok()?).ok()?;
+    let bytes = super::validate_manifest::read_capped(
+        &*d,
+        MANIFEST_FILENAME,
+        super::validate_manifest::MANIFEST_MAX_BYTES,
+    )
+    .ok()?;
+    let m: RunManifest = serde_json::from_slice(&bytes).ok()?;
     (m.status == ManifestStatus::Success && m.export_name == export)
         .then_some(m.source.extraction?.cursor_high?)
 }
