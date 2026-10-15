@@ -98,10 +98,11 @@ soak:
 
 # Full live suite under nextest (per-test isolation), sweeping stale fixtures
 # FIRST so an interrupted prior run never pollutes the shared `rivet` DB, and
-# again after a green run so no orphaned replication slot keeps pinning WAL.
+# again after a green run so no orphaned replication slot keeps pinning WAL. The warehouse env
+# comes from dev/stand/registry.yaml as in the gate, so the cloud cells verify, not skip.
 # Requires `docker compose up -d` (postgres + mysql + the validator containers).
 test-live: sweep-test-db sweep-test-cloud
-	$(LIVE) cargo nextest run --run-ignored all
+	$(LIVE) $(PY) -m dev.pytools.warehouse_env -- cargo nextest run --run-ignored all
 	@$(MAKE) --no-print-directory sweep-test-db sweep-test-cloud
 
 # ── Fixture seed ────────────────────────────────────────────────────────────
