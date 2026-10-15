@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`rivet compact` on a BigQuery base partitioned by hour planned one MERGE job per 166 days of
+  the key's whole value span.** A row holding the end-of-time sentinel `9999-12-31` (or any date
+  outside BigQuery's partitioned days, 1960-01-01 to 2159-12-31) stretched the span to the sentinel:
+  17,544 serial MERGE jobs for two changed rows (0.27.0 through 0.31.0; monthly and yearly keys planned
+  fewer). **Now** the days outside the partitioned range, which BigQuery keeps in one unpartitioned
+  partition, take one MERGE per side, and only the span of values inside the range is stepped.
+  **What to do:** nothing.
+
 - **`rivet init --mode cdc` on SQL Server named a capture instance that did not exist.** It wrote
   `capture_instance: <schema>_<table>` by convention, so a table whose CDC was enabled under another
   instance name got a config that failed on its first run (0.31.0 and earlier). **Now** init reads
