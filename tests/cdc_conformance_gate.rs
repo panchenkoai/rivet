@@ -1140,6 +1140,13 @@ fn every_live_cdc_test_asserts_an_outcome() {
             // destination listing, or the state DB) — not merely that the
             // process exited 0.
             let asserts_outcome = chunk.contains("manifest_rows")
+                // A refusal walk whose named remedy `DeliversTheSource`: the walk
+                // helper grades that delivery through the default rig oracle and
+                // refuses to run with the oracle off (tests/common/rig/remedy.rs).
+                || chunk.contains("Then::DeliversTheSource")
+                // The shared re-baseline remedy of live_operator_contract.rs is
+                // that same `DeliversTheSource` under one name.
+                || chunk.contains("rebaseline(")
                 // `cdc_id_ops` (-> `read_cdc_changes`, arrow straight off the
                 // parquet) asserts CONTENT (ids+ops), the strongest claim shape
                 // in this list — but its READER shares rivet's own

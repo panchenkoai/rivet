@@ -88,6 +88,7 @@ pub(crate) fn run_capture(
     };
     // Fault point: stream (and any server-side anchor) opened, nothing read.
     crate::test_hook::maybe_panic_at("cdc_after_open");
+    crate::test_hook::maybe_pause_at("cdc_after_open");
     let engine = cap.cdc_cfg.engine.engine();
     let cap_tables: Vec<String> = cap.outputs.iter().map(|o| o.table.clone()).collect();
     let mut outputs = Vec::with_capacity(cap.outputs.len());
