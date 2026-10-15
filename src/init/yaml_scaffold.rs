@@ -1208,10 +1208,16 @@ omitting differ per engine — see cdc.md)",
             "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
             ident.to_lowercase()
         )),
-        "mssql" => lines.push(format!(
-            "      capture_instance: {}_{}  # sp_cdc_enable_table instance; needs CDC enabled + SQL Server Agent",
-            info.schema, info.table
-        )),
+        "mssql" => lines.push(match &info.cdc_capture_instance {
+            Some(ci) => format!(
+                "      capture_instance: {ci}  # the instance cdc.change_tables holds for this table; needs SQL Server Agent"
+            ),
+            None => format!(
+                "      capture_instance: {schema}_{table}  # CDC is not enabled on this table yet: EXEC sys.sp_cdc_enable_table @source_schema = N'{schema}', @source_name = N'{table}', @role_name = NULL, @capture_instance = N'{schema}_{table}'; needs SQL Server Agent",
+                schema = info.schema,
+                table = info.table
+            ),
+        }),
         "oracle" => lines.push(format!(
             "      # LogMiner (preview): the table needs ALTER TABLE {qualified_table} ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS; the user is a common C## user"
         )),
@@ -1596,6 +1602,7 @@ mod tests {
         assert!(!is_simple_pg_ident("Orders"));
         let rel = |schema: &str, table: &str, st: &str| {
             let info = TableInfo {
+                cdc_capture_instance: None,
                 density: None,
                 schema: schema.into(),
                 table: table.into(),
@@ -1819,6 +1826,7 @@ mod tests {
                 let infos: Vec<TableInfo> = ["a", "b"]
                     .iter()
                     .map(|n| TableInfo {
+                        cdc_capture_instance: None,
                         schema: schema.into(),
                         table: (*n).into(),
                         ..make_table(vec![pk("id", "bigint")])
@@ -1949,6 +1957,7 @@ mod tests {
         };
         let none = InitYamlDestination::default();
         let named = |n: &str, cols: Vec<ColumnInfo>| TableInfo {
+            cdc_capture_instance: None,
             table: n.into(),
             ..make_table(cols)
         };
@@ -2035,6 +2044,7 @@ mod tests {
             let infos: Vec<TableInfo> = names
                 .iter()
                 .map(|n| TableInfo {
+                    cdc_capture_instance: None,
                     schema: "sales".into(),
                     table: (*n).into(),
                     ..make_table(vec![col("id", "bigint")])
@@ -2077,6 +2087,7 @@ mod tests {
 
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".into(),
             table: "payments".into(),
@@ -2273,6 +2284,7 @@ mod tests {
             ..Default::default()
         };
         let info = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".into(),
             table: "orders".into(),
@@ -2329,6 +2341,7 @@ mod tests {
             ..Default::default()
         };
         let info = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".into(),
             table: "events".into(),
@@ -2559,6 +2572,7 @@ mod tests {
         // decimal overrides as QUALIFIED `table.column` keys (never a bare key
         // that would apply to every table).
         let orders = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: "orders".into(),
@@ -2567,6 +2581,7 @@ mod tests {
             columns: vec![col("id", "bigint"), decimal_col("amount", 18, 2)],
         };
         let invoices = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: "invoices".into(),
@@ -2627,6 +2642,7 @@ mod tests {
             ..col(name, ty)
         };
         let t = |name: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: name.into(),
@@ -2672,6 +2688,7 @@ mod tests {
             ..col(name, ty)
         };
         let orders = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: "orders".into(),
@@ -2682,6 +2699,7 @@ mod tests {
         // No primary key at all: the recipe must still read by `table:` (a
         // `query:` export can never be a baseline) and fall back to `full`.
         let audit = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: "audit".into(),
@@ -2745,6 +2763,7 @@ mod tests {
             ..col(name, ty)
         };
         let mk = |table: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: table.into(),
@@ -2781,6 +2800,7 @@ mod tests {
     #[test]
     fn whole_db_cdc_puts_each_tables_partition_where_the_load_reads_it() {
         let mk = |table: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: table.into(),
@@ -2864,6 +2884,7 @@ mod tests {
     #[test]
     fn whole_db_cdc_fallback_on_mysql_gives_every_export_its_own_server_id() {
         let mk = |table: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: table.into(),
@@ -2903,6 +2924,7 @@ mod tests {
     #[test]
     fn a_mixed_case_table_scaffolds_a_lowercase_slot() {
         let info = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "sales".into(),
             table: "Orders".into(),
@@ -2957,6 +2979,7 @@ mod tests {
     #[test]
     fn recipe_readability_and_mode_follow_the_engine_and_the_key() {
         let mk = |table: &str, cols: Vec<ColumnInfo>| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "app".into(),
             table: table.into(),
@@ -2994,6 +3017,7 @@ mod tests {
     #[test]
     fn an_oracle_mixed_case_name_is_never_an_unquoted_table() {
         let mk = |schema: &str, table: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: schema.into(),
             table: table.into(),
@@ -3011,6 +3035,7 @@ mod tests {
     #[test]
     fn only_a_multi_table_cdc_scaffold_on_mysql_or_public_postgres_is_one_stream() {
         let mk = |schema: &str, table: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: schema.into(),
             table: table.into(),
@@ -3073,6 +3098,7 @@ mod tests {
     #[test]
     fn whole_db_cdc_with_no_readable_table_falls_back_to_the_per_table_scaffold() {
         let mk = |table: &str| TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".into(),
             table: table.into(),
@@ -3176,6 +3202,7 @@ mod tests {
 
     fn chunked_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".into(),
             table: "events".into(),
@@ -3300,6 +3327,7 @@ mod tests {
     #[test]
     fn full_mode_pg_non_public_schema_emits_qualified_table() {
         let info = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "billing".into(),
             table: "invoices".into(),

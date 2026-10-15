@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **`rivet init --mode cdc` on SQL Server named a capture instance that did not exist.** It wrote
+  `capture_instance: <schema>_<table>` by convention, so a table whose CDC was enabled under another
+  instance name got a config that failed on its first run (0.31.0 and earlier). **Now** init reads
+  `cdc.change_tables` and writes the instance it holds (the newest of two); a table without CDC gets
+  the conventional name with the `sp_cdc_enable_table` call that creates it. **What to do:** nothing.
+
 - **Two `rivet run`s of one `mode: cdc` export at once both delivered the stream.** A batch run
   holds the export's run lease and a second run beside it is refused; a CDC run took no lease, so
   the second read the same changes again (MySQL, SQL Server, Oracle and MongoDB delivered duplicate
