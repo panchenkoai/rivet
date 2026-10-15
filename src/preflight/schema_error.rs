@@ -37,11 +37,13 @@ impl PreflightSchemaError {
 
     /// Render to the single, shared author-facing preflight error.
     pub(crate) fn into_error(self) -> anyhow::Error {
-        anyhow::anyhow!(
-            "preflight: {} ({}). Check the table/column names in the export's query, \
+        crate::error::coded(
+            crate::error::codes::SOURCE_QUERY_FAILED,
+            format!(
+                "preflight: {} ({}). Check the table/column names in the export's query, \
              and that the connecting user has SELECT on them.",
-            self.detail,
-            self.code_label
+                self.detail, self.code_label
+            ),
         )
     }
 }

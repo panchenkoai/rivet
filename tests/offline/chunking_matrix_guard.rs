@@ -362,7 +362,10 @@ const MATRICES: &[(&str, usize)] = &[
     // `refusal_*` row; every one is asserted by its code offline, none is walked by a live cell yet.
     // 99 -> 100 (2026-10-15): the MongoDB unseekable-`_id` refusal gained a registry code and its
     // `refusal_*` row; asserted by its code offline, not walked by a live cell yet.
-    ("docs/sabotage-matrix.yaml", 100),
+    // 100 -> 104 (2026-10-15): the four refusals that gained a registry code in the last batch
+    // (init config exists, destination prefix mode mismatch, mixed split generations, load spec
+    // missing) each get a `refusal_*` row; asserted by their codes offline, not walked by a live cell yet.
+    ("docs/sabotage-matrix.yaml", 104),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

@@ -1086,6 +1086,38 @@ scenarios:
     mongo:    { gap: "asserted by its code offline (mongo: an_unseekable_id_span_and_an_undecodable_cursor_token_are_refused_by_code); the walk needs a collection seeded with two `_id` types under `page_size`: refuse twice, drop `page_size` and `parallel`, normalise `_id`, and one wrong remedy" }
     oracle:   { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
 
+  - id: refusal_init_config_exists
+    what: "RIVET_INIT_CONFIG_EXISTS: `rivet init -o <path>` over a config already at the path; the scaffold is written only beside it (`-o <new-path>`) or after the old one is moved aside"
+    postgres: { gap: "asserted by its code offline (init: init_stops_carry_their_codes); the walk needs an init cell: refuse twice, move the config aside, `-o <new-path>` as the second remedy, and one wrong remedy" }
+    mysql:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_dest_prefix_mode_mismatch
+    what: "RIVET_DEST_PREFIX_MODE_MISMATCH: an export whose destination prefix already holds a manifest of the other mode (a batch export over a CDC prefix, or the reverse); the export runs only from its own prefix"
+    postgres: { gap: "asserted by its code offline (manifest: cross_shape_overwrite_is_refused_same_shape_allowed); the walk needs a run cell: refuse twice, point the export at its own prefix, and one wrong remedy" }
+    mysql:    { na: "the refusal reads the manifest at the prefix and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal reads the manifest at the prefix and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal reads the manifest at the prefix and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal reads the manifest at the prefix and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_split_generations_mixed
+    what: "RIVET_LOAD_SPLIT_GENERATIONS_MIXED: a Full load over a `--pool --split` prefix whose parts span more than one split generation (a plain snapshot beside split units, two bottom or top windows, or interior bounds that do not tile); the load runs only from a fresh prefix or after the stale generation is cleared"
+    postgres: { gap: "asserted by its code offline (manifest/census: ensure_single_generation_refuses_a_mixed_and_a_non_tiling_selection); the walk needs a split-run-then-load cell: refuse twice, load from a fresh prefix, clear the stale generation as the second remedy, and one wrong remedy" }
+    mysql:    { na: "the refusal reads the manifests at the prefix and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal reads the manifests at the prefix and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal reads the manifests at the prefix and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal reads the manifests at the prefix and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_spec_missing
+    what: "RIVET_LOAD_SPEC_MISSING: `rivet load` for an export whose column types no run recorded in the state DB; the load runs only after `rivet run` for that export"
+    postgres: { gap: "asserted by its code offline (preflight: an_unknown_target_and_an_export_with_no_recorded_spec_are_refused_by_code); the walk needs a load cell over a state DB with no spec: refuse twice, `rivet run` the export, and one wrong remedy" }
+    mysql:    { na: "the refusal reads the state DB and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal reads the state DB and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal reads the state DB and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal reads the state DB and does not depend on the source engine: the postgres column carries the row" }
+
   - id: edit_destination_path_cursor_stored_before_destinations_were_recorded
     what: "a cursor (incremental; MongoDB `resume`) whose row holds no destination (`export_state.destination` NULL, as rivet 0.31 and earlier wrote it): a run with the config unchanged continues and records where it delivers, and a destination moved after that is refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH)"
     postgres: { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres }

@@ -1382,6 +1382,147 @@ pub mod codes {
         "remove `page_size` and `parallel` so the collection is read in one ordered scan, or fix the `_id` values the message names",
     );
 
+    /// An option given a value in a form it does not take (`--format`, `--mode`, `--date`, `--param`).
+    pub const CLI_VALUE_INVALID: Code = usage(
+        "RIVET_CLI_VALUE_INVALID",
+        "pass the option a value in the form the message names",
+    );
+    /// A `--run-id` no run-status row carries.
+    pub const CLI_RUN_ID_UNKNOWN: Code = usage(
+        "RIVET_CLI_RUN_ID_UNKNOWN",
+        "pass a run id `rivet state runs -c <config>` lists",
+    );
+    /// `rivet check` or `rivet doctor` ended with a failed check; each is printed above the stop.
+    pub const CLI_PREFLIGHT_FAILED: Code = usage(
+        "RIVET_CLI_PREFLIGHT_FAILED",
+        "fix each check the output above names, then run the command again",
+    );
+    /// `rivet doctor` met a transient fault on a probe, so the verdict is not a verdict on the config.
+    pub const CLI_PREFLIGHT_UNVERIFIED: Code = environment(
+        "RIVET_CLI_PREFLIGHT_UNVERIFIED",
+        "run `rivet doctor` again once the source or destination the output names answers",
+    );
+    /// A `target:` (or `--target`) naming no warehouse rivet types for.
+    pub const CONFIG_TARGET_UNKNOWN: Code = usage(
+        "RIVET_CONFIG_TARGET_UNKNOWN",
+        "set `target:` (or `--target`) to one of the names the message lists",
+    );
+    /// `tls.ca_file` cannot be read or holds no PEM certificate.
+    pub const CONFIG_TLS_CA_INVALID: Code = usage(
+        "RIVET_CONFIG_TLS_CA_INVALID",
+        "point `tls.ca_file` at a readable PEM file holding the CA certificate",
+    );
+    /// A column of a type the export's file format cannot write (CSV: a nested type; Parquet: a negative decimal scale).
+    pub const CONFIG_FORMAT_COLUMN_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_FORMAT_COLUMN_UNSUPPORTED",
+        "change `format:`, or cast or drop the column in the export's query",
+    );
+    /// A source column named like a column `meta_columns` adds.
+    pub const CONFIG_META_COLUMN_COLLISION: Code = usage(
+        "RIVET_CONFIG_META_COLUMN_COLLISION",
+        "alias the source column in a `query:`, or turn the colliding meta column off",
+    );
+    /// A `row_hash` or `quality.unique_columns` column of a type rivet has no canonical form for.
+    pub const CONFIG_CANON_TYPE_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_CANON_TYPE_UNSUPPORTED",
+        "leave the column out of the gate the message names, or cast it in the query",
+    );
+    /// A `quality:` check naming a column the export does not project.
+    pub const CONFIG_QUALITY_COLUMN_UNKNOWN: Code = usage(
+        "RIVET_CONFIG_QUALITY_COLUMN_UNKNOWN",
+        "name columns the export projects under `quality:`, or add them to the query",
+    );
+    /// A `columns:` override type rivet does not parse, or a decimal precision or scale out of range.
+    pub const CONFIG_COLUMN_OVERRIDE_TYPE_INVALID: Code = usage(
+        "RIVET_CONFIG_COLUMN_OVERRIDE_TYPE_INVALID",
+        "give the `columns:` override one of the type names the message lists, with `decimal(precision,scale)` in range",
+    );
+    /// A cloud destination lacking a key its type requires (`bucket`).
+    pub const CONFIG_DESTINATION_SETTING_MISSING: Code = usage(
+        "RIVET_CONFIG_DESTINATION_SETTING_MISSING",
+        "set the destination key the message names",
+    );
+    /// A destination credential that is malformed, expired or refused by the provider's token endpoint.
+    pub const DEST_CREDENTIALS_INVALID: Code = environment(
+        "RIVET_DEST_CREDENTIALS_INVALID",
+        "issue the destination a fresh, complete credential (a new SAS, service-account key or `gcloud auth application-default login`)",
+    );
+    /// The destination prefix holds a manifest of another export mode (batch beside CDC).
+    pub const DEST_PREFIX_MODE_MISMATCH: Code = refusal(
+        "RIVET_DEST_PREFIX_MODE_MISMATCH",
+        "give the export its own destination prefix; a batch and a CDC export must not share one",
+    );
+    /// The object-store I/O runtime could not start: the OS refused a thread or a file descriptor.
+    pub const DEST_IO_RUNTIME_UNAVAILABLE: Code = environment(
+        "RIVET_DEST_IO_RUNTIME_UNAVAILABLE",
+        "raise the process's thread and open-file limits, or lower the export parallelism, then run again",
+    );
+    /// `rivet init -o` met a config at the output path.
+    pub const INIT_CONFIG_EXISTS: Code = refusal(
+        "RIVET_INIT_CONFIG_EXISTS",
+        "move the existing config aside, or write elsewhere with `-o <new-path>`",
+    );
+    /// `rivet init --table` found no columns for the table.
+    pub const INIT_TABLE_NOT_FOUND: Code = usage(
+        "RIVET_INIT_TABLE_NOT_FOUND",
+        "correct `--table` (and `--schema`), or grant the user SELECT on the table",
+    );
+    /// `rivet init` found no table or view to scaffold.
+    pub const INIT_NO_TABLES: Code = usage(
+        "RIVET_INIT_NO_TABLES",
+        "point `--schema` at a schema the user can read, and loosen `--include` / `--exclude`",
+    );
+    /// A Full load over a `--pool --split` prefix whose parts span more than one split generation.
+    pub const LOAD_SPLIT_GENERATIONS_MIXED: Code = refusal(
+        "RIVET_LOAD_SPLIT_GENERATIONS_MIXED",
+        "load from a fresh destination prefix, or clear the stale split generation, and run again",
+    );
+    /// A `rivet load` export with no column types recorded in the state DB.
+    pub const LOAD_SPEC_MISSING: Code = refusal(
+        "RIVET_LOAD_SPEC_MISSING",
+        "run `rivet run` for the export the message names so its column types are recorded, then load again",
+    );
+    /// A JSON-RPC request the MCP server does not understand: an unknown method or tool, or missing params.
+    pub const MCP_REQUEST_INVALID: Code = usage(
+        "RIVET_MCP_REQUEST_INVALID",
+        "send a method and tool name `tools/list` advertises, with `params`",
+    );
+    /// A plan file that is not one `rivet plan` wrote, or was edited after planning.
+    pub const PLAN_ARTIFACT_INVALID: Code = usage(
+        "RIVET_PLAN_ARTIFACT_INVALID",
+        "pass a plan file `rivet plan` wrote, unedited; run `rivet plan` again to regenerate it",
+    );
+    /// A chunked export on a table with no key the planner can range-chunk or keyset-page.
+    pub const PLAN_CHUNK_KEY_UNUSABLE: Code = usage(
+        "RIVET_PLAN_CHUNK_KEY_UNUSABLE",
+        "set `chunk_column:` (integer) or `chunk_by_key:` (a single-column NOT NULL unique key of a supported type), add such an index, or use `mode: full`",
+    );
+    /// The state database did not take a statement: a connection, a migration step or a claim failed.
+    pub const STATE_BACKEND_FAILED: Code = environment(
+        "RIVET_STATE_BACKEND_FAILED",
+        "check the state database (the SQLite file, or the `RIVET_STATE_URL` server and the role's rights), then run again",
+    );
+    /// The SQLite state file is not a database.
+    pub const STATE_FILE_CORRUPT: Code = environment(
+        "RIVET_STATE_FILE_CORRUPT",
+        "move the state file aside (rivet rebuilds it; cursors and skip-ledgers start fresh), or restore it from a backup",
+    );
+    /// Another rivet process holds the state migration lock.
+    pub const STATE_MIGRATION_LOCKED: Code = environment(
+        "RIVET_STATE_MIGRATION_LOCKED",
+        "wait for the other rivet process migrating this state database to finish, then run again",
+    );
+    /// A destination or file-writer invariant did not hold.
+    pub const INTERNAL_DEST_INVARIANT: Code = internal(
+        "RIVET_INTERNAL_DEST_INVARIANT",
+        "a destination invariant did not hold — a bug; report it with the message",
+    );
+    /// A state-store invariant did not hold.
+    pub const INTERNAL_STATE_INVARIANT: Code = internal(
+        "RIVET_INTERNAL_STATE_INVARIANT",
+        "a state-store invariant did not hold — a bug; report it with the message",
+    );
+
     /// Every registered code: the docs page and the guard tests read this one list.
     pub const ALL: &[Code] = &[
         CONFIG_NO_EXPORTS,
@@ -1546,6 +1687,34 @@ pub mod codes {
         SOURCE_CDC_SPILL_UNWRITABLE,
         INTERNAL_SOURCE_INVARIANT,
         SOURCE_KEYSET_KEY_UNORDERED,
+        CLI_VALUE_INVALID,
+        CLI_RUN_ID_UNKNOWN,
+        CLI_PREFLIGHT_FAILED,
+        CLI_PREFLIGHT_UNVERIFIED,
+        CONFIG_TARGET_UNKNOWN,
+        CONFIG_TLS_CA_INVALID,
+        CONFIG_FORMAT_COLUMN_UNSUPPORTED,
+        CONFIG_META_COLUMN_COLLISION,
+        CONFIG_CANON_TYPE_UNSUPPORTED,
+        CONFIG_QUALITY_COLUMN_UNKNOWN,
+        CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
+        CONFIG_DESTINATION_SETTING_MISSING,
+        DEST_CREDENTIALS_INVALID,
+        DEST_PREFIX_MODE_MISMATCH,
+        DEST_IO_RUNTIME_UNAVAILABLE,
+        INIT_CONFIG_EXISTS,
+        INIT_TABLE_NOT_FOUND,
+        INIT_NO_TABLES,
+        LOAD_SPLIT_GENERATIONS_MIXED,
+        LOAD_SPEC_MISSING,
+        MCP_REQUEST_INVALID,
+        PLAN_ARTIFACT_INVALID,
+        PLAN_CHUNK_KEY_UNUSABLE,
+        STATE_BACKEND_FAILED,
+        STATE_FILE_CORRUPT,
+        STATE_MIGRATION_LOCKED,
+        INTERNAL_DEST_INVARIANT,
+        INTERNAL_STATE_INVARIANT,
     ];
 }
 
@@ -1798,7 +1967,7 @@ mod tests {
     /// The families a code may name (`RIVET_<FAMILY>_<NAME>`).
     const FAMILIES: &[&str] = &[
         "CONFIG", "CLI", "SOURCE", "CDC", "SPILL", "TYPE", "STATE", "DEST", "PLAN", "LOAD",
-        "VALIDATE", "INIT", "INTERNAL", "RUN",
+        "VALIDATE", "INIT", "INTERNAL", "RUN", "MCP",
     ];
 
     #[test]

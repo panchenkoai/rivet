@@ -17,7 +17,12 @@ pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Resu
 /// The owner init reads when none is given: the session's current schema.
 pub(super) fn current_schema(conn: &mut OracleSource) -> Result<String> {
     conn.query_scalar("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")?
-        .ok_or_else(|| anyhow::anyhow!("oracle: could not read the current schema"))
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                "oracle: could not read the current schema",
+            )
+        })
 }
 
 /// `schema`, or the session's current schema for an unqualified / `public` placeholder.
@@ -58,7 +63,8 @@ pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> 
     {
         columns = columns_of(conn, &base_owner, &base_table)?;
         if columns.is_empty() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INIT_TABLE_NOT_FOUND,
                 "Table '{schema}.{table}' not found or has no columns: it is a synonym for \
                  '{base_owner}.{base_table}', which the user cannot read (or which does not exist)."
             );
@@ -70,7 +76,8 @@ pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> 
         (schema, table) = (base_owner, base_table);
     }
     if columns.is_empty() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INIT_TABLE_NOT_FOUND,
             "Table '{schema}.{table}' not found or has no columns. Oracle stores unquoted \
              names upper-case — check the spelling, and that the user can SELECT it."
         );

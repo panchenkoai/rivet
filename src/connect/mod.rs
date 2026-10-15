@@ -89,7 +89,8 @@ fn url_host_port(url: &str) -> (String, String) {
 /// mangles it).
 pub(crate) fn require_url_has_host(url: &str) -> Result<()> {
     if host_port_span(url).is_empty() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
             "source: invalid URL — no host found. Expected a URL of the form \
              scheme://host:port/database."
         );

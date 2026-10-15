@@ -20,8 +20,12 @@ pub struct S3Backend;
 /// stores its own copy inside `reqsign`; the `Zeroizing` wrapper only protects
 /// our transient handle.
 fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing<String>> {
-    let value = std::env::var(env_name)
-        .map_err(|_| anyhow::anyhow!("env var '{}' not set for S3 {}", env_name, label))?;
+    let value = std::env::var(env_name).map_err(|_| {
+        crate::error::coded(
+            crate::error::codes::CONFIG_SECRET_UNSET,
+            format!("env var '{}' not set for S3 {}", env_name, label),
+        )
+    })?;
     Ok(zeroize::Zeroizing::new(value))
 }
 
@@ -39,10 +43,12 @@ impl CloudBackend for S3Backend {
     ];
 
     fn build_operator(config: &DestinationConfig) -> Result<Operator> {
-        let bucket = config
-            .bucket
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("S3 destination requires 'bucket'"))?;
+        let bucket = config.bucket.as_deref().ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_DESTINATION_SETTING_MISSING,
+                "S3 destination requires 'bucket'",
+            )
+        })?;
 
         let mut builder = S3::default().bucket(bucket);
 

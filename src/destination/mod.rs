@@ -172,7 +172,10 @@ pub trait Destination: Send + Sync {
     /// listing call (S3/GCS object stores).
     fn list_prefix(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let _ = prefix;
-        anyhow::bail!("list_prefix is not supported by this destination backend")
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_DEST_INVARIANT,
+            "list_prefix is not supported by this destination backend"
+        )
     }
 
     /// Read the full body of `key` into memory.  Used for small artifacts
@@ -180,7 +183,10 @@ pub trait Destination: Send + Sync {
     /// a future streaming reader if and when `--validate --deep` lands.
     fn read(&self, key: &str) -> Result<Vec<u8>> {
         let _ = key;
-        anyhow::bail!("read is not supported by this destination backend")
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_DEST_INVARIANT,
+            "read is not supported by this destination backend"
+        )
     }
 
     /// Stat `key`, returning `None` if the object does not exist and the
@@ -189,13 +195,19 @@ pub trait Destination: Send + Sync {
     /// error rather than swallow it as `None`.
     fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let _ = key;
-        anyhow::bail!("head is not supported by this destination backend")
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_DEST_INVARIANT,
+            "head is not supported by this destination backend"
+        )
     }
 
     /// Delete the object at `key` under the destination prefix; an absent key is Ok.
     fn remove(&self, key: &str) -> Result<()> {
         let _ = key;
-        anyhow::bail!("remove is not supported by this destination backend")
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_DEST_INVARIANT,
+            "remove is not supported by this destination backend"
+        )
     }
 
     /// Move `from` to `to` at the destination prefix.
@@ -214,7 +226,10 @@ pub trait Destination: Send + Sync {
     /// "clutter problem, not a correctness problem" per the ADR.
     fn r#move(&self, from: &str, to: &str) -> Result<()> {
         let _ = (from, to);
-        anyhow::bail!("move is not supported by this destination backend")
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_DEST_INVARIANT,
+            "move is not supported by this destination backend"
+        )
     }
 }
 
@@ -524,5 +539,38 @@ mod dest_for_table_tests {
             "/data/cdc/orders",
             "local paths go through the filesystem join — no trailing slash needed"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    /// A backend with only the required methods: every optional one is a bug to reach.
+    struct Bare;
+    impl super::Destination for Bare {
+        fn write(&self, _: &std::path::Path, _: &str) -> super::Result<super::WriteOutcome> {
+            Ok(super::WriteOutcome { content_md5: None })
+        }
+        fn capabilities(&self) -> super::DestinationCapabilities {
+            super::DestinationCapabilities {
+                commit_protocol: super::WriteCommitProtocol::FinalizeOnClose,
+                idempotent_overwrite: true,
+                retry_safe: true,
+                partial_write_risk: false,
+            }
+        }
+    }
+
+    #[test]
+    fn an_unsupported_backend_operation_is_an_internal_invariant() {
+        use super::Destination as _;
+        for err in [
+            Bare.list_prefix("").unwrap_err(),
+            Bare.read("k").unwrap_err(),
+            Bare.head("k").unwrap_err(),
+            Bare.remove("k").unwrap_err(),
+            Bare.r#move("a", "b").unwrap_err(),
+        ] {
+            crate::error::assert_coded(&err, "RIVET_INTERNAL_DEST_INVARIANT", 6);
+        }
     }
 }

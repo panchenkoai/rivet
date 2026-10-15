@@ -380,7 +380,12 @@ pub fn check(
             .exports
             .iter()
             .find(|e| e.name == name)
-            .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", name))?;
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::CLI_EXPORT_UNKNOWN,
+                    format!("export '{}' not found in config", name),
+                )
+            })?;
         vec![e]
     } else {
         config.exports.iter().collect()
@@ -406,7 +411,8 @@ pub fn check(
         for why in &illegal {
             eprintln!("✗ {why}");
         }
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::PLAN_REJECTED,
             "rivet check: {} export(s) cannot be planned — `rivet run` would refuse this config",
             illegal.len()
         );
@@ -502,10 +508,13 @@ pub fn check(
             &export.name,
         );
         crate::destination::create_destination(&expanded).map_err(|e| {
-            anyhow::anyhow!(
-                "export '{}': destination preflight failed: {:#}",
-                export.name,
-                e
+            crate::error::recoded(
+                &e,
+                crate::error::codes::CLI_PREFLIGHT_FAILED,
+                format!(
+                    "export '{}': destination preflight failed: {:#}",
+                    export.name, e
+                ),
             )
         })?;
     }
@@ -533,15 +542,7 @@ pub fn check(
             // CLI `--target` wins; otherwise fall back to the per-export
             // `target:` from the config (slice #2a). A declared-but-unknown
             // target is a loud error — never silently ignored.
-            if let Some(t) = export.target.as_deref()
-                && crate::types::target::ExportTarget::parse(t).is_none()
-            {
-                anyhow::bail!(
-                    "export '{}': unknown target '{t}' (expected: {})",
-                    export.name,
-                    crate::types::target::ExportTarget::valid_target_names()
-                );
-            }
+            refuse_unknown_target(&export.name, export.target.as_deref())?;
             let eff_target = target.or_else(|| {
                 export
                     .target
@@ -612,14 +613,18 @@ pub fn check(
         }
 
         if strict_fails_on_unbuilt_reports(strict, reports_failed) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CLI_PREFLIGHT_FAILED,
                 "strict mode: the type report failed for {reports_failed} export(s) (see the warnings above)"
             );
         }
         match tally.outcome(strict, json_output) {
             TypeReportOutcome::Fail => {
                 crate::types::policy::refuse_fatal(&fatal, "rivet check")?;
-                anyhow::bail!("strict mode: unsafe type mappings found (see report above)")
+                crate::rivet_bail!(
+                    crate::error::codes::TYPE_UNSAFE_MAPPING,
+                    "strict mode: unsafe type mappings found (see report above)"
+                )
             }
             TypeReportOutcome::Note => {
                 // The table showed "fail ✗" but rc is 0 — say so explicitly.
@@ -671,6 +676,21 @@ fn fatal_violations(
             })
         })
         .collect()
+}
+
+/// An export's declared `target:` must name a warehouse rivet types for.
+fn refuse_unknown_target(export_name: &str, target: Option<&str>) -> Result<()> {
+    if let Some(t) = target
+        && crate::types::target::ExportTarget::parse(t).is_none()
+    {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_TARGET_UNKNOWN,
+            "export '{}': unknown target '{t}' (expected: {})",
+            export_name,
+            crate::types::target::ExportTarget::valid_target_names()
+        );
+    }
+    Ok(())
 }
 
 /// `--strict` fails when any export's type report could not be built.
@@ -745,7 +765,8 @@ pub fn load_type_reports(
         }
     }
     if !failures.is_empty() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_SPEC_MISSING,
             "{} export(s) could not be typed for the {} load, and a table that cannot \
              be typed must not silently not-load:\n  - {}",
             failures.len(),
@@ -1228,6 +1249,24 @@ mod tests {
     ///
     /// Found by the live BigQuery cycle, pinned here where it costs no
     /// warehouse: this goes RED the moment the recipe filter is dropped.
+    #[test]
+    fn an_unknown_target_and_an_export_with_no_recorded_spec_are_refused_by_code() {
+        let err = refuse_unknown_target("orders", Some("nope")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_TARGET_UNKNOWN", 1);
+        assert!(refuse_unknown_target("orders", Some("bigquery")).is_ok());
+
+        let yaml = "\nsource:\n  type: mysql\n  url: \"mysql://u:p@localhost:3306/db\"\n\
+             exports:\n  - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: \"/tmp/o\" }\n";
+        let cfg = crate::config::Config::from_yaml(yaml).expect("the config parses");
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let target = crate::types::target::ExportTarget::parse("bigquery").expect("bigquery");
+        let err = load_type_reports(&cfg, &state, target)
+            .err()
+            .expect("no spec is recorded for the export");
+        crate::error::assert_coded(&err, "RIVET_LOAD_SPEC_MISSING", 5);
+    }
+
     #[test]
     fn a_backfill_recipe_is_not_typed_for_the_load() {
         let yaml = "\nsource:\n  type: mysql\n  url: \"mysql://u:p@localhost:3306/db\"\n\

@@ -527,7 +527,8 @@ pub(super) fn source_type(source_url: &str) -> Result<&'static str> {
 /// Refuse a forced `--mode` the source cannot run, in the config loader's own words.
 fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Result<()> {
     match (source_type_of(source_url), mode) {
-        (Ok(st), Some(m)) if !st.is_sql() && !matches!(m, "full" | "cdc") => anyhow::bail!(
+        (Ok(st), Some(m)) if !st.is_sql() && !matches!(m, "full" | "cdc") => crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
             "init: --mode {m}: {}",
             crate::config::non_sql_mode_refusal(st, m)
         ),
@@ -538,7 +539,8 @@ fn refuse_unsupported_forced_mode(source_url: &str, mode: Option<&str>) -> Resul
 /// The engine the source URL's scheme names ([`crate::config::SourceType::from_url_scheme`]).
 pub(super) fn source_type_of(source_url: &str) -> Result<crate::config::SourceType> {
     let Some(t) = crate::config::SourceType::from_url_scheme(source_url) else {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
             "Unsupported source URL scheme. Expected postgresql://, mysql://, sqlserver://, mongodb://, or oracle://, got: {}",
             source_url
         )
@@ -677,7 +679,10 @@ impl InitYamlDestination {
 
     pub fn validate(&self) -> Result<()> {
         if self.gcs_bucket.is_some() && self.s3_bucket.is_some() {
-            anyhow::bail!("use at most one of --gcs-bucket and --s3-bucket");
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
+                "use at most one of --gcs-bucket and --s3-bucket"
+            );
         }
         Ok(())
     }
@@ -909,19 +914,34 @@ fn next_steps_block(
     s
 }
 
+/// The `--table` introspection found no columns for `qualified`: not there, or not readable.
+pub(super) fn table_not_found(qualified: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::INIT_TABLE_NOT_FOUND,
+        format!(
+            "Table '{qualified}' not found or has no columns. \
+             Check the table name and that the user has SELECT privilege."
+        ),
+    )
+}
+
 /// The "nothing to scaffold" error, filter-aware. When an `--include`/`--exclude`
 /// glob is active, an empty result usually means the globs filtered everything
 /// out (the schema has tables) — blaming `--schema`/privileges then sends the
 /// operator down the wrong path. Point at the filter first.
 fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
     if !filter.include.is_empty() || !filter.exclude.is_empty() {
-        anyhow::anyhow!(
+        crate::error::coded(
+            crate::error::codes::INIT_NO_TABLES,
             "No tables/views matched the --include/--exclude globs (or the schema is empty). \
              Check the globs — the same source without filters may discover tables — and also \
-             verify --schema and privileges."
+             verify --schema and privileges.",
         )
     } else {
-        anyhow::anyhow!("No tables or views found (check --schema and privileges)")
+        crate::error::coded(
+            crate::error::codes::INIT_NO_TABLES,
+            "No tables or views found (check --schema and privileges)",
+        )
     }
 }
 
@@ -933,16 +953,17 @@ fn write_config_output(path: &str, text: &str) -> Result<()> {
     // the config silently destroyed their work — a bare fs::write with no
     // exists-check. Scaffolding is regenerable; hand edits are not.
     if std::path::Path::new(path).exists() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INIT_CONFIG_EXISTS,
             "init: '{path}' already exists — refusing to overwrite a config that may \
              carry hand edits. Move it aside, or write elsewhere with `-o <new-path>`."
         );
     }
     std::fs::write(path, text).map_err(|e| {
-        anyhow::anyhow!(
+        crate::error::coded(crate::error::codes::CLI_OUTPUT_UNWRITABLE, format!(
             "init: could not write config to '{path}': {e} \
              (check the parent directory exists and is writable; `-o` takes a file path, not a directory)"
-        )
+        ))
     })
 }
 
@@ -960,7 +981,8 @@ fn resolve_single_table_schema<'a>(
     let (parsed_schema, name) = yaml_scaffold::parse_table(table);
     let has_embedded = table.contains('.');
     match schema_flag.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) if has_embedded && s != parsed_schema => anyhow::bail!(
+        Some(s) if has_embedded && s != parsed_schema => crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "init: --table '{table}' already names schema '{parsed_schema}', but --schema is \
              '{s}' — remove one so they agree"
         ),
@@ -1012,7 +1034,8 @@ fn introspect_single_table(
                 if let Some(url_db) = mysql::resolve_database_for_listing(source_url, None).ok()
                     && url_db != db
                 {
-                    anyhow::bail!(
+                    crate::rivet_bail!(
+                        crate::error::codes::CLI_OPTION_UNSUPPORTED,
                         "init: --schema '{db}' selects a different MySQL database than the source \
                          URL ('{url_db}') — the generated config connects via the URL and would \
                          export the URL's database, not '{db}'. Put the database in the URL instead \
@@ -1065,7 +1088,8 @@ fn introspect_single_table(
 /// it loudly; the database belongs in the connection URL.
 fn reject_mongo_schema(schema_flag: Option<&str>) -> Result<()> {
     if schema_flag.map(str::trim).is_some_and(|s| !s.is_empty()) {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "init: --schema is not supported for MongoDB — a collection has no schema \
              namespace. Put the database in the connection URL instead (mongodb://…/<db>)."
         );
@@ -1392,7 +1416,8 @@ fn introspect_all(
                 && let Some(url_db) = mysql::resolve_database_for_listing(source_url, None).ok()
                 && url_db != db
             {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CLI_OPTION_UNSUPPORTED,
                     "init: --schema '{db}' selects a different MySQL database than the source URL \
                      ('{url_db}') — `rivet init`/`run` connect via the URL and would list and export \
                      the URL's database, not '{db}'. Put the database in the URL instead (mysql://…/{db})."
@@ -3395,6 +3420,21 @@ mod tests {
         assert!(
             format!("{unfiltered}").contains("check --schema and privileges"),
             "unfiltered error keeps the schema/privileges hint: {unfiltered}"
+        );
+    }
+
+    #[test]
+    fn init_stops_carry_their_codes() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let err = write_config_output(f.path().to_str().unwrap(), "source: {}\n").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INIT_CONFIG_EXISTS", 5);
+        let err = no_tables_error(&TableFilter::default());
+        crate::error::assert_coded(&err, "RIVET_INIT_NO_TABLES", 1);
+        let err = table_not_found("public.orders");
+        crate::error::assert_coded(&err, "RIVET_INIT_TABLE_NOT_FOUND", 1);
+        assert!(
+            err.to_string()
+                .starts_with("Table 'public.orders' not found")
         );
     }
 

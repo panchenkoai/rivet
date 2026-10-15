@@ -221,10 +221,12 @@ impl CloudBackend for GcsBackend {
     const SCHEME: &'static str = "gs";
 
     fn build_operator(config: &DestinationConfig) -> Result<Operator> {
-        let bucket = config
-            .bucket
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("GCS destination requires 'bucket'"))?;
+        let bucket = config.bucket.as_deref().ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_DESTINATION_SETTING_MISSING,
+                "GCS destination requires 'bucket'",
+            )
+        })?;
 
         let mut builder = Gcs::default().bucket(bucket);
 

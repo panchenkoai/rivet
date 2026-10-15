@@ -76,7 +76,8 @@ pub fn parse_type_str(s: &str) -> Result<RivetType> {
             unit: TimeUnit::Nanosecond,
             timezone: Some("UTC".into()),
         }),
-        _ => anyhow::bail!(
+        _ => crate::rivet_bail!(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
             "column override: unrecognised type '{}'. \
              Supported: bool, int2/int4/int8, float4/float8, decimal(p,s), \
              date, timestamp, timestamp_ns, timestamp_tz, timestamp_tz_ns, \
@@ -89,42 +90,56 @@ pub fn parse_type_str(s: &str) -> Result<RivetType> {
 fn parse_decimal_params(original: &str, inner: &str) -> Result<RivetType> {
     let mut parts = inner.splitn(2, ',');
     let precision_str = parts.next().ok_or_else(|| {
-        anyhow::anyhow!(
-            "column override: expected decimal(precision,scale) in '{}'",
-            original
+        crate::error::coded(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
+            format!(
+                "column override: expected decimal(precision,scale) in '{}'",
+                original
+            ),
         )
     })?;
     let scale_str = parts.next().ok_or_else(|| {
-        anyhow::anyhow!(
-            "column override: missing scale in '{}' — use decimal(precision,scale)",
-            original
+        crate::error::coded(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
+            format!(
+                "column override: missing scale in '{}' — use decimal(precision,scale)",
+                original
+            ),
         )
     })?;
 
     let precision: u8 = precision_str.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "column override: precision '{}' is not a valid integer (0–76) in '{}'",
-            precision_str.trim(),
-            original
+        crate::error::coded(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
+            format!(
+                "column override: precision '{}' is not a valid integer (0–76) in '{}'",
+                precision_str.trim(),
+                original
+            ),
         )
     })?;
     let scale: i8 = scale_str.trim().parse().map_err(|_| {
-        anyhow::anyhow!(
-            "column override: scale '{}' is not a valid integer (-128..127) in '{}'",
-            scale_str.trim(),
-            original
+        crate::error::coded(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
+            format!(
+                "column override: scale '{}' is not a valid integer (-128..127) in '{}'",
+                scale_str.trim(),
+                original
+            ),
         )
     })?;
 
     if precision == 0 || precision > 76 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
             "column override: precision {} is out of range (1..=76) in '{}'",
             precision,
             original
         );
     }
     if scale > precision as i8 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
             "column override: scale {} exceeds precision {} in '{}'",
             scale,
             precision,
@@ -148,11 +163,13 @@ pub fn parse_column_overrides(
             crate::types::parse_type_str(type_str)
                 .map(|t| (col.clone(), t))
                 .map_err(|e| {
-                    anyhow::anyhow!(
-                        "export '{}': column override for '{}': {}",
-                        export_name,
-                        col,
-                        e
+                    crate::error::recoded(
+                        &e,
+                        crate::error::codes::CONFIG_COLUMN_OVERRIDE_TYPE_INVALID,
+                        format!(
+                            "export '{}': column override for '{}': {}",
+                            export_name, col, e
+                        ),
                     )
                 })
         })
@@ -413,6 +430,30 @@ mod tests {
         assert!(
             msg.contains("decimal(p,s)"),
             "error should list alternatives: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn an_unparseable_override_type_is_refused_by_code_through_the_export_wrapper() {
+        for s in [
+            "nope",
+            "decimal(0,0)",
+            "decimal(5,9)",
+            "decimal(x,1)",
+            "decimal(5)",
+        ] {
+            let err = super::parse_type_str(s).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_CONFIG_COLUMN_OVERRIDE_TYPE_INVALID", 1);
+        }
+        let raw = std::collections::HashMap::from([("c".to_string(), "nope".to_string())]);
+        let err = super::parse_column_overrides(&raw, "orders").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_COLUMN_OVERRIDE_TYPE_INVALID", 1);
+        assert!(
+            err.to_string()
+                .starts_with("export 'orders': column override for 'c':")
         );
     }
 }

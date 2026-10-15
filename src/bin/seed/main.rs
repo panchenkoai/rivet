@@ -4,7 +4,7 @@ mod fast;
 mod insert;
 mod mssql;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use clap::Parser;
 
 use args::{Args, SeedProfile};
@@ -42,7 +42,8 @@ fn confirm_destructive(
         }
         _ => format!("\n  postgres: {pg_url}\n  mysql:    {mysql_url}"),
     };
-    bail!(
+    rivet::rivet_bail!(
+        rivet::error::codes::CLI_OPTION_UNSUPPORTED,
         "refusing to seed: this will TRUNCATE ... CASCADE (SQL Server: DROP+CREATE) the following tables{urls}\n  tables:   {TRUNCATED_TABLES}\n\nThis is destructive and not reversible. Re-run with {CONFIRM_ENV}=1 to proceed."
     );
 }

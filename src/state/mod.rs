@@ -93,8 +93,13 @@ pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
     let connect = || crate::connect::postgres::connect_client(url, tls.as_ref());
     // The client panics where it cannot build its runtime (no file descriptor left).
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(connect))
-        .unwrap_or_else(|panic| Err(anyhow::anyhow!(client_panic_message(&*panic))))
-        .map_err(|e| anyhow::anyhow!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e))
+        .unwrap_or_else(|panic| Err(anyhow::Error::msg(client_panic_message(&*panic))))
+        .map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::STATE_BACKEND_FAILED,
+                format!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e),
+            )
+        })
 }
 
 /// The connect error a panic of the PostgreSQL client becomes.
@@ -324,7 +329,8 @@ impl StateStore {
         // empty path is the fix for the CLASS, so the next one fails loudly at
         // the open instead of quietly at recovery.
         if config_path.is_empty() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_STATE_INVARIANT,
                 "state: refusing to open a state database from an EMPTY path — \
                  it would resolve to './{STATE_DB_NAME}' in the current working \
                  directory rather than beside the config. Pass the config path, \
@@ -552,6 +558,18 @@ mod empty_state_path_guard {
     ///
     /// The sibling half of the fix is `open_at_ref`, so a worker never re-derives
     /// a location from a string at all.
+    #[test]
+    fn an_empty_path_and_a_refused_state_connection_carry_their_codes() {
+        let err = StateStore::open("")
+            .err()
+            .expect("an empty path is refused");
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_STATE_INVARIANT", 6);
+        let err = connect_pg("postgres://u:p@127.0.0.1:1/db")
+            .err()
+            .expect("nothing listens on port 1");
+        crate::error::assert_coded(&err, "RIVET_STATE_BACKEND_FAILED", 2);
+    }
+
     #[test]
     fn an_empty_config_path_is_refused_rather_than_resolved_to_the_cwd() {
         let msg = match StateStore::open("") {

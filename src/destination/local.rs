@@ -26,11 +26,17 @@ impl LocalDestination {
     /// whose path does not yet exist on disk, which is the common write case.
     fn safe_join(&self, key: &str) -> Result<PathBuf> {
         if key.contains('\0') {
-            anyhow::bail!("destination key contains a NUL byte: {key:?}");
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_PATH_UNSAFE,
+                "destination key contains a NUL byte: {key:?}"
+            );
         }
         let rel = Path::new(key);
         if rel.is_absolute() {
-            anyhow::bail!("destination key must be relative, got absolute path: {key:?}");
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_PATH_UNSAFE,
+                "destination key must be relative, got absolute path: {key:?}"
+            );
         }
         for component in rel.components() {
             match component {
@@ -39,7 +45,10 @@ impl LocalDestination {
                 // anchors (already rejected above on POSIX, caught here on
                 // Windows-shaped keys).
                 Component::ParentDir | Component::Prefix(_) | Component::RootDir => {
-                    anyhow::bail!("destination key escapes the destination root: {key:?}");
+                    crate::rivet_bail!(
+                        crate::error::codes::CONFIG_PATH_UNSAFE,
+                        "destination key escapes the destination root: {key:?}"
+                    );
                 }
             }
         }
@@ -121,7 +130,12 @@ impl super::Destination for LocalDestination {
         // same key into one prefix, and they deleted each other's staged file.
         let file_name = target
             .file_name()
-            .ok_or_else(|| anyhow::anyhow!("destination key has no file name: {remote_key}"))?
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::INTERNAL_DEST_INVARIANT,
+                    format!("destination key has no file name: {remote_key}"),
+                )
+            })?
             .to_string_lossy()
             .into_owned();
         let tmp = target.with_file_name(staging_name(&file_name));

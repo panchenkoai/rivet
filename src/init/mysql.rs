@@ -33,9 +33,7 @@ pub(super) fn resolve_database_for_listing(url: &str, schema_cli: Option<&str>) 
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "MySQL: put the database in the URL (mysql://user:pass@host:3306/dbname) or pass --schema <database>"
-            )
+            crate::error::coded(crate::error::codes::CONFIG_SOURCE_URL_INVALID, "MySQL: put the database in the URL (mysql://user:pass@host:3306/dbname) or pass --schema <database>")
         })
 }
 
@@ -94,10 +92,7 @@ pub(super) fn introspect(conn: &mut mysql::PooledConn, table: &str) -> Result<Ta
         conn.exec(COLUMNS_SQL, (table,))?;
 
     if rows.is_empty() {
-        anyhow::bail!(
-            "Table '{table}' not found or has no columns. \
-             Check the table name and that the user has SELECT privilege."
-        );
+        return Err(super::table_not_found(table));
     }
 
     let columns = rows

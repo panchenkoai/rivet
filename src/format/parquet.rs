@@ -73,7 +73,8 @@ impl super::Format for ParquetFormat {
                 | arrow::datatypes::DataType::Decimal256(_, s) if *s < 0
             )
         }) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_FORMAT_COLUMN_UNSUPPORTED,
                 "Parquet cannot write column '{}' ({:?}): a NEGATIVE decimal scale is valid in \
                  the source and in Arrow but not in the Parquet decimal type (scale must be >= 0). \
                  Cast the column to a non-negative scale in the query (e.g. \
@@ -309,6 +310,11 @@ mod tests {
         assert!(
             result.is_err(),
             "a negative-scale decimal must be refused, not crash mid-export"
+        );
+        crate::error::assert_coded(
+            result.as_ref().err().unwrap(),
+            "RIVET_CONFIG_FORMAT_COLUMN_UNSUPPORTED",
+            1,
         );
         let msg = result.err().unwrap().to_string();
         assert!(

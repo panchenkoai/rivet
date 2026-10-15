@@ -1154,11 +1154,14 @@ fn write_lock_not_taken(db: Option<&str>, e: &rusqlite::Error) -> anyhow::Error 
     // the new `state` CLI).
     let msg = e.to_string();
     if msg.contains("file is not a database") || msg.contains("database disk image") {
-        return anyhow::anyhow!(
-            "state: {msg} — the state DB file is CORRUPT (or not a SQLite file at \
+        return crate::error::coded(
+            crate::error::codes::STATE_FILE_CORRUPT,
+            format!(
+                "state: {msg} — the state DB file is CORRUPT (or not a SQLite file at \
              all), not locked. Move it aside and re-run (rivet rebuilds state; \
              incremental cursors and skip-ledgers start fresh), or restore it from \
              a backup."
+            ),
         );
     }
     // READONLY is a third disease: no process holds the database and no wait ends it.
@@ -1174,11 +1177,14 @@ fn write_lock_not_taken(db: Option<&str>, e: &rusqlite::Error) -> anyhow::Error 
             ),
         ));
     }
-    anyhow::anyhow!(
-        "state: could not acquire the migration lock within the busy timeout ({e}). \
+    crate::error::coded(
+        crate::error::codes::STATE_MIGRATION_LOCKED,
+        format!(
+            "state: could not acquire the migration lock within the busy timeout ({e}). \
          Another rivet process is migrating this state database; wait for it to \
          finish and retry. Running the migration ladder without the lock is what \
          produces 'no such table' / 'duplicate column' failures on a shared backend."
+        ),
     )
 }
 
@@ -1236,7 +1242,7 @@ mod write_lock_tests {
             Some("s.db"),
             &sqlite(rusqlite::ffi::SQLITE_BUSY, "database is locked"),
         );
-        assert_eq!(crate::error::error_code(&busy), None);
+        crate::error::assert_coded(&busy, "RIVET_STATE_MIGRATION_LOCKED", 2);
         assert!(
             busy.to_string()
                 .contains("Another rivet process is migrating this state database"),
@@ -1246,7 +1252,7 @@ mod write_lock_tests {
             Some("s.db"),
             &sqlite(rusqlite::ffi::SQLITE_NOTADB, "file is not a database"),
         );
-        assert_eq!(crate::error::error_code(&corrupt), None);
+        crate::error::assert_coded(&corrupt, "RIVET_STATE_FILE_CORRUPT", 1);
         assert!(corrupt.to_string().contains("CORRUPT"), "{corrupt}");
         assert!(
             !corrupt.to_string().contains("Another rivet process"),
@@ -1301,8 +1307,12 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
                 "{}\nINSERT INTO schema_version (version) VALUES ({});",
                 sql, ver
             );
-            conn.execute_batch(&atomic_sql)
-                .map_err(|e| anyhow::anyhow!("state: migration v{} failed: {}", ver, e))?;
+            conn.execute_batch(&atomic_sql).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::STATE_BACKEND_FAILED,
+                    format!("state: migration v{} failed: {}", ver, e),
+                )
+            })?;
         }
     }
 
@@ -1321,7 +1331,8 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
         );
     }
     if final_version != SCHEMA_VERSION {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_STATE_INVARIANT,
             "state: migration incomplete — expected schema v{} but reached v{}",
             SCHEMA_VERSION,
             final_version
@@ -1364,23 +1375,38 @@ pub(super) fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
     // EMPTY schema: THREE of the four died with `state(pg): create version table:
     // db error`, at the very first statement. One survived. That is the first day
     // of a shared deployment.
-    let mut tx = client
-        .transaction()
-        .map_err(|e| anyhow::anyhow!("state(pg): begin migration: {}", super::pg_detail(&e)))?;
+    let mut tx = client.transaction().map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::STATE_BACKEND_FAILED,
+            format!("state(pg): begin migration: {}", super::pg_detail(&e)),
+        )
+    })?;
     tx.batch_execute(&format!(
         "SELECT pg_advisory_xact_lock({PG_MIGRATION_LOCK});"
     ))
-    .map_err(|e| anyhow::anyhow!("state(pg): take migration lock: {}", super::pg_detail(&e)))?;
+    .map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::STATE_BACKEND_FAILED,
+            format!("state(pg): take migration lock: {}", super::pg_detail(&e)),
+        )
+    })?;
     migrate_pg_locked(&mut tx)?;
-    tx.commit()
-        .map_err(|e| anyhow::anyhow!("state(pg): commit migration: {}", super::pg_detail(&e)))
+    tx.commit().map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::STATE_BACKEND_FAILED,
+            format!("state(pg): commit migration: {}", super::pg_detail(&e)),
+        )
+    })
 }
 
 fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
     client
         .batch_execute("CREATE TABLE IF NOT EXISTS rivet_schema_version (version BIGINT NOT NULL);")
         .map_err(|e| {
-            anyhow::anyhow!("state(pg): create version table: {}", super::pg_detail(&e))
+            crate::error::coded(
+                crate::error::codes::STATE_BACKEND_FAILED,
+                format!("state(pg): create version table: {}", super::pg_detail(&e)),
+            )
         })?;
 
     let current: i64 = client
@@ -1388,7 +1414,12 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
             "SELECT COALESCE(MAX(version), 0) FROM rivet_schema_version",
             &[],
         )
-        .map_err(|e| anyhow::anyhow!("state(pg): read schema version: {}", super::pg_detail(&e)))?
+        .map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::STATE_BACKEND_FAILED,
+                format!("state(pg): read schema version: {}", super::pg_detail(&e)),
+            )
+        })?
         .get(0);
 
     for &(ver, sql) in PG_MIGRATIONS {
@@ -1399,10 +1430,13 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
                 sql, ver
             );
             client.batch_execute(&batch).map_err(|e| {
-                anyhow::anyhow!(
-                    "state(pg): migration v{} failed: {}",
-                    ver,
-                    super::pg_detail(&e)
+                crate::error::coded(
+                    crate::error::codes::STATE_BACKEND_FAILED,
+                    format!(
+                        "state(pg): migration v{} failed: {}",
+                        ver,
+                        super::pg_detail(&e)
+                    ),
                 )
             })?;
         }
@@ -1415,7 +1449,10 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
              WHERE version < (SELECT MAX(version) FROM rivet_schema_version);",
         )
         .map_err(|e| {
-            anyhow::anyhow!("state(pg): prune schema versions: {}", super::pg_detail(&e))
+            crate::error::coded(
+                crate::error::codes::STATE_BACKEND_FAILED,
+                format!("state(pg): prune schema versions: {}", super::pg_detail(&e)),
+            )
         })?;
 
     // Verify the DB actually reached the expected version.
@@ -1425,9 +1462,12 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
             &[],
         )
         .map_err(|e| {
-            anyhow::anyhow!(
-                "state(pg): read final schema version: {}",
-                super::pg_detail(&e)
+            crate::error::coded(
+                crate::error::codes::STATE_BACKEND_FAILED,
+                format!(
+                    "state(pg): read final schema version: {}",
+                    super::pg_detail(&e)
+                ),
             )
         })?
         .get(0);
@@ -1440,7 +1480,8 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
         );
     }
     if final_version != SCHEMA_VERSION {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_STATE_INVARIANT,
             "state(pg): migration incomplete — expected schema v{} but reached v{}",
             SCHEMA_VERSION,
             final_version

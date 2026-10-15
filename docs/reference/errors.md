@@ -177,3 +177,31 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_CDC_SPILL_UNWRITABLE` | environment | 2 if transient, else 1 | free space on the spill directory's filesystem (RIVET_CDC_SPILL_DIR, else beside the checkpoint) and check its write permission, then re-run |
 | `RIVET_INTERNAL_SOURCE_INVARIANT` | internal | 6 | a source reader invariant did not hold — a bug; report it with the message |
 | `RIVET_SOURCE_KEYSET_KEY_UNORDERED` | refusal | 5 | remove `page_size` and `parallel` so the collection is read in one ordered scan, or fix the `_id` values the message names |
+| `RIVET_CLI_VALUE_INVALID` | usage | 1 | pass the option a value in the form the message names |
+| `RIVET_CLI_RUN_ID_UNKNOWN` | usage | 1 | pass a run id `rivet state runs -c <config>` lists |
+| `RIVET_CLI_PREFLIGHT_FAILED` | usage | 1 | fix each check the output above names, then run the command again |
+| `RIVET_CLI_PREFLIGHT_UNVERIFIED` | environment | 2 if transient, else 1 | run `rivet doctor` again once the source or destination the output names answers |
+| `RIVET_CONFIG_TARGET_UNKNOWN` | usage | 1 | set `target:` (or `--target`) to one of the names the message lists |
+| `RIVET_CONFIG_TLS_CA_INVALID` | usage | 1 | point `tls.ca_file` at a readable PEM file holding the CA certificate |
+| `RIVET_CONFIG_FORMAT_COLUMN_UNSUPPORTED` | usage | 1 | change `format:`, or cast or drop the column in the export's query |
+| `RIVET_CONFIG_META_COLUMN_COLLISION` | usage | 1 | alias the source column in a `query:`, or turn the colliding meta column off |
+| `RIVET_CONFIG_CANON_TYPE_UNSUPPORTED` | usage | 1 | leave the column out of the gate the message names, or cast it in the query |
+| `RIVET_CONFIG_QUALITY_COLUMN_UNKNOWN` | usage | 1 | name columns the export projects under `quality:`, or add them to the query |
+| `RIVET_CONFIG_COLUMN_OVERRIDE_TYPE_INVALID` | usage | 1 | give the `columns:` override one of the type names the message lists, with `decimal(precision,scale)` in range |
+| `RIVET_CONFIG_DESTINATION_SETTING_MISSING` | usage | 1 | set the destination key the message names |
+| `RIVET_DEST_CREDENTIALS_INVALID` | environment | 2 if transient, else 1 | issue the destination a fresh, complete credential (a new SAS, service-account key or `gcloud auth application-default login`) |
+| `RIVET_DEST_PREFIX_MODE_MISMATCH` | refusal | 5 | give the export its own destination prefix; a batch and a CDC export must not share one |
+| `RIVET_DEST_IO_RUNTIME_UNAVAILABLE` | environment | 2 if transient, else 1 | raise the process's thread and open-file limits, or lower the export parallelism, then run again |
+| `RIVET_INIT_CONFIG_EXISTS` | refusal | 5 | move the existing config aside, or write elsewhere with `-o <new-path>` |
+| `RIVET_INIT_TABLE_NOT_FOUND` | usage | 1 | correct `--table` (and `--schema`), or grant the user SELECT on the table |
+| `RIVET_INIT_NO_TABLES` | usage | 1 | point `--schema` at a schema the user can read, and loosen `--include` / `--exclude` |
+| `RIVET_LOAD_SPLIT_GENERATIONS_MIXED` | refusal | 5 | load from a fresh destination prefix, or clear the stale split generation, and run again |
+| `RIVET_LOAD_SPEC_MISSING` | refusal | 5 | run `rivet run` for the export the message names so its column types are recorded, then load again |
+| `RIVET_MCP_REQUEST_INVALID` | usage | 1 | send a method and tool name `tools/list` advertises, with `params` |
+| `RIVET_PLAN_ARTIFACT_INVALID` | usage | 1 | pass a plan file `rivet plan` wrote, unedited; run `rivet plan` again to regenerate it |
+| `RIVET_PLAN_CHUNK_KEY_UNUSABLE` | usage | 1 | set `chunk_column:` (integer) or `chunk_by_key:` (a single-column NOT NULL unique key of a supported type), add such an index, or use `mode: full` |
+| `RIVET_STATE_BACKEND_FAILED` | environment | 2 if transient, else 1 | check the state database (the SQLite file, or the `RIVET_STATE_URL` server and the role's rights), then run again |
+| `RIVET_STATE_FILE_CORRUPT` | environment | 2 if transient, else 1 | move the state file aside (rivet rebuilds it; cursors and skip-ledgers start fresh), or restore it from a backup |
+| `RIVET_STATE_MIGRATION_LOCKED` | environment | 2 if transient, else 1 | wait for the other rivet process migrating this state database to finish, then run again |
+| `RIVET_INTERNAL_DEST_INVARIANT` | internal | 6 | a destination invariant did not hold — a bug; report it with the message |
+| `RIVET_INTERNAL_STATE_INVARIANT` | internal | 6 | a state-store invariant did not hold — a bug; report it with the message |

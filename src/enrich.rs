@@ -131,7 +131,8 @@ pub fn enrich_schema(schema: &SchemaRef, meta: &MetaColumns) -> Result<SchemaRef
             .iter()
             .find(|f| f.name().eq_ignore_ascii_case(added.name()))
         {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_META_COLUMN_COLLISION,
                 "source column '{0}' collides with the '{1}' column rivet adds for \
                  meta_columns — rename it in a `query:` (select it under another alias) \
                  or turn that meta column off",
@@ -223,7 +224,8 @@ pub fn row_hash_columns_of(available: &[String], spec: &RowHash) -> Result<Vec<S
     };
     for name in declared {
         if !available.iter().any(|a| a == name) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_ROW_HASH_INVALID,
                 "meta_columns.row_hash names column '{name}', which this export does not \
                  project. Available: {}",
                 available.join(", ")
@@ -241,7 +243,10 @@ pub fn row_hash_array(batch: &RecordBatch, cols: &[String]) -> Result<ArrayRef> 
         .iter()
         .map(|c| {
             batch.schema().index_of(c).map_err(|_| {
-                anyhow::anyhow!("row_hash: column '{c}' vanished from the batch schema")
+                crate::error::coded(
+                    crate::error::codes::INTERNAL_RUN_INVARIANT,
+                    format!("row_hash: column '{c}' vanished from the batch schema"),
+                )
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -449,7 +454,8 @@ fn write_canon(
         // none of them (`RivetType` has no variant that resolves to one), so
         // rather than guess a canonical form for a shape we cannot generate and
         // cannot test against real data, refuse — loudly, naming the escape.
-        other => anyhow::bail!(
+        other => crate::rivet_bail!(
+            crate::error::codes::CONFIG_CANON_TYPE_UNSUPPORTED,
             "{}: column '{}' has type {other}, for which rivet has no canonical form, so \
              comparing it could attest that different values are equal. {}",
             who.by.label(),
@@ -494,25 +500,31 @@ fn leaf_formatter<'a>(
     options: &'a arrow::util::display::FormatOptions,
 ) -> Result<arrow::util::display::ArrayFormatter<'a>> {
     arrow::util::display::ArrayFormatter::try_new(array, options).map_err(|e| {
-        anyhow::anyhow!(
-            "{}: column '{}' has type {} which Arrow cannot render, so it cannot be hashed \
+        crate::error::coded(
+            crate::error::codes::CONFIG_CANON_TYPE_UNSUPPORTED,
+            format!(
+                "{}: column '{}' has type {} which Arrow cannot render, so it cannot be hashed \
              ({e}). {}",
-            who.by.label(),
-            who.column,
-            array.data_type(),
-            who.by.remedy()
+                who.by.label(),
+                who.column,
+                array.data_type(),
+                who.by.remedy()
+            ),
         )
     })
 }
 
 fn downcast<'a, T: 'static>(array: &'a dyn arrow::array::Array, who: Who<'_>) -> Result<&'a T> {
     array.as_any().downcast_ref::<T>().ok_or_else(|| {
-        anyhow::anyhow!(
-            "{}: column '{}' declares {} but its array is a different kind — refusing \
+        crate::error::coded(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            format!(
+                "{}: column '{}' declares {} but its array is a different kind — refusing \
              rather than hashing a value read as the wrong shape",
-            who.by.label(),
-            who.column,
-            array.data_type()
+                who.by.label(),
+                who.column,
+                array.data_type()
+            ),
         )
     })
 }
@@ -586,7 +598,9 @@ mod tests {
                 Field::new("id", DataType::Int64, false),
                 Field::new(name, DataType::Utf8, true),
             ]));
-            let err = enrich_schema(&schema, &all_on).unwrap_err().to_string();
+            let err = enrich_schema(&schema, &all_on).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_CONFIG_META_COLUMN_COLLISION", 1);
+            let err = err.to_string();
             assert!(
                 err.contains(&format!("source column '{name}' collides"))
                     && err.contains("rename it in a `query:`"),
@@ -1407,5 +1421,38 @@ mod tests {
                 ),
             "{msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use std::sync::Arc;
+
+    #[test]
+    fn a_column_with_no_canonical_form_and_a_vanished_column_carry_their_codes() {
+        use arrow::array::{ArrayRef, Int32Array, UnionArray};
+        use arrow::datatypes::{DataType, Field, Schema, UnionFields};
+        let fields: UnionFields = [(0i8, Arc::new(Field::new("a", DataType::Int32, false)))]
+            .into_iter()
+            .collect();
+        let children: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![1, 2]))];
+        let union = UnionArray::try_new(
+            fields.clone(),
+            arrow::buffer::ScalarBuffer::from(vec![0i8, 0]),
+            None,
+            children,
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "u",
+            DataType::Union(fields, arrow::datatypes::UnionMode::Sparse),
+            false,
+        )]));
+        let batch =
+            arrow::record_batch::RecordBatch::try_new(schema, vec![Arc::new(union)]).unwrap();
+        let err = super::row_hash_array(&batch, &["u".to_string()]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_CANON_TYPE_UNSUPPORTED", 1);
+        let err = super::row_hash_array(&batch, &["gone".to_string()]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_RUN_INVARIANT", 6);
     }
 }

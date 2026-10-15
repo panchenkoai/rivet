@@ -58,8 +58,12 @@ impl StateStore {
     /// Persist an aggregate.  `per_export` is serialized as a JSON array into
     /// `details_json`.
     pub fn record_run_aggregate(&self, agg: &RunAggregate) -> Result<()> {
-        let details = serde_json::to_string(&agg.per_export)
-            .map_err(|e| anyhow::anyhow!("run_aggregate: serialize details_json: {:#}", e))?;
+        let details = serde_json::to_string(&agg.per_export).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_STATE_INVARIANT,
+                format!("run_aggregate: serialize details_json: {:#}", e),
+            )
+        })?;
         let sql = "INSERT INTO run_aggregate (
                 run_aggregate_id, started_at, finished_at, duration_ms,
                 config_path, parallel_mode,

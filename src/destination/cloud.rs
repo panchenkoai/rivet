@@ -291,9 +291,17 @@ pub(crate) fn io_runtime() -> Result<Arc<tokio::runtime::Runtime>> {
             .thread_name("rivet-io")
             .enable_all()
             .build()
-            .map_err(|e| anyhow::anyhow!("failed to create the object-store tokio runtime: {e}"))?,
+            .map_err(io_runtime_unavailable)?,
     );
     Ok(Arc::clone(RUNTIME.get_or_init(|| built)))
+}
+
+/// The OS refused the object-store runtime a thread or a descriptor.
+fn io_runtime_unavailable(e: std::io::Error) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::DEST_IO_RUNTIME_UNAVAILABLE,
+        format!("failed to create the object-store tokio runtime: {e}"),
+    )
 }
 
 impl<B: CloudBackend> CloudDestination<B> {
@@ -1012,5 +1020,16 @@ mod tests {
             !probed::<GcsBackend>(&local),
             "a missing LOCAL part file is not a store answer"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn a_runtime_the_os_refuses_is_reported_by_code() {
+        let err = super::io_runtime_unavailable(std::io::Error::other(
+            "Resource temporarily unavailable",
+        ));
+        crate::error::assert_coded(&err, "RIVET_DEST_IO_RUNTIME_UNAVAILABLE", 1);
     }
 }

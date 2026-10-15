@@ -144,7 +144,8 @@ pub(crate) fn maybe_transient_once(point: &str) -> crate::error::Result<()> {
     if std::env::var("RIVET_TEST_TRANSIENT_ONCE").is_ok_and(|p| p == point)
         && !FIRED.swap(true, std::sync::atomic::Ordering::SeqCst)
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_TEST_FAULT_INJECTED,
             "Unexpected (temporary) rivet test-hook: injected transient error at '{point}' \
              (RIVET_TEST_TRANSIENT_ONCE)"
         );

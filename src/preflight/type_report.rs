@@ -366,7 +366,8 @@ fn resolved_units(
                     } else {
                         "Restore this login's SELECT on the cdc schema"
                     };
-                    anyhow::bail!(
+                    crate::rivet_bail!(
+                        crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
                         "mssql: {why}, and `table: {}` is a BARE name — which relation it \
                          means depends on the connection's default schema, so rivet cannot \
                          say what these artifacts hold. The warehouse schema is planned \

@@ -375,7 +375,8 @@ pub fn ensure_single_generation(selected: &[&CensusRun<'_>]) -> Result<()> {
         .filter(|m| m.split_window.as_ref().unwrap().hi.is_none())
         .count();
     if plain > 0 || bottoms > 1 || tops > 1 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_SPLIT_GENERATIONS_MIXED,
             "Full load over a --pool --split prefix selected parts from MORE THAN ONE split \
              generation ({} split units incl. {bottoms} bottom + {tops} top window(s){}); \
              loading their union would DUPLICATE rows. The prefix holds a prior split run's \
@@ -413,7 +414,8 @@ pub fn ensure_single_generation(selected: &[&CensusRun<'_>]) -> Result<()> {
     los.sort();
     his.sort();
     if los != his {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_SPLIT_GENERATIONS_MIXED,
             "Full load over a --pool --split prefix selected an INCOHERENT set of split windows \
              — the interior boundaries do not tile the key space, so a later run re-sampled to \
              different boundaries and an older unit was substituted for a crashed one. Their \
@@ -937,7 +939,9 @@ mod tests {
         ];
         let census = ManifestCensus::new(&mixed);
         let sel = census.latest_generation();
-        let err = ensure_single_generation(&sel).unwrap_err().to_string();
+        let err = ensure_single_generation(&sel).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_LOAD_SPLIT_GENERATIONS_MIXED", 5);
+        let err = err.to_string();
         assert!(err.contains("MORE THAN ONE split generation"), "{err}");
 
         // One bottom + one top, but the interior boundaries do not meet.
@@ -947,7 +951,9 @@ mod tests {
         ];
         let census = ManifestCensus::new(&holed);
         let sel = census.latest_generation();
-        let err = ensure_single_generation(&sel).unwrap_err().to_string();
+        let err = ensure_single_generation(&sel).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_LOAD_SPLIT_GENERATIONS_MIXED", 5);
+        let err = err.to_string();
         assert!(err.contains("INCOHERENT set of split windows"), "{err}");
 
         // A plain single snapshot is always coherent.

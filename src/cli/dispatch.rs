@@ -50,7 +50,8 @@ fn check_export_selection(config: &Config, export: Option<&str>) -> Result<()> {
     }
     let mut known: Vec<&str> = config.exports.iter().map(|e| e.name.as_str()).collect();
     known.sort_unstable();
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::CLI_EXPORT_UNKNOWN,
         "export '{}' not found in config.\n  Known exports: {}\n  Hint: check the spelling against the names above.",
         name,
         if known.is_empty() {
@@ -338,14 +339,18 @@ fn dispatch_cdc(a: CdcArgs) -> Result<()> {
     // writes the state-DB metric + journal.
     let tbl = match a.table.as_slice() {
         [t] => t.clone(),
-        _ => anyhow::bail!(
+        _ => crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "rivet cdc --output requires exactly one --table (its schema is resolved from the source)"
         ),
     };
     let fmt = match a.format.as_str() {
         "parquet" => crate::config::FormatType::Parquet,
         "csv" => crate::config::FormatType::Csv,
-        other => anyhow::bail!("--format must be 'parquet' or 'csv', got {other:?}"),
+        other => crate::rivet_bail!(
+            crate::error::codes::CLI_VALUE_INVALID,
+            "--format must be 'parquet' or 'csv', got {other:?}"
+        ),
     };
     let dest = crate::destination::create_destination(&crate::config::DestinationConfig {
         destination_type: crate::config::DestinationType::Local,
@@ -459,12 +464,7 @@ fn dispatch_check(
     // A declared `--target` that doesn't parse is a loud error — never silently
     // dropped to `None` (which would give false target-compat assurance). This
     // mirrors the config-level `target:` validation in `preflight/mod.rs`.
-    let tgt = match target.as_deref() {
-        Some(s) => Some(crate::types::target::ExportTarget::parse(s).ok_or_else(|| {
-            anyhow::anyhow!("unknown target '{s}' (expected: bigquery, duckdb, snowflake)")
-        })?),
-        None => None,
-    };
+    let tgt = target.as_deref().map(parse_cli_target).transpose()?;
     if let Some(name) = export.as_deref() {
         check_export_selection(&Config::load_with_params(&config, p.as_ref())?, Some(name))?;
     }
@@ -522,6 +522,16 @@ fn batch_plans(
         .collect())
 }
 
+/// The `--target` of `rivet check`, refused by code when it names no warehouse rivet types for.
+fn parse_cli_target(s: &str) -> Result<crate::types::target::ExportTarget> {
+    crate::types::target::ExportTarget::parse(s).ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::CONFIG_TARGET_UNKNOWN,
+            format!("unknown target '{s}' (expected: bigquery, duckdb, snowflake)"),
+        )
+    })
+}
+
 /// The strategy of each plan that built, for the preflight to describe.
 fn planned_strategies(plans: &[BatchPlan]) -> preflight::PlannedStrategies {
     plans
@@ -536,14 +546,16 @@ fn report_plan_compatibility(plans: Vec<BatchPlan>, json_output: bool) -> Result
     if json_output {
         return Ok(());
     }
-    let mut rejected: Option<String> = None;
+    let mut rejected: Option<anyhow::Error> = None;
     for (name, plan) in plans {
         let plan = match plan {
             Ok(plan) => plan,
             Err(e) => {
                 let line = format!("[plan-build] export '{name}': the plan did not build: {e:#}");
                 println!("Rejected: {line}");
-                rejected.get_or_insert(line);
+                rejected.get_or_insert_with(|| {
+                    crate::error::recoded(&e, crate::error::codes::PLAN_REJECTED, line)
+                });
                 continue;
             }
         };
@@ -552,15 +564,17 @@ fn report_plan_compatibility(plans: Vec<BatchPlan>, json_output: bool) -> Result
             match d.level {
                 crate::plan::DiagnosticLevel::Rejected => {
                     println!("Rejected: {line}");
-                    rejected.get_or_insert(line);
+                    rejected.get_or_insert_with(|| {
+                        crate::error::coded(crate::error::codes::PLAN_REJECTED, line)
+                    });
                 }
                 crate::plan::DiagnosticLevel::Warning => println!("Warning: {line}"),
                 crate::plan::DiagnosticLevel::Degraded => println!("Degraded: {line}"),
             }
         }
     }
-    if let Some(line) = rejected {
-        anyhow::bail!("{line}");
+    if let Some(rejected) = rejected {
+        return Err(rejected);
     }
     Ok(())
 }
@@ -595,7 +609,8 @@ fn dispatch_init(
             "full" | "incremental" | "chunked" | "time_window" | "cdc"
         )
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_VALUE_INVALID,
             "--mode must be one of: full, incremental, chunked, time_window, cdc (got {m:?})"
         );
     }
@@ -667,7 +682,8 @@ fn resolve_init_tls(
         return Ok(None);
     };
     if ca.is_some() && matches!(mode, TlsMode::Disable | TlsMode::Require) {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "--tls-ca is meaningless with `--tls {}`: that mode never verifies the server \
              certificate, so the CA would be silently ignored. Use `--tls verify-ca` or \
              `--tls verify-full` (or drop --tls-ca).",
@@ -726,7 +742,10 @@ fn dispatch_validate(args: crate::cli::args::ValidateArgs) -> Result<()> {
     let parsed_date = match date {
         Some(s) => Some(
             chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|e| {
-                anyhow::anyhow!("invalid --date '{}': expected YYYY-MM-DD ({})", s, e)
+                crate::error::coded(
+                    crate::error::codes::CLI_VALUE_INVALID,
+                    format!("invalid --date '{}': expected YYYY-MM-DD ({})", s, e),
+                )
             })?,
         ),
         None => None,
@@ -858,7 +877,8 @@ fn require_config_file(config: &str) -> Result<()> {
     if std::path::Path::new(config).is_file() {
         return Ok(());
     }
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::CONFIG_FILE_UNREADABLE,
         "config '{config}' is not a file — refusing to answer from the state DB its \
          directory would imply (a fresh empty DB reads as an all-clear verdict)"
     )
@@ -973,7 +993,8 @@ fn finish_run_cmd(config: &str, run_id: &str) -> Result<()> {
             );
             Ok(())
         }
-        FinishOutcome::NotFound => anyhow::bail!(
+        FinishOutcome::NotFound => crate::rivet_bail!(
+            crate::error::codes::CLI_RUN_ID_UNKNOWN,
             "no run-status row has run_id '{run_id}' — check `rivet state runs -c \
              <config>`; refusing to report success for a stamp that touched nothing"
         ),
@@ -1257,5 +1278,19 @@ mod subcommand_error_tests {
             format!("{err:#}").contains("1 export(s) cannot be planned"),
             "{err:#}"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn an_unknown_run_id_and_an_unknown_target_are_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        std::fs::write(&cfg, "exports: []\n").unwrap();
+        let err = super::finish_run_cmd(cfg.to_str().unwrap(), "no-such-run").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_RUN_ID_UNKNOWN", 1);
+        let err = super::parse_cli_target("nope").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_TARGET_UNKNOWN", 1);
     }
 }
