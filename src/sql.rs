@@ -298,6 +298,18 @@ pub(crate) fn oracle_catalog_name(part: &str) -> String {
     }
 }
 
+/// The widest Oracle `NUMBER(p, 0)` range chunking slices as an integer; a value past i64 is refused when the bounds are read.
+#[cfg(feature = "oracle")]
+pub(crate) const ORACLE_RANGE_INT_MAX_PRECISION: u32 = 19;
+
+/// The `all_tab_columns tc` predicate for an Oracle column range chunking slices as an integer.
+#[cfg(feature = "oracle")]
+pub(crate) fn oracle_range_int_pred() -> String {
+    format!(
+        "tc.data_type = 'NUMBER' AND tc.data_scale = 0 AND tc.data_precision <= {ORACLE_RANGE_INT_MAX_PRECISION}"
+    )
+}
+
 /// `(owner, table)` catalog literals for an Oracle `[owner.]table`: an unquoted
 /// part folds upper-case as Oracle resolves it, a double-quoted part stays verbatim.
 pub(crate) fn oracle_catalog_preds(qualified: &str) -> (String, String) {

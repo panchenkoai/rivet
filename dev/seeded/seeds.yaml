@@ -1872,6 +1872,22 @@ seeds:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
       oracle:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
+  - name: oracle-number19-not-integer
+    class: "an integer-family test drawn one step narrower than the type the engine uses for a 64-bit key, so the common key type is refused for range chunking"
+    history: "2026-10-06 - open defect (range chunking refused an Oracle NUMBER(19) primary key as not integer-family) through 0.31.0; fixed by one shared bound ORACLE_RANGE_INT_MAX_PRECISION = 19 for introspection, preflight and init"
+    scope: source
+    patch: oracle-number19-not-integer/shared.patch
+    engines:
+      postgres:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mysql:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mssql:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mongo:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      oracle:
+        cells: [range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle]
   - name: fractional-chunk-key-under-query
     class: "a type guard the planner applies only when it can read a catalog, so the same key under `query:` is range-sliced and its fractional values are skipped with exit 0"
     history: "2026-10-09 - open defect (a `double precision` chunk_column under `query:` delivered 40 of 43 rows, exit 0) through 0.31.0; fixed by `bail_if_fractional`, which reads the query's result type before the bounds"
