@@ -983,6 +983,7 @@ pub(crate) fn synthetic_failed_summary(export_name: &str, err: &anyhow::Error) -
         schema_fingerprint: None,
         manifest_verification: None,
         apply_context: None,
+        snapshot_legs: Vec::new(),
         column_checksums: Vec::new(),
         column_checksums_incomplete: false,
         column_checksums_short_cover: false,
@@ -1746,6 +1747,28 @@ fn snapshot_legs_fan_out(allowed: bool, legs: usize) -> bool {
     allowed && legs > 1
 }
 
+/// A CDC export's outcome under its own name: a failed leg stops it, else the stream runs; the legs ride along for its aggregate entry.
+fn cdc_outcome_with_legs(
+    export_name: &str,
+    legs: Vec<(Result<()>, RunSummary)>,
+    stream: impl FnOnce() -> (Result<()>, RunSummary),
+) -> (Result<()>, RunSummary) {
+    let entries = legs
+        .iter()
+        .map(|(_, leg)| super::aggregate::entry_from_summary(leg))
+        .collect();
+    let (result, mut summary) = match legs.into_iter().find_map(|(res, _)| res.err()) {
+        Some(e) => {
+            let mut failed = synthetic_failed_summary(export_name, &e);
+            failed.mode = "cdc".into();
+            (Err(e), failed)
+        }
+        None => stream(),
+    };
+    summary.snapshot_legs = entries;
+    (result, summary)
+}
+
 /// Record one finished baseline snapshot in the state DB, right after it lands; best-effort.
 fn record_snapshot_done(
     state: &StateStore,
@@ -1862,10 +1885,9 @@ fn run_export_job_inner(
             }
             done
         };
-        if let Some(failed) = outcomes.into_iter().find(|(res, _)| res.is_err()) {
-            return failed;
-        }
-        return super::cdc_job::run_cdc_export(config_path, config, export, state, opts.strict);
+        return cdc_outcome_with_legs(&export.name, outcomes, || {
+            super::cdc_job::run_cdc_export(config_path, config, export, state, opts.strict)
+        });
     }
     // A base-and-buffer table's rows carry the delete flag as DATA. `LOAD DATA`
     // fills a column the FILE lacks with NULL — never with the column's DEFAULT,
@@ -2197,6 +2219,89 @@ mod snapshot_leg_tests {
             !snapshot_legs_fan_out(false, 5),
             "not allowed, never pooled"
         );
+    }
+
+    /// One finished run of `name` that wrote `rows` rows in `files` parts.
+    fn wrote(name: &str, status: &str, rows: i64, files: usize) -> (Result<()>, RunSummary) {
+        let summary = RunSummary {
+            export_name: name.into(),
+            status: status.into(),
+            total_rows: rows,
+            files_produced: files,
+            bytes_written: rows as u64 * 10,
+            bytes_read: rows as u64 * 20,
+            mode: "cdc".into(),
+            ..Default::default()
+        };
+        let result = if status == "failed" {
+            Err(anyhow::anyhow!("{name} broke"))
+        } else {
+            Ok(())
+        };
+        (result, summary)
+    }
+
+    /// The CDC export's entry counts its legs and its stream, while its own summary (the metric row's source) keeps the stream's counts.
+    #[test]
+    fn a_cdc_entry_counts_its_snapshot_legs_and_its_stream() {
+        let legs = vec![
+            wrote("pg_cdc__snapshot_a", "success", 1000, 1),
+            wrote("pg_cdc__snapshot_b", "success", 5000, 1),
+        ];
+        let (result, summary) =
+            cdc_outcome_with_legs("pg_cdc", legs, || wrote("pg_cdc", "success", 3, 1));
+        assert!(result.is_ok());
+        assert_eq!((summary.total_rows, summary.files_produced), (3, 1));
+        let e = super::super::aggregate::entry_from_summary(&summary);
+        assert_eq!(
+            (
+                e.export_name.as_str(),
+                e.status.as_str(),
+                e.rows,
+                e.files,
+                e.bytes,
+                e.bytes_read
+            ),
+            ("pg_cdc", "success", 6003, 3, 60_030, 120_060)
+        );
+    }
+
+    /// A failed leg fails the CDC export under its own name, with every leg's rows, and never opens the stream.
+    #[test]
+    fn a_failed_snapshot_leg_fails_the_cdc_entry_under_its_own_name() {
+        let legs = vec![
+            wrote("pg_cdc__snapshot_a", "success", 1000, 1),
+            wrote("pg_cdc__snapshot_b", "failed", 40, 1),
+        ];
+        let (result, summary) = cdc_outcome_with_legs("pg_cdc", legs, || {
+            panic!("the stream must not run after a failed leg")
+        });
+        assert_eq!(
+            format!("{:#}", result.expect_err("the export fails")),
+            "pg_cdc__snapshot_b broke"
+        );
+        let e = super::super::aggregate::entry_from_summary(&summary);
+        assert_eq!(
+            (
+                e.export_name.as_str(),
+                e.status.as_str(),
+                e.mode.as_str(),
+                e.rows,
+                e.files
+            ),
+            ("pg_cdc", "failed", "cdc", 1040, 2)
+        );
+        assert_eq!(e.error_message.as_deref(), Some("pg_cdc__snapshot_b broke"));
+    }
+
+    /// Without legs the stream's outcome is the export's, unchanged.
+    #[test]
+    fn a_cdc_run_without_legs_is_its_stream() {
+        let (result, summary) =
+            cdc_outcome_with_legs("pg_cdc", Vec::new(), || wrote("pg_cdc", "success", 7, 2));
+        assert!(result.is_ok());
+        let e = super::super::aggregate::entry_from_summary(&summary);
+        assert_eq!((e.rows, e.files, e.bytes, e.bytes_read), (7, 2, 70, 140));
     }
 
     /// A finished leg is recorded under the key the next run's snapshot plan asks for,

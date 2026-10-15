@@ -2497,3 +2497,21 @@ seeds:
         na: "a Mongo export has no `mode: chunked`"
       oracle:
         cells: [stand_empty_table_under_chunk_by_days_oracle]
+  - name: cdc-entry-without-snapshot-legs
+    class: "a CDC export's run-aggregate entry carries the stream's counts only, so the first run of an `initial: snapshot` export reports `rows: 0, files: 0` to a scheduler while its snapshot legs wrote the whole table"
+    history: "2026-10-15 - confirmed live on PostgreSQL through the Airflow provider (`--summary-output` read into XCom): two tables of 1000 + 5000 rows reported `rows: 0, files: 0`, through 0.31.0; fixed by `with_snapshot_legs`, the one fold every entry writer calls"
+    scope: source
+    patch: cdc-entry-without-snapshot-legs/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_cdc_entry_counts_its_snapshot_legs_and_its_stream", "lib:a_cdc_childs_entry_counts_the_snapshot_legs_it_ran", "lib:a_failed_snapshot_leg_fails_the_cdc_entry_under_its_own_name"]
+      postgres:
+        cells: [cdc_entry_counts_the_snapshot_legs_postgres, cdc_entry_counts_the_snapshot_legs_under_child_processes_postgres]
+      mysql:
+        cells: [cdc_entry_counts_the_snapshot_legs_mysql]
+      mssql:
+        cells: [cdc_entry_counts_the_snapshot_legs_mssql]
+      mongo:
+        cells: [cdc_entry_counts_the_snapshot_legs_mongo]
+      oracle:
+        cells: [cdc_entry_counts_the_snapshot_legs_oracle]

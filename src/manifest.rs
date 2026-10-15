@@ -97,6 +97,11 @@ pub fn is_run_unique_manifest_name(name: &str) -> bool {
 /// [`snapshot_family`] live together so they cannot drift apart.
 pub const SNAPSHOT_LEG_INFIX: &str = "__snapshot_";
 
+/// The export name of `parent`'s `initial: snapshot` leg for the captured table `label`.
+pub fn snapshot_leg_name(parent: &str, label: &str) -> String {
+    format!("{parent}{SNAPSHOT_LEG_INFIX}{label}")
+}
+
 // ── artifact identity ────────────────────────────────────────────────────────
 //
 // WHAT MAKES TWO MANIFESTS "THE SAME". Six guards across the codebase ask a

@@ -102,20 +102,37 @@ pub(super) fn metrics_to_json(metrics: &[ExportMetric]) -> Result<String> {
     })
 }
 
-/// Convert a per-export summary into an aggregate row.
+/// Convert a per-export summary into an aggregate row, the snapshot legs it ran included.
 pub(super) fn entry_from_summary(s: &RunSummary) -> RunAggregateEntry {
-    RunAggregateEntry {
-        export_name: s.export_name.clone(),
-        status: s.status.clone(),
-        run_id: s.run_id.clone(),
-        rows: s.total_rows,
-        files: s.files_produced as i64,
-        bytes: s.bytes_written,
-        bytes_read: s.bytes_read,
-        duration_ms: s.duration_ms,
-        mode: s.mode.clone(),
-        error_message: s.error_message.clone(),
+    with_snapshot_legs(
+        RunAggregateEntry {
+            export_name: s.export_name.clone(),
+            status: s.status.clone(),
+            run_id: s.run_id.clone(),
+            rows: s.total_rows,
+            files: s.files_produced as i64,
+            bytes: s.bytes_written,
+            bytes_read: s.bytes_read,
+            duration_ms: s.duration_ms,
+            mode: s.mode.clone(),
+            error_message: s.error_message.clone(),
+        },
+        &s.snapshot_legs,
+    )
+}
+
+/// A CDC export's entry plus what its `initial: snapshot` legs wrote in the same invocation.
+fn with_snapshot_legs(
+    mut entry: RunAggregateEntry,
+    legs: &[RunAggregateEntry],
+) -> RunAggregateEntry {
+    for leg in legs {
+        entry.rows += leg.rows;
+        entry.files += leg.files;
+        entry.bytes += leg.bytes;
+        entry.bytes_read += leg.bytes_read;
     }
+    entry
 }
 
 /// Build the aggregate from per-export entries plus run-level metadata.
@@ -576,47 +593,14 @@ pub(super) fn collect_child_entries(
 ) -> Vec<RunAggregateEntry> {
     let mut out = Vec::with_capacity(exports.len());
     for export in exports {
-        let mut entry: Option<RunAggregateEntry> = None;
-        match state.get_metrics(Some(&export.name), 1) {
-            Ok(rows) => {
-                // A `running` row is an IN-FLIGHT marker, not an outcome. Since
-                // this branch began projecting a run's aggregate as each part
-                // lands, a hard-crashed child (OOM-kill, panic — there is no
-                // catch_unwind) leaves exactly such a row: partial `total_rows`,
-                // status `running`, timestamped by its last durable part. Taking
-                // it as the child's result reported those partial rows as the
-                // export's outcome AND discarded the real cause, which the parent
-                // holds in `child_failures` and which only the fallback below
-                // surfaces. Before the projection existed a crashed child left no
-                // row at all and fell through correctly.
-                if let Some(m) = rows.into_iter().next()
-                    && m.status != "running"
-                    && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&m.run_at)
-                    && parsed.with_timezone(&Utc) >= started_at
-                {
-                    entry = Some(RunAggregateEntry {
-                        export_name: m.export_name,
-                        status: m.status,
-                        run_id: m.run_id.unwrap_or_default(),
-                        rows: m.total_rows,
-                        files: m.files_produced,
-                        bytes: m.bytes_written.max(0) as u64,
-                        bytes_read: m.bytes_read.max(0) as u64,
-                        duration_ms: m.duration_ms,
-                        mode: m.mode.unwrap_or_default(),
-                        error_message: m.error_message,
-                    });
-                }
-            }
-            Err(e) => {
-                log::warn!(
-                    "aggregate: metric query failed for '{}': {:#} (treating as failed)",
-                    export.name,
-                    e
-                );
-            }
-        }
-
+        let entry = finished_entry_since(state, &export.name, started_at).unwrap_or_else(|e| {
+            log::warn!(
+                "aggregate: metric query failed for '{}': {:#} (treating as failed)",
+                export.name,
+                e
+            );
+            None
+        });
         out.push(entry.unwrap_or_else(|| {
             RunAggregateEntry {
                 export_name: export.name.clone(),
@@ -637,7 +621,69 @@ pub(super) fn collect_child_entries(
             }
         }));
     }
-    out
+    exports
+        .iter()
+        .zip(out)
+        .map(|(export, entry)| {
+            with_snapshot_legs(entry, &snapshot_legs_since(state, export, started_at))
+        })
+        .collect()
+}
+
+/// The entries of the `initial: snapshot` legs `export` finished since `started_at`.
+fn snapshot_legs_since(
+    state: &StateStore,
+    export: &crate::config::ExportConfig,
+    started_at: DateTime<Utc>,
+) -> Vec<RunAggregateEntry> {
+    if export.mode != crate::config::ExportMode::Cdc {
+        return Vec::new();
+    }
+    crate::config::cdc_captured_tables(export)
+        .iter()
+        .filter_map(|table| {
+            let leg = crate::manifest::snapshot_leg_name(&export.name, table);
+            finished_entry_since(state, &leg, started_at).unwrap_or_else(|e| {
+                log::warn!("aggregate: metric query failed for snapshot leg '{leg}': {e:#}");
+                None
+            })
+        })
+        .collect()
+}
+
+/// The latest `export_metrics` row of `name` as an entry, when it is finished and written since `started_at`.
+fn finished_entry_since(
+    state: &StateStore,
+    name: &str,
+    started_at: DateTime<Utc>,
+) -> Result<Option<RunAggregateEntry>> {
+    // A `running` row is an IN-FLIGHT marker, not an outcome. Since this branch
+    // began projecting a run's aggregate as each part lands, a hard-crashed child
+    // (OOM-kill, panic — there is no catch_unwind) leaves exactly such a row:
+    // partial `total_rows`, status `running`, timestamped by its last durable
+    // part. Taking it as the child's result reported those partial rows as the
+    // export's outcome AND discarded the real cause, which the parent holds in
+    // `child_failures` and which only the caller's fallback surfaces.
+    let Some(m) = state.get_metrics(Some(name), 1)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let since = chrono::DateTime::parse_from_rfc3339(&m.run_at)
+        .is_ok_and(|at| at.with_timezone(&Utc) >= started_at);
+    if m.status == "running" || !since {
+        return Ok(None);
+    }
+    Ok(Some(RunAggregateEntry {
+        export_name: m.export_name,
+        status: m.status,
+        run_id: m.run_id.unwrap_or_default(),
+        rows: m.total_rows,
+        files: m.files_produced,
+        bytes: m.bytes_written.max(0) as u64,
+        bytes_read: m.bytes_read.max(0) as u64,
+        duration_ms: m.duration_ms,
+        mode: m.mode.unwrap_or_default(),
+        error_message: m.error_message,
+    }))
 }
 
 #[cfg(test)]
@@ -747,6 +793,53 @@ mod tests {
             entries[0].error_message.as_deref(),
             Some("child killed by signal 9"),
             "the parent's own cause must survive — it is the only place it exists"
+        );
+    }
+
+    /// One finished `export_metrics` row, as a run of `name` writes it.
+    fn finished_metric(state: &crate::state::StateStore, name: &str, rows: i64, files: i64) {
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: name.into(),
+                run_id: format!("{name}_run"),
+                total_rows: rows,
+                files_produced: files,
+                bytes_written: rows * 10,
+                bytes_read: rows * 20,
+                status: "success".into(),
+                mode: Some("full".into()),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    /// A process child's CDC entry counts the snapshot legs it ran in this invocation, and only those.
+    #[test]
+    fn a_cdc_childs_entry_counts_the_snapshot_legs_it_ran() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+        // A leg of an earlier invocation: before `started_at`, so not this run's work.
+        finished_metric(&state, "pg_cdc__snapshot_orders", 7, 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let started_at = Utc::now();
+        finished_metric(&state, "pg_cdc__snapshot_items", 1000, 1);
+        finished_metric(&state, "pg_cdc", 3, 1);
+        finished_metric(&state, "unrelated", 50, 5);
+
+        let export: crate::config::ExportConfig = serde_yaml_ng::from_str(
+            "name: pg_cdc\nmode: cdc\ntables: [items, orders]\nformat: parquet\n\
+             destination:\n  type: local\n  path: /tmp\n",
+        )
+        .expect("parse test ExportConfig");
+        let entries = collect_child_entries(&state, &[&export], started_at, &HashMap::new());
+
+        assert_eq!(entries.len(), 1, "the legs are not units of their own");
+        let e = &entries[0];
+        assert_eq!(e.export_name, "pg_cdc");
+        assert_eq!(
+            (e.rows, e.files, e.bytes, e.bytes_read),
+            (1003, 2, 10_030, 20_060),
+            "the stream plus this run's leg, never the earlier leg or another export"
         );
     }
     use super::*;

@@ -262,6 +262,8 @@ pub struct RunSummary {
     pub apply_context: Option<ApplyContext>,
     /// Structured event log for this run.  Answers the four DoD observability questions.
     pub journal: RunJournal,
+    /// The `initial: snapshot` legs a CDC run ran in this invocation; folded into its aggregate entry only.
+    pub snapshot_legs: Vec<crate::state::RunAggregateEntry>,
 }
 
 /// One `(label, value)` line in the rendered summary block. The label is a
@@ -375,6 +377,7 @@ impl RunSummary {
             schema_fingerprint: None,
             manifest_verification: None,
             apply_context: None,
+            snapshot_legs: Vec::new(),
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
             column_checksums_short_cover: false,
@@ -454,6 +457,7 @@ impl RunSummary {
             schema_fingerprint: None,
             manifest_verification: None,
             apply_context: None,
+            snapshot_legs: Vec::new(),
             column_checksums: Vec::new(),
             column_checksums_incomplete: false,
             column_checksums_short_cover: false,
