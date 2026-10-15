@@ -1220,14 +1220,21 @@ fn execute_load<R>(
         active_at_fetch: None,
         marker_active: std::collections::HashSet::new(),
     };
-    let inputs = match prepare_load(
+    // Everything the selection can stop on happens before any warehouse write, so every
+    // stop is typed and journaled as `refused` here: untyped and unrecorded, the load read
+    // as never attempted, and a `failed` row would have counted as rivet's own attempt.
+    let inputs = match load::before_write(prepare_load(
         store,
         job.plan,
         job.state,
         &target_fqtn,
         job.allow_source_drift,
-    )? {
-        Some(i)
+    )) {
+        Err(e) => {
+            ctx.record(&[], 0, load::ledger::ledger_status(&e));
+            return Err(e);
+        }
+        Ok(Some(i))
             if nothing_to_load(holds_whole_table_pass(job.plan, &i.runs), i.uris.is_empty()) =>
         {
             ctx.active_at_fetch = i.active_at_fetch.clone();
@@ -1236,13 +1243,13 @@ fn execute_load<R>(
             ctx.record_empty_runs(&i.source_run_ids);
             return Ok(None);
         }
-        Some(i) => {
+        Ok(Some(i)) => {
             ctx.source_ident = i.source_ident.clone();
             ctx.active_at_fetch = i.active_at_fetch.clone();
             ctx.marker_active = i.marker_active.clone();
             i
         }
-        None => {
+        Ok(None) => {
             print_up_to_date(&job);
             ctx.record_skip();
             return Ok(None);
@@ -2736,6 +2743,90 @@ mod load_ledger_tests {
             state.loaded_source_run_ids("db.orders").unwrap().is_empty(),
             "an up-to-date no-op consumes no runs"
         );
+    }
+
+    /// A stop raised while the runs are selected, before anything is written, is on the
+    /// record as `refused` and the next cycle refuses again by the same code: journaled
+    /// `failed` (or not at all) it would read as rivet's own attempt, or as a load that
+    /// never happened. RED against the envelope propagating the stop untyped and unrecorded.
+    #[test]
+    fn a_mixed_split_generation_is_journaled_refused_and_refuses_again() {
+        let state = StateStore::open_in_memory().unwrap();
+        mixed_split_generation_refuses_twice(&state, "orders_split");
+    }
+
+    /// The same rule on a shared Postgres ledger, where the `refused` row outlives the
+    /// process and the next cycle is another process. Env-gated on RIVET_TEST_STATE_URL.
+    #[test]
+    fn pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let state = StateStore::open_at_ref(&crate::state::StateRef::Postgres(url)).unwrap();
+        let table = format!("orders_split_{}", std::process::id());
+        mixed_split_generation_refuses_twice(&state, &table);
+    }
+
+    /// Two load cycles over a prefix holding two split generations, on `state`.
+    fn mixed_split_generation_refuses_twice(state: &StateStore, table: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = cdc_plan(&dir, table);
+        plan.mode = load::plan::LoadMode::Full;
+        // A 2-unit split generation plus a stale 3-unit one under the same prefix.
+        for (run, unit, lo, hi) in [
+            ("r1", "orders#0", None, Some("500")),
+            ("r2", "orders#1", Some("500"), None),
+            ("r3", "orders#2", None, Some("300")),
+        ] {
+            let part = format!("{run}.parquet");
+            let mut m = super::live_only_decisions::success_manifest(run, &part);
+            m.export_name = unit.into();
+            m.mode = "batch".into();
+            m.split_window = Some(crate::manifest::SplitWindow {
+                key_column: "id".into(),
+                lo: lo.map(str::to_string),
+                hi: hi.map(str::to_string),
+            });
+            super::live_only_decisions::write_at(&dir, &format!("p/{part}"), b"x");
+            super::live_only_decisions::write_at(
+                &dir,
+                &format!("p/manifest-{run}.json"),
+                &serde_json::to_vec(&m).unwrap(),
+            );
+        }
+        let fqtn = format!("db.{table}");
+        for cycle in 1..=2 {
+            let mut job = cdc_job(&dir, state, &plan);
+            job.mode = load::plan::LoadMode::Full;
+            let err = execute_load(
+                job,
+                |_| {},
+                |_, _, _, _| -> Result<(u64, ())> {
+                    panic!("a mixed generation must stop before the run closure")
+                },
+                |_, _| {},
+            )
+            .err()
+            .unwrap_or_else(|| panic!("cycle {cycle}: the mixed generation is refused"));
+            crate::error::assert_coded(&err, "RIVET_LOAD_SPLIT_GENERATIONS_MIXED", 5);
+            let loads = state.recent_loads(Some(&fqtn), 10).unwrap();
+            assert_eq!(
+                loads.iter().map(|l| l.status.as_str()).collect::<Vec<_>>(),
+                vec!["refused"],
+                "cycle {cycle}: the stop is on the record, once per load id"
+            );
+            assert!(
+                err.is::<load::Refused>(),
+                "cycle {cycle}: typed as a stop before the write: {err:#}"
+            );
+            assert!(
+                !state.has_load_attempt(&fqtn).unwrap(),
+                "cycle {cycle}: a refusal is never rivet's own attempt"
+            );
+        }
     }
 
     /// Runs that produced no files (an idle CDC cycle) are consumed by the load that
