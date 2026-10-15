@@ -756,6 +756,24 @@ fn implicit_key<'a>(
         .map(ImplicitKey::UniqueKey)
 }
 
+/// The refusal of a range-sliced `chunk_column` that is not integer-family; `where_found` names where its type was read.
+pub(crate) fn chunk_column_not_integer(
+    export: &str,
+    column: &str,
+    where_found: &str,
+) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::CONFIG_CHUNK_COLUMN_NOT_INTEGER,
+        format!(
+            "export '{export}': chunk_column '{column}' {where_found} is not an integer-family column — \
+             range chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
+             numeric/decimal/float/text key silently drops every value between two window \
+             boundaries. Use `chunk_by_key: {column}` (keyset — any orderable indexed key), an \
+             integer column, or `mode: full`."
+        ),
+    ))
+}
+
 /// [`implicit_key`], or the refusal of a shape chunked mode cannot page: a `chunk_column` range chunking cannot slice, a MySQL unique key under a `uuid` override, or no key at all.
 fn validated_implicit_key<'a>(
     source_type: crate::config::SourceType,
@@ -770,17 +788,11 @@ fn validated_implicit_key<'a>(
             // between windows. `chunk_by_days` (date half-open) is type-safe.
             let range_sliced = export.chunk_by_days.is_none();
             if range_sliced && !introspection.is_integer_column(c) {
-                anyhow::bail!(
-                    "export '{}': chunk_column '{}' on {} is not an integer-family column — range \
-                     chunking derives integer min/max boundaries and slices with `BETWEEN`, so a \
-                     numeric/decimal/float/text key silently drops every value between two window \
-                     boundaries. Use `chunk_by_key: {}` (keyset — any orderable indexed key), an \
-                     integer column, or `mode: full`.",
-                    export.name,
+                return Err(chunk_column_not_integer(
+                    &export.name,
                     c,
-                    tbl,
-                    c
-                );
+                    &format!("on {tbl}"),
+                ));
             }
             Ok(ImplicitKey::Column(c))
         }

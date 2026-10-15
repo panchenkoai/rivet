@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A float `chunk_column` under `query:` lost its fractional keys with exit 0.** With `table:` the
+  planner refused a non-integer range key; with `query:` it could not read a catalog, only warned,
+  and integer `BETWEEN` windows skipped every key between two whole numbers (a `double precision` key
+  delivered 40 of 43 rows) (0.31.0 and earlier). **Now** the run reads the query's result type before
+  it plans the windows and refuses a float or scaled-decimal key with
+  `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER` (exit 1), the same code the `table:` refusal now carries.
+  **What to do:** use `chunk_by_key:` (keyset) or an integer column for such a key.
+
 - **Two `rivet run`s of one `mode: cdc` export at once both delivered the stream.** A batch run
   holds the export's run lease and a second run beside it is refused; a CDC run took no lease, so
   the second read the same changes again (MySQL, SQL Server, Oracle and MongoDB delivered duplicate

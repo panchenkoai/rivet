@@ -560,6 +560,11 @@ pub mod codes {
         "RIVET_CONFIG_CHUNK_BY_DAYS_INVALID",
         "set `chunk_by_days` to 1 or more",
     );
+    /// A range-sliced `chunk_column` whose values are not all whole numbers: integer windows would skip the rest.
+    pub const CONFIG_CHUNK_COLUMN_NOT_INTEGER: Code = usage(
+        "RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER",
+        "use `chunk_by_key:` (keyset), an integer column, or `mode: full`",
+    );
     pub const CONFIG_DUPLICATE_EXPORT: Code = usage(
         "RIVET_CONFIG_DUPLICATE_EXPORT",
         "give every export a unique `name`",
@@ -865,6 +870,7 @@ pub mod codes {
         CONFIG_NO_EXPORTS,
         CONFIG_CHUNK_COUNT_INVALID,
         CONFIG_CHUNK_BY_DAYS_INVALID,
+        CONFIG_CHUNK_COLUMN_NOT_INTEGER,
         CONFIG_DUPLICATE_EXPORT,
         CONFIG_CDC_RESOURCE_CONFLICT,
         CONFIG_CDC_ROLLOVER_INVALID,
