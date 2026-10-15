@@ -1088,13 +1088,24 @@ fn finalize_keyset_anchor(
         return None;
     }
     let ran_ahead = refused_by_a_gate(o) && cursor_ran_ahead(progress, plan, run_id);
-    if !keyset_anchor_survives(o, ran_ahead) {
+    if !keyset_anchor_survives(o, ran_ahead) || !anchor_holds_a_part(state, progress) {
         let _ = state.clear_resume_run_id(&plan.export_name, &plan.source.state_key());
         // Parallel keyset persists its per-range recovery rows under the same
         // anchor; clear them too (a no-op for sequential keyset, which writes none).
         let _ = state.clear_keyset_ranges(&plan.export_name, &plan.source.state_key());
     }
     ran_ahead.then(|| ran_ahead_warning(&plan.export_name, run_id))
+}
+
+/// Whether the stored keyset anchor names a run that recorded a part; an anchor with none has nothing to resume.
+fn anchor_holds_a_part(state: &StateStore, progress: &ProgressClaim<'_>) -> bool {
+    match progress.resume_run_id() {
+        Ok(Some(anchor)) => !state
+            .list_files_for_run(&anchor)
+            .is_ok_and(|parts| parts.is_empty()),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 /// Mark a run `running` at its START — in the central run-status ledger AND (for
@@ -2480,6 +2491,69 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_broke_off_before_its_first_part_releases_its_anchor() {
+        let plan = keyset_plan(true);
+        let st = StateStore::open_in_memory().unwrap();
+        let key = plan.progress_key();
+        st.set_resume_run_id(&key, "r1").unwrap();
+        st.persist_keyset_ranges("orders", &key.source, "r1", "id", &[(None, None)])
+            .unwrap();
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r1",
+                &outcome(true, &None)
+            ),
+            None
+        );
+        assert_eq!(
+            anchor_left(&st, &plan),
+            (None, false),
+            "no part: nothing to resume"
+        );
+
+        st.set_resume_run_id(&key, "r1").unwrap();
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r2",
+                &outcome(true, &None)
+            ),
+            None
+        );
+        assert_eq!(
+            anchor_left(&st, &plan),
+            (None, false),
+            "stopped before adopting an anchor with no part: nothing to resume"
+        );
+    }
+
+    #[test]
+    fn a_run_stopped_before_adopting_an_anchor_with_parts_keeps_it() {
+        let plan = keyset_plan(true);
+        let st = anchored_state(&plan);
+        assert_eq!(
+            finalize_keyset_anchor(
+                &st,
+                &claimed(&st, &plan),
+                &plan,
+                "r2",
+                &outcome(true, &None)
+            ),
+            None
+        );
+        assert_eq!(
+            anchor_left(&st, &plan),
+            (Some("r1".to_string()), true),
+            "r1's committed parts are still to be resumed"
+        );
+    }
+
+    #[test]
     fn a_refused_run_whose_cursor_ran_ahead_keeps_its_anchor_and_says_so() {
         let plan = keyset_plan(true);
         let kept = (Some("r1".to_string()), true);
@@ -3628,6 +3702,18 @@ mod tests {
             .unwrap();
         state
             .persist_keyset_ranges(name, "another/source", "run_2", "id", &one)
+            .unwrap();
+        state
+            .record_file(crate::state::FilePart {
+                run_id: "run_1",
+                export_name: name,
+                file_name: "p0",
+                rows: 1,
+                bytes: 1,
+                format: "parquet",
+                compression: None,
+                cursor_high: Some("1"),
+            })
             .unwrap();
         let anchored = || state.get_resume_run_id(name, &key.source).unwrap();
 

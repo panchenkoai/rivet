@@ -7,7 +7,7 @@ and alerting for free, and a real `rivet` binary doing the work. It builds **one
 DAG per source database** (PostgreSQL, MySQL, SQL Server) from a single factory.
 
 The operator package that replaces this recipe's `BashOperator` (retry by error class,
-load and compact tasks, CDC) is [`integrations/airflow`](../../../integrations/airflow/README.md).
+load and compact tasks, CDC) is [`airflow-provider-rivet`](https://github.com/panchenkoai/airflow-provider-rivet).
 
 > **MongoDB fits the same pattern.** MongoDB is a first-class Rivet source
 > (full + CDC), so a `mongo.yaml` config yields a `rivet_waves_mongo` DAG

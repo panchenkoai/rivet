@@ -218,6 +218,7 @@ const PRODUCT_ENV_SURFACE: &[&str] = &[
     "src/load/bigquery/mod.rs maybe_panic_at \"compact_before_merge\"",
     "src/load/bigquery/tests.rs env::var \"BIGQUERY_TEST_LOCATION\"",
     "src/load/bigquery/tests.rs env::var \"BIGQUERY_TEST_PROJECT\"",
+    "src/load/orchestrate.rs env::var \"RIVET_TEST_STATE_URL\"",
     "src/load/bigquery/tests.rs env::var \"RIVET_BQ_TEST_DATASET\"",
     "src/load/bq_rest.rs env::var \"RIVET_BQ_ACCESS_TOKEN\"",
     "src/load/bq_rest.rs env::var \"RIVET_BQ_API_ENDPOINT\"",

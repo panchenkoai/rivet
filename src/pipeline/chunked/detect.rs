@@ -35,6 +35,47 @@ fn query_wrapped_row_count(
     parse_scalar_i64(&raw)
 }
 
+/// The plan of a table with no row: one window that matches nothing, the same for a range and a date key.
+const EMPTY_WINDOW: (i64, i64) = (0, 0);
+
+/// The `min`/`max` text of `chunk_column` over `base_query`: `None` when the result holds no row, a coded refusal when a bound is absent over rows.
+fn read_key_span(
+    src: &mut dyn Source,
+    base_query: &str,
+    chunk_column: &str,
+    export_name: &str,
+    source_type: crate::config::SourceType,
+) -> Result<Option<(String, String)>> {
+    let min = src.query_scalar(&crate::sql::aggregate_sql(
+        source_type,
+        "min",
+        chunk_column,
+        base_query,
+    ))?;
+    let max = src.query_scalar(&crate::sql::aggregate_sql(
+        source_type,
+        "max",
+        chunk_column,
+        base_query,
+    ))?;
+    if let (Some(min), Some(max)) = (min, max) {
+        return Ok(Some((min, max)));
+    }
+    let rows = query_wrapped_row_count(src, base_query, source_type)?;
+    if rows <= 0 {
+        return Ok(None);
+    }
+    Err(crate::error::coded(
+        crate::error::codes::SOURCE_PROBE_UNREADABLE,
+        format!(
+            "export '{export_name}': min/max({chunk_column}) returned no readable value although \
+             the table has ~{rows} row(s) — the driver cannot render this key's type, and a plan \
+             on it would export NOTHING while reporting success. Use `chunk_by_key:` (keyset) or \
+             a chunk_column of another type."
+        ),
+    ))
+}
+
 /// Refuse to range/date-chunk on a column that has NULL values.
 ///
 /// Range chunking filters with `WHERE col BETWEEN min AND max` and date chunking
@@ -276,26 +317,11 @@ pub(crate) fn detect_and_generate_chunks(
         // NULL-keyed rows are excluded by the date predicate `>= start AND < end`
         // — refuse rather than drop them silently.
         bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
-        let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
-        let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
-        let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
-            crate::error::coded(
-                crate::error::codes::SOURCE_PROBE_UNREADABLE,
-                format!(
-                    "export '{}': min({}) returned NULL — table may be empty",
-                    export_name, chunk_column
-                ),
-            )
-        })?;
-        let max_str = src.query_scalar(&max_sql)?.ok_or_else(|| {
-            crate::error::coded(
-                crate::error::codes::SOURCE_PROBE_UNREADABLE,
-                format!(
-                    "export '{}': max({}) returned NULL — table may be empty",
-                    export_name, chunk_column
-                ),
-            )
-        })?;
+        let Some((min_str, max_str)) =
+            read_key_span(src, base_query, chunk_column, export_name, source_type)?
+        else {
+            return Ok(vec![EMPTY_WINDOW]);
+        };
 
         let min_date = parse_date_flexible(&min_str).ok_or_else(|| {
             crate::error::coded(crate::error::codes::SOURCE_PROBE_UNREADABLE, format!(
@@ -333,34 +359,9 @@ pub(crate) fn detect_and_generate_chunks(
     bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
     bail_if_fractional(src, base_query, chunk_column, export_name)?;
 
-    let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
-    let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
-
-    // An UNREADABLE bound is not zero. Three different inputs used to land on the
-    // same `unwrap_or(0)` and only the first is legitimate:
-    //
-    //   1. the scalar is NULL — the table really is empty, and one empty window
-    //      is the right plan (`integer_range_null_minmax_collapses_to_zero_zero`);
-    //   2. the text does not parse as a whole integer — a DECIMAL/NUMERIC/float key;
-    //   3. `query_scalar` returns `Ok(None)` for a value it cannot render (the
-    //      PostgreSQL adapter did for `numeric`; it now refuses such a value itself).
-    //
-    // Cases 2 and 3 made min = max = 0, so the plan became the single window
-    // `WHERE col BETWEEN 0 AND 0`. PostgreSQL compares numeric to integer
-    // happily, so the query was VALID and returned nothing: a 100-row table
-    // exported 0 rows with `status: success` and exit 0 (measured; the sparsity
-    // diagnostic even reassured, since a span of 1 over a 100-row estimate reads
-    // as perfectly dense).
-    //
-    // Case 3 is indistinguishable from case 1 at this layer — both arrive as
-    // `None` — so emptiness is CHECKED rather than assumed. The extra COUNT runs
-    // only on the None path, i.e. only when something is already unusual.
-    //
-    // The parse is STRICT, deliberately not the float-tolerant `parse_scalar_i64`
-    // used for the row count above: that one reads "998.75" as 998, and a max
-    // bound rounded DOWN drops every row above it — trading a loud zero-row
-    // export for a quiet partial one. The DATE branch sixty lines up already
-    // hard-errors on both an absent and an unparseable bound; this matches it.
+    // The parse is STRICT, deliberately not the float-tolerant `parse_scalar_i64`:
+    // that one reads "998.75" as 998, and a max bound rounded DOWN drops every row
+    // above it — trading a loud zero-row export for a quiet partial one.
     let strict_i64 = |text: &str| -> Option<i64> {
         let t = text.trim();
         if let Ok(v) = t.parse::<i64>() {
@@ -373,43 +374,28 @@ pub(crate) fn detect_and_generate_chunks(
             _ => None,
         }
     };
-    let read_bound = |src: &mut dyn Source, raw: Option<String>, which: &str| -> Result<i64> {
-        match raw {
-            Some(text) => strict_i64(&text).ok_or_else(|| {
-                crate::error::coded(
-                    crate::error::codes::CONFIG_CHUNK_COLUMN_NOT_INTEGER,
-                    format!(
-                        "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
+    let read_bound = |text: &str, which: &str| -> Result<i64> {
+        strict_i64(text).ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_CHUNK_COLUMN_NOT_INTEGER,
+                format!(
+                    "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
                      range chunking slices with an integer BETWEEN, so a fractional key silently \
                      drops rows between windows and a wider one cannot be sliced. Use \
                      `chunk_by_key:` (keyset — any orderable unique indexed key) or an integer \
                      column.",
-                        export_name, which, chunk_column, text
-                    ),
-                )
-            }),
-            None => {
-                let rows = query_wrapped_row_count(src, base_query, source_type)?;
-                if rows <= 0 {
-                    return Ok(0); // genuinely empty — the one legitimate zero
-                }
-                Err(crate::error::coded(
-                    crate::error::codes::SOURCE_PROBE_UNREADABLE,
-                    format!(
-                        "export '{}': {}({}) returned no readable value although the table has ~{} \
-                     row(s) — the driver cannot render this key's type. Range chunking would plan the single window `BETWEEN 0 AND \
-                     0` and export NOTHING while reporting success. Use `chunk_by_key:` (keyset) \
-                     or an integer column.",
-                        export_name, which, chunk_column, rows
-                    ),
-                ))
-            }
-        }
+                    export_name, which, chunk_column, text
+                ),
+            )
+        })
     };
-    let min_raw = src.query_scalar(&min_sql)?;
-    let min_val = read_bound(src, min_raw, "min")?;
-    let max_raw = src.query_scalar(&max_sql)?;
-    let max_val = read_bound(src, max_raw, "max")?;
+    let (min_val, max_val) =
+        match read_key_span(src, base_query, chunk_column, export_name, source_type)? {
+            Some((min_text, max_text)) => {
+                (read_bound(&min_text, "min")?, read_bound(&max_text, "max")?)
+            }
+            None => EMPTY_WINDOW,
+        };
 
     let effective_chunk_size = if let Some(count) = chunk_count {
         let span = (max_val - min_val).max(0) as usize + 1;
@@ -707,16 +693,11 @@ mod tests {
         assert_eq!(chunks[9], (901, 1000));
     }
 
-    /// An EMPTY table plans one empty window — the single legitimate zero.
-    ///
-    /// Renamed from `…_collapses_to_zero_zero`: the zero is now REACHED rather
-    /// than fallen into. An absent bound used to be indistinguishable from an
-    /// unrenderable one, so both produced `(0,0)`; the emptiness is checked now,
-    /// which is why the script carries a `0` row count for each bound probe.
+    /// An EMPTY table plans one empty window — the single legitimate zero, reached by a row count of 0.
     #[test]
     fn integer_range_empty_table_plans_one_empty_window() {
-        // min → NULL, count → 0, max → NULL, count → 0, then the sparsity estimate.
-        let mut src = ScriptedSource::new([null(), ok("0"), null(), ok("0"), ok("0")]);
+        // min → NULL, max → NULL, count → 0, then the sparsity estimate.
+        let mut src = ScriptedSource::new([null(), null(), ok("0"), ok("0")]);
         let chunks = detect(&mut src, 100, None).unwrap();
         assert_eq!(chunks, vec![(0, 0)]);
     }
@@ -728,14 +709,18 @@ mod tests {
     /// Measured before the fix: 100 rows in, 0 rows out, `status: success`.
     #[test]
     fn unrenderable_bound_on_a_non_empty_table_is_an_error() {
-        let mut src = ScriptedSource::new([null(), ok("100")]);
-        let err = detect(&mut src, 10, None)
-            .expect_err("a None bound over a NON-empty table must abort, not plan (0,0)");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("no readable value") && msg.contains("chunk_by_key"),
-            "the error must name the cause and the escape; got: {msg}"
-        );
+        for by_days in [None, Some(7)] {
+            let mut src = ScriptedSource::new([null(), null(), ok("100")]);
+            let err = detect(&mut src, 10, by_days)
+                .expect_err("a None bound over a NON-empty table must abort, not plan (0,0)");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("no readable value although the table has ~100 row(s)")
+                    && msg.contains("chunk_by_key"),
+                "the error must name the cause and the escape; got: {msg}"
+            );
+            crate::error::assert_coded(&err, "RIVET_SOURCE_PROBE_UNREADABLE", 5);
+        }
     }
 
     /// A NON-EMPTY table whose bounds cannot be read as i64 must ERROR, not
@@ -795,6 +780,22 @@ mod tests {
         let mut src = ScriptedSource::new([ok("2023-01-01"), ok("2023-01-31")]).with_null_keys(7);
         let err = detect(&mut src, 10_000, Some(7)).unwrap_err();
         assert!(format!("{err:#}").contains("NULL in chunk_column"));
+        crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_NULL", 5);
+    }
+
+    /// A table whose every key is NULL (min and max NULL over rows) is refused as NULL-keyed under both chunkings, never planned as empty.
+    #[test]
+    fn an_all_null_key_is_refused_as_null_keyed_not_planned_empty() {
+        for by_days in [None, Some(7)] {
+            let mut src = ScriptedSource::new([null(), null(), ok("40")]).with_null_keys(40);
+            let err = detect(&mut src, 10_000, by_days).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_NULL", 5);
+            assert!(
+                !src.seen_sql.iter().any(|s| s.starts_with("SELECT min(")),
+                "the refusal comes before any bound is read: {:?}",
+                src.seen_sql
+            );
+        }
     }
 
     // ── chunk_by_days path ──────────────────────────────────────────────────
@@ -819,12 +820,41 @@ mod tests {
     }
 
     #[test]
-    fn chunk_by_days_null_min_returns_error() {
-        let mut src = ScriptedSource::new([null()]);
-        let result = detect(&mut src, 10_000, Some(7));
-        assert!(result.is_err());
-        let msg = format!("{:#}", result.unwrap_err());
-        assert!(msg.contains("NULL") || msg.contains("empty"), "got: {msg}");
+    fn chunk_by_days_empty_table_plans_the_empty_window_a_range_key_plans() {
+        let mut src = ScriptedSource::new([null(), null(), ok("0")]);
+        assert_eq!(detect(&mut src, 10_000, Some(7)).unwrap(), vec![(0, 0)]);
+        let mut range = ScriptedSource::new([null(), null(), ok("0"), ok("0")]);
+        assert_eq!(detect(&mut range, 100, None).unwrap(), vec![(0, 0)]);
+    }
+
+    /// The span reader: both bounds read, no count; no row, `None`; a bound absent over rows, the coded refusal.
+    #[test]
+    fn read_key_span_reads_bounds_and_counts_only_when_one_is_absent() {
+        let span = |replies: Vec<Result<Option<String>>>| {
+            let mut src = ScriptedSource::new(replies);
+            let got = read_key_span(&mut src, "SELECT * FROM t", "k", "e", SourceType::Postgres);
+            (got, src.seen_sql)
+        };
+        let (got, seen) = span(vec![ok("1"), ok("9")]);
+        assert_eq!(got.unwrap(), Some(("1".into(), "9".into())));
+        assert_eq!(seen.len(), 2, "no count when both bounds read: {seen:?}");
+        let (got, seen) = span(vec![null(), null(), ok("0")]);
+        assert_eq!(got.unwrap(), None);
+        assert_eq!(seen[2], "SELECT COUNT(*) FROM t");
+        for replies in [
+            vec![null(), null(), ok("3")],
+            vec![ok("1"), null(), ok("3")],
+            vec![null(), ok("9"), ok("3")],
+        ] {
+            let err = span(replies).0.unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_SOURCE_PROBE_UNREADABLE", 5);
+            assert!(
+                format!("{err:#}").contains(
+                    "export 'e': min/max(k) returned no readable value although the table has ~3 row(s)"
+                ),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]
