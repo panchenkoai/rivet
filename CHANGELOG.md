@@ -10,6 +10,14 @@
   `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER` (exit 1), the same code the `table:` refusal now carries.
   **What to do:** use `chunk_by_key:` (keyset) or an integer column for such a key.
 
+- **A SQL Server password holding `@` reached the state database.** In the keyword/value URL form
+  (`sqlserver://host;user=sa;password=p@ss;…`) the `@` inside the password was read as the end of a
+  userinfo, so the source key rivet stores beside every cursor kept the password's tail (0.31.0 and
+  earlier). **Now** keyword passwords are masked before anything is cut from the URL. **What to do:**
+  if such a password was in use, the progress stored under the old key is not found and the next run
+  of an incremental export reads its table again; rotate that password, since the state database
+  held part of it.
+
 - **A MySQL CDC stream refused a `TIME` past 24 hours with the batch remedy, "cast it in a query",
   which a stream has no query for.** The check also ran by the column's native type, so a
   `columns: { col: string }` override could not carry the duration as text (0.31.0 and earlier).
