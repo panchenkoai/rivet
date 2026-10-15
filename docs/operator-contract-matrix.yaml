@@ -48,6 +48,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no cursor column" }
     oracle:   { test: a_cursor_column_in_another_case_is_refused_by_code_oracle }
 
+  - id: run_lease_per_source
+    what: "2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name; a run on the same source is refused RIVET_STATE_RUN_IN_PROGRESS (exit 5); the live run delivers"
+    postgres: { test: one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same }
+    mysql:    { na: "one cell holds the pair: the live run reads PostgreSQL and the run beside it MySQL; the lease key is one function for every engine (run_lease_key)" }
+    mssql:    { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
+    mongo:    { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
+    oracle:   { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
+
   - id: concurrent_full_runs
     what: "RESULTS 4: a second concurrent `full` run is refused, or the prefix holds each key once"
     postgres: { test: a_second_concurrent_full_run_does_not_double_the_prefix_postgres }
@@ -264,6 +272,30 @@ scenarios:
     mongo:    { test: open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo }
     oracle:   { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
 
+  - id: run_missing_bucket_s3
+    what: "2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND (exit 1) naming the bucket, not the store's raw NotFound (s3)"
+    postgres: { test: a_run_into_a_missing_bucket_is_refused_by_code_s3 }
+    mysql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mssql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mongo:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    oracle:   { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+
+  - id: run_missing_bucket_gcs
+    what: "2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND (exit 1) naming the bucket, not the store's raw NotFound (gcs)"
+    postgres: { test: a_run_into_a_missing_bucket_is_refused_by_code_gcs }
+    mysql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mssql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mongo:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    oracle:   { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+
+  - id: run_missing_bucket_azure
+    what: "2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND (exit 1) naming the bucket, not the store's raw NotFound (azure)"
+    postgres: { test: a_run_into_a_missing_bucket_is_refused_by_code_azure }
+    mysql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mssql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mongo:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    oracle:   { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+
   - id: validate_missing_bucket_s3
     what: "RESULTS 5: `validate` on a bucket that does not exist cannot verify: exit 1, RIVET_VERIFY_MANIFEST_READ_ERROR naming the bucket (s3)"
     postgres: { test: validate_fails_on_a_missing_bucket_s3 }
@@ -348,7 +380,7 @@ scenarios:
     what: "RESULTS 19: the config `rivet init --mode cdc` writes runs as written (SQL Server: with the capture instance the catalog holds)"
     postgres: { test: the_config_init_writes_runs_cdc_postgres }
     mysql:    { test: the_config_init_writes_runs_cdc_mysql }
-    mssql:    { test: open_defect_init_cdc_writes_the_capture_instance_the_catalog_holds_mssql }
+    mssql:    { test: init_cdc_writes_the_capture_instance_the_catalog_holds_mssql }
     mongo:    { test: the_config_init_writes_runs_cdc_mongo }
     oracle:   { test: a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet }
 

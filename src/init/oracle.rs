@@ -98,6 +98,7 @@ pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> 
             .max(0),
     };
     Ok(TableInfo {
+        cdc_capture_instance: None,
         density,
         schema,
         table,
@@ -359,6 +360,7 @@ mod tests {
                 .collect()
         };
         let table = |pk: [&str; 7], stamp: [&str; 7]| TableInfo {
+            cdc_capture_instance: None,
             schema: "RIVET".into(),
             table: "T".into(),
             row_estimate: 500_000,

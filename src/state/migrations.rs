@@ -580,6 +580,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     ),
     // v35: the highest key a committed parallel-keyset range delivered; NULL for an empty range or one committed before v35.
     (35, "ALTER TABLE keyset_range ADD COLUMN max_key TEXT;"),
+    // v36: the source a run reads, so a run under its (export, source) lease closes only that source's dead `running` rows; NULL on a row written before v36.
+    (36, "ALTER TABLE run_status ADD COLUMN source TEXT;"),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -1073,6 +1075,11 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         35,
         "ALTER TABLE keyset_range ADD COLUMN IF NOT EXISTS max_key TEXT;",
+    ),
+    // v36: see the SQLite ladder.
+    (
+        36,
+        "ALTER TABLE run_status ADD COLUMN IF NOT EXISTS source TEXT;",
     ),
 ];
 

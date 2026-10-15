@@ -72,6 +72,9 @@ pub(crate) struct TableInfo {
     /// not part of the replayable catalog shape.
     #[serde(skip, default)]
     pub density: Option<crate::init::density::DensityProbe>,
+    /// The SQL Server CDC capture instance `cdc.change_tables` holds for this table (the newest when two), read at init time.
+    #[serde(skip, default)]
+    pub cdc_capture_instance: Option<String>,
 }
 
 impl TableInfo {
@@ -1663,6 +1666,7 @@ mod tests {
     #[test]
     fn every_skipped_table_is_named_from_the_decision() {
         let named = |n: &str| TableInfo {
+            cdc_capture_instance: None,
             table: n.into(),
             ..make_table(100, vec![col("id", "bigint", true)])
         };
@@ -1753,6 +1757,7 @@ mod tests {
     #[test]
     fn a_schema_init_prints_the_cursor_notice_only_when_an_export_lacks_a_cursor() {
         let table = |n: &str, ty: &str| TableInfo {
+            cdc_capture_instance: None,
             table: n.into(),
             ..make_table(100, vec![col("c", ty, false)])
         };
@@ -1782,10 +1787,12 @@ mod tests {
     #[test]
     fn a_schema_init_prints_the_decimal_note_only_when_it_wrote_the_default_decimal() {
         let plain = TableInfo {
+            cdc_capture_instance: None,
             table: "plain".into(),
             ..make_table(100, vec![col("id", "bigint", true)])
         };
         let ledger = TableInfo {
+            cdc_capture_instance: None,
             table: "ledger".into(),
             ..make_table(
                 100,
@@ -1827,10 +1834,12 @@ mod tests {
     #[test]
     fn exports_needing_a_cursor_names_every_one_of_them() {
         let stamped = |n: &str| TableInfo {
+            cdc_capture_instance: None,
             table: n.into(),
             ..make_table(100, vec![col("updated_at", "timestamp", false)])
         };
         let unstamped = |n: &str| TableInfo {
+            cdc_capture_instance: None,
             table: n.into(),
             ..make_table(100, vec![col("email", "text", false)])
         };
@@ -2085,6 +2094,7 @@ mod tests {
 
         // And the pass-through, so the extraction cannot quietly drop tables.
         let info = TableInfo {
+            cdc_capture_instance: None,
             schema: "s".into(),
             table: "t".into(),
             row_estimate: 1,
@@ -2152,6 +2162,7 @@ mod tests {
 
     fn make_table(rows: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".to_string(),
             table: "orders".to_string(),
@@ -2745,6 +2756,7 @@ mod tests {
     #[test]
     fn generate_schema_config_emits_multiple_exports() {
         let a = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".to_string(),
             table: "users".to_string(),
@@ -2753,6 +2765,7 @@ mod tests {
             columns: vec![col("id", "bigint", true)],
         };
         let b = TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".to_string(),
             table: "orders".to_string(),

@@ -7,8 +7,8 @@
 .rivet/runs/pa_audit_b_<RUNID>/summary.json
 .rivet/runs/pa_audit_b_<RUNID>/summary.md
 .rivet_state.db
-.rivet_state.db.lease-chunk-run-pa_audit_a
-.rivet_state.db.lease-chunk-run-pa_audit_b
+.rivet_state.db.lease-chunk-run-pa_audit_a-<SOURCE>
+.rivet_state.db.lease-chunk-run-pa_audit_b-<SOURCE>
 out
 out/p04_a
 out/p04_a/_SUCCESS
