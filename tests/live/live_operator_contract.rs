@@ -335,6 +335,27 @@ fn cursor_write_fails(engine: SqlEngine) {
     );
 }
 
+/// 2026-10-14 sweep P6: a `cursor_column` spelled in another case than the column is refused by code, and the spelling the refusal names delivers.
+fn cursor_column_in_another_case(engine: SqlEngine) {
+    let (table, _guard) = id_v_table(engine, "oc_cursorcase", ROWS);
+    let mut rig = engine
+        .rig(&table)
+        .mode("incremental")
+        .export_line("cursor_column: V");
+    rig.refuses_twice_then(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_CONFIG_CURSOR_COLUMN_CASE", 1),
+        vec![Remedy::new(
+            "Set `cursor_column: v`.",
+            Then::DeliversTheSource,
+            |r| {
+                r.replace_export_line("cursor_column", "cursor_column: v");
+            },
+        )],
+    );
+}
+
 /// RESULTS 4: a second `full` run beside a live one is refused, or the prefix still holds each key once.
 fn concurrent_full_runs(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_twofull", 200);
@@ -1779,6 +1800,31 @@ fn a_run_whose_cursor_write_fails_delivers_and_does_not_exit_0_oracle() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres"]
+fn a_cursor_column_in_another_case_is_refused_by_code_postgres() {
+    cursor_column_in_another_case(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_cursor_column_in_another_case_is_refused_by_code_mysql() {
+    cursor_column_in_another_case(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_column_in_another_case_is_refused_by_code_mssql() {
+    cursor_column_in_another_case(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_column_in_another_case_is_refused_by_code_oracle() {
+    cursor_column_in_another_case(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
 fn a_second_concurrent_full_run_does_not_double_the_prefix_postgres() {
     concurrent_full_runs(SqlEngine::Pg);
 }
@@ -2471,9 +2517,13 @@ fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
         Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
     );
     assert!(
-        !run.status.success() && text(&run).contains(refusal),
-        "fixture: `run` refuses the absent collection\n{}",
+        text(&run).contains(refusal),
+        "`run` refuses the absent collection\n{}",
         text(&run)
+    );
+    assert_refused(
+        &run,
+        Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
     );
     let present = Rig::mongo_batch("t").source_url(&url);
     assert!(

@@ -181,9 +181,39 @@ pub(crate) fn refuse_override_case_miss(keys: &[String], names: &[&str]) -> Resu
     Ok(())
 }
 
+/// Refuse a `cursor_column` that names no result column as spelled but one ignoring case; the cursor could never advance.
+pub(crate) fn refuse_cursor_case_miss(cursor: &str, names: &[&str]) -> Result<()> {
+    if names.contains(&cursor) {
+        return Ok(());
+    }
+    if let Some(real) = names.iter().find(|n| n.eq_ignore_ascii_case(cursor)) {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_CURSOR_COLUMN_CASE,
+            "`cursor_column: {cursor}` is not in the result set, which names the column `{real}` — the \
+             cursor could never advance and every run would re-read the whole table. Set \
+             `cursor_column: {real}`."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cursor_named_only_in_another_case_is_refused_by_code_and_names_the_spelling() {
+        let names = ["id", "updated_at"];
+        assert!(refuse_cursor_case_miss("updated_at", &names).is_ok());
+        assert!(refuse_cursor_case_miss("missing", &names).is_ok());
+        let err = refuse_cursor_case_miss("UPDATED_AT", &names).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_CONFIG_CURSOR_COLUMN_CASE")
+        );
+        assert!(format!("{err:#}").contains("Set `cursor_column: updated_at`."));
+        assert!(refuse_cursor_case_miss("V", &["v", "V"]).is_ok());
+    }
 
     #[test]
     fn decimal_parses_precision_and_scale() {
