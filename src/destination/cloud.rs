@@ -1018,8 +1018,8 @@ mod tests {
         let under = dest.list_prefix("dir").unwrap();
         let asked = listings.lock().unwrap().clone();
         assert!(
-            asked[1].contains("prefix=p%2Fdir%2F"),
-            "a sub-prefix gets its slash: {asked:?}"
+            asked[1].contains("prefix=p%2Fdir%2F") && !asked[1].contains("delimiter"),
+            "a sub-prefix gets its slash and is walked recursively too: {asked:?}"
         );
         assert_eq!(under.len(), 1);
     }
