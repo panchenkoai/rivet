@@ -1099,4 +1099,50 @@ mod tests {
             "no cursor recorded"
         );
     }
+
+    #[test]
+    fn a_stored_cursor_past_the_success_manifest_is_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = super::super::commit::tests::test_plan();
+        plan.strategy =
+            crate::plan::ExtractionStrategy::Incremental(crate::plan::IncrementalCursorPlan {
+                primary_column: "id".into(),
+                fallback_column: None,
+                mode: Default::default(),
+                settle: None,
+            });
+        plan.destination.path = Some(dir.path().to_string_lossy().into_owned());
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            "{\"manifest_version\": 1, \"run_id\": \"r\", \"export_name\": \"orders\", \
+             \"export_family\": \"orders\", \"mode\": \"incremental\", \"started_at\": \"\", \
+             \"finished_at\": \"\", \"status\": \"success\", \
+             \"source\": {\"engine\": \"postgres\", \"extraction\": {\"strategy\": \"incremental\", \"cursor_high\": \"40\"}}, \
+             \"destination\": {\"kind\": \"local\", \"uri\": \"x\"}, \"format\": \"parquet\", \
+             \"compression\": \"zstd\", \"schema_fingerprint\": \"\", \"row_count\": 0, \
+             \"part_count\": 0, \"parts\": []}",
+        )
+        .unwrap();
+        let verdict = |stored: Option<&str>| {
+            let s = crate::state::StateStore::open_in_memory().unwrap();
+            if let Some(v) = stored {
+                s.update_with_column(&plan.progress_key(), v).unwrap();
+            }
+            let progress = s.claim(plan.progress_key()).unwrap();
+            refuse_a_cursor_past_the_manifest(&plan, &progress)
+                .err()
+                .map(|e| {
+                    assert_eq!(crate::error::classify_exit(&e), 5);
+                    crate::error::error_code(&e).map(str::to_owned)
+                })
+        };
+        assert_eq!(
+            verdict(Some("42")),
+            Some(Some("RIVET_STATE_CURSOR_PAST_MANIFEST".into())),
+            "past cursor_high"
+        );
+        assert_eq!(verdict(Some("40")), None, "at cursor_high");
+        assert_eq!(verdict(Some("39")), None, "below cursor_high");
+        assert_eq!(verdict(None), None, "no stored cursor");
+    }
 }
