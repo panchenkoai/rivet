@@ -758,6 +758,8 @@ impl TargetLoader for BigQueryLoader {
             lo: cell(1),
             hi: cell(2),
             nulls: cell(3).parse().unwrap_or(0),
+            in_lo: cell(4),
+            in_hi: cell(5),
         };
         let changes_rows = probe.rows;
         let merges = plan_compact_merges(&base, &changes_fqtn, specs, pk, order, key, &probe)?;
