@@ -911,6 +911,7 @@ fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
     for id in 1..=5 {
         s.insert(id);
     }
+    s.settle();
     let opened = |r: &Rig| {
         r.state_count(
             "SELECT count(*) FROM run_status WHERE export_name = '{export}' AND status = 'running'",
