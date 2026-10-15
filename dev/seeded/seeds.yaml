@@ -1815,15 +1815,15 @@ seeds:
     patch: missing-bucket-uncoded-on-write/shared.patch
     engines:
       postgres:
-        cells: [a_run_into_a_missing_bucket_is_refused_by_code_gcs]
+        cells: [a_run_into_a_missing_bucket_is_refused_by_code_s3, a_run_into_a_missing_bucket_is_refused_by_code_gcs, a_run_into_a_missing_bucket_is_refused_by_code_azure]
       mysql:
-        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cell over fake-gcs"
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
       mssql:
-        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cell over fake-gcs"
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
       mongo:
-        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cell over fake-gcs"
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
       oracle:
-        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cell over fake-gcs"
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
   - name: cdc-run-without-lease
     class: "a `mode: cdc` run takes no run lease, so a second run beside a live stream reads and delivers the same changes again"
     history: "2026-10-14 - found by the by-hand CLI sweep (P2): duplicates on MySQL, SQL Server, Oracle, MongoDB CDC, an uncoded slot error on PostgreSQL, through 0.31.0; fixed by `cdc_run_lease`"

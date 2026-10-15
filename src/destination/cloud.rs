@@ -255,6 +255,23 @@ fn listing_says_container_absent<B: CloudBackend>(
     first_page_error.is_some_and(|kind| B::ABSENT_CONTAINER.contains(&kind))
 }
 
+/// The opendal kind of one error in a chain: an opendal error itself, or the one an `io::Error` from opendal's std writer wraps.
+fn opendal_kind(e: &(dyn std::error::Error + 'static)) -> Option<opendal::ErrorKind> {
+    e.downcast_ref::<opendal::Error>()
+        .or_else(|| {
+            e.downcast_ref::<std::io::Error>()?
+                .get_ref()?
+                .downcast_ref::<opendal::Error>()
+        })
+        .map(opendal::Error::kind)
+}
+
+/// Whether a failed write may have hit an absent container: some error in its chain has a kind the backend's listing answers an absent container with.
+fn write_error_may_mean_absent_container<B: CloudBackend>(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| opendal_kind(c).is_some_and(|k| B::ABSENT_CONTAINER.contains(&k)))
+}
+
 /// What an operator reads when the configured bucket or container does not exist.
 fn container_absent_message(scheme: &str, container: &str) -> String {
     format!(
@@ -378,15 +395,9 @@ impl<B: CloudBackend> CloudDestination<B> {
 }
 
 impl<B: CloudBackend> CloudDestination<B> {
-    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the store answered "not found" to a write and the bucket itself is absent; any other error unchanged.
+    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the write failed with a kind the backend reports an absent container by and the bucket itself is absent; any other error unchanged.
     fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
-        let not_found = err.chain().any(|c| {
-            c.downcast_ref::<opendal::Error>()
-                .is_some_and(|e| e.kind() == opendal::ErrorKind::NotFound)
-                || c.downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-        });
-        match not_found.then(|| self.require_container()) {
+        match write_error_may_mean_absent_container::<B>(&err).then(|| self.require_container()) {
             Some(Err(absent)) => absent,
             _ => err,
         }
@@ -968,5 +979,38 @@ mod tests {
         assert!(!absent::<AzureBackend>(Some(ConfigInvalid)));
         assert!(!absent::<S3Backend>(Some(PermissionDenied)));
         assert!(!absent::<S3Backend>(None));
+    }
+
+    /// A write is probed for an absent container when an error in its chain, or the opendal error a std-writer `io::Error` wraps, has one of the backend's absent-container kinds.
+    #[test]
+    fn a_failed_write_is_probed_by_the_backends_absent_container_kinds() {
+        use super::write_error_may_mean_absent_container as probed;
+        use crate::destination::azure::AzureBackend;
+        use crate::destination::s3::S3Backend;
+        use opendal::ErrorKind::{ConfigInvalid, NotFound, PermissionDenied};
+        let op = |k| anyhow::Error::new(opendal::Error::new(k, "write")).context("upload");
+        let wrapped = |k| {
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                opendal::Error::new(k, "write"),
+            ))
+        };
+        assert!(
+            probed::<S3Backend>(&op(ConfigInvalid)),
+            "S3 NoSuchBucket on a one-shot PUT"
+        );
+        assert!(
+            probed::<S3Backend>(&wrapped(ConfigInvalid)),
+            "S3 NoSuchBucket on a streamed part"
+        );
+        assert!(probed::<GcsBackend>(&op(NotFound)));
+        assert!(probed::<AzureBackend>(&wrapped(NotFound)));
+        assert!(!probed::<GcsBackend>(&op(ConfigInvalid)));
+        assert!(!probed::<AzureBackend>(&wrapped(PermissionDenied)));
+        let local = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(
+            !probed::<GcsBackend>(&local),
+            "a missing LOCAL part file is not a store answer"
+        );
     }
 }

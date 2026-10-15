@@ -1,14 +1,14 @@
 --- a/src/destination/cloud.rs
 +++ b/src/destination/cloud.rs
-@@ -386,10 +386,8 @@
-                 || c.downcast_ref::<std::io::Error>()
-                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-         });
--        match not_found.then(|| self.require_container()) {
+@@ -397,10 +397,8 @@
+ impl<B: CloudBackend> CloudDestination<B> {
+     /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the write failed with a kind the backend reports an absent container by and the bucket itself is absent; any other error unchanged.
+     fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
+-        match write_error_may_mean_absent_container::<B>(&err).then(|| self.require_container()) {
 -            Some(Err(absent)) => absent,
 -            _ => err,
 -        }
-+        let _ = not_found;
++        let _ = write_error_may_mean_absent_container::<B>(&err);
 +        err
      }
  
