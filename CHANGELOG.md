@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A MySQL CDC stream refused a `TIME` past 24 hours with the batch remedy, "cast it in a query",
+  which a stream has no query for.** The check also ran by the column's native type, so a
+  `columns: { col: string }` override could not carry the duration as text (0.31.0 and earlier).
+  **Now** the refusal (`RIVET_SOURCE_VALUE_UNREPRESENTABLE`, exit 5) names the two remedies a stream
+  has: the column declared `string` in `columns:`, which carries the value as text
+  (`800:00:00.000000`), or the column left out of the capture followed by the re-baseline recipe.
+  **What to do:** nothing.
 - **Two `rivet run`s of one `mode: cdc` export at once both delivered the stream.** A batch run
   holds the export's run lease and a second run beside it is refused; a CDC run took no lease, so
   the second read the same changes again (MySQL, SQL Server, Oracle and MongoDB delivered duplicate
