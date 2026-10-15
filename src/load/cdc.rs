@@ -2193,6 +2193,12 @@ mod compact_tests {
         }
         // A probe that did not say steps every partitioned day of the span: slower, and
         // no winner is left outside every window.
+        let half = plan(Some(&hour), &probe("2026-10-01", "9999-12-31", "none", ""));
+        assert_eq!(
+            half.len(),
+            295,
+            "one side read is not a reading: the clamped span"
+        );
         let unread = plan(Some(&hour), &probe("2026-10-01", "9999-12-31", "", ""));
         assert_eq!(
             unread.len(),
