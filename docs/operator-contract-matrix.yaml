@@ -272,6 +272,30 @@ scenarios:
     mongo:    { test: open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo }
     oracle:   { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
 
+  - id: run_missing_bucket_s3
+    what: "2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND (exit 1) naming the bucket, not the store's raw NotFound (s3)"
+    postgres: { test: a_run_into_a_missing_bucket_is_refused_by_code_s3 }
+    mysql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mssql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mongo:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    oracle:   { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+
+  - id: run_missing_bucket_gcs
+    what: "2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND (exit 1) naming the bucket, not the store's raw NotFound (gcs)"
+    postgres: { test: a_run_into_a_missing_bucket_is_refused_by_code_gcs }
+    mysql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mssql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mongo:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    oracle:   { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+
+  - id: run_missing_bucket_azure
+    what: "2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND (exit 1) naming the bucket, not the store's raw NotFound (azure)"
+    postgres: { test: a_run_into_a_missing_bucket_is_refused_by_code_azure }
+    mysql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mssql:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    mongo:    { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+    oracle:   { na: "a run's write reaches the destination after the source is read; the source engine does not take part (MinIO, fake-gcs and Azurite cells under postgres)" }
+
   - id: validate_missing_bucket_s3
     what: "RESULTS 5: `validate` on a bucket that does not exist cannot verify: exit 1, RIVET_VERIFY_MANIFEST_READ_ERROR naming the bucket (s3)"
     postgres: { test: validate_fails_on_a_missing_bucket_s3 }
