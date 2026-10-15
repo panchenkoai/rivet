@@ -392,6 +392,19 @@ pub(crate) fn unsafe_mapping_refusal(message: String) -> anyhow::Error {
     crate::error::coded(crate::error::codes::TYPE_UNSAFE_MAPPING, message)
 }
 
+/// The async runtime a driver runs on, or an environment stop naming `engine` when the process cannot start one.
+pub(crate) fn driver_runtime(
+    engine: &str,
+    built: std::io::Result<tokio::runtime::Runtime>,
+) -> Result<tokio::runtime::Runtime> {
+    built.map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::SOURCE_RUNTIME_UNAVAILABLE,
+            format!("{engine}: tokio runtime build failed: {e}"),
+        )
+    })
+}
+
 /// A key column list, or `None` when the table has no key.
 pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {
     (!cols.is_empty()).then_some(cols)
@@ -509,6 +522,25 @@ pub(crate) fn keyset_keys_primary_first(columns: &[(String, bool)]) -> Vec<Strin
         keys.extend(class.into_iter().cloned());
     }
     keys
+}
+
+#[cfg(test)]
+mod driver_runtime_tests {
+    #[test]
+    fn a_process_out_of_descriptors_is_an_environment_stop_not_an_internal_error() {
+        let emfile = std::io::Error::from_raw_os_error(24);
+        let err = super::driver_runtime("mssql", Err(emfile)).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_RUNTIME_UNAVAILABLE")
+        );
+        assert!(
+            matches!(crate::error::classify_exit(&err), 1 | 2),
+            "exit {}: running out of descriptors is the environment, not a bug",
+            crate::error::classify_exit(&err)
+        );
+        assert!(format!("{err:#}").starts_with("mssql: tokio runtime build failed: "));
+    }
 }
 
 #[cfg(test)]

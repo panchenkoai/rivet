@@ -419,9 +419,12 @@ pub(crate) fn source_object_of_capture_instance(
         from_lsn: None,
         checkpoint_identity: None,
     };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = crate::source::driver_runtime(
+        "mssql cdc",
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build(),
+    )?;
     let mut client = rt.block_on(connect(cfg, tls))?;
 
     // Three outcomes, kept APART. Collapsing them into `Ok(None)` — which the first
@@ -613,9 +616,12 @@ impl MssqlChangeStream {
                 format!("mssql cdc: malformed resume LSN {lsn:?}"),
             ));
         }
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
+        let rt = crate::source::driver_runtime(
+            "mssql cdc",
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+        )?;
         let mut client = rt.block_on(connect(cfg, tls))?;
         let identity = rt.block_on(db_identity(&mut client))?;
         if cfg.from_lsn.is_some() {
@@ -1198,9 +1204,12 @@ pub(crate) fn pin_checkpoint_at_max_lsn(
         from_lsn: None,
         checkpoint_identity: None,
     };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let rt = crate::source::driver_runtime(
+        "mssql cdc",
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build(),
+    )?;
     let (identity, anchor) = rt.block_on(async {
         let mut client = connect(&cfg, tls).await?;
         let identity = db_identity(&mut client).await?;

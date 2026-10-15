@@ -90,7 +90,16 @@ pub fn stand_bq_location() -> &'static str {
     text(&["bigquery", "location"])
 }
 
-/// A disposable BigQuery dataset name — the only kind `make sweep-test-cloud` drops.
+/// The age past which a cloud test object is a leftover, in milliseconds: every dataset a test
+/// creates expires its tables at this age, so storage empties itself even where no sweep runs.
+pub fn stand_cloud_ttl_ms() -> u64 {
+    stand()["cloud_ttl_hours"]
+        .as_u64()
+        .expect("registry cloud_ttl_hours is a whole number")
+        * 3_600_000
+}
+
+/// A disposable BigQuery dataset name, dropped by `make sweep-test-cloud` once older than the TTL.
 pub fn stand_bq_tmp(name: &str) -> String {
     format!("{}{name}", text(&["bigquery", "tmp_prefix"]))
 }

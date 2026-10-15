@@ -170,6 +170,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_CDC_TABLE_UNSUPPORTED` | usage | 1 | export the table in batch (`mode: full`), or capture a table the message's supported list covers |
 | `RIVET_SOURCE_CDC_TRANSACTION_TOO_LARGE` | usage | 1 | split the source transaction, or raise RIVET_CDC_MAX_TX_ROWS / RIVET_CDC_MAX_TX_BYTES when a transaction this large is expected |
 | `RIVET_SOURCE_QUERY_COLUMN_UNREFERENCEABLE` | usage | 1 | give the column an alias in the export's `query:` (e.g. `... AS row_id`) |
+| `RIVET_SOURCE_RUNTIME_UNAVAILABLE` | environment | 2 if transient, else 1 | the process could not start the async runtime its driver needs (out of file descriptors or threads): raise the open-files limit (`ulimit -n`) or lower parallelism, then rerun |
 | `RIVET_SOURCE_CONNECT_FAILED` | environment | 2 if transient, else 1 | check the host, port, credentials and TLS settings in the source URL; the driver's own words follow the colon |
 | `RIVET_SOURCE_QUERY_FAILED` | environment | 2 if transient, else 1 | fix what the server's words name (the statement, the login's rights on the object, or the session), then run again |
 | `RIVET_SOURCE_CDC_SPILL_UNLOCKABLE` | environment | 2 if transient, else 1 | point RIVET_CDC_SPILL_DIR at a local, flock-capable filesystem, or raise the rollover memory cap so the transaction stays in memory |

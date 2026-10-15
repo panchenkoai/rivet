@@ -9,12 +9,10 @@
 // 673 -> 554 (2026-10-15): every error site under `src/config/` carries a registered code (-119).
 // 554 -> 553 (2026-10-15): a fractional range-chunk key under `query:` is refused by code.
 // 553 -> 458 (2026-10-15): every error site under `src/load/` carries a registered code (-95).
-// 554 -> 459 (2026-10-15): every error site under `src/load/` carries a registered code (-95).
-// 459 -> 339 (2026-10-15): every error site under `src/pipeline/`, the rebuilt resolve_url error in
+// 458 -> 338 (2026-10-15): every error site under `src/pipeline/`, the rebuilt resolve_url error in
 // `src/plan/build.rs`, and the two test-hook faults carry a registered code (-120).
-// 339 -> 153 (2026-10-15): every error site under `src/source/` (the five engines and the shared
+// 338 -> 152 (2026-10-15): every error site under `src/source/` (the five engines and the shared
 // CDC, spill, checksum and validate modules) carries a registered code (-186).
-// 153 -> 152 (2026-10-15): main merged, bringing the fractional range-chunk key refusal (-1).
 // 152 -> 0 (2026-10-15): every remaining site (cli, destination, plan, init, state, preflight,
 // enrich, format, manifest, mcp, types, connect, scalar, workers, the seed tool) carries a
 // registered code (-152). The ceiling stays 0: a new bare `bail!` / `ensure!` / `anyhow!` fails.

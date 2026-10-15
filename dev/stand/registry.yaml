@@ -20,6 +20,10 @@ sources:
 # 1M-row harness fixture, expensive to rebuild). Nothing else is permanent.
 databases: [rivet, rivet_bench]
 
+# PostgreSQL containers outside `sources` whose replication slots the sweep also reads: the
+# standby pair (dev/pytools/cdc_stand.py standby). An orphaned slot there pins WAL like anywhere.
+slot_hosts: [rivet-pg-cdc-primary-1, rivet-pg-cdc-standby-1]
+
 bigquery:
   project: rivet-data-tool
   location: US
@@ -31,6 +35,11 @@ bigquery:
 
 gcs:
   bucket: rivet_data_test
+# A cloud test object older than this is a leftover: no gate or run lasts a day. The cloud
+# sweep deletes by AGE, never by pid (one bucket and project serve several machines), and keeps
+# the bucket's lifecycle rule and the datasets' default table expiration at this age, so storage
+# empties itself even where no sweep runs.
+cloud_ttl_hours: 24
 
 snowflake:
   # The `snow` connection name; each machine keeps its own key-pair login under it, never in the repo.

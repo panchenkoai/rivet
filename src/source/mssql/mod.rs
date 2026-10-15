@@ -344,15 +344,12 @@ impl MssqlSource {
             tls,
         );
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| {
-                crate::error::coded(
-                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
-                    format!("mssql: tokio runtime build failed: {e}"),
-                )
-            })?;
+        let rt = crate::source::driver_runtime(
+            "mssql",
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build(),
+        )?;
 
         let client = rt.block_on(dial(config, url))?;
 

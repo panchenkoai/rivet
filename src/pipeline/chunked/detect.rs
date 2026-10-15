@@ -379,15 +379,12 @@ pub(crate) fn detect_and_generate_chunks(
                 crate::error::coded(
                     crate::error::codes::CONFIG_CHUNK_COLUMN_NOT_INTEGER,
                     format!(
-                                    "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
+                        "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
                      range chunking slices with an integer BETWEEN, so a fractional key silently \
                      drops rows between windows and a wider one cannot be sliced. Use \
                      `chunk_by_key:` (keyset — any orderable unique indexed key) or an integer \
                      column.",
-                    export_name,
-                    which,
-                    chunk_column,
-                    text
+                        export_name, which, chunk_column, text
                     ),
                 )
             }),
