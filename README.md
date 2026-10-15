@@ -97,6 +97,10 @@ curl -L "$BASE/rivet-$VERSION-aarch64-apple-darwin.tar.gz" | tar xz      # or x8
 sudo mv rivet-*/rivet /usr/local/bin/                                     # x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 ```
 
+On Debian 12, RHEL 8/9, Amazon Linux 2023 or an Apache Airflow image (glibc older than 2.39), take the
+`-glibc2.28` asset of your architecture instead, e.g. `rivet-$VERSION-x86_64-unknown-linux-gnu-glibc2.28.tar.gz`:
+it runs on any glibc 2.28 or newer.
+
 Verify with `shasum -a 256 -c SHA256SUMS.txt` (macOS) or `sha256sum -c SHA256SUMS.txt` (Linux). Windows: `cargo install rivet-cli`.
 
 From a container, `localhost` is not your machine — use `host.docker.internal` (Docker Desktop) or `--add-host=host.docker.internal:host-gateway` on Linux.
