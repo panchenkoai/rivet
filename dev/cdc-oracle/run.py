@@ -261,7 +261,7 @@ def _write_cfg(work, a, t, ckpt, out) -> str:
     with open(cfg, "w") as f:
         f.write(f"""source: {src}
 exports:
-  - name: oracle
+  - name: {t}_{a.scenario.replace('-', '_')}
     table: {tbl}
     mode: cdc
     format: parquet
