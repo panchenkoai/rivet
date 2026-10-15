@@ -814,6 +814,17 @@ pub(crate) fn error_names_its_own_cause(e: &anyhow::Error) -> bool {
     text.contains("16 MB BSON limit")
 }
 
+/// What an operator reads when the server is a standalone, which serves no change stream.
+const STANDALONE_MESSAGE: &str = "mongodb cdc: this MongoDB server is a standalone, and MongoDB serves \
+     change streams only on a replica set or a sharded cluster (server error 40573). Point `url:` at \
+     a replica-set member or a mongos, or run this server as a one-member replica set (`--replSet` \
+     and `rs.initiate()`); a standalone can still be exported with `mode: full`.";
+
+/// Does this driver error text say the server is not a replica set (error 40573)?
+fn names_standalone(text: &str) -> bool {
+    text.contains("Location40573") || text.contains("only supported on replica sets")
+}
+
 /// Does this driver error text name an OVERSIZED change event?
 ///
 /// A named predicate rather than an inline `||`, per the rule that live-only glue
@@ -848,6 +859,12 @@ fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
     let text = e.to_string();
     if names_history_lost(&text) {
         return crate::source::cdc::checkpoint_identity::log_gap(history_lost_message(&text));
+    }
+    if names_standalone(&text) {
+        return anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            STANDALONE_MESSAGE,
+        ));
     }
     if names_oversize_event(&text) {
         return anyhow::anyhow!(
@@ -1070,6 +1087,23 @@ mod tests {
     /// (which recognises nothing, since one message never carries both spellings),
     /// and `tier` survived being replaced by `""` and by `"xyzzy"` outright — nothing
     /// asserted it said anything at all.
+    /// Error 40573 is a standalone server, by its code name or its sentence; nothing else is.
+    #[test]
+    fn a_standalone_server_is_named_by_either_spelling_of_40573() {
+        assert!(super::names_standalone(
+            "Kind: Command failed: Error code 40573 (Location40573): The $changeStream stage \
+             is only supported on replica sets, labels: {}"
+        ));
+        assert!(super::names_standalone("Error code 40573 (Location40573)"));
+        assert!(super::names_standalone(
+            "The $changeStream stage is only supported on replica sets"
+        ));
+        assert!(!super::names_standalone(
+            "Kind: Command failed: Error code 286 (ChangeStreamHistoryLost)"
+        ));
+        assert!(super::STANDALONE_MESSAGE.contains("`mode: full`"));
+    }
+
     /// Error 286 by its code name is a log gap, worded as one and ending in the re-baseline remedy.
     #[test]
     fn a_lost_change_stream_history_is_named_and_worded_as_a_log_gap() {
