@@ -365,7 +365,8 @@ const MATRICES: &[(&str, usize)] = &[
     // 100 -> 104 (2026-10-15): the four refusals that gained a registry code in the last batch
     // (init config exists, destination prefix mode mismatch, mixed split generations, load spec
     // missing) each get a `refusal_*` row; asserted by their codes offline, not walked by a live cell yet.
-    ("docs/sabotage-matrix.yaml", 104),
+    // 104 -> 103 (2026-10-15): the Oracle cell of corrupt_cursor_moved_forward is written with the fix.
+    ("docs/sabotage-matrix.yaml", 103),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

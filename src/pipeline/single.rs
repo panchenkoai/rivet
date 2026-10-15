@@ -337,6 +337,49 @@ fn refuse_an_incomparable_cursor(
     ))
 }
 
+/// Refuse a stored cursor past the `cursor_high` of the destination's last success manifest: the rows between were never delivered there.
+pub(super) fn refuse_a_cursor_past_the_manifest(
+    plan: &ResolvedRunPlan,
+    progress: &crate::state::ProgressClaim<'_>,
+) -> Result<()> {
+    if !progress.key().continues_high_water || progress.resume_run_id()?.is_some() {
+        return Ok(());
+    }
+    let Some(stored) = progress.cursor()?.last_cursor_value else {
+        return Ok(());
+    };
+    let export = &plan.export_name;
+    let Some(high) = super::finalize::last_success_cursor_high(&plan.destination, export) else {
+        return Ok(());
+    };
+    if cursor_is_past(&stored, &high) != Some(true) {
+        return Ok(());
+    }
+    crate::rivet_bail!(
+        crate::error::codes::STATE_CURSOR_PAST_MANIFEST,
+        "export '{export}': its stored cursor `{stored}` is past `{high}`, the last value the \
+         success manifest at `{}` says was delivered — continuing from it would never deliver \
+         the rows between; nothing was read or written.\n  \
+         Hint: `rivet state reset -c <config> --export {export}` starts the cursor over with a \
+         full pass.",
+        crate::manifest::destination_uri_for_manifest(&plan.destination)
+    )
+}
+
+/// Whether `stored` orders after `high`: as numbers when both are, else as text of one length; `None` when they cannot be ordered.
+pub(crate) fn cursor_is_past(stored: &str, high: &str) -> Option<bool> {
+    if stored == high {
+        return Some(false);
+    }
+    if let (Ok(a), Ok(b)) = (stored.parse::<i128>(), high.parse::<i128>()) {
+        return Some(a > b);
+    }
+    if let (Ok(a), Ok(b)) = (stored.parse::<f64>(), high.parse::<f64>()) {
+        return a.partial_cmp(&b).map(|o| o.is_gt());
+    }
+    (stored.len() == high.len()).then(|| stored > high)
+}
+
 /// A part's file name, `<export>_<run stamp>`: a `_part<N>` suffix whenever the run seals more than one part.
 fn part_file_name(
     export: &str,
@@ -968,5 +1011,89 @@ mod tests {
         assert!(!is_port_closed(&anyhow::anyhow!(
             "db error: FATAL: the database system is starting up"
         )));
+    }
+
+    #[test]
+    fn a_stored_cursor_is_past_the_manifest_only_when_it_orders_after_cursor_high() {
+        // below / equal / above, as numbers (a text order would put "9" past "10")
+        assert_eq!(cursor_is_past("9", "10"), Some(false));
+        assert_eq!(cursor_is_past("40", "40"), Some(false));
+        assert_eq!(cursor_is_past("42", "40"), Some(true));
+        assert_eq!(cursor_is_past("18446744073709551615", "40"), Some(true));
+        assert_eq!(cursor_is_past("12.5", "12.75"), Some(false));
+        // timestamps of one rendering order as text
+        assert_eq!(
+            cursor_is_past("2026-02-01T00:00:00Z", "2026-01-31T23:59:59Z"),
+            Some(true)
+        );
+        assert_eq!(
+            cursor_is_past("2026-01-01T00:00:00Z", "2026-01-31T23:59:59Z"),
+            Some(false)
+        );
+        // two renderings cannot be ordered: the run proceeds
+        assert_eq!(
+            cursor_is_past("2026-02-01 00:00:00.5", "2026-02-01 00:00:00"),
+            None
+        );
+        assert_eq!(cursor_is_past("abc", "ab"), None);
+    }
+
+    #[test]
+    fn no_success_manifest_means_no_cursor_high_to_compare_with() {
+        use super::super::finalize::last_success_cursor_high;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = crate::config::DestinationConfig {
+            destination_type: crate::config::DestinationType::Local,
+            path: Some(dir.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        assert_eq!(
+            last_success_cursor_high(&dest, "orders"),
+            None,
+            "no manifest"
+        );
+        let write = |status: &str, export: &str, high: Option<&str>| {
+            let high = high.map_or(String::new(), |h| {
+                format!(
+                    ", \"extraction\": {{\"strategy\": \"incremental\", \"cursor_high\": \"{h}\"}}"
+                )
+            });
+            std::fs::write(
+                dir.path().join("manifest.json"),
+                format!(
+                    "{{\"manifest_version\": 1, \"run_id\": \"r\", \"export_name\": \"{export}\", \
+                     \"export_family\": \"{export}\", \"mode\": \"incremental\", \"started_at\": \"\", \
+                     \"finished_at\": \"\", \"status\": \"{status}\", \
+                     \"source\": {{\"engine\": \"postgres\"{high}}}, \
+                     \"destination\": {{\"kind\": \"local\", \"uri\": \"x\"}}, \"format\": \"parquet\", \
+                     \"compression\": \"zstd\", \"schema_fingerprint\": \"\", \"row_count\": 0, \
+                     \"part_count\": 0, \"parts\": []}}"
+                ),
+            )
+            .unwrap();
+        };
+        write("success", "orders", Some("40"));
+        assert_eq!(
+            last_success_cursor_high(&dest, "orders").as_deref(),
+            Some("40")
+        );
+        write("failed", "orders", Some("40"));
+        assert_eq!(
+            last_success_cursor_high(&dest, "orders"),
+            None,
+            "not a success"
+        );
+        write("success", "other", Some("40"));
+        assert_eq!(
+            last_success_cursor_high(&dest, "orders"),
+            None,
+            "another export's"
+        );
+        write("success", "orders", None);
+        assert_eq!(
+            last_success_cursor_high(&dest, "orders"),
+            None,
+            "no cursor recorded"
+        );
     }
 }
