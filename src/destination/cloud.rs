@@ -877,7 +877,10 @@ mod tests {
                     if list_statuses.len() > 1 {
                         list_statuses.pop_front();
                     }
-                    (status, "{}")
+                    (
+                        status,
+                        r#"{"items":[{"name":"p/part.parquet","size":"5","md5Hash":"bWQ1","etag":"e","updated":"2026-10-16T00:00:00.000Z","contentType":"application/octet-stream"}],"prefixes":["p/dir/"]}"#,
+                    )
                 } else {
                     (stat_status, "{}")
                 };
@@ -988,6 +991,37 @@ mod tests {
             dest.remove("part.parquet").is_ok(),
             "a delete the store answers 404 is complete by opendal's contract: nothing to classify"
         );
+    }
+
+    /// A listing walks the prefix recursively (no delimiter), under the configured prefix as it is, and hands back files only, keys relative to that prefix.
+    #[test]
+    fn a_listing_is_recursive_under_the_prefix_and_hands_back_relative_file_keys() {
+        use crate::destination::Destination;
+        let (endpoint, listings) = stub_store(404, 200);
+        let dest = stub_destination(&endpoint);
+        let listed = dest.list_prefix("").unwrap();
+        let asked = listings.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(
+            asked[0].contains("prefix=p%2F&") || asked[0].ends_with("prefix=p%2F"),
+            "the configured prefix as it is, one slash: {asked:?}"
+        );
+        assert!(!asked[0].contains("delimiter"), "recursive: {asked:?}");
+        assert_eq!(
+            listed.len(),
+            1,
+            "the directory entry is not an object: {listed:?}"
+        );
+        assert_eq!(listed[0].key, "part.parquet");
+        assert_eq!(listed[0].size_bytes, 5);
+        assert_eq!(listed[0].content_md5.as_deref(), Some("bWQ1"));
+        let under = dest.list_prefix("dir").unwrap();
+        let asked = listings.lock().unwrap().clone();
+        assert!(
+            asked[1].contains("prefix=p%2Fdir%2F"),
+            "a sub-prefix gets its slash: {asked:?}"
+        );
+        assert_eq!(under.len(), 1);
     }
 
     /// `head` answers "absent" only for a key: a bucket that does not exist is an error with its own code.
