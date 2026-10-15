@@ -1171,7 +1171,7 @@ fn mongo_resume_force() {
     );
 }
 
-/// The earlier night's finding: range chunking takes an Oracle `NUMBER(19)` primary key (scale 0) as an integer key.
+/// The earlier night's finding: range chunking takes an Oracle `NUMBER(19)` primary key (scale 0) as an integer key, and refuses a value past i64.
 #[cfg(feature = "oracle")]
 fn oracle_range_chunking_takes_a_number_19_key() {
     let (table, _guard) = id_v_table(SqlEngine::Oracle, "oc_n19", ROWS);
@@ -1181,6 +1181,15 @@ fn oracle_range_chunking_takes_a_number_19_key() {
         "range chunking refused an Oracle NUMBER(19) integer key (exit {:?})\n{}",
         out.status.code(),
         text(&out)
+    );
+    SqlEngine::Oracle.exec(&format!(
+        "INSERT INTO {table} (\"id\", \"v\") VALUES (9999999999999999999, 0)"
+    ));
+    let past = range_checkpoint_rig(SqlEngine::Oracle, &table).run();
+    assert!(
+        !past.status.success() && text(&past).contains("within the 64-bit range"),
+        "a NUMBER(19) key past the 64-bit range is refused, not sliced\n{}",
+        text(&past)
     );
 }
 
@@ -2360,8 +2369,8 @@ fn a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle() {
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (range chunking refuses NUMBER(19)), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_range_chunking_takes_a_number_19_key_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle() {
     oracle_range_chunking_takes_a_number_19_key();
 }
 

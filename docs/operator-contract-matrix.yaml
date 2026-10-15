@@ -353,12 +353,12 @@ scenarios:
     oracle:   { na: "the standby twin is PostgreSQL's (logical decoding on a hot standby); a MySQL replica is an ordinary binlog source, covered by live_cdc_replica" }
 
   - id: range_chunking_number_19
-    what: "2026-10-06 finding: range chunking takes an Oracle NUMBER(19) integer primary key"
+    what: "2026-10-06 finding: range chunking takes an Oracle NUMBER(19) integer primary key, and refuses a key value past the 64-bit range instead of slicing it"
     postgres: { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
     mysql:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
     mssql:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
     mongo:    { na: "NUMBER(19) is Oracle's; BIGINT keys range-chunk on the other engines (every range cell of this matrix)" }
-    oracle:   { test: open_defect_range_chunking_takes_a_number_19_key_oracle }
+    oracle:   { test: range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle }
 
   - id: decimal_chunk_column_verdict_follows_the_estimate
     what: "2026-10-09 finding: a `mode: chunked` config with a DECIMAL `chunk_column` is refused over 10 rows (chunk_size 4) and over 3: the shape is validated before the small-table escape"

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Range chunking refused an Oracle `NUMBER(19)` key.** A `NUMBER(19)` primary key (the type a
+  64-bit integer key usually has on Oracle) was read as not integer-family, so `mode: chunked` over it
+  exited 1, and `rivet init` and the preflight did not offer it as a range key (0.31.0 and earlier).
+  **Now** `NUMBER(p, 0)` up to precision 19 is an integer key everywhere; a value past the 64-bit
+  range is refused when the bounds are read, with a message that says so. **What to do:** nothing.
+
 - **Two `rivet run`s of one `mode: cdc` export at once both delivered the stream.** A batch run
   holds the export's run lease and a second run beside it is refused; a CDC run took no lease, so
   the second read the same changes again (MySQL, SQL Server, Oracle and MongoDB delivered duplicate

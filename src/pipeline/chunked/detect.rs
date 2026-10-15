@@ -332,10 +332,11 @@ pub(crate) fn detect_and_generate_chunks(
         match raw {
             Some(text) => strict_i64(&text).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "export '{}': {}({}) = {:?} is not a whole integer — range chunking slices \
-                     with an integer BETWEEN, so a fractional key silently drops rows between \
-                     windows. Use `chunk_by_key:` (keyset — any orderable unique indexed key) \
-                     or an integer column.",
+                    "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
+                     range chunking slices with an integer BETWEEN, so a fractional key silently \
+                     drops rows between windows and a wider one cannot be sliced. Use \
+                     `chunk_by_key:` (keyset — any orderable unique indexed key) or an integer \
+                     column.",
                     export_name,
                     which,
                     chunk_column,

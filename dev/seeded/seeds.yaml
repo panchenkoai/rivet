@@ -1824,6 +1824,22 @@ seeds:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
       oracle:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
+  - name: oracle-number19-not-integer
+    class: "an integer-family test drawn one step narrower than the type the engine uses for a 64-bit key, so the common key type is refused for range chunking"
+    history: "2026-10-06 - open defect (range chunking refused an Oracle NUMBER(19) primary key as not integer-family) through 0.31.0; fixed by one shared bound ORACLE_RANGE_INT_MAX_PRECISION = 19 for introspection, preflight and init"
+    scope: source
+    patch: oracle-number19-not-integer/shared.patch
+    engines:
+      postgres:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mysql:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mssql:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mongo:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      oracle:
+        cells: [range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle]
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"

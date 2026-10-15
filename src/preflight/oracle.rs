@@ -231,7 +231,7 @@ fn unknown_key_column_detail(col: &str, catalog: Option<&(String, bool)>) -> Str
     }
 }
 
-/// The single integer `NUMBER(p<=18,0)` primary-key column of `table`, if any.
+/// The single integer `NUMBER(p<=19,0)` primary-key column of `table`, if any.
 fn single_int_pk_oracle(conn: &mut OracleSource, qualified: &str) -> Option<String> {
     let (owner, table) = crate::sql::oracle_catalog_preds(qualified);
     conn.query_scalar(&format!(
@@ -240,8 +240,8 @@ fn single_int_pk_oracle(conn: &mut OracleSource, qualified: &str) -> Option<Stri
          JOIN all_tab_columns tc ON tc.owner = cc.owner AND tc.table_name = cc.table_name \
            AND tc.column_name = cc.column_name \
          WHERE c.constraint_type = 'P' AND c.owner = {owner} AND c.table_name = {table} \
-         HAVING COUNT(*) = 1 AND MIN(CASE WHEN tc.data_type = 'NUMBER' AND tc.data_scale = 0 \
-           AND tc.data_precision <= 18 THEN 1 ELSE 0 END) = 1"
+         HAVING COUNT(*) = 1 AND MIN(CASE WHEN {int_pred} THEN 1 ELSE 0 END) = 1",
+        int_pred = crate::sql::oracle_range_int_pred()
     ))
     .ok()
     .flatten()

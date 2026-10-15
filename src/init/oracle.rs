@@ -238,12 +238,14 @@ fn column_info(f: &[Option<String>]) -> Option<ColumnInfo> {
 }
 
 /// An Oracle catalog type in the vocabulary init's classifiers read: an integer
-/// NUMBER(p<=18,0) is `bigint` (range-chunkable), a bare, INTEGER (precision NULL, scale 0) or wider integer NUMBER is
+/// NUMBER(p<=19,0) is `bigint` (range-chunkable), a bare, INTEGER (precision NULL, scale 0) or wider integer NUMBER is
 /// `number` (keysettable, never range-chunked), a scaled NUMBER is `numeric`, and DATE — which carries
 /// the time to the second — is `datetime`, not the day-coarse `date`.
 fn catalog_type(data_type: &str, precision: Option<u32>, scale: Option<i32>) -> String {
     match (data_type, precision, scale) {
-        ("NUMBER", Some(p), Some(0)) if p <= 18 => "bigint".into(),
+        ("NUMBER", Some(p), Some(0)) if p <= crate::sql::ORACLE_RANGE_INT_MAX_PRECISION => {
+            "bigint".into()
+        }
         ("NUMBER", None, None) | ("NUMBER", _, Some(0)) => "number".into(),
         ("NUMBER", _, _) => "numeric".into(),
         ("DATE", _, _) => "datetime".into(),
@@ -302,7 +304,8 @@ mod tests {
     #[test]
     fn oracle_types_map_onto_the_classifier_vocabulary() {
         assert_eq!(catalog_type("NUMBER", Some(10), Some(0)), "bigint");
-        assert_eq!(catalog_type("NUMBER", Some(19), Some(0)), "number");
+        assert_eq!(catalog_type("NUMBER", Some(19), Some(0)), "bigint");
+        assert_eq!(catalog_type("NUMBER", Some(20), Some(0)), "number");
         assert_eq!(catalog_type("NUMBER", None, None), "number");
         assert_eq!(catalog_type("NUMBER", None, Some(0)), "number", "INTEGER");
         assert_eq!(catalog_type("NUMBER", Some(12), Some(2)), "numeric");
