@@ -183,6 +183,15 @@ pub const REBASELINE_REMEDY: &str = "Re-baseline the stream in one run: delete t
      re-reads every table after, so nothing falls between the two. A separate `mode: full` \
      export does not re-baseline the stream.";
 
+/// Edit the JSON checkpoint at `ckpt` in place (a stream's identity or position, as a cell sabotages it).
+pub fn rewrite_checkpoint(ckpt: &std::path::Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ckpt).expect("a checkpoint to edit"))
+            .expect("a JSON checkpoint");
+    edit(&mut v);
+    std::fs::write(ckpt, v.to_string()).expect("write the edited checkpoint");
+}
+
 /// Follow [`REBASELINE_REMEDY`] on a rig with a local destination, step by step as printed, then run once.
 pub fn follow_rebaseline_remedy(rig: &mut Rig, has_baseline: bool) {
     apply_rebaseline_remedy(rig, has_baseline);

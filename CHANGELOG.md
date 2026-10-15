@@ -7,6 +7,13 @@
   `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
   carries the code. **What to do:** nothing.
 
+- **Two `rivet run`s of one `mode: cdc` export at once both delivered the stream.** A batch run
+  holds the export's run lease and a second run beside it is refused; a CDC run took no lease, so
+  the second read the same changes again (MySQL, SQL Server, Oracle and MongoDB delivered duplicate
+  change rows; on PostgreSQL the first run died on the busy slot with an uncoded error) (0.31.0 and
+  earlier). **Now** a CDC run holds the run lease for its whole stream and a second one is refused
+  with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5) before it opens the source. **What to do:** nothing.
+
 - **`rivet apply --pool` wrote its own lines into a `destination: stdout` export.** The predicted
   and actual makespan lines (and the wave headers of a multi-wave run) went to stdout, mixed into the
   exported CSV or JSON bytes (0.31.0 and earlier). **Now** they go to stderr, like every other run
