@@ -947,13 +947,12 @@ fn one_export_name_on_two_sources() {
     let on_state = [("RIVET_STATE_URL", state.as_str())];
     let opened = |_: &Rig| {
         let mut db = postgres::Client::connect(&state, postgres::NoTls).expect("the state server");
+        // Before the first run creates `run_status` the query fails: not open yet.
         db.query_one(
             "SELECT count(*) FROM run_status WHERE export_name = $1 AND status = 'running'",
             &[&name],
         )
-        .expect("read run_status")
-        .get::<_, i64>(0)
-            > 0
+        .is_ok_and(|row| row.get::<_, i64>(0) > 0)
     };
     let (live, (beside, refused)) = first
         .beside_a_live_run(
