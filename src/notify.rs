@@ -370,46 +370,58 @@ mod tests {
 
     // ─── Mock HTTP receiver ─────────────────────────────────────────────────
 
-    /// A minimal TCP-based HTTP/1.1 "server" that accepts one connection,
-    /// reads the request, and replies with a configurable status line.
-    ///
-    /// Returns `(url, join_handle)` where:
-    ///   * `url` is a `http://127.0.0.1:<port>` that can be placed into
-    ///     `SlackConfig::webhook_url`;
-    ///   * `join_handle` lets the test wait for the response to be sent
-    ///     (and collect the captured request body for assertions).
-    fn mock_webhook(status_line: &'static str) -> (String, std::thread::JoinHandle<String>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{}/hook", addr);
+    /// How long a test waits for the one request its mock webhook expects.
+    const WEBHOOK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-        let handle = std::thread::spawn(move || {
+    /// A one-request HTTP/1.1 receiver replying `status_line`: `(url, request)`, where
+    /// `request` yields the raw request it read. It stops waiting after [`WEBHOOK_WAIT`],
+    /// so a POST that never comes fails the test instead of hanging it.
+    fn mock_webhook(status_line: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
             use std::io::{Read, Write};
-            let (mut stream, _) = listener.accept().expect("mock webhook: accept");
-            // Read up to 64 KiB of the request — enough for any realistic
-            // notification payload.
+            let deadline = std::time::Instant::now() + WEBHOOK_WAIT;
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("mock webhook: accept: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(WEBHOOK_WAIT)).unwrap();
             let mut buf = [0u8; 64 * 1024];
             let n = stream.read(&mut buf).unwrap_or(0);
-            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-
             let body = "ok";
             let response = format!(
-                "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                status_line,
+                "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
-                body,
             );
             let _ = stream.write_all(response.as_bytes());
             let _ = stream.flush();
-            request
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
         });
+        (url, rx)
+    }
 
-        (url, handle)
+    /// The request the mock webhook read, or a failure naming the POST that never came.
+    fn posted(request: &std::sync::mpsc::Receiver<String>) -> String {
+        request
+            .recv_timeout(WEBHOOK_WAIT + std::time::Duration::from_secs(1))
+            .unwrap_or_else(|_| panic!("no request reached the mock webhook in {WEBHOOK_WAIT:?}"))
     }
 
     #[test]
     fn maybe_send_posts_to_webhook_when_failure_trigger_fires() {
-        let (url, handle) = mock_webhook("200 OK");
+        let (url, request) = mock_webhook("200 OK");
         let cfg = NotificationsConfig {
             slack: Some(SlackConfig {
                 webhook_url: Some(url),
@@ -419,7 +431,7 @@ mod tests {
         };
         maybe_send(Some(&cfg), &stub_summary("failed", None));
 
-        let request = handle.join().expect("mock receiver panicked");
+        let request = posted(&request);
         assert!(
             request.starts_with("POST /hook"),
             "maybe_send must issue a POST to the webhook path; got request:\n{request}"
@@ -436,7 +448,7 @@ mod tests {
 
     #[test]
     fn maybe_send_swallows_5xx_response_without_panic() {
-        let (url, handle) = mock_webhook("500 Internal Server Error");
+        let (url, request) = mock_webhook("500 Internal Server Error");
         let cfg = NotificationsConfig {
             slack: Some(SlackConfig {
                 webhook_url: Some(url),
@@ -446,12 +458,12 @@ mod tests {
         };
         // Must not panic; the 5xx is logged and the pipeline continues.
         maybe_send(Some(&cfg), &stub_summary("failed", None));
-        let _ = handle.join();
+        assert!(posted(&request).starts_with("POST /hook"));
     }
 
     #[test]
     fn maybe_send_swallows_429_response_without_panic() {
-        let (url, handle) = mock_webhook("429 Too Many Requests");
+        let (url, request) = mock_webhook("429 Too Many Requests");
         let cfg = NotificationsConfig {
             slack: Some(SlackConfig {
                 webhook_url: Some(url),
@@ -460,7 +472,7 @@ mod tests {
             }),
         };
         maybe_send(Some(&cfg), &stub_summary("failed", None));
-        let _ = handle.join();
+        assert!(posted(&request).starts_with("POST /hook"));
     }
 
     #[test]

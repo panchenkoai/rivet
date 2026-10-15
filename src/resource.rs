@@ -247,38 +247,47 @@ mod tests {
         sem.release();
     }
 
+    /// How long a test waits for a parked acquirer to be woken.
+    const WAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// A worker parked in `acquire()`: it signals once admitted, then returns its permit.
+    fn park_acquirer(sem: &std::sync::Arc<Semaphore>) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sem = std::sync::Arc::clone(sem);
+        std::thread::spawn(move || {
+            sem.acquire();
+            let _ = tx.send(());
+            sem.release();
+        });
+        rx
+    }
+
+    /// Waits for the parked acquirer, so a lost wake-up fails the test instead of hanging it.
+    fn admitted(woke: &std::sync::mpsc::Receiver<()>, why: &str) {
+        woke.recv_timeout(WAKE_WAIT)
+            .unwrap_or_else(|_| panic!("{why}: not woken in {WAKE_WAIT:?}"));
+    }
+
     #[test]
     fn semaphore_blocks_fourth_until_release() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         let sem = Arc::new(Semaphore::new(2));
         sem.acquire();
         sem.acquire();
 
-        let entered = Arc::new(AtomicBool::new(false));
-        let entered_w = Arc::clone(&entered);
-        let sem_w = Arc::clone(&sem);
-        let handle = std::thread::spawn(move || {
-            sem_w.acquire();
-            entered_w.store(true, Ordering::Release);
-            sem_w.release();
-        });
+        let woke = park_acquirer(&sem);
 
         // Worker is parked in `acquire()` — give it a moment and confirm.
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            !entered.load(Ordering::Acquire),
+            woke.try_recv().is_err(),
             "worker must be blocked while 2/2 permits are taken"
         );
 
         // Releasing one permit must wake the worker.
         sem.release();
-        handle.join().expect("worker thread");
-        assert!(
-            entered.load(Ordering::Acquire),
-            "worker should have entered after release"
-        );
+        admitted(&woke, "worker should have entered after release");
         sem.release();
     }
 
@@ -295,41 +304,28 @@ mod tests {
     #[test]
     fn semaphore_resize_up_wakes_parked_acquirer() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         // 1/1 permits taken → a second acquirer parks.
         let sem = Arc::new(Semaphore::new(1));
         sem.acquire();
 
-        let entered = Arc::new(AtomicBool::new(false));
-        let entered_w = Arc::clone(&entered);
-        let sem_w = Arc::clone(&sem);
-        let handle = std::thread::spawn(move || {
-            sem_w.acquire();
-            entered_w.store(true, Ordering::Release);
-            sem_w.release();
-        });
+        let woke = park_acquirer(&sem);
 
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            !entered.load(Ordering::Acquire),
+            woke.try_recv().is_err(),
             "worker must be parked while 1/1 permits are taken"
         );
 
         // Raising the ceiling (not a release) must wake the parked worker.
         sem.resize(2);
-        handle.join().expect("worker thread");
-        assert!(
-            entered.load(Ordering::Acquire),
-            "raising the ceiling should admit the parked worker"
-        );
+        admitted(&woke, "raising the ceiling should admit the parked worker");
         sem.release();
     }
 
     #[test]
     fn semaphore_resize_down_blocks_new_acquire_until_count_drops() {
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
 
         // 2/2 taken, then shrink ceiling to 1.
         let sem = Arc::new(Semaphore::new(2));
@@ -341,18 +337,11 @@ mod tests {
         // fresh acquirer must block.
         sem.release();
 
-        let entered = Arc::new(AtomicBool::new(false));
-        let entered_w = Arc::clone(&entered);
-        let sem_w = Arc::clone(&sem);
-        let handle = std::thread::spawn(move || {
-            sem_w.acquire();
-            entered_w.store(true, Ordering::Release);
-            sem_w.release();
-        });
+        let woke = park_acquirer(&sem);
 
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            !entered.load(Ordering::Acquire),
+            woke.try_recv().is_err(),
             "count(1) >= new max(1): acquirer must block after shrink"
         );
 
@@ -360,10 +349,9 @@ mod tests {
         // worker then takes and returns that permit itself, so accounting stays
         // balanced (3 acquires / 3 releases) — no trailing release here.
         sem.release();
-        handle.join().expect("worker thread");
-        assert!(
-            entered.load(Ordering::Acquire),
-            "acquirer should proceed once count falls below the new ceiling"
+        admitted(
+            &woke,
+            "acquirer should proceed once count falls below the new ceiling",
         );
     }
 }
