@@ -1,11 +1,11 @@
 --- a/src/sql.rs
 +++ b/src/sql.rs
-@@ -299,7 +299,7 @@
- }
+@@ -300,7 +300,7 @@
  
  /// The widest Oracle `NUMBER(p, 0)` range chunking slices as an integer; a value past i64 is refused when the bounds are read.
+ #[cfg(feature = "oracle")]
 -pub(crate) const ORACLE_RANGE_INT_MAX_PRECISION: u32 = 19;
 +pub(crate) const ORACLE_RANGE_INT_MAX_PRECISION: u32 = 18;
  
  /// The `all_tab_columns tc` predicate for an Oracle column range chunking slices as an integer.
- pub(crate) fn oracle_range_int_pred() -> String {
+ #[cfg(feature = "oracle")]
