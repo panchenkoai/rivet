@@ -2481,3 +2481,19 @@ seeds:
         na: "a MongoDB change row is two text cells, and the MySQL cell fix does not run"
       oracle:
         na: "Oracle has no TIME type, and the MySQL cell fix does not run"
+  - name: empty-table-under-chunk-by-days
+    class: "a planner probe reads an empty result (no row, so min and max are NULL) as an unreadable bound, so an empty table under `chunk_by_days` stops the run instead of exporting zero rows"
+    history: "2026-10-15 - found while coding the src/pipeline error sites: the date planner stopped on `min(...) returned NULL — table may be empty` since date-native chunking (0.2.0-beta.3) through 0.31.0 (by source), exit 5 `RIVET_SOURCE_PROBE_UNREADABLE` once coded, while the same empty table range-chunked on its id exported zero rows with exit 0; fixed by `read_key_span`, the one span reader both chunk planners call"
+    scope: source
+    patch: empty-table-under-chunk-by-days/shared.patch
+    engines:
+      postgres:
+        cells: [stand_empty_table_under_chunk_by_days_postgres]
+      mysql:
+        cells: [stand_empty_table_under_chunk_by_days_mysql]
+      mssql:
+        cells: [stand_empty_table_under_chunk_by_days_mssql]
+      mongo:
+        na: "a Mongo export has no `mode: chunked`"
+      oracle:
+        cells: [stand_empty_table_under_chunk_by_days_oracle]

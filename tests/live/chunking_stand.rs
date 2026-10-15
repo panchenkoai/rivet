@@ -990,11 +990,26 @@ fn run_chunk_count(eng: Eng, n: usize) {
     rig.assert_complete("id", ROWS, "chunk_count over a dense key");
 }
 
+/// Create the empty `(id BIGINT PK, d DATE NOT NULL)` table the `chunk_by_days` cells key on.
+fn create_dated(eng: Eng) -> (String, StandCleanup) {
+    let table = eng.table_name("stand_dated");
+    let guard = StandCleanup(eng, table.clone());
+    let ddl = format!("CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)");
+    match eng {
+        Eng::Pg => pg_connect().batch_execute(&ddl).unwrap(),
+        Eng::My => mysql_connect().query_drop(ddl).unwrap(),
+        Eng::Ms => mssql_exec(&ddl),
+        Eng::Or => ora(&format!(
+            "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, d DATE NOT NULL)"
+        )),
+    }
+    (table, guard)
+}
+
 /// Seed a table keyed by a DATE column `d` spanning `days` distinct days
 /// (id BIGINT PK, d DATE NOT NULL), for `chunk_by_days` date-window chunking.
 fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCleanup) {
-    let table = eng.table_name("stand_dated");
-    let guard = StandCleanup(eng, table.clone());
+    let (table, guard) = create_dated(eng);
     // Row `i`'s date, per engine. `recent` → the last `days` days from today
     // (time_window anchors on today, so 2023 dates fall outside its window); else a
     // fixed 2023 span (chunk_by_days only cares about the span width).
@@ -1012,8 +1027,7 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
         Eng::Pg => {
             let mut c = pg_connect();
             c.batch_execute(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL);
-                 INSERT INTO {table} (id, d) SELECT g, {} FROM generate_series(1, {rows}) g;
+                "INSERT INTO {table} (id, d) SELECT g, {} FROM generate_series(1, {rows}) g;
                  ANALYZE {table};",
                 d("g")
             ))
@@ -1021,10 +1035,6 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
         }
         Eng::My => {
             let mut c = mysql_connect();
-            c.query_drop(format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)"
-            ))
-            .unwrap();
             c.query_drop(format!(
                 "SET SESSION cte_max_recursion_depth = {}",
                 rows + 10
@@ -1040,9 +1050,6 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
         }
         Eng::Ms => {
             mssql_exec(&format!(
-                "CREATE TABLE {table} (id BIGINT PRIMARY KEY, d DATE NOT NULL)"
-            ));
-            mssql_exec(&format!(
                 "INSERT INTO {table} (id, d) \
                  SELECT value, {} FROM GENERATE_SERIES(CAST(1 AS BIGINT), CAST({rows} AS BIGINT))",
                 d("value")
@@ -1050,9 +1057,6 @@ fn seed_dated(eng: Eng, rows: i64, days: i64, recent: bool) -> (String, StandCle
             mssql_exec(&format!("UPDATE STATISTICS {table}"));
         }
         Eng::Or => {
-            ora(&format!(
-                "CREATE TABLE {table} (id NUMBER(18) PRIMARY KEY, d DATE NOT NULL)"
-            ));
             ora(&format!(
                 "INSERT INTO {table} (id, d) SELECT LEVEL, {} FROM dual CONNECT BY LEVEL <= {rows}",
                 d("LEVEL")
@@ -1101,6 +1105,144 @@ fn run_chunk_by_days(eng: Eng) {
     // Distinct-on-`id` separates the two: a dropped boundary day shows up in the
     // row total, a double-covered one only in the distinct count.
     rig.assert_complete("id", ROWS, "chunk_by_days over a 35-day span");
+}
+
+/// The rows of `table`, counted by the source itself.
+fn source_rows(eng: Eng, table: &str) -> i64 {
+    let from = eng.qualified(table);
+    match eng {
+        Eng::Pg => pg_connect()
+            .query_one(&format!("SELECT COUNT(*) FROM {from}"), &[])
+            .unwrap()
+            .get(0),
+        Eng::My => mysql_connect()
+            .query_first(format!("SELECT COUNT(*) FROM {from}"))
+            .unwrap()
+            .unwrap(),
+        Eng::Ms => mssql_query_strings(&format!(
+            "SELECT CONVERT(varchar(32), COUNT(*)) FROM {from}"
+        ))[0]
+            .parse()
+            .unwrap(),
+        #[cfg(feature = "oracle")]
+        Eng::Or => ora_text_rows(&format!("SELECT TO_CHAR(COUNT(*)) FROM {from}"))[0][0]
+            .as_deref()
+            .unwrap()
+            .parse()
+            .unwrap(),
+        #[cfg(not(feature = "oracle"))]
+        Eng::Or => unreachable!("Eng::Or cells are compiled only with the `oracle` feature"),
+    }
+}
+
+/// What a chunked run over an empty table left behind, digits masked where a run id or a time goes.
+#[derive(Debug, PartialEq)]
+struct EmptyRun {
+    exit: Option<i32>,
+    files: Vec<String>,
+    manifest_rows: i64,
+    journal: Vec<String>,
+    recorded: String,
+}
+
+/// Run `lines` over the empty `table` (the rig oracle grades source against destination) and read what the run left: exit, destination files, manifest rows, the metrics journal and `state files`.
+fn empty_run_delivery(eng: Eng, table: &str, lines: &[&str]) -> EmptyRun {
+    let rig = lines
+        .iter()
+        .fold(eng.rig(table).mode("chunked"), |r, l| r.export_line(l));
+    let out = rig.run_args_env(&[], &[("RUST_LOG", "warn")]);
+    assert!(
+        out.status.success(),
+        "an empty table chunked by {lines:?} exports zero rows with exit 0; got {:?}, stderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut files: Vec<String> = files_under(&rig.out_dir())
+        .iter()
+        .map(|p| {
+            p.strip_prefix(rig.out_dir())
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                .collect()
+        })
+        .collect();
+    files.sort();
+    let metrics =
+        String::from_utf8_lossy(&rig.cli(&["metrics", "--last", "1"]).stdout).into_owned();
+    let journal: Vec<String> = metrics
+        .lines()
+        .filter(|l| l.starts_with(rig.export_name()))
+        .map(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            format!("status={} rows={} files={}", cols[1], cols[2], cols[5])
+        })
+        .collect();
+    let recorded = String::from_utf8_lossy(&rig.cli(&["state", "files"]).stdout)
+        .trim()
+        .to_string();
+    EmptyRun {
+        exit: out.status.code(),
+        files,
+        manifest_rows: manifest_rows(&rig.out_dir()),
+        journal,
+        recorded,
+    }
+}
+
+/// An empty table under `chunk_by_days` exports zero rows with exit 0 and delivers what an empty integer-range run delivers.
+fn run_empty_table_under_chunk_by_days(eng: Eng) {
+    eng.require();
+    let (table, _guard) = create_dated(eng);
+    assert_eq!(source_rows(eng, &table), 0, "fixture: the table is empty");
+    let by_range = empty_run_delivery(
+        eng,
+        &table,
+        &[
+            &format!("chunk_column: {}", eng.col("id")),
+            "chunk_size: 100",
+        ],
+    );
+    let by_days = empty_run_delivery(
+        eng,
+        &table,
+        &[
+            &format!("chunk_column: {}", eng.col("d")),
+            "chunk_by_days: 7",
+        ],
+    );
+    assert_eq!(
+        (
+            by_range.manifest_rows,
+            by_range.files.contains(&"_SUCCESS".to_string()),
+            by_range.journal.clone()
+        ),
+        (0, true, vec!["status=success rows=0 files=0".to_string()]),
+        "the empty range-chunked run this cell compares with marks a whole, empty dataset: {by_range:?}"
+    );
+    assert_eq!(
+        by_days, by_range,
+        "an empty table under chunk_by_days delivers what the same empty table range-chunked on its id delivers"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres"]
+fn stand_empty_table_under_chunk_by_days_postgres() {
+    run_empty_table_under_chunk_by_days(Eng::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql"]
+fn stand_empty_table_under_chunk_by_days_mysql() {
+    run_empty_table_under_chunk_by_days(Eng::My);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mssql"]
+fn stand_empty_table_under_chunk_by_days_mssql() {
+    run_empty_table_under_chunk_by_days(Eng::Ms);
 }
 
 /// `mode: time_window` — a bounded date scan (`time_column` + `days_window`)
@@ -3050,6 +3192,12 @@ mod oracle_cells {
     #[ignore = "live: requires docker compose up -d oracle"]
     fn stand_chunk_by_days_oracle() {
         run_chunk_by_days(Eng::Or);
+    }
+
+    #[test]
+    #[ignore = "live: requires docker compose up -d oracle"]
+    fn stand_empty_table_under_chunk_by_days_oracle() {
+        run_empty_table_under_chunk_by_days(Eng::Or);
     }
 
     #[test]
