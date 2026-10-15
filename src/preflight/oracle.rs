@@ -65,8 +65,11 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
         }
     }
 
-    let auto_pk: Option<String> =
-        auto_pk_probe_target(export, base_table).and_then(|t| single_int_pk_oracle(conn, t));
+    let auto_pk: Option<String> = auto_pk_probe_target(export, base_table).and_then(|t| {
+        crate::source::Source::introspect_for_chunking(conn, t)
+            .ok()
+            .and_then(|i| i.single_int_pk)
+    });
     let range_col = preflight_range_col_resolved(export, auto_pk.as_deref());
 
     let row_estimate = unfiltered_table.and_then(|t| {
@@ -229,22 +232,6 @@ fn unknown_key_column_detail(col: &str, catalog: Option<&(String, bool)>) -> Str
         ),
         _ => format!("column '{col}' is not in the export's result"),
     }
-}
-
-/// The single integer `NUMBER(p<=19,0)` primary-key column of `table`, if any.
-fn single_int_pk_oracle(conn: &mut OracleSource, qualified: &str) -> Option<String> {
-    let (owner, table) = crate::sql::oracle_catalog_preds(qualified);
-    conn.query_scalar(&format!(
-        "SELECT MIN(cc.column_name) FROM all_constraints c \
-         JOIN all_cons_columns cc ON cc.owner = c.owner AND cc.constraint_name = c.constraint_name \
-         JOIN all_tab_columns tc ON tc.owner = cc.owner AND tc.table_name = cc.table_name \
-           AND tc.column_name = cc.column_name \
-         WHERE c.constraint_type = 'P' AND c.owner = {owner} AND c.table_name = {table} \
-         HAVING COUNT(*) = 1 AND MIN(CASE WHEN {int_pred} THEN 1 ELSE 0 END) = 1",
-        int_pred = crate::sql::oracle_range_int_pred()
-    ))
-    .ok()
-    .flatten()
 }
 
 /// `MIN`/`MAX` of `expr` over the export's rows, as display text.
