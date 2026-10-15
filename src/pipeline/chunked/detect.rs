@@ -45,6 +45,42 @@ fn query_wrapped_row_count(
 /// range path historically did not. We detect the condition on the live data
 /// (one aggregate — a nullable column with zero actual NULLs is fine and must
 /// not be rejected) and bail with the same posture as keyset rather than drop
+/// Whether `t` is a type that holds fractions (a float, a decimal with a scale), so integer `BETWEEN` windows over it skip keys.
+fn holds_fractions(t: &crate::types::RivetType) -> bool {
+    use crate::types::RivetType as T;
+    match t {
+        T::Float32 | T::Float64 => true,
+        T::Decimal { scale, .. } => *scale > 0,
+        _ => false,
+    }
+}
+
+/// Refuse a range-sliced `chunk_column` whose result type holds fractions: integer `BETWEEN` windows skip every fractional key. Any other type is left to the bound read.
+fn bail_if_fractional(
+    src: &mut dyn Source,
+    base_query: &str,
+    chunk_column: &str,
+    export_name: &str,
+) -> Result<()> {
+    let Ok(columns) = src.type_mappings(base_query, &crate::types::ColumnOverrides::new()) else {
+        return Ok(());
+    };
+    let Some(col) = columns
+        .iter()
+        .find(|c| c.column_name.eq_ignore_ascii_case(chunk_column))
+    else {
+        return Ok(());
+    };
+    if holds_fractions(&col.rivet_type) {
+        return Err(crate::plan::build::chunk_column_not_integer(
+            export_name,
+            chunk_column,
+            &format!("(the query returns it as {})", col.source_native_type),
+        ));
+    }
+    Ok(())
+}
+
 /// rows silently.
 fn bail_if_null_keyed(
     src: &mut dyn Source,
@@ -295,6 +331,7 @@ pub(crate) fn detect_and_generate_chunks(
     // NULL-keyed rows are excluded by `WHERE col BETWEEN min AND max` — refuse
     // rather than drop them silently.
     bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
+    bail_if_fractional(src, base_query, chunk_column, export_name)?;
 
     let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
     let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
@@ -342,11 +379,15 @@ pub(crate) fn detect_and_generate_chunks(
                 crate::error::coded(
                     crate::error::codes::CONFIG_CHUNK_COLUMN_NOT_INTEGER,
                     format!(
-                        "export '{}': {}({}) = {:?} is not a whole integer — range chunking slices \
-                     with an integer BETWEEN, so a fractional key silently drops rows between \
-                     windows. Use `chunk_by_key:` (keyset — any orderable unique indexed key) \
-                     or an integer column.",
-                        export_name, which, chunk_column, text
+                                    "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
+                     range chunking slices with an integer BETWEEN, so a fractional key silently \
+                     drops rows between windows and a wider one cannot be sliced. Use \
+                     `chunk_by_key:` (keyset — any orderable unique indexed key) or an integer \
+                     column.",
+                    export_name,
+                    which,
+                    chunk_column,
+                    text
                     ),
                 )
             }),
@@ -539,7 +580,104 @@ mod tests {
             _query: &str,
             _column_overrides: &crate::types::ColumnOverrides,
         ) -> Result<Vec<crate::types::TypeMapping>> {
-            unimplemented!()
+            Ok(Vec::new())
+        }
+    }
+
+    /// A source that describes one column, `k`, as `t`; every other call is unreachable here.
+    struct DescribedSource(crate::types::RivetType);
+
+    impl crate::source::Source for DescribedSource {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            unreachable!()
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![crate::types::TypeMapping {
+                column_name: "K".into(),
+                source_native_type: "double precision".into(),
+                rivet_type: self.0.clone(),
+                arrow_type: None,
+                fidelity: crate::types::TypeFidelity::Exact,
+                nullable: false,
+                warnings: vec![],
+                delivery: crate::types::Delivery::Native,
+            }])
+        }
+    }
+
+    #[test]
+    fn a_fractional_chunk_column_is_refused_by_code_naming_its_type() {
+        use crate::types::RivetType as T;
+        let err = bail_if_fractional(
+            &mut DescribedSource(T::Float64),
+            "SELECT k FROM t",
+            "k",
+            "e",
+        )
+        .expect_err("a float key is refused");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER")
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("chunk_column 'k' (the query returns it as double precision)"),
+            "{err:#}"
+        );
+        assert!(
+            bail_if_fractional(&mut DescribedSource(T::Int64), "SELECT k FROM t", "k", "e").is_ok()
+        );
+        assert!(
+            bail_if_fractional(
+                &mut DescribedSource(T::Float64),
+                "SELECT k FROM t",
+                "other",
+                "e"
+            )
+            .is_ok(),
+            "a column the query does not describe is left to the bound read"
+        );
+    }
+
+    #[test]
+    fn only_a_type_that_holds_fractions_is_refused_for_range_slicing() {
+        use crate::types::RivetType as T;
+        for t in [
+            T::Float32,
+            T::Float64,
+            T::Decimal {
+                precision: 10,
+                scale: 2,
+            },
+        ] {
+            assert!(holds_fractions(&t), "{t:?}");
+        }
+        for t in [
+            T::Int16,
+            T::Int32,
+            T::Int64,
+            T::UInt64,
+            T::Decimal {
+                precision: 19,
+                scale: 0,
+            },
+            T::Decimal {
+                precision: 38,
+                scale: -2,
+            },
+        ] {
+            assert!(!holds_fractions(&t), "{t:?}");
         }
     }
 

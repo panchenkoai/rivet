@@ -821,8 +821,7 @@ fn introspect_oracle_on(
         ))?
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    // Integer NUMBER(p<=18, 0): the columns range chunking can do arithmetic on.
-    let int_pred = "tc.data_type = 'NUMBER' AND tc.data_scale = 0 AND tc.data_precision <= 18";
+    let int_pred = crate::sql::oracle_range_int_pred();
     let int_columns = src.query_list(&format!(
         "SELECT tc.column_name FROM all_tab_columns tc \
          WHERE tc.owner = {owner} AND tc.table_name = {table} AND {int_pred} ORDER BY tc.column_id"

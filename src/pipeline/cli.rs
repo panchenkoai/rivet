@@ -261,7 +261,8 @@ pub fn reset_state(config_path: &str, export_name: &str) -> Result<()> {
         )
     })?;
     let state = StateStore::open(config_path)?;
-    let _held = super::chunked::claim_export_progress(&state, export_name, "reset its state")?;
+    let _held =
+        super::chunked::claim_export_progress(&state, export_name, &source, "reset its state")?;
     state.reset(export_name, &source)?;
     println!("State reset for export '{}'", export_name);
     Ok(())
@@ -294,7 +295,7 @@ pub fn accept_state(
         );
         return Ok(());
     }
-    config.source.try_state_key().map_err(|e| {
+    let source = config.source.try_state_key().map_err(|e| {
         crate::error::recoded(
             &e,
             crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
@@ -309,8 +310,12 @@ pub fn accept_state(
     let config_dir = config_dir.unwrap_or_else(|| std::path::Path::new("."));
     let plan = crate::plan::build_plan(&config, export, config_dir, false, false, false, params)?;
     let state = StateStore::open(config_path)?;
-    let _held =
-        super::chunked::claim_export_progress(&state, export_name, "accept its edited query")?;
+    let _held = super::chunked::claim_export_progress(
+        &state,
+        export_name,
+        &source,
+        "accept its edited query",
+    )?;
     match state.accept(&plan.progress_key())? {
         crate::state::Accepted::NoProgress => println!(
             "Export '{export_name}' holds no stored progress on this source that a run would continue from; nothing to accept."
@@ -512,8 +517,12 @@ pub fn reset_chunk_checkpoint(config_path: &str, export_name: &str) -> Result<()
         );
     }
     let state = StateStore::open(config_path)?;
-    let _held =
-        super::chunked::claim_export_progress(&state, export_name, "remove its chunk checkpoint")?;
+    let _held = super::chunked::claim_export_progress(
+        &state,
+        export_name,
+        &config.source.state_key(),
+        "remove its chunk checkpoint",
+    )?;
     let n = state.reset_chunk_checkpoint(export_name)?;
     // Abandoning the resume also clears the committed/verified boundary, so
     // `rivet state progression` does not report a stale chunk boundary after
@@ -574,11 +583,12 @@ pub fn reset_chunk_checkpoints_stuck(config_path: &str) -> Result<()> {
     );
 
     for name in targets {
-        let Some(_held) = super::chunked::try_run_lease(&state, &name)? else {
+        let source = cfg.source.state_key();
+        let Some(_held) = super::chunked::try_run_lease(&state, &name, &source)? else {
             println!(
                 "Skipping '{}': {} is in progress in a live rivet process, so its checkpoint is not stuck.",
                 name,
-                super::chunked::live_run_label(&state, &name)?
+                super::chunked::live_run_label(&state, &name, &source)?
             );
             continue;
         };
@@ -1581,7 +1591,11 @@ exports:
             "the source did not resolve — nothing was changed",
         );
         write_accept_config(&config_path, url, "spent = 0");
-        let held = crate::pipeline::chunked::try_run_lease(&state, "orders")
+        let source = crate::config::Config::load_with_params(&config_path, Some(&by("id")))
+            .unwrap()
+            .source
+            .state_key();
+        let held = crate::pipeline::chunked::try_run_lease(&state, "orders", &source)
             .unwrap()
             .expect("a live run's lease");
         for _cycle in 1..=2 {
@@ -1768,7 +1782,7 @@ exports:
             ..key.clone()
         };
         run.update_with_column(&elsewhere, "2026-08-01").unwrap();
-        let held = crate::pipeline::chunked::try_run_lease(&run, "transactions")
+        let held = crate::pipeline::chunked::try_run_lease(&run, "transactions", &key.source)
             .unwrap()
             .expect("the live run's lease");
 

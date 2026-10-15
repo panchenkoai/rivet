@@ -181,7 +181,13 @@ pub(super) fn run_cdc_export(
     // `until_current` finishes below. Best-effort.
     let started_at = chrono::Utc::now().to_rfc3339();
     let run_prefix = super::finalize::destination_uri_for_manifest(&export.destination);
-    if let Err(e) = state.begin_run(&run_id, &export.name, &run_prefix, &started_at) {
+    if let Err(e) = state.begin_run_under_lease(
+        &run_id,
+        &export.name,
+        &config.source.state_key(),
+        &run_prefix,
+        &started_at,
+    ) {
         log::warn!("cdc: run-status begin failed for '{}': {e:#}", export.name);
     }
     // NO bucket-side running marker here — deliberately, and the gap is REAL:

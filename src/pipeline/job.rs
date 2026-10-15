@@ -1113,20 +1113,34 @@ fn ledger_begin_run(
     let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
     let started_at = chrono::Utc::now().to_rfc3339();
     state
-        .begin_run_under_lease(run_id, &plan.export_name, &prefix, &started_at)
+        .begin_run_under_lease(
+            run_id,
+            &plan.export_name,
+            &plan.source.state_key(),
+            &prefix,
+            &started_at,
+        )
         .map_err(|e| state_not_writable(&plan.export_name, &e))?;
     super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
     Ok(())
 }
 
 /// The run lease of a `mode: cdc` export, refused by code while a live process holds it.
-fn cdc_run_lease<'s>(state: &'s StateStore, export: &str) -> Result<crate::state::LoadLease<'s>> {
-    match chunked::try_run_lease(state, export) {
+fn cdc_run_lease<'s>(
+    state: &'s StateStore,
+    export: &str,
+    source: &str,
+) -> Result<crate::state::LoadLease<'s>> {
+    match chunked::try_run_lease(state, export, source) {
         Ok(Some(lease)) => Ok(lease),
         Ok(None) => crate::rivet_bail!(
             crate::error::codes::STATE_RUN_IN_PROGRESS,
             "{}",
-            chunked::live_run_refusal(export, state.newest_running_run(export)?.as_deref(), false)
+            chunked::live_run_refusal(
+                export,
+                state.newest_running_run(export, source)?.as_deref(),
+                false
+            )
         ),
         Err(e) => Err(state_not_writable(export, &e)),
     }
@@ -1783,7 +1797,7 @@ fn run_export_job_inner(
         }
         // The export's run lease for the whole stream, as a batch run holds it: a second
         // run beside a live one is refused before it opens the source or writes anything.
-        let _run_lease = match cdc_run_lease(state, &export.name) {
+        let _run_lease = match cdc_run_lease(state, &export.name, &config.source.state_key()) {
             Ok(lease) => lease,
             Err(e) => {
                 let summary = synthetic_failed_summary(&export.name, &e);

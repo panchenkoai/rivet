@@ -214,17 +214,20 @@ def unreleased(text: str) -> str:
 
 
 def changelog_verdict(changed: list[str], base_log: str, head_log: str, body: str | None) -> tuple[str, str]:
-    """(verdict, line): a src/ change needs an Unreleased entry or an explicit "No user-visible change"."""
+    """(verdict, line): a src/ change needs a changelog.d/ fragment (or an Unreleased entry) or an explicit "No user-visible change"."""
     src = [p for p in changed if p.startswith("src/")]
     if not src:
         return "N/A", "no change under src/"
+    fragments = [p for p in changed if p.startswith("changelog.d/") and p.endswith(".md") and p != "changelog.d/README.md"]
+    if fragments:
+        return "PASS", f"{len(src)} src/ file(s) changed; changelog fragment {', '.join(fragments)}"
     if unreleased(base_log) != unreleased(head_log):
         return "PASS", f"{len(src)} src/ file(s) changed; CHANGELOG Unreleased has an entry"
     if body is not None and NO_CHANGE.search(body):
         return "PASS", f"{len(src)} src/ file(s) changed; PR body declares No user-visible change"
     if body is None:
-        return "DECLARE", f"{len(src)} src/ file(s) changed and no CHANGELOG Unreleased entry: add one, or write 'No user-visible change' in the PR body"
-    return "FAIL", f"{len(src)} src/ file(s) changed, no CHANGELOG Unreleased entry and no 'No user-visible change' line in the PR body"
+        return "DECLARE", f"{len(src)} src/ file(s) changed and no changelog entry: add a fragment under changelog.d/ (see its README), or write 'No user-visible change' in the PR body"
+    return "FAIL", f"{len(src)} src/ file(s) changed, no changelog.d/ fragment or CHANGELOG Unreleased entry, and no 'No user-visible change' line in the PR body"
 
 
 # ── the branch checks (CI and local) ────────────────────────────────────────
@@ -471,6 +474,8 @@ def self_test() -> int:
     assert changelog_verdict(["src/a.rs"], log, log, "No user-visible change: a refactor.")[0] == "PASS"
     assert changelog_verdict(["tests/a.rs"], log, log, "")[0] == "N/A"
     assert changelog_verdict(["src/a.rs"], log, log, None)[0] == "DECLARE"
+    assert changelog_verdict(["src/a.rs", "changelog.d/fix-a.md"], log, log, "## Why\n")[0] == "PASS"
+    assert changelog_verdict(["src/a.rs", "changelog.d/README.md"], log, log, "## Why\n")[0] == "FAIL", "the README is not a fragment"
 
     with tempfile.TemporaryDirectory() as t:
         m = Path(t) / "mutants.out"

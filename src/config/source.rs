@@ -625,7 +625,9 @@ fn find_userinfo(raw: &str) -> Option<(usize, usize)> {
 
 /// `engine://host:port/database` of `url`, credentials, query and fragment dropped; a keyword/value string keeps its pairs with the password masked.
 pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
-    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    // A keyword/value password may hold `@`, which would read as the end of a userinfo.
+    let url = &crate::redact::redact_keyword_passwords(url);
+    let rest = url.split_once("://").map_or(url.as_str(), |(_, r)| r);
     let rest = find_userinfo(url).map_or(rest, |(at, _)| &url[at + 1..]);
     let at_host = rest.split(['?', '#']).next().unwrap_or(rest);
     let key = format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase();
@@ -735,6 +737,24 @@ mod tests {
         assert_ne!(
             k,
             source_state_key(SourceType::Postgres, "postgresql://u@db.host:5432/other")
+        );
+    }
+
+    #[test]
+    fn a_keyword_password_holding_an_at_sign_stays_out_of_the_source_key() {
+        use super::{SourceType, source_state_key};
+        let k = source_state_key(
+            SourceType::Mssql,
+            "sqlserver://127.0.0.1:1;databaseName=app;user=sa;password=p@Sekret9;encrypt=true",
+        );
+        assert!(!k.to_lowercase().contains("sekret9"), "{k}");
+        assert_eq!(
+            k,
+            source_state_key(
+                SourceType::Mssql,
+                "sqlserver://127.0.0.1:1;databaseName=app;user=sa;password=other;encrypt=true",
+            ),
+            "the key names the server, not the password"
         );
     }
 

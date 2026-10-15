@@ -255,6 +255,23 @@ fn listing_says_container_absent<B: CloudBackend>(
     first_page_error.is_some_and(|kind| B::ABSENT_CONTAINER.contains(&kind))
 }
 
+/// The opendal kind of one error in a chain: an opendal error itself, or the one an `io::Error` from opendal's std writer wraps.
+fn opendal_kind(e: &(dyn std::error::Error + 'static)) -> Option<opendal::ErrorKind> {
+    e.downcast_ref::<opendal::Error>()
+        .or_else(|| {
+            e.downcast_ref::<std::io::Error>()?
+                .get_ref()?
+                .downcast_ref::<opendal::Error>()
+        })
+        .map(opendal::Error::kind)
+}
+
+/// Whether a failed write may have hit an absent container: some error in its chain has a kind the backend's listing answers an absent container with.
+fn write_error_may_mean_absent_container<B: CloudBackend>(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|c| opendal_kind(c).is_some_and(|k| B::ABSENT_CONTAINER.contains(&k)))
+}
+
 /// What an operator reads when the configured bucket or container does not exist.
 fn container_absent_message(scheme: &str, container: &str) -> String {
     format!(
@@ -377,8 +394,17 @@ impl<B: CloudBackend> CloudDestination<B> {
     }
 }
 
-impl<B: CloudBackend> super::Destination for CloudDestination<B> {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
+impl<B: CloudBackend> CloudDestination<B> {
+    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the write failed with a kind the backend reports an absent container by and the bucket itself is absent; any other error unchanged.
+    fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
+        match write_error_may_mean_absent_container::<B>(&err).then(|| self.require_container()) {
+            Some(Err(absent)) => absent,
+            _ => err,
+        }
+    }
+
+    /// Upload one local part to `remote_key` under the prefix.
+    fn write_part(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
         let size = std::fs::metadata(local_path)?.len();
         // One-shot upload when the part fits this destination's memory budget: one
@@ -422,6 +448,13 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         };
         log::info!("uploaded {}://{} ({size} bytes)", B::SCHEME, key);
         Ok(outcome)
+    }
+}
+
+impl<B: CloudBackend> super::Destination for CloudDestination<B> {
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
+        self.write_part(local_path, remote_key)
+            .map_err(|e| self.absent_container_or(e))
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {
@@ -810,7 +843,7 @@ mod tests {
                 let n = stream.read(&mut head).unwrap_or(0);
                 let request = String::from_utf8_lossy(&head[..n]).into_owned();
                 let target = request.split_whitespace().nth(1).unwrap_or("");
-                let is_listing = target.contains("/o?");
+                let is_listing = target.contains("/o?") && !target.starts_with("/upload/");
                 let (status, body) = if is_listing {
                     seen.lock().unwrap().push(target.to_string());
                     (list_status, "{}")
@@ -840,6 +873,44 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    /// A write the store answers 404 is the missing bucket's coded error when the bucket is absent, and the store's own error otherwise.
+    #[test]
+    fn a_write_into_a_missing_container_is_refused_by_code() {
+        use crate::destination::Destination;
+        let part = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(part.path(), b"bytes").unwrap();
+        let (endpoint, _) = stub_store(404, 404);
+        let err = stub_destination(&endpoint)
+            .write(part.path(), "part.parquet")
+            .expect_err("the bucket is absent");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_DEST_CONTAINER_NOT_FOUND")
+        );
+        assert!(err.to_string().starts_with("gs://exports:"), "{err:#}");
+
+        let (endpoint, listings) = stub_store(404, 200);
+        let err = stub_destination(&endpoint)
+            .write(part.path(), "part.parquet")
+            .expect_err("the store refused the write");
+        assert_eq!(crate::error::error_code(&err), None, "{err:#}");
+        assert_eq!(
+            listings.lock().unwrap().len(),
+            1,
+            "the 404 asked about the bucket"
+        );
+
+        let (endpoint, listings) = stub_store(500, 404);
+        let err = stub_destination(&endpoint)
+            .write(part.path(), "part.parquet")
+            .expect_err("the store failed the write");
+        assert_eq!(crate::error::error_code(&err), None, "{err:#}");
+        assert!(
+            listings.lock().unwrap().is_empty(),
+            "only a 404 asks about the bucket"
+        );
     }
 
     /// `head` answers "absent" only for a key: a bucket that does not exist is an error with its own code.
@@ -908,5 +979,38 @@ mod tests {
         assert!(!absent::<AzureBackend>(Some(ConfigInvalid)));
         assert!(!absent::<S3Backend>(Some(PermissionDenied)));
         assert!(!absent::<S3Backend>(None));
+    }
+
+    /// A write is probed for an absent container when an error in its chain, or the opendal error a std-writer `io::Error` wraps, has one of the backend's absent-container kinds.
+    #[test]
+    fn a_failed_write_is_probed_by_the_backends_absent_container_kinds() {
+        use super::write_error_may_mean_absent_container as probed;
+        use crate::destination::azure::AzureBackend;
+        use crate::destination::s3::S3Backend;
+        use opendal::ErrorKind::{ConfigInvalid, NotFound, PermissionDenied};
+        let op = |k| anyhow::Error::new(opendal::Error::new(k, "write")).context("upload");
+        let wrapped = |k| {
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                opendal::Error::new(k, "write"),
+            ))
+        };
+        assert!(
+            probed::<S3Backend>(&op(ConfigInvalid)),
+            "S3 NoSuchBucket on a one-shot PUT"
+        );
+        assert!(
+            probed::<S3Backend>(&wrapped(ConfigInvalid)),
+            "S3 NoSuchBucket on a streamed part"
+        );
+        assert!(probed::<GcsBackend>(&op(NotFound)));
+        assert!(probed::<AzureBackend>(&wrapped(NotFound)));
+        assert!(!probed::<GcsBackend>(&op(ConfigInvalid)));
+        assert!(!probed::<AzureBackend>(&wrapped(PermissionDenied)));
+        let local = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(
+            !probed::<GcsBackend>(&local),
+            "a missing LOCAL part file is not a store answer"
+        );
     }
 }
