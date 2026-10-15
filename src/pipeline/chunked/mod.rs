@@ -400,9 +400,12 @@ pub(crate) fn live_run_refusal(export: &str, run_id: Option<&str>, resumable: bo
     )
 }
 
-/// The key of an export's run lease on one source: held by every run of the export that reads `source`, taken by every command that rewrites its stored progress or its destination.
+/// The key of an export's run lease on one source: held by every run of the export that reads `source`, taken by every command that rewrites its stored progress or its destination. The source enters as a hash, so a lease file name stays short and names no host.
 fn run_lease_key(export: &str, source: &str) -> String {
-    format!("chunk-run:{export}@{source}")
+    format!(
+        "chunk-run:{export}@{:016x}",
+        xxhash_rust::xxh3::xxh3_64(source.as_bytes())
+    )
 }
 
 /// `export`'s run lease on `source`, or `None` while a live process holds it.

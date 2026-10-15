@@ -1,10 +1,13 @@
 --- a/src/pipeline/chunked/mod.rs
 +++ b/src/pipeline/chunked/mod.rs
-@@ -402,7 +402,8 @@
+@@ -402,10 +402,8 @@
  
- /// The key of an export's run lease on one source: held by every run of the export that reads `source`, taken by every command that rewrites its stored progress or its destination.
+ /// The key of an export's run lease on one source: held by every run of the export that reads `source`, taken by every command that rewrites its stored progress or its destination. The source enters as a hash, so a lease file name stays short and names no host.
  fn run_lease_key(export: &str, source: &str) -> String {
--    format!("chunk-run:{export}@{source}")
+-    format!(
+-        "chunk-run:{export}@{:016x}",
+-        xxhash_rust::xxh3::xxh3_64(source.as_bytes())
+-    )
 +    let _ = source;
 +    format!("chunk-run:{export}")
  }
