@@ -420,11 +420,12 @@ fn empty_at_baseline_cycle(rig: Rig, tables: Vec<String>, bq: BqLive, src: &mut 
             out.status.code(),
             said.contains(&format!("COMPACT OK [{empty}]")),
             said.contains(&format!("COMPACT FAILED [{full}]")),
-            said.contains("the base table does not exist"),
+            said.contains("[RIVET_LOAD_COMPACT_BASE_MISSING]")
+                && said.contains("the base table does not exist"),
         ),
-        (Some(1), true, true, true),
-        "(exit code, the healthy table is reported merged, the other is named as failed, \
-         with its cause):\n{said}"
+        (Some(5), true, true, true),
+        "(exit code of a refusal, the healthy table is reported merged, the other is named as \
+         refused, by code and cause):\n{said}"
     );
     assert_table_is_source(&bq, empty, src, "mixed outcome");
     let last = |t: &str| {
