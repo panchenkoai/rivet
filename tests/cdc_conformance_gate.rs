@@ -1303,6 +1303,10 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // it (the exact risk this gate guards). E.g. the corrupt-checkpoint
                 // roast — the run must fail loudly, not re-anchor and exit 0.
                 || chunk.contains("run_expect_fail(")
+                // `assert_refused` (tests/common/rig/remedy.rs) demands the exit
+                // class AND the `[RIVET_*]` code a refusal prints, so a 0-row
+                // success (exit 0, no code) fails it, as it fails run_expect_fail.
+                || chunk.contains("assert_refused(")
                 // Reads the persisted CDC checkpoint/anchor bytes back — the
                 // client-anchor engines' state-DB oracle. The spelling is the
                 // READ, not the accessor: the bare `checkpoint())` substring
