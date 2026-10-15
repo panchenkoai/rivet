@@ -914,7 +914,9 @@ fn flush(
         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
         // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
         // computed once per column, applied per cell.
-        let fix = value::mysql_cell_fix(engine, &m.source_native_type);
+        // The planned type, as `ensure_schema` declared it (after the three meta columns).
+        let dt = schema.field(arrays.len()).data_type();
+        let fix = value::mysql_cell_fix(engine, &m.source_native_type).filter(|f| f.applies_to(dt));
         // after-image for insert/update; before-image (the key) for delete.
         // Finding #41: a NAMED key-only image (PG DELETE) maps by COLUMN NAME
         // into the resolved schema — positional mapping put a non-first PK's
@@ -924,8 +926,6 @@ fn flush(
         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
         // column's image index once and reuse it by pointer identity.
         let memo = image_name_memo(events, &m.column_name);
-        // The planned type, as `ensure_schema` declared it (after the three meta columns).
-        let dt = schema.field(arrays.len()).data_type();
         let refuse = |r: value::CellRefusal| {
             r.into_error(&m.column_name, dt, overridden.contains(&m.column_name))
         };

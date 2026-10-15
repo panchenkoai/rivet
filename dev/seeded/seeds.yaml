@@ -1872,6 +1872,22 @@ seeds:
         na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
       oracle:
         na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+  - name: mongo-standalone-uncoded
+    class: "a server error that names a missing deployment prerequisite is passed up as the driver's raw dump instead of the coded prerequisite refusal"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6, row 808): `mode: cdc` on a standalone MongoDB exited 1 with `Error code 40573 … RawDocumentBuf { data: … }`, while `doctor` named it plainly, through 0.31.0; fixed by `names_standalone` in diagnose_stream_error"
+    scope: source
+    patch: mongo-standalone-uncoded/shared.patch
+    engines:
+      postgres:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mysql:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mssql:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mongo:
+        cells: [a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo]
+      oracle:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"
@@ -2350,3 +2366,19 @@ seeds:
         na: 'a bounded run ends at the open-time bound (idle_poll_stops / past_time_bound in src/source/mongo/cdc.rs) and every later pull stops there too, so a second pass yields nothing; the single-pass defect has no effect'
       oracle:
         na: '`exhausted` is set once (src/source/oracle/cdc.rs:1434) and never cleared, and the first pass mines every window to the frontier, so a second pass yields nothing; the single-pass defect has no effect'
+  - name: mysql-cdc-time-remedy-names-the-batch-cast
+    class: "a refusal on the CDC path prints the batch path's remedy (a cast in the export's query), which a stream has no seam for, and the check runs by the column's native type, so the override remedy the stream does have is blocked"
+    history: "2026-10-15 - found by the first walk of the MySQL TIME-past-a-day cell on a stream: `RIVET_SOURCE_VALUE_UNREPRESENTABLE` named `Cast it in a query, e.g. TIME_TO_SEC(col)` and a `columns: { t: string }` override was still refused, through 0.31.0; fixed by the CDC wording of the TimeOfDay fix and `MysqlCellFix::applies_to`"
+    scope: source
+    patch: mysql-cdc-time-remedy-names-the-batch-cast/shared.patch
+    engines:
+      postgres:
+        na: "a PostgreSQL `time` is a time of day, never a duration past it, and the MySQL cell fix does not run"
+      mysql:
+        cells: [a_time_past_a_day_in_a_stream_is_refused_by_code_and_both_remedies_deliver_mysql]
+      mssql:
+        na: "a SQL Server `time` is a time of day, never a duration past it, and the MySQL cell fix does not run"
+      mongo:
+        na: "a MongoDB change row is two text cells, and the MySQL cell fix does not run"
+      oracle:
+        na: "Oracle has no TIME type, and the MySQL cell fix does not run"

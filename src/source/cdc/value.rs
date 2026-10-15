@@ -861,6 +861,12 @@ fn parse_enum_labels(native: &str) -> Vec<String> {
 
 impl MysqlCellFix {
     /// The value the typed column needs for wire value `v`, or why the wire value has no reading.
+    /// Whether the fix concerns the planned column type: the TIME check guards a Time64 column only, so a `string` override carries a duration as text.
+    pub(crate) fn applies_to(&self, dt: &DataType) -> bool {
+        !matches!(self, MysqlCellFix::TimeOfDay)
+            || matches!(dt, DataType::Time64(TimeUnit::Microsecond))
+    }
+
     pub(crate) fn apply(&self, v: &RivetValue) -> Result<RivetValue, FixRefusal> {
         use RivetValue as V;
         Ok(match (self, v) {
@@ -907,7 +913,13 @@ impl MysqlCellFix {
             (MysqlCellFix::SetLabels(labels), V::UInt(u)) => set_labels(labels, *u),
             (MysqlCellFix::TimeOfDay, V::TimeMicros(us)) if !crate::types::is_time_of_day(*us) => {
                 return Err(FixRefusal {
-                    reason: crate::source::mysql::time_outside_day_refusal(*us),
+                    reason: format!(
+                        "{} A stream has no query to cast it in: declare the column `string` in \
+                         `columns:` to carry it as text, or leave the column out of the capture, \
+                         then: {}",
+                        crate::source::mysql::time_outside_day(*us),
+                        crate::source::cdc::checkpoint_identity::RECOVER
+                    ),
                     code: Some(crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE),
                 });
             }
@@ -1989,8 +2001,19 @@ mod tests {
         assert!(
             err.reason
                 .starts_with("mysql: TIME 838:59:59.000000 is outside 00:00..24:00")
-                && err.reason.contains("CAST(col AS CHAR)"),
-            "{err:?}"
+                && err
+                    .reason
+                    .contains("declare the column `string` in `columns:`")
+                && err
+                    .reason
+                    .contains("leave the column out of the capture, then: Re-baseline")
+                && !err.reason.contains("Cast it in a query"),
+            "a stream names the remedies it has, not the batch cast: {err:?}"
+        );
+        assert!(
+            t.applies_to(&DataType::Time64(TimeUnit::Microsecond))
+                && !t.applies_to(&DataType::Utf8),
+            "the TIME check guards a Time64 column only"
         );
         assert_eq!(
             t.apply(&V::TimeMicros(1)).unwrap(),
