@@ -1824,6 +1824,22 @@ seeds:
         na: "a MongoDB export is `mode: full` or `cdc` only, so it has no cursor column"
       oracle:
         cells: [a_cursor_column_in_another_case_is_refused_by_code_oracle]
+  - name: cdc-run-without-lease
+    class: "a `mode: cdc` run takes no run lease, so a second run beside a live stream reads and delivers the same changes again"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P2): duplicates on MySQL, SQL Server, Oracle, MongoDB CDC, an uncoded slot error on PostgreSQL, through 0.31.0; fixed by `cdc_run_lease`"
+    scope: source
+    patch: cdc-run-without-lease/shared.patch
+    engines:
+      postgres:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres]
+      mysql:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql]
+      mssql:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql]
+      mongo:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
+      oracle:
+        cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"

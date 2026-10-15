@@ -7272,10 +7272,10 @@ fn mysql_cdc_refuses_a_partial_json_binlog_instead_of_dropping_the_update() {
 ///
 /// Used only on the isolated :3306 server under `quiet_window_guard`: on :3307 a
 /// MINIMAL window would refuse every concurrent MySQL CDC test.
-struct RowMetadata(String, String);
+pub(crate) struct RowMetadata(String, String);
 
 impl RowMetadata {
-    fn set(root_url: &str, to: &str) -> Self {
+    pub(crate) fn set(root_url: &str, to: &str) -> Self {
         let mut c = mysql::Conn::new(mysql::Opts::from_url(root_url).unwrap()).expect("root conn");
         let was: String = c
             .query_first("SELECT @@GLOBAL.binlog_row_metadata")
@@ -7296,7 +7296,7 @@ impl Drop for RowMetadata {
 }
 
 /// A table on the isolated :3306 server, dropped on scope exit.
-struct BatchServerTable(String, String);
+pub(crate) struct BatchServerTable(pub(crate) String, pub(crate) String);
 
 impl Drop for BatchServerTable {
     fn drop(&mut self) {
@@ -7307,7 +7307,7 @@ impl Drop for BatchServerTable {
 }
 
 /// A `(id, a, b)` table on :3306 as root, for the row-metadata refusals.
-fn row_metadata_fixture(prefix: &str) -> (String, mysql::PooledConn, BatchServerTable) {
+pub(crate) fn row_metadata_fixture(prefix: &str) -> (String, mysql::PooledConn, BatchServerTable) {
     let root_url = MYSQL_URL.replace("rivet:rivet@", "root:rivet@");
     let table = unique_name(prefix).to_lowercase();
     let mut c = mysql::Pool::new(root_url.as_str())

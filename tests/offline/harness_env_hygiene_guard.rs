@@ -236,6 +236,7 @@ const PRODUCT_ENV_SURFACE: &[&str] = &[
     "src/mcp.rs env::var \"PGBOUNCER_ADMIN_URL\"",
     "src/notify.rs env::var env",
     "src/pipeline/cdc/mod.rs maybe_panic_at \"cdc_after_open\"",
+    "src/pipeline/cdc/mod.rs maybe_pause_at \"cdc_after_open\"",
     "src/pipeline/cdc/mod.rs maybe_panic_at \"cdc_before_resolve\"",
     "src/pipeline/cdc/sink.rs maybe_panic_at \"cdc_after_ack\"",
     "src/pipeline/cdc/sink.rs maybe_panic_at \"cdc_after_checkpoint_before_ack\"",

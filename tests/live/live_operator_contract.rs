@@ -905,6 +905,34 @@ fn pg_cdc_missing_table_leaves_no_slot(baseline: bool) {
 
 // (d) the exit-code contract
 
+/// A second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as `RIVET_STATE_RUN_IN_PROGRESS`, and the first delivers.
+fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
+    s.rig.run_ok();
+    for id in 1..=5 {
+        s.insert(id);
+    }
+    let opened = |r: &Rig| {
+        r.state_count(
+            "SELECT count(*) FROM run_status WHERE export_name = '{export}' AND status = 'running'",
+        ) > 0
+    };
+    let (first, second) = s
+        .rig
+        .beside_a_live_run(
+            &[("RIVET_TEST_PAUSE_AT", "cdc_after_open:6000")],
+            opened,
+            Rig::run,
+        )
+        .answered_while_alive();
+    assert!(
+        first.status.success(),
+        "the live stream finishes:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    s.rig.run_ok();
+}
+
 /// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
 fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_live", 300);
@@ -1983,6 +2011,46 @@ fn a_corrupt_cdc_checkpoint_is_refused_by_code_mssql() {
 
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql() {
+    second_cdc_run_beside_a_live_one(CdcScenario::mysql(
+        "oc_cdc2",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres() {
+    second_cdc_run_beside_a_live_one(CdcScenario::pg(
+        "oc_cdc2",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql() {
+    second_cdc_run_beside_a_live_one(CdcScenario::mssql(
+        "oc_cdc2",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+    ));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle() {
+    second_cdc_run_beside_a_live_one(CdcScenario::oracle_with("oc_cdc2", |r, _| r));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo() {
+    second_cdc_run_beside_a_live_one(CdcScenario::mongo_with("oc_cdc2", |r, _| r));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn a_cdc_truncate_is_refused_by_code_mysql() {
     truncate_is_refused_by_code(
         CdcScenario::mysql("oc_trunc", "id BIGINT PRIMARY KEY, v BIGINT"),
@@ -2546,6 +2614,215 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
     );
 }
 
+/// MySQL: rows logged while the server had `binlog_row_metadata = MINIMAL` and reordered since cannot be named: refused as `RIVET_SOURCE_CDC_UNDECODABLE` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; with the server back on FULL the re-baseline recipe as printed delivers the source.
+#[test]
+#[ignore = "live: requires docker compose up -d mysql (:3306, log_bin=ON)"]
+fn a_nameless_backlog_is_refused_by_code_mysql() {
+    use mysql::prelude::Queryable as _;
+    let _serial = quiet_window_guard();
+    let (root_url, mut c, t) = crate::live_cdc::row_metadata_fixture("oc_nameless");
+    let table = t.1.clone();
+    let _meta = crate::live_cdc::RowMetadata::set(&root_url, "FULL");
+    c.query_drop(format!("INSERT INTO {table} VALUES (1,'AAA','BBB')"))
+        .unwrap();
+    let mut rig = Rig::mysql_cdc(&table)
+        .source_url(&root_url)
+        .cdc("initial: snapshot");
+    rig.run_ok();
+    c.query_drop("SET GLOBAL binlog_row_metadata=MINIMAL")
+        .unwrap();
+    c.query_drop(format!("INSERT INTO {table} VALUES (2,'CCC','DDD')"))
+        .unwrap();
+    c.query_drop("SET GLOBAL binlog_row_metadata=FULL").unwrap();
+    c.query_drop(format!(
+        "ALTER TABLE {table} MODIFY COLUMN b VARCHAR(9) AFTER id"
+    ))
+    .unwrap();
+    c.query_drop(format!("INSERT INTO {table} VALUES (3,'EEE','FFF')"))
+        .unwrap();
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_UNDECODABLE", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
+}
+
+/// A source value the output type cannot hold is refused as `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5) on every run of a batch export; emptying the destination changes nothing; each remedy the text names (map the value in the export's `query:`, exclude the column) delivers the source.
+fn an_unrepresentable_value_is_refused_by_code(e: SqlEngine) {
+    e.alive();
+    let (id, t) = (e.col("id"), e.col("t"));
+    let (col_type, plain, hostile, mapped, cast_sentence) = match e {
+        SqlEngine::Pg => (
+            "TIMESTAMP",
+            "'2024-01-01 00:00:00'",
+            "'infinity'",
+            format!("CASE WHEN {t} = 'infinity' THEN '9999-12-31' ELSE {t} END"),
+            "maps the sentinels to a real bound",
+        ),
+        SqlEngine::Mysql => (
+            "TIME(6)",
+            "'12:00:00'",
+            "'838:59:59'",
+            format!("CAST({t} AS CHAR)"),
+            "Cast it in a query",
+        ),
+        other => panic!("no unrepresentable-value fixture on {other:?}"),
+    };
+    let (table, _guard) = e.create(
+        "unrep",
+        &format!("{id} {} PRIMARY KEY, {t} {col_type}", e.int64()),
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} ({id}, {t}) VALUES (1, {plain})"
+    ));
+    e.exec(&format!(
+        "INSERT INTO {table} ({id}, {t}) VALUES (2, {hostile})"
+    ));
+    let mut rig = e
+        .rig("unrep")
+        .query(&format!("SELECT {id}, {t} FROM {table} ORDER BY {id}"));
+    let same = Refused::by_code("RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+    let mut remedies = vec![
+        Remedy::wrong(
+            "empties the destination and runs again",
+            Then::Refuses(same),
+            |r| {
+                for f in std::fs::read_dir(r.out_dir())
+                    .expect("the destination")
+                    .flatten()
+                {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            },
+        ),
+        Remedy::new(cast_sentence, Then::DeliversTheSource, {
+            let (id, t, table) = (id.clone(), t.clone(), table.clone());
+            move |r| {
+                r.rebuilt(|rig| {
+                    rig.query(&format!(
+                        "SELECT {id}, {mapped} AS {t} FROM {table} ORDER BY {id}"
+                    ))
+                })
+            }
+        }),
+    ];
+    if matches!(e, SqlEngine::Pg) {
+        remedies.push(Remedy::new(
+            "exclude the column",
+            Then::DeliversTheSource,
+            {
+                let (id, table) = (id.clone(), table.clone());
+                move |r| {
+                    r.rebuilt(|rig| rig.query(&format!("SELECT {id} FROM {table} ORDER BY {id}")))
+                }
+            },
+        ));
+    }
+    rig.refuses_twice_and_walks_out(&["run"], &[], same, remedies);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_unrepresentable_value_is_refused_by_code_postgres() {
+    an_unrepresentable_value_is_refused_by_code(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_unrepresentable_value_is_refused_by_code_mysql() {
+    an_unrepresentable_value_is_refused_by_code(SqlEngine::Mysql);
+}
+
+/// A captured cell the stream cannot carry (`NaN` into a NUMERIC column) is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone meets the cell again; "leave the column out of the capture" (the column dropped at the source) and the re-baseline recipe as printed deliver the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_cell_the_stream_cannot_carry_is_refused_by_code_postgres() {
+    let mut s = CdcScenario::pg_with(
+        "oc_nan",
+        "id BIGINT PRIMARY KEY, v BIGINT, n NUMERIC(18, 2)",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    s.insert(1);
+    s.rig.run_ok();
+    s.insert(2);
+    s.rig.run_ok();
+    let table = s.table.clone();
+    s.sql(&format!("INSERT INTO {table} VALUES (3, 3, 'NaN')"));
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(
+                "RIVET_SOURCE_CDC_CELL_UNSUPPORTED",
+                5,
+            ))),
+            Remedy::new(
+                "leave the column out of the capture",
+                Then::DeliversTheSource,
+                move |r| {
+                    postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+                        .expect("connect postgres-cdc")
+                        .batch_execute(&format!("ALTER TABLE {table} DROP COLUMN n"))
+                        .expect("leave the column out at the source");
+                    apply_rebaseline_remedy(r, true)
+                },
+            ),
+        ],
+    );
+}
+
+/// A checkpoint whose `field` names another server is refused as `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the re-baseline recipe as printed delivers the source.
+fn a_checkpoint_of_another_server_is_refused_by_code(mut s: CdcScenario, field: &str) {
+    s.insert(1);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(2);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(3);
+    s.settle();
+    rewrite_checkpoint(&s.rig.checkpoint(), |v| {
+        v[field] = "00000000-0000-0000-0000-000000000000".into()
+    });
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_checkpoint_of_another_server_is_refused_by_code_mysql() {
+    a_checkpoint_of_another_server_is_refused_by_code(
+        CdcScenario::mysql_with("oc_foreign", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot")
+        }),
+        "server_uuid",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_checkpoint_of_another_database_is_refused_by_code_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    a_checkpoint_of_another_server_is_refused_by_code(
+        CdcScenario::mssql_with("oc_foreign", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot")
+        }),
+        "family_guid",
+    );
+}
+
 /// RESULTS 17 (Oracle): a checkpoint whose SCN the retained redo no longer reaches is refused as `RIVET_SOURCE_CDC_LOG_GAP` (exit 5) on every run; the re-baseline delivers the source.
 #[cfg(feature = "oracle")]
 #[test]
@@ -2553,9 +2830,7 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
 fn a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     let s = oracle_stream_with_a_change_waiting("oc_ogap", |r| r);
-    crate::live_cdc_oracledb::rewrite_checkpoint(&s.rig.checkpoint(), |v| {
-        v["low_water"] = "1".into()
-    });
+    rewrite_checkpoint(&s.rig.checkpoint(), |v| v["low_water"] = "1".into());
     oracle_walk_out_of(s, "RIVET_SOURCE_CDC_LOG_GAP");
 }
 
@@ -2566,7 +2841,7 @@ fn a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle() {
 fn a_checkpoint_of_another_database_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     let s = oracle_stream_with_a_change_waiting("oc_odbid", |r| r);
-    crate::live_cdc_oracledb::rewrite_checkpoint(&s.rig.checkpoint(), |v| v["dbid"] = "1".into());
+    rewrite_checkpoint(&s.rig.checkpoint(), |v| v["dbid"] = "1".into());
     oracle_walk_out_of(s, "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT");
 }
 

@@ -144,6 +144,14 @@ scenarios:
     mongo:    { test: a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo }
     oracle:   { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
 
+  - id: cdc_run_in_progress_code
+    what: "a second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 5), and the first delivers"
+    postgres: { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres }
+    mysql:    { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql }
+    mssql:    { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql }
+    mongo:    { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo }
+    oracle:   { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle }
+
   - id: plan_unreadable_source
     what: "RESULTS 10: `plan` over a table that does not exist fails as RIVET_PLAN_SOURCE_UNREADABLE (exit 1) and seals no artifact"
     postgres: { test: plan_refuses_a_table_that_does_not_exist_postgres }
