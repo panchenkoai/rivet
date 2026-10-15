@@ -9,6 +9,17 @@
   has: the column declared `string` in `columns:`, which carries the value as text
   (`800:00:00.000000`), or the column left out of the capture followed by the re-baseline recipe.
   **What to do:** nothing.
+
+- **`mode: cdc` on a standalone MongoDB failed with the driver's raw dump.** The run exited 1 with
+  `Error code 40573 … RawDocumentBuf { data: "7d00…" }` and no `RIVET_*` code (0.31.0 and earlier).
+  **Now** it is refused `RIVET_SOURCE_CDC_PREREQUISITE`, naming the standalone and the ways out (a
+  replica-set member, a one-member replica set, or `mode: full`). **What to do:** nothing.
+
+- **`rivet run` refused a MongoDB collection that does not exist without its code.** `rivet check`
+  refused it `RIVET_SOURCE_COLLECTION_NOT_FOUND`; `rivet run` printed the same sentence with no
+  `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
+  carries the code. **What to do:** nothing.
+
 - **A `cursor_column` spelled in another case than its column failed with the raw database error on
   PostgreSQL and Oracle.** MySQL and SQL Server refused it with `RIVET_CONFIG_CURSOR_COLUMN_CASE`; on
   PostgreSQL and Oracle the quoted name failed the query first, so the run exited 1 with

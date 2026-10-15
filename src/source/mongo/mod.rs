@@ -166,19 +166,21 @@ fn default_server_selection_timeout(opts: &mut ClientOptions) {
         .get_or_insert(std::time::Duration::from_secs(10));
 }
 
-/// The refusal for a collection the database does not list; `None` when it exists or the listing was not allowed (a role without `listCollections`).
-fn missing_collection_refusal(
+/// Refuse a collection the database does not list; a listing that was not allowed (a role without `listCollections`) refuses nothing.
+fn refuse_a_missing_collection(
     db: &str,
     collection: &str,
     listed: Option<Vec<String>>,
-) -> Option<String> {
-    listed.filter(|names| names.is_empty()).map(|_| {
-        format!(
+) -> Result<()> {
+    if listed.is_some_and(|names| names.is_empty()) {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_COLLECTION_NOT_FOUND,
             "MongoDB collection `{db}.{collection}` does not exist — an export of it would \
              succeed with 0 rows and a full load would then empty the warehouse table. Check \
              the `table:` name (a dotted collection name is written whole)."
-        )
-    })
+        );
+    }
+    Ok(())
 }
 
 impl MongoSession {
@@ -191,15 +193,7 @@ impl MongoSession {
                 .filter(doc! { "name": collection })
                 .into_future(),
         );
-        match missing_collection_refusal(self.db(), collection, listed.ok()) {
-            Some(refusal) => {
-                crate::rivet_bail!(
-                    crate::error::codes::SOURCE_COLLECTION_NOT_FOUND,
-                    "{refusal}"
-                )
-            }
-            None => Ok(()),
-        }
+        refuse_a_missing_collection(self.db(), collection, listed.ok())
     }
 }
 
@@ -662,10 +656,7 @@ impl Source for MongoSource {
                 .filter(doc! { "name": coll_name })
                 .into_future(),
         );
-        if let Some(refusal) = missing_collection_refusal(self.session.db(), coll_name, listed.ok())
-        {
-            anyhow::bail!("{refusal}");
-        }
+        refuse_a_missing_collection(self.session.db(), coll_name, listed.ok())?;
         let schema = blob_schema();
         sink.on_schema(schema.clone())?;
 
@@ -1036,19 +1027,21 @@ mod tests {
 
     #[test]
     fn only_a_collection_the_database_does_not_list_is_refused() {
-        let refusal = missing_collection_refusal("rivet", "orderz", Some(vec![]))
-            .expect("an empty listing for the exact name means the collection is missing");
+        let refusal = refuse_a_missing_collection("rivet", "orderz", Some(vec![]))
+            .expect_err("an empty listing for the exact name means the collection is missing");
+        assert_eq!(
+            crate::error::error_code(&refusal),
+            Some("RIVET_SOURCE_COLLECTION_NOT_FOUND")
+        );
         assert!(
-            refusal.contains("`rivet.orderz` does not exist"),
-            "{refusal}"
+            format!("{refusal:#}").contains("`rivet.orderz` does not exist"),
+            "{refusal:#}"
         );
-        assert_eq!(
-            missing_collection_refusal("rivet", "orders", Some(vec!["orders".into()])),
-            None
+        assert!(
+            refuse_a_missing_collection("rivet", "orders", Some(vec!["orders".into()])).is_ok()
         );
-        assert_eq!(
-            missing_collection_refusal("rivet", "orders", None),
-            None,
+        assert!(
+            refuse_a_missing_collection("rivet", "orders", None).is_ok(),
             "a role without listCollections is not evidence of absence"
         );
     }
