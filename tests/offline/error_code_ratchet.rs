@@ -6,7 +6,8 @@
 /// Uncoded error sites in product code under `src/`: `bail!(`, `ensure!(` and `anyhow!(`, outside
 /// test items, comments and literals. 673 on 2026-10-15, when the count widened from `bail!` alone
 /// (401 by the old count): a bare `bail!` rewritten as `anyhow!` no longer leaves the count.
-const CEILING: usize = 673; // ratchet-pin: uncoded-bail-sites
+// 673 -> 554 (2026-10-15): every error site under `src/config/` carries a registered code (-119).
+const CEILING: usize = 554; // ratchet-pin: uncoded-bail-sites
 
 /// Occurrences of a bare `bail!(`, `ensure!(` or `anyhow!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {
