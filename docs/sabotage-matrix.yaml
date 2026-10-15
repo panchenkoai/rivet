@@ -367,8 +367,8 @@ scenarios:
 
   - id: refusal_source_value_unrepresentable
     what: "RIVET_SOURCE_VALUE_UNREPRESENTABLE: a source value the output type cannot hold"
-    postgres: { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
-    mysql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
+    postgres: { test: an_unrepresentable_value_is_refused_by_code_postgres }
+    mysql:    { test: an_unrepresentable_value_is_refused_by_code_mysql }
     mssql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, `map the value in the export's query:` and `exclude the column` each applied, and one wrong remedy" }
     mongo:    { na: "raised by the PostgreSQL, MySQL and SQL Server converters (src/source/*/arrow_convert.rs) and the MySQL TIME fix of the CDC value seam; no MongoDB site (documents are carried as JSON)" }
     oracle:   { na: "raised by the PostgreSQL, MySQL and SQL Server converters (src/source/*/arrow_convert.rs) and the MySQL TIME fix of the CDC value seam; no Oracle site" }
