@@ -2085,6 +2085,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_cdc_scaffold_names_the_stream_object_each_engine_reads() {
+        let lines_for = |st: &str, info: &TableInfo| {
+            let mut d = ScaffoldDecisions::default();
+            cdc_export_lines(
+                info,
+                st,
+                &InitYamlDestination::default(),
+                "dbo.payments",
+                0,
+                "payments",
+                &mut d,
+            )
+            .join("\n")
+        };
+        let mut info = make_table(vec![pk("id", "bigint")]);
+        info.schema = "dbo".into();
+        let derived = lines_for("mssql", &info);
+        assert!(
+            derived.contains("      capture_instance: dbo_payments  # CDC is not enabled on this table yet: EXEC sys.sp_cdc_enable_table @source_schema = N'dbo', @source_name = N'payments', @role_name = NULL, @capture_instance = N'dbo_payments';"),
+            "{derived}"
+        );
+        info.cdc_capture_instance = Some("ci_payments_v2".into());
+        let read = lines_for("mssql", &info);
+        assert!(
+            read.contains("      capture_instance: ci_payments_v2  # the instance cdc.change_tables holds for this table"),
+            "{read}"
+        );
+        assert!(!read.contains("dbo_payments"), "{read}");
+        let pg = lines_for("postgres", &info);
+        assert!(pg.contains("      slot: rivet_payments  #"), "{pg}");
+        assert!(pg.contains("    mode: cdc"), "{pg}");
+    }
+
     fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
             cdc_capture_instance: None,
