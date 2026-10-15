@@ -1872,6 +1872,22 @@ seeds:
         na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
       oracle:
         cells: [range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle]
+  - name: mongo-standalone-uncoded
+    class: "a server error that names a missing deployment prerequisite is passed up as the driver's raw dump instead of the coded prerequisite refusal"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6, row 808): `mode: cdc` on a standalone MongoDB exited 1 with `Error code 40573 … RawDocumentBuf { data: … }`, while `doctor` named it plainly, through 0.31.0; fixed by `names_standalone` in diagnose_stream_error"
+    scope: source
+    patch: mongo-standalone-uncoded/shared.patch
+    engines:
+      postgres:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mysql:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mssql:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+      mongo:
+        cells: [a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo]
+      oracle:
+        na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"

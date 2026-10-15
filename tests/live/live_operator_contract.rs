@@ -2509,6 +2509,28 @@ fn plan_refuses_a_collection_that_does_not_exist_mongo() {
     plan_on_an_unreadable_source(Rig::mongo_batch("absent").source_url(&url), 1);
 }
 
+/// 2026-10-14 sweep P6: a `mode: cdc` export over a standalone MongoDB is refused by code, twice, before any checkpoint.
+#[test]
+#[ignore = "live: requires docker compose up -d mongo"]
+fn a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo() {
+    let (url, _m, _guard) = mongo_db("oc_cdcstand", 3);
+    let rig = Rig::mongo_cdc("t").source_url(&url);
+    for cycle in 1..=2 {
+        let out = rig.run();
+        assert_refused(&out, Refused::by_code("RIVET_SOURCE_CDC_PREREQUISITE", 1));
+        assert!(
+            text(&out).contains("standalone") && !text(&out).contains("RawDocumentBuf"),
+            "cycle {cycle}: the refusal names the standalone and carries no raw driver dump\n{}",
+            text(&out)
+        );
+        assert_eq!(
+            std::fs::read(rig.checkpoint()).ok(),
+            None,
+            "cycle {cycle}: the refused stream left no checkpoint"
+        );
+    }
+}
+
 #[test]
 #[ignore = "live: requires docker compose up -d mongo"]
 fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
