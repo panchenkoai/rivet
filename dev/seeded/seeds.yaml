@@ -1888,6 +1888,22 @@ seeds:
         na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
       oracle:
         cells: [range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle]
+  - name: fractional-chunk-key-under-query
+    class: "a type guard the planner applies only when it can read a catalog, so the same key under `query:` is range-sliced and its fractional values are skipped with exit 0"
+    history: "2026-10-09 - open defect (a `double precision` chunk_column under `query:` delivered 40 of 43 rows, exit 0) through 0.31.0; fixed by `bail_if_fractional`, which reads the query's result type before the bounds"
+    scope: source
+    patch: fractional-chunk-key-under-query/shared.patch
+    engines:
+      postgres:
+        cells: [a_float_chunk_column_under_query_is_refused_by_code_postgres]
+      mysql:
+        na: "the run-time type read is one function for every engine (`Source::type_mappings`); the postgres cell grades it"
+      mssql:
+        na: "the run-time type read is one function for every engine (`Source::type_mappings`); the postgres cell grades it"
+      mongo:
+        na: "a Mongo export has no `mode: chunked`"
+      oracle:
+        na: "the run-time type read is one function for every engine (`Source::type_mappings`); the postgres cell grades it"
   - name: init-capture-instance-derived
     class: "a generated config derives the name of a server object by convention instead of reading the catalog that holds it, so the config names an object that does not exist"
     history: "2026-10-07 - open defect (`rivet init --mode cdc` on SQL Server wrote `capture_instance: dbo_<table>` whatever cdc.change_tables held) through 0.31.0; fixed by reading cdc.change_tables in mssql::introspect"

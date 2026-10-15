@@ -445,7 +445,9 @@ pub(crate) fn column_type_of(specs: &[TargetColumnSpec], col: &str) -> TargetTyp
 /// partition column over everything the compaction touches ([`touched_values_sql`]) —
 /// as strings; the MERGE's pruning bounds come from here. `time_type` (the column's
 /// DATE / DATETIME / TIMESTAMP) normalises a time key to one `YYYY-MM-DD` shape via
-/// [`date_of`]; an integer range column is cast.
+/// [`date_of`]; an integer range column is cast. A time key adds `(in_lo, in_hi)`, the
+/// min/max inside [`PARTITIONED_DAYS`] ([`NOTHING_INSIDE`] when no value is), the span
+/// the plan steps through.
 pub fn compact_probe_sql(
     changes_fqtn: &str,
     base_fqtn: &str,
@@ -466,13 +468,30 @@ pub fn compact_probe_sql(
     } else {
         touched_values_sql(changes_fqtn, base_fqtn, &pk_refs, c, time_type)
     };
+    let inside = if time_type.is_some() {
+        let (from, until) = PARTITIONED_DAYS;
+        let v = format!("IF(v >= DATE '{from}' AND v < DATE '{until}', v, NULL)");
+        format!(
+            ", IFNULL(CAST(MIN({v}) AS STRING), '{NOTHING_INSIDE}') AS in_lo, \
+             IFNULL(CAST(MAX({v}) AS STRING), '{NOTHING_INSIDE}') AS in_hi"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "SELECT (SELECT COUNT(*) FROM `{changes_fqtn}`) AS n, \
          IFNULL(CAST(MIN(v) AS STRING), '') AS lo, IFNULL(CAST(MAX(v) AS STRING), '') AS hi, \
-         (SELECT COUNTIF(`{c}` IS NULL) FROM `{changes_fqtn}`) AS null_keys \
+         (SELECT COUNTIF(`{c}` IS NULL) FROM `{changes_fqtn}`) AS null_keys{inside} \
          FROM ({values})"
     )
 }
+
+/// The days BigQuery's time-unit partitions cover, `[from, until)`; a value outside
+/// them sits in the one `__UNPARTITIONED__` partition.
+pub const PARTITIONED_DAYS: (&str, &str) = ("1960-01-01", "2160-01-01");
+
+/// The probe's `in_lo`/`in_hi` when no value lies inside [`PARTITIONED_DAYS`].
+pub const NOTHING_INSIDE: &str = "none";
 
 /// Split `[lo, hi]` (inclusive dates) into half-open day windows of at most
 /// `step_days` — one MERGE per window keeps each job under BigQuery's cap on the
@@ -1202,6 +1221,10 @@ pub struct CompactProbe {
     pub lo: String,
     pub hi: String,
     pub nulls: u64,
+    /// A time key's min/max inside [`PARTITIONED_DAYS`], or [`NOTHING_INSIDE`]; anything
+    /// else unread steps the whole clamped span, so no value is left out of a window.
+    pub in_lo: String,
+    pub in_hi: String,
 }
 
 /// What every compaction MERGE is built from: the data columns (meta columns and
@@ -1225,8 +1248,9 @@ fn merge_inputs<'a>(
 /// The MERGE statements one compaction runs, decided from the probe alone: none
 /// for an empty buffer; one unbounded MERGE when the base has no partition key
 /// (or the key is the load time); otherwise one per window of the key's range —
-/// at most 4,000 partitions each, the cap on what one statement may modify —
-/// plus one for the rows whose key is NULL. Pure, so the loader is glue.
+/// at most 4,000 partitions each, the cap on what one statement may modify, and for
+/// a time key one per side outside [`PARTITIONED_DAYS`] — plus one for the rows
+/// whose key is NULL. Pure, so the loader is glue.
 pub fn plan_compact_merges(
     base: &str,
     changes_fqtn: &str,
@@ -1287,8 +1311,37 @@ pub fn plan_compact_merges(
                 }
             };
             let all_lo = time_literal(ty, lo_d);
-            let all_hi = upper(hi_d + chrono::Duration::days(1));
-            for (from, to) in day_windows(lo_d, hi_d, step) {
+            let past_hi = hi_d + chrono::Duration::days(1);
+            let all_hi = upper(past_hi);
+            // Only the span inside the partitioned days is stepped; each side outside
+            // them is one partition, so one window. Stepping an hourly key up to a
+            // `9999-12-31` sentinel planned 17,544 serial MERGE jobs for two rows.
+            let (Ok(from_d), Ok(until_d)) = (parse(PARTITIONED_DAYS.0), parse(PARTITIONED_DAYS.1))
+            else {
+                unreachable!("PARTITIONED_DAYS are dates");
+            };
+            let mut windows = Vec::new();
+            if lo_d < from_d {
+                windows.push((lo_d, past_hi.min(from_d)));
+            }
+            let inside = match (parse(&probe.in_lo), parse(&probe.in_hi)) {
+                (Ok(a), Ok(b)) => Some((a, b)),
+                _ if probe.in_lo == NOTHING_INSIDE && probe.in_hi == NOTHING_INSIDE => None,
+                _ => {
+                    let (a, b) = (
+                        lo_d.max(from_d),
+                        hi_d.min(until_d - chrono::Duration::days(1)),
+                    );
+                    (a <= b).then_some((a, b))
+                }
+            };
+            if let Some((a, b)) = inside {
+                windows.extend(day_windows(a, b, step));
+            }
+            if hi_d >= until_d {
+                windows.push((lo_d.max(until_d), past_hi));
+            }
+            for (from, to) in windows {
                 let bound = RangeBound {
                     column: col.to_string(),
                     lo: time_literal(ty, from),
@@ -1889,12 +1942,15 @@ mod compact_tests {
         );
     }
 
+    /// A probe that does not say where its values lie inside the partitioned days.
     fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
         CompactProbe {
             rows,
             lo: lo.into(),
             hi: hi.into(),
             nulls,
+            in_lo: String::new(),
+            in_hi: String::new(),
         }
     }
 
@@ -2086,6 +2142,78 @@ mod compact_tests {
         );
     }
 
+    /// A time key's value outside the partitioned days sits in the one unpartitioned
+    /// partition: each side outside is one window, and only the span the probe found
+    /// inside is stepped. RED: stepping an hourly key up to the `9999-12-31` sentinel
+    /// planned 17,544 serial MERGE jobs for two buffer rows.
+    #[test]
+    fn a_time_key_outside_the_partitioned_days_is_one_window_per_side() {
+        let hour = PartitionKey::Time {
+            column: Some("created_at".into()),
+            granularity: Granularity::Hour,
+        };
+        let probe = |lo: &str, hi: &str, in_lo: &str, in_hi: &str| CompactProbe {
+            rows: 2,
+            lo: lo.into(),
+            hi: hi.into(),
+            nulls: 0,
+            in_lo: in_lo.into(),
+            in_hi: in_hi.into(),
+        };
+        let eot = plan(
+            Some(&hour),
+            &probe("2026-10-01", "9999-12-31", "2026-10-01", "2026-10-15"),
+        );
+        assert_eq!(eot.len(), 2, "the days inside and the sentinel");
+        assert!(
+            eot[0].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '2026-10-01T00:00:00' AND `created_at` < DATETIME '2026-10-16T00:00:00'")
+                && eot[1].contains("WHERE __rn = 1 AND `created_at` >= DATETIME '2160-01-01T00:00:00'\n"),
+            "{eot:?}"
+        );
+        let outside = plan(
+            Some(&hour),
+            &probe("0001-01-01", "9999-12-31", "none", "none"),
+        );
+        assert_eq!(outside.len(), 2, "nothing inside: one window per side");
+        assert!(
+            outside[0].contains("`created_at` >= DATETIME '0001-01-01T00:00:00' AND `created_at` < DATETIME '1960-01-01T00:00:00'")
+                && outside[1].contains("`created_at` >= DATETIME '2160-01-01T00:00:00'\n"),
+            "{outside:?}"
+        );
+        let below = plan(
+            Some(&hour),
+            &probe("1900-01-01", "2024-07-18", "2024-01-01", "2024-07-18"),
+        );
+        assert_eq!(below.len(), 3, "one window below, 200 days inside in two");
+        for merge in &outside {
+            assert!(
+                merge.contains("ON __rivet_t.`id` = __rivet_s.`id` AND (__rivet_t.`created_at` >= DATETIME '0001-01-01T00:00:00' OR __rivet_t.`created_at` IS NULL)"),
+                "the base stays bounded by the whole touched span: {merge}"
+            );
+        }
+        // A probe that did not say steps every partitioned day of the span: slower, and
+        // no winner is left outside every window.
+        let half = plan(Some(&hour), &probe("2026-10-01", "9999-12-31", "none", ""));
+        assert_eq!(
+            half.len(),
+            295,
+            "one side read is not a reading: the clamped span"
+        );
+        let unread = plan(Some(&hour), &probe("2026-10-01", "9999-12-31", "", ""));
+        assert_eq!(
+            unread.len(),
+            295,
+            "48,669 days in 166-day steps, then the sentinel"
+        );
+        assert!(
+            unread[293].contains("AND `created_at` < DATETIME '2160-01-01T00:00:00'")
+                && unread[294].contains("`created_at` >= DATETIME '2160-01-01T00:00:00'\n"),
+            "{}\n{}",
+            unread[293],
+            unread[294]
+        );
+    }
+
     fn bound(lo: &str, hi: &str) -> RangeBound {
         RangeBound {
             column: "created_at".into(),
@@ -2224,6 +2352,11 @@ mod compact_tests {
                 && t.contains("(SELECT COUNTIF(`created_at` IS NULL) FROM `p.d.t__changes`) AS null_keys"),
             "the range covers the base's rows of the buffer's keys, the NULL count is the buffer's: {t}"
         );
+        assert!(
+            t.contains("IFNULL(CAST(MIN(IF(v >= DATE '1960-01-01' AND v < DATE '2160-01-01', v, NULL)) AS STRING), 'none') AS in_lo")
+                && t.contains("MAX(IF(v >= DATE '1960-01-01' AND v < DATE '2160-01-01', v, NULL)) AS STRING), 'none') AS in_hi"),
+            "a time key reads the span inside the partitioned days: {t}"
+        );
         // A TIMESTAMP is read as a UTC day: an unqualified `DATE(timestamp)` follows the
         // project's default time zone, while the bounds it feeds are rendered `+00` and
         // the partitions are UTC days — under `Asia/Tokyo` the two disagreed by a day at
@@ -2243,7 +2376,8 @@ mod compact_tests {
         let r = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, Some("bucket"), None, false);
         assert!(
             r.contains("SELECT `bucket` AS v FROM `p.d.t__changes` UNION ALL SELECT __rivet_t.`bucket` FROM `p.d.t` AS __rivet_t")
-                && !r.contains("DATE("),
+                && !r.contains("DATE(")
+                && !r.contains("in_lo"),
             "{r}"
         );
         let n = compact_probe_sql("p.d.t__changes", "p.d.t", &pk, None, None, false);
@@ -2272,20 +2406,23 @@ mod compact_column_tests {
     use super::*;
     use crate::load::plan::{Granularity, PartitionKey};
 
+    /// A probe that does not say where its values lie inside the partitioned days.
     fn probe(rows: u64, lo: &str, hi: &str, nulls: u64) -> CompactProbe {
         CompactProbe {
             rows,
             lo: lo.into(),
             hi: hi.into(),
             nulls,
+            in_lo: String::new(),
+            in_hi: String::new(),
         }
     }
 
-    /// A YEAR key steps 4,000 x 365 days, so four centuries are ONE window. RED
-    /// against `4000 + 365` (34 windows) and `4000 / 365` (13,000 of them) — the
+    /// A YEAR key steps 4,000 x 365 days, so the two partitioned centuries are ONE
+    /// window. RED against `4000 + 365` (17 windows) and `4000 / 365` (7,305) — the
     /// arm the day/hour/month cases never reach.
     #[test]
-    fn a_yearly_key_plans_one_window_for_four_centuries() {
+    fn a_yearly_key_plans_one_window_for_the_partitioned_centuries() {
         let year = PartitionKey::Time {
             column: Some("created_at".into()),
             granularity: Granularity::Year,
@@ -2302,13 +2439,13 @@ mod compact_column_tests {
             &["id".to_string()],
             SourceEngine::MySql,
             Some(&year),
-            &probe(4, "1600-01-01", "2000-01-01", 0),
+            &probe(4, "1960-01-01", "2159-12-31", 0),
         )
         .expect("a plan");
-        assert_eq!(plans.len(), 1, "146,098 days at 1,460,000 per window");
+        assert_eq!(plans.len(), 1, "73,049 days at 1,460,000 per window");
         assert!(
-            plans[0].contains("__rivet_t.`created_at` >= DATETIME '1600-01-01T00:00:00'")
-                && plans[0].contains("__rivet_t.`created_at` < DATETIME '2000-01-02T00:00:00'"),
+            plans[0].contains("__rivet_t.`created_at` >= DATETIME '1960-01-01T00:00:00'")
+                && plans[0].contains("__rivet_t.`created_at` < DATETIME '2160-01-01T00:00:00'"),
             "the one window covers the whole span: {}",
             plans[0]
         );

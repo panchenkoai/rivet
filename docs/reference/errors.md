@@ -18,6 +18,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_CONFIG_NO_EXPORTS` | usage | 1 | declare at least one export under `exports:` |
 | `RIVET_CONFIG_CHUNK_COUNT_INVALID` | usage | 1 | set `chunk_count` to 1 or more |
 | `RIVET_CONFIG_CHUNK_BY_DAYS_INVALID` | usage | 1 | set `chunk_by_days` to 1 or more |
+| `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER` | usage | 1 | use `chunk_by_key:` (keyset), an integer column, or `mode: full` |
 | `RIVET_CONFIG_DUPLICATE_EXPORT` | usage | 1 | give every export a unique `name` |
 | `RIVET_CONFIG_CDC_RESOURCE_CONFLICT` | usage | 1 | give each CDC export its own slot / server_id / checkpoint path |
 | `RIVET_CONFIG_CDC_ROLLOVER_INVALID` | usage | 1 | set `cdc.rollover` to 1 or more, or omit it |

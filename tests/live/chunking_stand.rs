@@ -2984,10 +2984,10 @@ fn stand_pool_split_cloud_crash_then_resume_declares_every_id_postgres() {
     pool_split_cloud(Some(("RIVET_TEST_ERROR_AT", "chunk_export:1")));
 }
 
-/// A `double precision` chunk_column under `query:` is refused or delivers every row: integer windows skip the fractional keys.
+/// A `double precision` chunk_column under `query:` is refused by code before a byte is written: integer windows would skip the fractional keys.
 #[test]
-#[ignore = "live+gate-only: postgres; open defect (float chunk_column under query), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_float_chunk_column_under_query_is_refused_by_code_postgres() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.create(
@@ -3005,18 +3005,14 @@ fn open_defect_a_float_chunk_column_under_query_keeps_its_fractional_keys_postgr
         .restage("chunked", &["chunk_column: k", "chunk_size: 10"])
         .dest_path(out.path().to_path_buf());
     let run = rig.run();
-    if !run.status.success() {
-        let said = String::from_utf8_lossy(&run.stderr);
-        assert!(
-            said.contains("chunk_column"),
-            "a refusal must name the chunk_column:\n{said}"
-        );
-        return;
-    }
-    let delivered = read_ids(out.path()).len();
-    assert!(
-        delivered == 43,
-        "a double precision chunk_column under `query:` delivered {delivered} of 43 rows with exit 0"
+    assert_refused(
+        &run,
+        Refused::by_code("RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER", 1),
+    );
+    assert_eq!(
+        read_ids(out.path()),
+        Vec::<i64>::new(),
+        "the refused run wrote nothing"
     );
 }
 
