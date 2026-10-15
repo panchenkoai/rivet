@@ -2497,3 +2497,14 @@ seeds:
         na: "a Mongo export has no `mode: chunked`"
       oracle:
         cells: [stand_empty_table_under_chunk_by_days_oracle]
+
+  - name: load-refusal-not-journaled
+    class: a `rivet load` stop raised before any warehouse write but outside the typed refusal seam reaches the ledger as something other than `refused` (no row, or `failed`), and a state-DB fault wears the missing-spec refusal code
+    history: "found 2026-10-15 while coding the last error sites (#594): a split prefix holding two generations stopped with RIVET_LOAD_SPLIT_GENERATIONS_MIXED and left no load_run row; load_type_reports folded a failed state read into RIVET_LOAD_SPEC_MISSING"
+    scope: state
+    patch: load-refusal-not-journaled/shared.patch
+    engines:
+      sqlite-state:
+        cells: ["lib:a_mixed_split_generation_is_journaled_refused_and_refuses_again", "lib:a_missing_spec_and_an_unreadable_spec_store_are_two_codes"]
+      postgres-state:
+        cells: ["lib:pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"]

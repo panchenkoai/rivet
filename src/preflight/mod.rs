@@ -757,22 +757,33 @@ pub fn load_type_reports(
                         .map(|t| format!(" table '{t}'"))
                         .unwrap_or_default()
                 )),
-                Err(e) => failures.push(format!(
-                    "export '{}': reading its load spec from the state DB: {e:#}",
-                    export.name
-                )),
+                // The state DB not answering is the environment, not a missing spec.
+                Err(e) => {
+                    return Err(crate::error::recoded(
+                        &e,
+                        crate::error::codes::STATE_BACKEND_FAILED,
+                        format!(
+                            "export '{}': reading its load spec from the state DB: {e:#}",
+                            export.name
+                        ),
+                    ));
+                }
             }
         }
     }
     if !failures.is_empty() {
-        crate::rivet_bail!(
-            crate::error::codes::LOAD_SPEC_MISSING,
-            "{} export(s) could not be typed for the {} load, and a table that cannot \
-             be typed must not silently not-load:\n  - {}",
-            failures.len(),
-            target.label(),
-            failures.join("\n  - ")
-        );
+        return Err(anyhow::Error::new(crate::error::Refused(
+            crate::error::coded(
+                crate::error::codes::LOAD_SPEC_MISSING,
+                format!(
+                    "{} export(s) could not be typed for the {} load, and a table that cannot \
+                 be typed must not silently not-load:\n  - {}",
+                    failures.len(),
+                    target.label(),
+                    failures.join("\n  - ")
+                ),
+            ),
+        )));
     }
     Ok((out, keys))
 }
@@ -1265,6 +1276,42 @@ mod tests {
             .err()
             .expect("no spec is recorded for the export");
         crate::error::assert_coded(&err, "RIVET_LOAD_SPEC_MISSING", 5);
+    }
+
+    /// The two reasons an export cannot be typed are two codes and two exits: no
+    /// recorded spec is a refusal, typed as the load's stop before any write; a state
+    /// DB that cannot answer is the environment, never a refusal.
+    #[test]
+    fn a_missing_spec_and_an_unreadable_spec_store_are_two_codes() {
+        let yaml = "\nsource:\n  type: mysql\n  url: \"mysql://u:p@localhost:3306/db\"\n\
+             exports:\n  - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: \"/tmp/o\" }\n";
+        let cfg = crate::config::Config::from_yaml(yaml).expect("the config parses");
+        let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
+        let target = crate::types::target::ExportTarget::parse("bigquery").expect("bigquery");
+
+        let missing = load_type_reports(&cfg, &state, target)
+            .err()
+            .expect("no spec recorded");
+        crate::error::assert_coded(&missing, "RIVET_LOAD_SPEC_MISSING", 5);
+        assert!(
+            missing.is::<crate::load::Refused>(),
+            "a missing spec is the load's own stop: {missing:#}"
+        );
+
+        state.exec_for_test("DROP TABLE export_load_spec");
+        let fault = load_type_reports(&cfg, &state, target)
+            .err()
+            .expect("the spec table is gone");
+        crate::error::assert_coded(&fault, "RIVET_STATE_BACKEND_FAILED", 1);
+        assert!(
+            !fault.is::<crate::load::Refused>(),
+            "a state fault is not a refusal: {fault:#}"
+        );
+        assert!(
+            format!("{fault:#}").contains("export 'orders'"),
+            "the fault names the export: {fault:#}"
+        );
     }
 
     #[test]
