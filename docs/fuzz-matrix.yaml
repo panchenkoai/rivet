@@ -68,7 +68,7 @@ scenarios:
     oracle:   { test: sql_query_text }
 
   - id: fuzz_redacted_text
-    what: "the log-line and error text read by the secret redactors (src/redact.rs: URL userinfo, keyword/value passwords, secret query parameters) — engine-agnostic text code every emitted line passes through, quoting drivers, servers and operator input; any UTF-8 text is rewritten or returned in one pass, never a panic (the URL scan re-read a run of letters from each of its bytes through 0.31.0: 256 KiB without whitespace took 18.6 s)"
+    what: "the log-line and error text read by the secret redactors (src/redact.rs: URL userinfo, keyword/value passwords, secret query parameters) and by the recovery-hint stripper of a failed export's message (src/pipeline/mod.rs strip_chunked_recovery_hint) — engine-agnostic text code every emitted line passes through, quoting drivers, servers and operator input; any UTF-8 text is rewritten or returned in one pass, never a panic (the URL scan re-read a run of letters from each of its bytes through 0.31.0: 256 KiB without whitespace took 18.6 s; the hint stripper re-read the tail from every `; `: 512 KiB took 21 s)"
     postgres: { test: redact_text }
     mysql:    { test: redact_text }
     mssql:    { test: redact_text }

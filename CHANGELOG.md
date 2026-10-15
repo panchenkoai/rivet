@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **The end-of-run summary of a failed export re-read its error text from every `; `.** The step
+  that strips the inline `rivet …` recovery hint was quadratic in the message: a 512 KiB message
+  made of `; ` took 21 s (×4 per doubling) before the summary printed (0.31.0 and earlier).
+  **Now** the cut is found in one pass each way; the summary of the same message prints in
+  milliseconds. **What to do:** nothing.
+
 - **`rivet compact` on a BigQuery base partitioned by hour planned one MERGE job per 166 days of
   the key's whole value span.** A row holding the end-of-time sentinel `9999-12-31` (or any date
   outside BigQuery's partitioned days, 1960-01-01 to 2159-12-31) stretched the span to the sentinel:
