@@ -2500,6 +2500,45 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
     );
 }
 
+/// A captured cell the stream cannot carry (`NaN` into a NUMERIC column) is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone meets the cell again; "leave the column out of the capture" (the column dropped at the source) and the re-baseline recipe as printed deliver the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_cell_the_stream_cannot_carry_is_refused_by_code_postgres() {
+    let mut s = CdcScenario::pg_with(
+        "oc_nan",
+        "id BIGINT PRIMARY KEY, v BIGINT, n NUMERIC(18, 2)",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    s.insert(1);
+    s.rig.run_ok();
+    s.insert(2);
+    s.rig.run_ok();
+    let table = s.table.clone();
+    s.sql(&format!("INSERT INTO {table} VALUES (3, 3, 'NaN')"));
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(
+                "RIVET_SOURCE_CDC_CELL_UNSUPPORTED",
+                5,
+            ))),
+            Remedy::new(
+                "leave the column out of the capture",
+                Then::DeliversTheSource,
+                move |r| {
+                    postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+                        .expect("connect postgres-cdc")
+                        .batch_execute(&format!("ALTER TABLE {table} DROP COLUMN n"))
+                        .expect("leave the column out at the source");
+                    apply_rebaseline_remedy(r, true)
+                },
+            ),
+        ],
+    );
+}
+
 /// A checkpoint whose `field` names another server is refused as `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the re-baseline recipe as printed delivers the source.
 fn a_checkpoint_of_another_server_is_refused_by_code(mut s: CdcScenario, field: &str) {
     s.insert(1);
