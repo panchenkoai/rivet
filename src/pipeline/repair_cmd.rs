@@ -88,11 +88,17 @@ pub fn run_repair_command(
         .exports
         .iter()
         .find(|e| e.name == export_name)
-        .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", export_name))?;
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CLI_EXPORT_UNKNOWN,
+                format!("export '{}' not found in config", export_name),
+            )
+        })?;
 
     let mut plan = build_plan(&config, export, config_dir, false, false, false, params)?;
     if !matches!(plan.strategy, ExtractionStrategy::Chunked(_)) {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "repair: '{}' mode — only chunked exports are supported in v1 (Epic H)",
             plan.strategy.mode_label()
         );
@@ -129,12 +135,21 @@ fn load_or_build_reconcile(
 ) -> Result<ReconcileReport> {
     match source {
         RepairReportSource::File(path) => {
-            let raw = std::fs::read_to_string(&path)
-                .map_err(|e| anyhow::anyhow!("cannot read reconcile report '{}': {}", path, e))?;
-            let r: ReconcileReport = serde_json::from_str(&raw)
-                .map_err(|e| anyhow::anyhow!("invalid reconcile report '{}': {}", path, e))?;
+            let raw = std::fs::read_to_string(&path).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::CLI_INPUT_UNREADABLE,
+                    format!("cannot read reconcile report '{}': {}", path, e),
+                )
+            })?;
+            let r: ReconcileReport = serde_json::from_str(&raw).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::CLI_REPORT_INVALID,
+                    format!("invalid reconcile report '{}': {}", path, e),
+                )
+            })?;
             if r.export_name != plan.export_name {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CLI_REPORT_INVALID,
                     "repair: reconcile report is for export '{}' but config targets '{}'",
                     r.export_name,
                     plan.export_name
@@ -338,13 +353,18 @@ fn record_repair_parts_in_manifest(
             MANIFEST_FILENAME,
             crate::pipeline::validate_manifest::MANIFEST_MAX_BYTES,
         )?,
-        None => anyhow::bail!(
+        None => crate::rivet_bail!(
+            crate::error::codes::DEST_MANIFEST_MISSING,
             "no manifest.json at the destination prefix — cannot record repair parts \
              (was the original export finalized?)"
         ),
     };
-    let mut manifest: RunManifest = serde_json::from_slice(&raw)
-        .map_err(|e| anyhow::anyhow!("destination manifest.json is unparseable: {e}"))?;
+    let mut manifest: RunManifest = serde_json::from_slice(&raw).map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::DEST_CONTROL_ARTIFACT_INVALID,
+            format!("destination manifest.json is unparseable: {e}"),
+        )
+    })?;
 
     let superseded = superseded_parts(&manifest, repaired, chunk_run_id);
     let removed = superseded_checksums(&*dest, &manifest, &superseded);
@@ -578,8 +598,12 @@ fn emit_plan(plan: &RepairPlan, format: &RepairOutputFormat) -> Result<()> {
         RepairOutputFormat::Pretty => print_plan_pretty(plan),
         RepairOutputFormat::Json(None) => println!("{}", plan.to_json_pretty()?),
         RepairOutputFormat::Json(Some(path)) => {
-            std::fs::write(path, plan.to_json_pretty()?)
-                .map_err(|e| anyhow::anyhow!("cannot write repair plan '{}': {}", path, e))?;
+            std::fs::write(path, plan.to_json_pretty()?).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+                    format!("cannot write repair plan '{}': {}", path, e),
+                )
+            })?;
             println!("Repair plan written to: {}", path);
         }
     }
@@ -591,8 +615,12 @@ fn emit_report(report: &RepairReport, format: &RepairOutputFormat) -> Result<()>
         RepairOutputFormat::Pretty => print_report_pretty(report),
         RepairOutputFormat::Json(None) => println!("{}", report.to_json_pretty()?),
         RepairOutputFormat::Json(Some(path)) => {
-            std::fs::write(path, report.to_json_pretty()?)
-                .map_err(|e| anyhow::anyhow!("cannot write repair report '{}': {}", path, e))?;
+            std::fs::write(path, report.to_json_pretty()?).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+                    format!("cannot write repair report '{}': {}", path, e),
+                )
+            })?;
             println!("Repair report written to: {}", path);
         }
     }
@@ -1201,5 +1229,36 @@ mod tests {
             2,
             "no presence verdict for the superseded part"
         );
+    }
+
+    #[test]
+    fn a_missing_or_invalid_report_and_a_prefix_without_a_manifest_are_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = crate::pipeline::commit::tests::test_plan();
+        let missing = dir.path().join("absent.json").to_str().unwrap().to_string();
+        let err =
+            load_or_build_reconcile(&plan, &state, RepairReportSource::File(missing)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_INPUT_UNREADABLE", 1);
+        let garbage = dir.path().join("garbage.json");
+        std::fs::write(&garbage, b"not json").unwrap();
+        let err = load_or_build_reconcile(
+            &plan,
+            &state,
+            RepairReportSource::File(garbage.to_str().unwrap().to_string()),
+        )
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_REPORT_INVALID", 1);
+
+        let prefix = dir.path().join("prefix");
+        std::fs::create_dir_all(&prefix).unwrap();
+        let empty = std::collections::BTreeMap::new();
+        let err = record_repair_parts_in_manifest(&dest_cfg(&prefix), &[], None, &empty, None)
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_MANIFEST_MISSING", 1);
+        std::fs::write(prefix.join(MANIFEST_FILENAME), b"{not a manifest").unwrap();
+        let err = record_repair_parts_in_manifest(&dest_cfg(&prefix), &[], None, &empty, None)
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_CONTROL_ARTIFACT_INVALID", 5);
     }
 }

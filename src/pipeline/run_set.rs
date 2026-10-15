@@ -33,7 +33,12 @@ impl RunSet {
                     .exports
                     .iter()
                     .find(|e| e.name == name)
-                    .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", name))?
+                    .ok_or_else(|| {
+                        crate::error::coded(
+                            crate::error::codes::CLI_EXPORT_UNKNOWN,
+                            format!("export '{}' not found in config", name),
+                        )
+                    })?
                     .clone(),
             ],
             None => {

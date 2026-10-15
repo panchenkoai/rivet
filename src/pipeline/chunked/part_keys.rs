@@ -158,7 +158,12 @@ fn parquet_keys(bytes: Vec<u8>, column: &str, by_days: bool) -> Result<Keys> {
         .fields()
         .iter()
         .position(|f| f.name().eq_ignore_ascii_case(column))
-        .ok_or_else(|| anyhow::anyhow!("no column `{column}`"))?;
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                format!("no column `{column}`"),
+            )
+        })?;
     let mask = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), [i]);
     let mut keys = Vec::new();
     for batch in builder.with_projection(mask).build()? {
@@ -234,7 +239,12 @@ fn csv_keys(bytes: &[u8], column: &str, by_days: bool) -> Result<Keys> {
         .headers()?
         .iter()
         .position(|h| h.eq_ignore_ascii_case(column))
-        .ok_or_else(|| anyhow::anyhow!("no column `{column}`"))?;
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                format!("no column `{column}`"),
+            )
+        })?;
     let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
     let mut keys = Vec::new();
     for record in reader.records() {

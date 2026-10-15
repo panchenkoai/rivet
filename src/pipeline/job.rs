@@ -236,7 +236,8 @@ fn settle_columns_are_temporal(
             m.rivet_type,
             crate::types::RivetType::Date | crate::types::RivetType::Timestamp { .. }
         ) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_SETTLE_COLUMN_NOT_TEMPORAL,
                 "export '{}': settle column `{name}` is {}, not a date/timestamp — the settle \
                  window compares it against the source clock. Point `settle.column` at the \
                  row's insert/update time (the cursor is used when `settle.column` is omitted).",
@@ -733,7 +734,10 @@ fn resolve_final_result(
     // — and an unreachable prefix makes those questions moot. Ordered before so
     // the exit code names the condition an operator must act on first.
     if let Some(why) = manifest_gap {
-        return Err(anyhow::anyhow!(why));
+        return Err(crate::error::coded(
+            crate::error::codes::DEST_MANIFEST_NOT_WRITTEN,
+            why,
+        ));
     }
     gates.into_iter().collect()
 }
@@ -801,7 +805,8 @@ fn reconcile_run_gate(
     // and NOT corruption (exit 3). Diverged from the `reconcile` subcommand before,
     // which propagated the same connect error (#10 bughunt).
     if let Some(reason) = could_not_verify {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::RUN_RECONCILE_UNVERIFIED,
             "reconcile could not be verified for '{}': {reason}. The export completed and is \
              durable; re-run to obtain the reconcile assurance, or drop `--reconcile`.",
             summary.export_name
@@ -1276,10 +1281,13 @@ fn plan_rejection_error(export_name: &str, rejected: &[String]) -> Option<anyhow
     if rejected.is_empty() {
         return None;
     }
-    Some(anyhow::anyhow!(
-        "export '{}': plan validation failed:\n  {}",
-        export_name,
-        rejected.join("\n  ")
+    Some(crate::error::coded(
+        crate::error::codes::PLAN_REJECTED,
+        format!(
+            "export '{}': plan validation failed:\n  {}",
+            export_name,
+            rejected.join("\n  ")
+        ),
     ))
 }
 
@@ -2046,15 +2054,18 @@ fn unexpanded_partition_error(plan: &ResolvedRunPlan) -> Option<anyhow::Error> {
         .flatten()
         .any(|s| s.contains("{partition}"))
         .then(|| {
-            anyhow::anyhow!(
-                "export '{}': the destination still holds the `{{partition}}` token: a \
+            crate::error::coded(
+                crate::error::codes::PLAN_PARTITION_TOKEN_UNEXPANDED,
+                format!(
+                    "export '{}': the destination still holds the `{{partition}}` token: a \
                  `partition_by` export is expanded into one export per partition when the config \
                  runs, and this plan was built without that expansion — a sealed `rivet plan` \
                  artifact cannot carry it, and a destination that names `{{partition}}` without \
                  `partition_by:` has nothing to expand. Run the config instead: `rivet apply \
                  <config.yaml>` or `rivet run --config <config.yaml>`; without `partition_by:`, \
                  remove the token.",
-                plan.export_name
+                    plan.export_name
+                ),
             )
         })
 }
@@ -2071,6 +2082,10 @@ mod snapshot_leg_tests {
         let config = dir.path().join("rivet.yaml").to_string_lossy().into_owned();
         let expanded = crate::pipeline::commit::tests::test_plan();
         assert!(unexpanded_partition_error(&expanded).is_none());
+        let mut unexpanded = expanded.clone();
+        unexpanded.destination.prefix = Some("x/{partition}".into());
+        let err = unexpanded_partition_error(&unexpanded).unwrap();
+        crate::error::assert_coded(&err, "RIVET_PLAN_PARTITION_TOKEN_UNEXPANDED", 1);
         for in_prefix in [false, true] {
             let mut plan = expanded.clone();
             let template = format!("{}/{{partition}}", dir.path().display());
@@ -4317,5 +4332,24 @@ mod tests {
             "a count that failed on the held connection is asked again on a fresh one: {why:?}"
         );
         assert_eq!((counted, verdict), (None, None));
+    }
+
+    #[test]
+    fn a_rejected_plan_a_manifest_gap_and_an_unverified_reconcile_carry_their_codes() {
+        let err = plan_rejection_error("orders", &["[rule] bad".to_string()]).unwrap();
+        crate::error::assert_coded(&err, "RIVET_PLAN_REJECTED", 1);
+        assert!(plan_rejection_error("orders", &[]).is_none());
+
+        let gap =
+            Some("the manifest write FAILED, so the prefix has 2 durable part(s)".to_string());
+        let err = resolve_final_result(false, Ok(()), gap, [Ok(()), Ok(()), Ok(())]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_MANIFEST_NOT_WRITTEN", 1);
+
+        let summary = RunSummary {
+            export_name: "orders".into(),
+            ..Default::default()
+        };
+        let err = reconcile_run_gate(&summary, Some("source count query failed")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_RUN_RECONCILE_UNVERIFIED", 1);
     }
 }

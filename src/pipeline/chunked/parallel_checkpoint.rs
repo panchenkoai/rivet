@@ -336,9 +336,9 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                         result,
                         crate::test_hook::maybe_error_at_index("chunk_export", chunk_index),
                     ) {
-                        (Ok((_, parts, ..)), Err(msg)) => {
+                        (Ok((_, parts, ..)), Err(e)) => {
                             debris.extend(parts);
-                            Err(anyhow::anyhow!(msg))
+                            Err(e)
                         }
                         (result, _) => result,
                     };
@@ -475,10 +475,13 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
             other => unreachable!("chunked parts are recorded under a chunk unit, not {other:?}"),
         },
         |errs| {
-            anyhow::anyhow!(
-                "export '{}': parallel checkpoint worker errors:\n{}",
-                plan.export_name,
-                errs.join("\n")
+            crate::error::coded(
+                crate::error::codes::RUN_UNITS_FAILED,
+                format!(
+                    "export '{}': parallel checkpoint worker errors:\n{}",
+                    plan.export_name,
+                    errs.join("\n")
+                ),
             )
         },
     );
@@ -489,7 +492,8 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
     let tasks = state.list_chunk_tasks_for_run(&run_id)?;
     if pending > 0 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::RUN_UNITS_FAILED,
             "{}",
             incomplete_run_error(
                 &plan.export_name,

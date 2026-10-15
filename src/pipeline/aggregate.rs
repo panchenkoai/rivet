@@ -94,7 +94,12 @@ impl From<&ExportMetric> for MetricRowJson {
 #[allow(dead_code)]
 pub(super) fn metrics_to_json(metrics: &[ExportMetric]) -> Result<String> {
     let rows: Vec<MetricRowJson> = metrics.iter().map(MetricRowJson::from).collect();
-    serde_json::to_string_pretty(&rows).map_err(|e| anyhow::anyhow!("serde_json: {:#}", e))
+    serde_json::to_string_pretty(&rows).map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            format!("serde_json: {:#}", e),
+        )
+    })
 }
 
 /// Convert a per-export summary into an aggregate row.
@@ -532,13 +537,25 @@ pub(super) fn write_json(path: &Path, agg: &RunAggregate) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("create_dir_all({}): {:#}", parent.display(), e))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+                format!("create_dir_all({}): {:#}", parent.display(), e),
+            )
+        })?;
     }
-    let json =
-        serde_json::to_string_pretty(agg).map_err(|e| anyhow::anyhow!("serde_json: {:#}", e))?;
-    std::fs::write(path, json)
-        .map_err(|e| anyhow::anyhow!("write({}): {:#}", path.display(), e))?;
+    let json = serde_json::to_string_pretty(agg).map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            format!("serde_json: {:#}", e),
+        )
+    })?;
+    std::fs::write(path, json).map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+            format!("write({}): {:#}", path.display(), e),
+        )
+    })?;
     Ok(())
 }
 
@@ -1443,5 +1460,15 @@ mod tests {
         assert_eq!(round.run_aggregate_id, agg.run_aggregate_id);
         assert_eq!(round.per_export.len(), 1);
         assert_eq!(round.per_export[0].export_name, "a");
+    }
+
+    #[test]
+    fn an_unwritable_aggregate_path_is_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let agg = build(Vec::new(), Utc::now(), Utc::now(), None, "sequential");
+        let err = write_json(&file.join("sub").join("agg.json"), &agg).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_OUTPUT_UNWRITABLE", 1);
     }
 }

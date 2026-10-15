@@ -46,7 +46,12 @@ pub fn run_reconcile_command(
         .exports
         .iter()
         .find(|e| e.name == export_name)
-        .ok_or_else(|| anyhow::anyhow!("export '{}' not found in config", export_name))?;
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CLI_EXPORT_UNKNOWN,
+                format!("export '{}' not found in config", export_name),
+            )
+        })?;
 
     let plan = build_plan(&config, export, config_dir, false, false, false, params)?;
 
@@ -56,7 +61,8 @@ pub fn run_reconcile_command(
     let report = match &plan.strategy {
         ExtractionStrategy::Chunked(_) => reconcile_chunked(&plan, &state, export)?,
         ExtractionStrategy::TimeWindow { .. } => {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
                 "reconcile: time-window mode is not supported in v1 (Epic F). \
                  Convert to chunked mode with `chunk_by_days` for partition-level reconcile."
             );
@@ -64,7 +70,8 @@ pub fn run_reconcile_command(
         ExtractionStrategy::Snapshot
         | ExtractionStrategy::Incremental(_)
         | ExtractionStrategy::Keyset(_) => {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
                 "reconcile: '{}' mode has no natural partitions — use `rivet run --reconcile` for a whole-export count check",
                 plan.strategy.mode_label()
             );
@@ -136,16 +143,20 @@ fn reconcile_chunked_inner(plan: &ResolvedRunPlan, state: &StateStore) -> Result
         .claim(plan.progress_key())?
         .latest_chunk_run()?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "reconcile: no chunk run recorded for export '{}'. \
+            crate::error::coded(
+                crate::error::codes::STATE_CHUNK_RUN_MISSING,
+                format!(
+                    "reconcile: no chunk run recorded for export '{}'. \
                  Enable `chunk_checkpoint: true` and run the export first.",
-                plan.export_name
+                    plan.export_name
+                ),
             )
         })?;
 
     let tasks = state.list_chunk_tasks_for_run(&run_id)?;
     if tasks.is_empty() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
             "reconcile: chunk run '{}' for export '{}' has no tasks",
             run_id,
             plan.export_name
@@ -204,7 +215,10 @@ where
 {
     let cp = match &plan.strategy {
         ExtractionStrategy::Chunked(cp) => cp,
-        _ => anyhow::bail!("reconcile_chunked_tasks requires Chunked strategy"),
+        _ => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            "reconcile_chunked_tasks requires Chunked strategy"
+        ),
     };
 
     let mut out: Vec<PartitionResult> = Vec::with_capacity(tasks.len());
@@ -259,8 +273,12 @@ fn emit_report(report: &ReconcileReport, format: &ReconcileOutputFormat) -> Resu
         }
         ReconcileOutputFormat::Json(Some(path)) => {
             let json = report.to_json_pretty()?;
-            std::fs::write(path, &json)
-                .map_err(|e| anyhow::anyhow!("cannot write reconcile report '{}': {}", path, e))?;
+            std::fs::write(path, &json).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::CLI_OUTPUT_UNWRITABLE,
+                    format!("cannot write reconcile report '{}': {}", path, e),
+                )
+            })?;
             println!("Reconcile report written to: {}", path);
         }
     }
@@ -625,5 +643,12 @@ mod tests {
             out.contains("rivet validate --depth full"),
             "and must point at the check that DOES read the files; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn reconcile_without_a_recorded_chunk_run_is_refused_by_code() {
+        let state = StateStore::open_in_memory().unwrap();
+        let err = reconcile_chunked_inner(&chunked_plan(), &state).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_STATE_CHUNK_RUN_MISSING", 1);
     }
 }

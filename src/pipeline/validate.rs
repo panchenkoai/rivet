@@ -26,7 +26,8 @@ pub fn validate_output(path: &Path, format: FormatType, expected_rows: usize) ->
     };
 
     if actual != expected_rows {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::DEST_PART_ROWS_MISMATCH,
             "validation failed: expected {} rows, got {} in {}",
             expected_rows,
             actual,
@@ -233,5 +234,15 @@ mod tests {
         }
         writer.close().expect("close");
         validate_output(f.path(), FormatType::Parquet, 12).unwrap();
+    }
+
+    #[test]
+    fn a_part_short_of_its_counted_rows_is_an_integrity_stop_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part.csv");
+        std::fs::write(&path, "id\n1\n2\n").unwrap();
+        assert!(validate_output(&path, FormatType::Csv, 2).is_ok());
+        let err = validate_output(&path, FormatType::Csv, 5).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_PART_ROWS_MISMATCH", 3);
     }
 }

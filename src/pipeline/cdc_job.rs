@@ -335,6 +335,26 @@ pub(super) fn run_cdc_export(
 /// `snapshot` anchors, then snapshots every table. Anchor-BEFORE-snapshot is the
 /// whole point: a change landing mid-snapshot is then also in the change stream,
 /// an overlap the PK+`__op` dedupe absorbs, never a gap.
+/// The refusal of a SQL Server CDC export whose `table: t` and capture instance `ci` (emitting `schema.table`) name different relations.
+fn capture_instance_mismatch(
+    export: &str,
+    t: &str,
+    ci: &str,
+    schema: &str,
+    table: &str,
+) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH,
+        format!(
+            "sqlserver cdc: export '{export}' configures `table: {t}` while capture \
+             instance '{ci}' emits changes for `{schema}.{table}` — the two \
+             name different relations, so the snapshot would back up one and \
+             the drain capture the other. Set `table:` to `{schema}.{table}`, \
+             or point `capture_instance:` at the table you meant."
+        ),
+    )
+}
+
 pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
@@ -365,7 +385,11 @@ pub(super) fn initial_snapshot_pending(
     let (tables, multi) = match (&export.tables, &export.table) {
         (Some(ts), _) => (ts.clone(), true),
         (None, Some(t)) => (vec![t.clone()], false),
-        (None, None) => anyhow::bail!("export '{}': cdc mode requires `table:`", export.name),
+        (None, None) => crate::rivet_bail!(
+            crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+            "export '{}': cdc mode requires `table:`",
+            export.name
+        ),
     };
     // The relation the SNAPSHOT must read, when the engine can name it from a
     // catalog rather than from the configured string. On SQL Server the capture
@@ -389,7 +413,8 @@ pub(super) fn initial_snapshot_pending(
                 // name resolves to and then never re-reads (round-4, DEMONSTRATED:
                 // correcting the typo left the fabricated row in place and the real
                 // rows never backfilled). Refuse where it is still cheap.
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_CDC_PREREQUISITE,
                     "sqlserver cdc: export '{}' names capture instance '{ci}', which \
                      `cdc.change_tables` does not know. Enable CDC on the table \
                      (`sys.sp_cdc_enable_table`) or fix the name — continuing would \
@@ -408,14 +433,13 @@ pub(super) fn initial_snapshot_pending(
                 if crate::source::cdc::sink::table_matches(CdcEngine::Mssql, t, &schema, &table) {
                     continue;
                 }
-                anyhow::bail!(
-                    "sqlserver cdc: export '{}' configures `table: {t}` while capture \
-                     instance '{ci}' emits changes for `{schema}.{table}` — the two \
-                     name different relations, so the snapshot would back up one and \
-                     the drain capture the other. Set `table:` to `{schema}.{table}`, \
-                     or point `capture_instance:` at the table you meant.",
-                    export.name,
-                );
+                return Err(capture_instance_mismatch(
+                    &export.name,
+                    t,
+                    ci,
+                    &schema,
+                    &table,
+                ));
             }
             Some(format!("{schema}.{table}"))
         }
@@ -501,7 +525,7 @@ pub(super) fn initial_snapshot_pending(
     // a reference the run would reject cannot have reached this point, and the
     // recipe-vs-stream type conflict was refused there too (`Config::validate`).
     let recipes = crate::config::resolve_backfill(export, &config.exports)
-        .map_err(|why| anyhow::anyhow!(why))?;
+        .map_err(|why| crate::error::coded(crate::error::codes::CONFIG_CDC_SHAPE_INVALID, why))?;
 
     // The anchor — one entry point; `ensure_anchor` picks the engine's
     // mechanism (idempotent: a present anchor is never moved). After the refusal
@@ -770,9 +794,9 @@ fn run_cdc_inner(
         (None, None) => {
             return (
                 Vec::new(),
-                Err(anyhow::anyhow!(
-                    "export '{}': cdc mode requires `table:`",
-                    export.name
+                Err(crate::error::coded(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+                    format!("export '{}': cdc mode requires `table:`", export.name),
                 )),
             );
         }
@@ -1750,6 +1774,16 @@ mod tests {
             cdc_drift_key("shop", "a", true),
             cdc_drift_key("shop", "b", true),
             "two tables of one stream must not share a baseline"
+        );
+    }
+
+    #[test]
+    fn a_table_contradicting_its_capture_instance_is_refused_by_code() {
+        let err = capture_instance_mismatch("orders", "dbo.orders", "dbo_sales", "dbo", "sales");
+        crate::error::assert_coded(&err, "RIVET_CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH", 1);
+        assert!(
+            format!("{err}").contains("Set `table:` to `dbo.sales`"),
+            "{err}"
         );
     }
 }

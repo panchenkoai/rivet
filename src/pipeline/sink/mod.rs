@@ -500,9 +500,12 @@ impl ExportSink {
         let schema = batch.schema();
         let idx = schema.index_of(name)?;
         let indices: Vec<usize> = (0..schema.fields().len()).filter(|&i| i != idx).collect();
-        batch
-            .project(&indices)
-            .map_err(|e| anyhow::anyhow!("project batch without {}: {}", name, e))
+        batch.project(&indices).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                format!("project batch without {}: {}", name, e),
+            )
+        })
     }
 
     pub fn maybe_split(&mut self) -> Result<()> {
@@ -632,7 +635,8 @@ impl ExportSink {
                 _ => None,
             };
             if let Some(value_bytes) = over {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::SOURCE_VALUE_TOO_LARGE,
                     "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
                      per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
                      batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
@@ -844,7 +848,8 @@ impl ExportSink {
                         );
                     }
                     crate::tuning::BatchMemoryPolicy::Fail => {
-                        anyhow::bail!(
+                        crate::rivet_bail!(
+                            crate::error::codes::CONFIG_BATCH_MEMORY_EXCEEDED,
                             "batch memory {} MB exceeds max_batch_memory_mb={} MB \
                              ({} rows). Lower batch_size to ~{} or set \
                              on_batch_memory_exceeded: auto_shrink.",
@@ -901,7 +906,8 @@ impl BatchSink for ExportSink {
                         | arrow::datatypes::DataType::Timestamp(_, _)
                 )
             {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CONFIG_SETTLE_COLUMN_NOT_TEMPORAL,
                     "settle column `{name}` is {}, not a date/timestamp — the settle window \
                      compares it against the source clock. Point `settle.column` at the row's \
                      insert/update time (the cursor is used when `settle.column` is omitted).",

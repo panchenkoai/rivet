@@ -465,7 +465,8 @@ pub(crate) fn write_part_file(
         if let (Some(local), Some(remote)) = (md5_digest_bytes(&md5), md5_digest_bytes(stored))
             && local != remote
         {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::DEST_UPLOAD_CORRUPTED,
                 "upload integrity check failed for '{file_name}': local MD5 differs from \
                  the store-reported checksum — the part corrupted in transit"
             );
@@ -514,8 +515,7 @@ pub(crate) fn write_sink_parts(
     for (idx, part) in parts.into_iter().enumerate() {
         let one = || -> Result<PartRecord> {
             // Test-only: fail part `idx` after its earlier siblings are durable.
-            crate::test_hook::maybe_error_at_index("sink_part_write", idx as i64)
-                .map_err(|msg| anyhow::anyhow!(msg))?;
+            crate::test_hook::maybe_error_at_index("sink_part_write", idx as i64)?;
             if let Some(fmt) = validate {
                 crate::pipeline::validate::validate_output(part.tmp.path(), fmt, part.rows)?;
             }
@@ -1008,8 +1008,10 @@ pub(crate) mod tests {
         match write_part_file(&dest, &src, 1, "part.parquet".into(), &landed) {
             Ok(_) => panic!("mismatched checksum must fail"),
             Err(e) => assert!(
-                e.to_string().contains("transit"),
-                "expected a transit-corruption error, got: {e}"
+                e.to_string().contains("transit")
+                    && crate::error::error_code(&e) == Some("RIVET_DEST_UPLOAD_CORRUPTED")
+                    && crate::error::classify_exit(&e) == 1,
+                "expected a coded transit-corruption error, got: {e}"
             ),
         }
         assert_eq!(

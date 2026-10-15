@@ -129,7 +129,10 @@ pub(crate) fn maybe_fail_at(point: &str) -> crate::error::Result<()> {
     if let Ok(p) = std::env::var("RIVET_TEST_ERROR_AT")
         && p == point
     {
-        anyhow::bail!("rivet test-hook: injected error at '{point}' (RIVET_TEST_ERROR_AT)");
+        crate::rivet_bail!(
+            crate::error::codes::CLI_TEST_FAULT_INJECTED,
+            "rivet test-hook: injected error at '{point}' (RIVET_TEST_ERROR_AT)"
+        );
     }
     Ok(())
 }
@@ -153,13 +156,25 @@ pub(crate) fn maybe_transient_once(point: &str) -> crate::error::Result<()> {
 /// per-worker SQL error (connection drop / statement timeout) MID-RANGE, distinct from
 /// the hard-exit crash: the worker RETURNS an error (not process death), the parallel
 /// runner collects it and bails, so NO `_SUCCESS` / manifest is finalized.
-pub(crate) fn maybe_error_at_index(point: &str, index: i64) -> Result<(), String> {
-    if let Ok(p) = std::env::var("RIVET_TEST_ERROR_AT")
-        && p == format!("{point}:{index}")
-    {
-        return Err(format!(
+pub(crate) fn maybe_error_at_index(point: &str, index: i64) -> anyhow::Result<()> {
+    fault_at_index(
+        point,
+        index,
+        std::env::var("RIVET_TEST_ERROR_AT").ok().as_deref(),
+    )
+}
+
+/// [`maybe_error_at_index`] against `configured`, the variable's value: the coded fault when it names `"{point}:{index}"`.
+pub(crate) fn fault_at_index(
+    point: &str,
+    index: i64,
+    configured: Option<&str>,
+) -> anyhow::Result<()> {
+    if configured == Some(format!("{point}:{index}").as_str()) {
+        crate::rivet_bail!(
+            crate::error::codes::CLI_TEST_FAULT_INJECTED,
             "rivet test-hook: injected error at '{point}:{index}' (RIVET_TEST_ERROR_AT)"
-        ));
+        );
     }
     Ok(())
 }
@@ -225,5 +240,19 @@ pub(crate) fn skip_live(why: &str) {
         .open(&path)
     {
         let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_injected_fault_carries_its_code_only_at_its_point() {
+        assert!(fault_at_index("chunk_export", 1, Some("chunk_export:2")).is_ok());
+        assert!(fault_at_index("chunk_export", 1, None).is_ok());
+        let err = fault_at_index("chunk_export", 1, Some("chunk_export:1")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_TEST_FAULT_INJECTED", 1);
+        assert!(format!("{err}").contains("'chunk_export:1'"));
     }
 }

@@ -287,8 +287,7 @@ pub(in crate::pipeline) fn run_chunked_parallel(
                     // joined, which a crashed process never does. Same point name and
                     // 0-based chunk index as the checkpoint runners
                     // (`RIVET_TEST_ERROR_AT=chunk_export:1`).
-                    crate::test_hook::maybe_error_at_index("chunk_export", i as i64)
-                        .map_err(|msg| anyhow::anyhow!(msg))?;
+                    crate::test_hook::maybe_error_at_index("chunk_export", i as i64)?;
 
                     let chunk_query = build_chunk_query_sql(
                         base_query,
@@ -398,11 +397,14 @@ pub(in crate::pipeline) fn run_chunked_parallel(
             other => unreachable!("chunked parts are recorded under a chunk unit, not {other:?}"),
         },
         |errs| {
-            anyhow::anyhow!(
-                "export '{}': {} chunks failed:\n{}",
-                plan.export_name,
-                errs.len(),
-                errs.join("\n")
+            crate::error::coded(
+                crate::error::codes::RUN_UNITS_FAILED,
+                format!(
+                    "export '{}': {} chunks failed:\n{}",
+                    plan.export_name,
+                    errs.len(),
+                    errs.join("\n")
+                ),
             )
         },
     );

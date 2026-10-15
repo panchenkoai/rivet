@@ -450,6 +450,7 @@ fn value_ceiling_rejects_oversized_cell() {
     let msg = format!("{err:#}");
     assert!(msg.contains("RIVET_VALUE_TOO_LARGE"), "got: {msg}");
     assert!(msg.contains("body"), "should name the column: {msg}");
+    crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_TOO_LARGE", 1);
 }
 
 #[test]
@@ -557,7 +558,9 @@ fn batch_memory_refusal_holds_at_the_limit_and_names_the_sizes() {
     sink.batch_memory_policy = crate::tuning::BatchMemoryPolicy::Fail;
     let limit = 1024 * 1024 + 777;
     sink.max_batch_memory_bytes = Some(limit);
-    let err = format!("{:#}", sink.process_dest_batch(&batch).unwrap_err());
+    let err = sink.process_dest_batch(&batch).unwrap_err();
+    crate::error::assert_coded(&err, "RIVET_CONFIG_BATCH_MEMORY_EXCEEDED", 1);
+    let err = format!("{err:#}");
     let want = format!(
         "batch memory {} MB exceeds max_batch_memory_mb={} MB (2 rows). Lower batch_size to ~{} ",
         bytes / (1024 * 1024),
@@ -565,6 +568,19 @@ fn batch_memory_refusal_holds_at_the_limit_and_names_the_sizes() {
         (2 * limit / bytes).max(1)
     );
     assert!(err.contains(&want), "{err}\nwant: {want}");
+}
+
+#[test]
+fn a_settle_column_that_is_not_temporal_is_refused_by_code() {
+    let mut sink = minimal_sink();
+    sink.settle_columns = vec!["updated".to_string()];
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "updated",
+        DataType::Utf8,
+        true,
+    )]));
+    let err = crate::source::BatchSink::on_schema(&mut sink, schema).unwrap_err();
+    crate::error::assert_coded(&err, "RIVET_CONFIG_SETTLE_COLUMN_NOT_TEMPORAL", 1);
 }
 
 // ─── helpers ─────────────────────────────────────────────────

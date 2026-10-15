@@ -100,7 +100,11 @@ pub fn run_validate_command(
     let exports: Vec<&crate::config::ExportConfig> = match export_name {
         Some(name) => match config.exports.iter().find(|e| e.name == name) {
             Some(e) => vec![e],
-            None => anyhow::bail!("export '{}' not found in config", name),
+            None => crate::rivet_bail!(
+                crate::error::codes::CLI_EXPORT_UNKNOWN,
+                "export '{}' not found in config",
+                name
+            ),
         },
         None => {
             // A `cdc.backfill` recipe never runs on its own, so its prefix holds
@@ -116,7 +120,10 @@ pub fn run_validate_command(
     };
 
     if exports.is_empty() {
-        anyhow::bail!("no exports defined in config — nothing to validate");
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_NO_EXPORTS,
+            "no exports defined in config — nothing to validate"
+        );
     }
 
     // `--prefix` only makes sense for a single export; with multiple
@@ -124,7 +131,8 @@ pub fn run_validate_command(
     // bytes.  Catch this at the boundary so we never head-check the wrong
     // dataset under operator triage pressure.
     if target.prefix_override.is_some() && exports.len() > 1 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "--prefix requires --export <name>: cannot apply one override to {} exports",
             exports.len()
         );
@@ -260,7 +268,10 @@ pub fn run_validate_command(
     if could_not_verify > 0 {
         // Could-not-verify only (no verified-wrong verdict): operational, generic
         // exit 1 — retry, don't stop-the-line.
-        anyhow::bail!("rivet validate: {could_not_verify} export(s) could not be verified");
+        crate::rivet_bail!(
+            crate::error::codes::VALIDATE_UNVERIFIED,
+            "rivet validate: {could_not_verify} export(s) could not be verified"
+        );
     }
     Ok(())
 }

@@ -45,7 +45,8 @@ pub fn run_apply_command(
         return super::run::run_waves(plan_file, force, parallel, resume);
     }
     if pool.is_some() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CLI_OPTION_UNSUPPORTED,
             "--pool schedules a whole CONFIG's exports (it needs the full set to order by \
              duration) and does not apply to a sealed single-export plan artifact. Pass the \
              YAML config instead: `rivet apply <config.yaml> --pool N`."
@@ -106,7 +107,8 @@ pub fn run_apply_command(
                 format!("{} hours old", age.num_hours())
             };
             if !force {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::PLAN_ARTIFACT_STALE,
                     "plan '{}' is {} (limit: 24 h). Regenerate with `rivet plan` or pass --force to override.",
                     artifact.export_name,
                     age_phrase,
@@ -182,7 +184,8 @@ pub fn run_apply_command(
             .last_cursor_value;
         if !artifact.cursor_matches(current.as_deref()) {
             if !force {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::PLAN_ARTIFACT_STALE,
                     "plan '{}': cursor has drifted since plan was generated \
                      (plan snapshot: {:?}, current: {:?}). \
                      Regenerate with `rivet plan` or pass --force to skip this check.",
@@ -311,7 +314,8 @@ fn reject_unrecoverable_inline_url(artifact: &PlanArtifact) -> Result<()> {
         return Ok(());
     }
 
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::PLAN_ARTIFACT_NO_CREDENTIALS,
         "plan '{}': source credentials were stripped from this artifact and cannot be \
          recovered at apply time — the plan was created from an inline `url:` config, whose \
          password is never persisted.\n  \
@@ -516,6 +520,7 @@ mod tests {
             msg.contains("hours old") || msg.contains("24 h"),
             "expected staleness error: {msg}"
         );
+        crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
     }
 
     // ── cursor drift ─────────────────────────────────────────────────────────
@@ -534,6 +539,7 @@ mod tests {
             msg.contains("drifted") || msg.contains("cursor"),
             "expected cursor drift error: {msg}"
         );
+        crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
     }
 
     // ── file I/O errors ──────────────────────────────────────────────────────
@@ -614,4 +620,23 @@ mod tests {
     // untouched_artifact`, and indirectly here by `stale_error_without_force_is_
     // rejected` / `cursor_drift_detected_no_prior_state`, which both pass the
     // integrity gate to reach the staleness / cursor gates they assert on.
+
+    #[test]
+    fn a_credential_stripped_plan_and_a_pooled_artifact_are_refused_by_code() {
+        let mut a = fresh_artifact();
+        let s = &mut a.resolved_plan.source;
+        s.url = Some("postgresql://REDACTED@h/db".into());
+        s.url_env = None;
+        s.url_file = None;
+        s.password_env = None;
+        s.host = None;
+        s.user = None;
+        let err = reject_unrecoverable_inline_url(&a).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_NO_CREDENTIALS", 1);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_artifact(&dir, &fresh_artifact());
+        let err = run_apply_command(&path, false, false, false, Some(2), false).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_OPTION_UNSUPPORTED", 1);
+    }
 }

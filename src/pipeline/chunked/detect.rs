@@ -26,9 +26,12 @@ fn query_wrapped_row_count(
             crate::sql::derived(source_type, "_rivet_rowcnt")
         ),
     };
-    let raw = src
-        .query_scalar(&sql)?
-        .ok_or_else(|| anyhow::anyhow!("COUNT(*) returned no row"))?;
+    let raw = src.query_scalar(&sql)?.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_RUN_INVARIANT,
+            "COUNT(*) returned no row",
+        )
+    })?;
     parse_scalar_i64(&raw)
 }
 
@@ -93,7 +96,8 @@ fn bail_if_null_keyed(
     // (no row → no bail), preserving the "detect on live data" intent.
     let sql = crate::sql::null_key_probe_sql(source_type, chunk_column, base_query);
     if src.query_scalar(&sql)?.is_some() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::PLAN_CHUNK_KEY_NULL,
             "export '{}': found NULL in chunk_column '{}'. Range/date chunking filters \
              with `BETWEEN min AND max` (or `>= .. < ..`), which excludes NULL — those rows would \
              be silently dropped from the export. Fix one of: use a NOT NULL column for \
@@ -275,31 +279,35 @@ pub(crate) fn detect_and_generate_chunks(
         let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
         let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
         let min_str = src.query_scalar(&min_sql)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "export '{}': min({}) returned NULL — table may be empty",
-                export_name,
-                chunk_column
+            crate::error::coded(
+                crate::error::codes::SOURCE_PROBE_UNREADABLE,
+                format!(
+                    "export '{}': min({}) returned NULL — table may be empty",
+                    export_name, chunk_column
+                ),
             )
         })?;
         let max_str = src.query_scalar(&max_sql)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "export '{}': max({}) returned NULL — table may be empty",
-                export_name,
-                chunk_column
+            crate::error::coded(
+                crate::error::codes::SOURCE_PROBE_UNREADABLE,
+                format!(
+                    "export '{}': max({}) returned NULL — table may be empty",
+                    export_name, chunk_column
+                ),
             )
         })?;
 
         let min_date = parse_date_flexible(&min_str).ok_or_else(|| {
-            anyhow::anyhow!(
+            crate::error::coded(crate::error::codes::SOURCE_PROBE_UNREADABLE, format!(
                 "export '{}': could not parse min({}) = {:?} as a date (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
                 export_name, chunk_column, min_str
-            )
+            ))
         })?;
         let max_date = parse_date_flexible(&max_str).ok_or_else(|| {
-            anyhow::anyhow!(
+            crate::error::coded(crate::error::codes::SOURCE_PROBE_UNREADABLE, format!(
                 "export '{}': could not parse max({}) = {:?} as a date (expected YYYY-MM-DD or YYYY-MM-DD HH:MM:SS)",
                 export_name, chunk_column, max_str
-            )
+            ))
         })?;
 
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch is valid");
@@ -368,16 +376,16 @@ pub(crate) fn detect_and_generate_chunks(
     let read_bound = |src: &mut dyn Source, raw: Option<String>, which: &str| -> Result<i64> {
         match raw {
             Some(text) => strict_i64(&text).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
+                crate::error::coded(
+                    crate::error::codes::CONFIG_CHUNK_COLUMN_NOT_INTEGER,
+                    format!(
+                        "export '{}': {}({}) = {:?} is not a whole integer within the 64-bit range — \
                      range chunking slices with an integer BETWEEN, so a fractional key silently \
                      drops rows between windows and a wider one cannot be sliced. Use \
                      `chunk_by_key:` (keyset — any orderable unique indexed key) or an integer \
                      column.",
-                    export_name,
-                    which,
-                    chunk_column,
-                    text
+                        export_name, which, chunk_column, text
+                    ),
                 )
             }),
             None => {
@@ -385,15 +393,15 @@ pub(crate) fn detect_and_generate_chunks(
                 if rows <= 0 {
                     return Ok(0); // genuinely empty — the one legitimate zero
                 }
-                Err(anyhow::anyhow!(
-                    "export '{}': {}({}) returned no readable value although the table has ~{} \
+                Err(crate::error::coded(
+                    crate::error::codes::SOURCE_PROBE_UNREADABLE,
+                    format!(
+                        "export '{}': {}({}) returned no readable value although the table has ~{} \
                      row(s) — the driver cannot render this key's type. Range chunking would plan the single window `BETWEEN 0 AND \
                      0` and export NOTHING while reporting success. Use `chunk_by_key:` (keyset) \
                      or an integer column.",
-                    export_name,
-                    which,
-                    chunk_column,
-                    rows
+                        export_name, which, chunk_column, rows
+                    ),
                 ))
             }
         }
@@ -426,8 +434,14 @@ pub(crate) fn detect_and_generate_chunks(
     // Checked variant: refuse an extreme-sparse plan (window count past the
     // ceiling) BEFORE the `Vec` allocates — the sparse guard below inspects
     // `chunks.len()` and so is structurally too late to stop the OOM itself.
-    let chunks = generate_chunks_checked(min_val, max_val, effective_chunk_size as i64)
-        .map_err(|e| anyhow::anyhow!("export '{export_name}': {e}"))?;
+    let chunks =
+        generate_chunks_checked(min_val, max_val, effective_chunk_size as i64).map_err(|e| {
+            crate::error::recoded(
+                &e,
+                crate::error::codes::PLAN_CHUNK_KEY_SPARSE,
+                format!("export '{export_name}': {e}"),
+            )
+        })?;
 
     // Sparsity diagnostic from a SCAN-FREE row estimate (catalog stats), never a
     // full COUNT(*): a full count on a large production table is exactly the
@@ -458,7 +472,10 @@ pub(crate) fn detect_and_generate_chunks(
     // explicit count is already bounded, and date paths never reach here.
     if chunk_count.is_none() {
         match sparse_chunk_action(chunks.len(), row_estimate, chunk_size) {
-            Some(SparseAction::Bail(msg)) => anyhow::bail!("export '{export_name}': {msg}"),
+            Some(SparseAction::Bail(msg)) => crate::rivet_bail!(
+                crate::error::codes::PLAN_CHUNK_KEY_SPARSE,
+                "export '{export_name}': {msg}"
+            ),
             Some(SparseAction::Warn(msg)) => log::warn!("export '{export_name}': {msg}"),
             None => {}
         }
@@ -742,6 +759,7 @@ mod tests {
             msg.contains("not a whole integer") && msg.contains("chunk_by_key"),
             "the error must name the problem and the escape; got: {msg}"
         );
+        crate::error::assert_coded(&err, "RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER", 1);
     }
 
     #[test]
@@ -769,6 +787,7 @@ mod tests {
         let err = detect(&mut src, 100, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("NULL in chunk_column"), "got: {msg}");
+        crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_NULL", 5);
     }
 
     #[test]
@@ -1134,5 +1153,28 @@ mod tests {
         assert_eq!(chunks.len(), 5, "got: {chunks:?}");
         assert_eq!(chunks[0], (1, 1));
         assert_eq!(chunks[4], (5, 5));
+    }
+
+    /// A span past the window ceiling keeps the sparse-key code through the export-name rewrap;
+    /// a `COUNT(*)` with no row is rivet's own invariant.
+    #[test]
+    fn a_sparse_key_and_an_unanswered_count_carry_their_codes() {
+        let mut src = ScriptedSource::new([ok("0"), ok(&i64::MAX.to_string())]);
+        let err = detect(&mut src, 100_000, None).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_SPARSE", 1);
+        assert!(format!("{err}").starts_with("export '"), "{err}");
+
+        let mut src = ScriptedSource::new([null()]);
+        let err = query_wrapped_row_count(
+            &mut src,
+            "SELECT * FROM t",
+            crate::config::SourceType::Postgres,
+        )
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_RUN_INVARIANT", 6);
+
+        let mut src = ScriptedSource::new([ok("2023-01-01"), ok("not a date")]);
+        let err = detect(&mut src, 10_000, Some(7)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_PROBE_UNREADABLE", 5);
     }
 }

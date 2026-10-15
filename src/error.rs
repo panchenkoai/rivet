@@ -436,6 +436,11 @@ pub fn coded(code: Code, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CodedError::new(code, message))
 }
 
+/// `message` built around `inner`, carrying `inner`'s code when it has one, else `fallback`.
+pub fn recoded(inner: &anyhow::Error, fallback: Code, message: impl Into<String>) -> anyhow::Error {
+    coded(code_of(inner).unwrap_or(fallback), message)
+}
+
 /// The stable `RIVET_*` error code for a failure, if one was tagged via
 /// [`CodedError`] anywhere in the anyhow context chain. `main` surfaces it as the
 /// JSON `code` field and a `[CODE]` prefix on the text error line.
@@ -1130,6 +1135,182 @@ pub mod codes {
         "a column builder got a type it cannot build — a bug; report it with the column's type",
     );
 
+    /// A `--export` / `-e` name no export in the config carries.
+    pub const CLI_EXPORT_UNKNOWN: Code = usage(
+        "RIVET_CLI_EXPORT_UNKNOWN",
+        "pass `--export` a name declared under `exports:` in this config",
+    );
+    /// `--run-id` names a run of another export than `--export`.
+    pub const CLI_RUN_ID_EXPORT_MISMATCH: Code = usage(
+        "RIVET_CLI_RUN_ID_EXPORT_MISMATCH",
+        "pass the `--export` the run id belongs to, or omit `--run-id`",
+    );
+    /// An option or mode the command's subject cannot take (`--pool` on a plan artifact, `--prefix` without `--export`, `--resume` with nothing to resume, a mode `reconcile` or `repair` has no partitions for).
+    pub const CLI_OPTION_UNSUPPORTED: Code = usage(
+        "RIVET_CLI_OPTION_UNSUPPORTED",
+        "drop the option, or give the command the config, export or mode it takes, as the message names",
+    );
+    /// The reconcile report passed to `rivet repair` does not parse or belongs to another export.
+    pub const CLI_REPORT_INVALID: Code = usage(
+        "RIVET_CLI_REPORT_INVALID",
+        "pass the report `rivet reconcile --report` wrote for this export",
+    );
+    /// A plan, report or run artifact file the command writes beside the config could not be written.
+    pub const CLI_OUTPUT_UNWRITABLE: Code = environment(
+        "RIVET_CLI_OUTPUT_UNWRITABLE",
+        "check the output path and its directory's write permission",
+    );
+    /// A file passed to the command could not be read.
+    pub const CLI_INPUT_UNREADABLE: Code = environment(
+        "RIVET_CLI_INPUT_UNREADABLE",
+        "check the path passed to the command and its read permission",
+    );
+    /// The OS could not say which binary runs, so no child process could be spawned.
+    pub const CLI_EXECUTABLE_UNRESOLVED: Code = environment(
+        "RIVET_CLI_EXECUTABLE_UNRESOLVED",
+        "run rivet from a binary the OS can resolve: not deleted, unmounted or replaced while it runs",
+    );
+    /// rivet's own test hook raised the fault `RIVET_TEST_ERROR_AT` names.
+    pub const CLI_TEST_FAULT_INJECTED: Code = environment(
+        "RIVET_CLI_TEST_FAULT_INJECTED",
+        "unset `RIVET_TEST_ERROR_AT`; the fault is rivet's own test hook, not the source",
+    );
+    /// Every export in the config is a CDC stream or a backfill recipe, which `rivet plan` does not plan.
+    pub const PLAN_NOTHING_TO_PLAN: Code = usage(
+        "RIVET_PLAN_NOTHING_TO_PLAN",
+        "run the CDC streams and backfill recipes with `rivet run`; `rivet plan` plans batch exports only",
+    );
+    /// A plan artifact older than 24 h, or whose cursor snapshot the state no longer matches.
+    pub const PLAN_ARTIFACT_STALE: Code = refusal(
+        "RIVET_PLAN_ARTIFACT_STALE",
+        "regenerate the plan with `rivet plan`, or pass `--force` to apply it as it is",
+    );
+    /// A plan artifact made from an inline `url:` config, whose password was never persisted.
+    pub const PLAN_ARTIFACT_NO_CREDENTIALS: Code = usage(
+        "RIVET_PLAN_ARTIFACT_NO_CREDENTIALS",
+        "re-plan from a config that gives the source `url_env:` or `url_file:`",
+    );
+    /// A plan whose destination still holds `{partition}`: a sealed artifact carries no `partition_by` expansion.
+    pub const PLAN_PARTITION_TOKEN_UNEXPANDED: Code = usage(
+        "RIVET_PLAN_PARTITION_TOKEN_UNEXPANDED",
+        "run the config (`rivet apply <config.yaml>` or `rivet run`), or drop `{partition}` from the destination",
+    );
+    /// A plan-level compatibility rule rejected the export.
+    pub const PLAN_REJECTED: Code = usage(
+        "RIVET_PLAN_REJECTED",
+        "fix the config so the rule the message names passes; `rivet check` reports the same rules",
+    );
+    /// Auto-sized range windows over a key so sparse the plan would make thousands of near-empty windows, or more than the window ceiling.
+    pub const PLAN_CHUNK_KEY_SPARSE: Code = usage(
+        "RIVET_PLAN_CHUNK_KEY_SPARSE",
+        "set an explicit `chunk_count:` (or a larger `chunk_size:`), page by `chunk_by_key:`, or use `mode: full`",
+    );
+    /// A range or date `chunk_column` (or a `--pool --split` key) with NULL values, which every window's predicate would drop.
+    pub const PLAN_CHUNK_KEY_NULL: Code = refusal(
+        "RIVET_PLAN_CHUNK_KEY_NULL",
+        "chunk on a NOT NULL column, drop the NULL rows with `WHERE <column> IS NOT NULL` in the query, or use `mode: full`",
+    );
+    /// `settle.column` names a column that is not a date or timestamp.
+    pub const CONFIG_SETTLE_COLUMN_NOT_TEMPORAL: Code = usage(
+        "RIVET_CONFIG_SETTLE_COLUMN_NOT_TEMPORAL",
+        "point `settle.column` at a date or timestamp column, or omit it to settle on the cursor",
+    );
+    /// A `--pool --split` export whose destination holds a run-varying placeholder, so a split resume could not find its prior partition.
+    pub const CONFIG_SPLIT_PREFIX_UNSTABLE: Code = usage(
+        "RIVET_CONFIG_SPLIT_PREFIX_UNSTABLE",
+        "give the split export a destination without run-varying placeholders (`{export}` and `{table}` are stable)",
+    );
+    /// An export named like a synthesized split unit (`<export>#<n>`).
+    pub const CONFIG_EXPORT_NAME_RESERVED: Code = usage(
+        "RIVET_CONFIG_EXPORT_NAME_RESERVED",
+        "rename the export: `<name>#<n>` names are reserved for split units",
+    );
+    /// One batch outgrew `max_batch_memory_mb` under `on_batch_memory_exceeded: fail`.
+    pub const CONFIG_BATCH_MEMORY_EXCEEDED: Code = usage(
+        "RIVET_CONFIG_BATCH_MEMORY_EXCEEDED",
+        "lower `batch_size`, or set `on_batch_memory_exceeded: auto_shrink`",
+    );
+    /// A SQL Server CDC export whose `table:` and `capture_instance:` name different relations.
+    pub const CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH: Code = usage(
+        "RIVET_CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH",
+        "set `table:` to the relation the capture instance emits, or point `capture_instance:` at the table you meant",
+    );
+    /// A single cell larger than `tuning.max_value_mb`.
+    pub const SOURCE_VALUE_TOO_LARGE: Code = usage(
+        "RIVET_SOURCE_VALUE_TOO_LARGE",
+        "raise `tuning.max_value_mb`, or set it to 0 to disable the guard",
+    );
+    /// A keyset page ended on the key value it started after: the key's rendering is coarser than its values, so the seek cannot advance.
+    pub const SOURCE_KEYSET_KEY_COARSE: Code = refusal(
+        "RIVET_SOURCE_KEYSET_KEY_COARSE",
+        "page on a unique key rivet reads exactly: an integer, text, uuid or date column, or a timestamp at microsecond precision or coarser (cast it in a curated query)",
+    );
+    /// `rivet reconcile` found no chunk run recorded for the export.
+    pub const STATE_CHUNK_RUN_MISSING: Code = usage(
+        "RIVET_STATE_CHUNK_RUN_MISSING",
+        "set `chunk_checkpoint: true` and run the export before `rivet reconcile`",
+    );
+    /// A plain run met an unfinished chunk checkpoint run of its export.
+    pub const STATE_CHUNK_RUN_UNFINISHED: Code = refusal(
+        "RIVET_STATE_CHUNK_RUN_UNFINISHED",
+        "`rivet run … --resume` continues the unfinished chunk run; `rivet state reset-chunks` abandons it",
+    );
+    /// `rivet repair` found no `manifest.json` at the destination prefix to record the repair parts in.
+    pub const DEST_MANIFEST_MISSING: Code = usage(
+        "RIVET_DEST_MANIFEST_MISSING",
+        "finish the export (a complete run writes `manifest.json` at the prefix) before `rivet repair`",
+    );
+    /// The run's parts are durable, and the manifest naming them could not be written.
+    pub const DEST_MANIFEST_NOT_WRITTEN: Code = environment(
+        "RIVET_DEST_MANIFEST_NOT_WRITTEN",
+        "restore write access to the destination prefix and run again; until a run completes, no manifest names the parts already there",
+    );
+    /// A control artifact the destination listed a moment earlier is gone.
+    pub const DEST_OBJECT_NOT_FOUND: Code = environment(
+        "RIVET_DEST_OBJECT_NOT_FOUND",
+        "run again: the object vanished between rivet's two reads of it; if it repeats, check what else writes to the prefix",
+    );
+    /// A part's local checksum differs from the one the store reported after upload.
+    pub const DEST_UPLOAD_CORRUPTED: Code = environment(
+        "RIVET_DEST_UPLOAD_CORRUPTED",
+        "run again: the part is uploaded afresh; if it repeats, check the network path and any proxy in front of the destination",
+    );
+    /// A split resume could not list the destination prefix it reconstructs its partition from.
+    pub const DEST_PREFIX_UNLISTABLE: Code = environment(
+        "RIVET_DEST_PREFIX_UNLISTABLE",
+        "restore list access to the destination prefix and retry the resume",
+    );
+    /// A part a checkpoint committed is gone from the destination, so a manifest naming it would declare absent rows.
+    pub const DEST_COMMITTED_PART_GONE: Code = refusal(
+        "RIVET_DEST_COMMITTED_PART_GONE",
+        "`rivet state reset -c <config> --export <name>` (keyset) or `rivet state reset-chunks` (range chunks) so the range is re-read, or export into a fresh prefix",
+    );
+    /// A manifest at the prefix that does not parse, or is far larger than one rivet writes.
+    pub const DEST_CONTROL_ARTIFACT_INVALID: Code = refusal(
+        "RIVET_DEST_CONTROL_ARTIFACT_INVALID",
+        "inspect the manifest at the prefix: one rivet wrote parses and is small; restore or remove it, then run again",
+    );
+    /// Under `validate: true`, a part just written does not hold the rows the sink counted.
+    pub const DEST_PART_ROWS_MISMATCH: Code = integrity(
+        "RIVET_DEST_PART_ROWS_MISMATCH",
+        "stop and report it: a writer bug or a damaged disk; the part was not committed",
+    );
+    /// One or more units (chunks, keyset ranges, child exports) of the run failed; the message lists each cause.
+    pub const RUN_UNITS_FAILED: Code = environment(
+        "RIVET_RUN_UNITS_FAILED",
+        "fix the first cause the message names and run again; a checkpointed run resumes from where it stopped",
+    );
+    /// `run --reconcile` could not obtain the source count to compare.
+    pub const RUN_RECONCILE_UNVERIFIED: Code = environment(
+        "RIVET_RUN_RECONCILE_UNVERIFIED",
+        "run again to obtain the reconcile assurance, or drop `--reconcile`; the export completed",
+    );
+    /// A run invariant did not hold.
+    pub const INTERNAL_RUN_INVARIANT: Code = internal(
+        "RIVET_INTERNAL_RUN_INVARIANT",
+        "a run invariant did not hold — a bug; report it with the message",
+    );
+
     /// Every registered code: the docs page and the guard tests read this one list.
     pub const ALL: &[Code] = &[
         CONFIG_NO_EXPORTS,
@@ -1245,6 +1426,41 @@ pub mod codes {
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
+        CLI_EXPORT_UNKNOWN,
+        CLI_RUN_ID_EXPORT_MISMATCH,
+        CLI_OPTION_UNSUPPORTED,
+        CLI_REPORT_INVALID,
+        CLI_OUTPUT_UNWRITABLE,
+        CLI_INPUT_UNREADABLE,
+        CLI_EXECUTABLE_UNRESOLVED,
+        CLI_TEST_FAULT_INJECTED,
+        PLAN_NOTHING_TO_PLAN,
+        PLAN_ARTIFACT_STALE,
+        PLAN_ARTIFACT_NO_CREDENTIALS,
+        PLAN_PARTITION_TOKEN_UNEXPANDED,
+        PLAN_REJECTED,
+        PLAN_CHUNK_KEY_SPARSE,
+        PLAN_CHUNK_KEY_NULL,
+        CONFIG_SETTLE_COLUMN_NOT_TEMPORAL,
+        CONFIG_SPLIT_PREFIX_UNSTABLE,
+        CONFIG_EXPORT_NAME_RESERVED,
+        CONFIG_BATCH_MEMORY_EXCEEDED,
+        CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH,
+        SOURCE_VALUE_TOO_LARGE,
+        SOURCE_KEYSET_KEY_COARSE,
+        STATE_CHUNK_RUN_MISSING,
+        STATE_CHUNK_RUN_UNFINISHED,
+        DEST_MANIFEST_MISSING,
+        DEST_MANIFEST_NOT_WRITTEN,
+        DEST_OBJECT_NOT_FOUND,
+        DEST_UPLOAD_CORRUPTED,
+        DEST_PREFIX_UNLISTABLE,
+        DEST_COMMITTED_PART_GONE,
+        DEST_CONTROL_ARTIFACT_INVALID,
+        DEST_PART_ROWS_MISMATCH,
+        RUN_UNITS_FAILED,
+        RUN_RECONCILE_UNVERIFIED,
+        INTERNAL_RUN_INVARIANT,
     ];
 }
 
@@ -1307,6 +1523,16 @@ pub fn codes_markdown() -> String {
 }
 
 pub type Result<T> = anyhow::Result<T>;
+
+/// Test helper: `err` carries `code` and classifies to `exit`.
+#[cfg(test)]
+pub(crate) fn assert_coded(err: &anyhow::Error, code: &str, exit: i32) {
+    assert_eq!(
+        (error_code(err), classify_exit(err)),
+        (Some(code), exit),
+        "{err:#}"
+    );
+}
 
 #[cfg(test)]
 mod tests {
@@ -1487,7 +1713,7 @@ mod tests {
     /// The families a code may name (`RIVET_<FAMILY>_<NAME>`).
     const FAMILIES: &[&str] = &[
         "CONFIG", "CLI", "SOURCE", "CDC", "SPILL", "TYPE", "STATE", "DEST", "PLAN", "LOAD",
-        "VALIDATE", "INIT", "INTERNAL",
+        "VALIDATE", "INIT", "INTERNAL", "RUN",
     ];
 
     #[test]
@@ -1720,5 +1946,28 @@ mod stop_marker_tests {
             std::error::Error::source(&stop).map(ToString::to_string),
             Some("disk gone".to_string())
         );
+    }
+
+    #[test]
+    fn recoded_keeps_the_inner_code_and_falls_back_without_one() {
+        use crate::error::{assert_coded, coded, codes, error_code, recoded};
+        let inner = coded(codes::CONFIG_SECRET_UNSET, "DB_URL is not set");
+        let out = recoded(
+            &inner,
+            codes::CONFIG_SOURCE_CONNECTION_INVALID,
+            format!("export 'o': the probe needs the URL: {inner}"),
+        );
+        assert_eq!(error_code(&out), Some("RIVET_CONFIG_SECRET_UNSET"));
+        assert_eq!(
+            format!("{out}"),
+            "export 'o': the probe needs the URL: DB_URL is not set"
+        );
+        let plain = anyhow::anyhow!("database is locked");
+        let out = recoded(
+            &plain,
+            codes::STATE_NOT_WRITABLE,
+            format!("open: {plain:#}"),
+        );
+        assert_coded(&out, "RIVET_STATE_NOT_WRITABLE", 1);
     }
 }

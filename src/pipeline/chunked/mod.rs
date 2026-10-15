@@ -258,8 +258,12 @@ fn replan(
     if !tasks.iter().any(|t| t.file_name.is_some()) {
         return Ok((!ranges.is_empty(), ranges.to_vec()));
     }
-    let windows =
-        stored_windows(tasks).map_err(|why| anyhow::anyhow!("stored chunk windows {why}"))?;
+    let windows = stored_windows(tasks).map_err(|why| {
+        crate::error::coded(
+            crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,
+            format!("stored chunk windows {why}"),
+        )
+    })?;
     Ok((false, math::ranges_uncovered(ranges, &windows)))
 }
 
@@ -508,6 +512,22 @@ pub(crate) fn recover_checkpoint_run(
 /// Render the `--config <path>` argument used in user-facing recovery hints,
 /// or a `<CONFIG>` placeholder when the config path is not available (e.g.
 /// the `rivet apply` path which only knows the plan file).
+/// The refusal of a plain run that met chunk checkpoint run `rid` of `export` still in progress; `raced` when a concurrent run opened it under this one.
+fn chunk_run_unfinished(export: &str, rid: &str, config_path: &str, raced: bool) -> anyhow::Error {
+    let raced = if raced {
+        " (a concurrent run won the race)"
+    } else {
+        ""
+    };
+    let hint = config_hint(config_path);
+    crate::error::coded(
+        crate::error::codes::STATE_CHUNK_RUN_UNFINISHED,
+        format!(
+            "export '{export}': chunk checkpoint run '{rid}' still in progress{raced}; use `rivet run {hint} --export {export} --resume` or `rivet state reset-chunks {hint} --export {export}`"
+        ),
+    )
+}
+
 pub(super) fn config_hint(config_path: &str) -> String {
     if config_path.is_empty() {
         "--config <CONFIG>".to_string()
@@ -597,7 +617,8 @@ pub(super) fn ensure_chunk_checkpoint_plan(
                 return Ok(rid);
             }
             None => {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CLI_OPTION_UNSUPPORTED,
                     "export '{}': --resume but no in-progress chunk checkpoint — nothing to \
                      continue; run without --resume (a crashed run is resumed by a plain run)",
                     plan.export_name
@@ -607,15 +628,12 @@ pub(super) fn ensure_chunk_checkpoint_plan(
     }
 
     if let Some((rid, _)) = crashed {
-        anyhow::bail!(
-            "export '{}': chunk checkpoint run '{}' still in progress; use `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
-            plan.export_name,
-            rid,
-            config_hint(config_path),
-            plan.export_name,
-            config_hint(config_path),
-            plan.export_name
-        );
+        return Err(chunk_run_unfinished(
+            &plan.export_name,
+            &rid,
+            config_path,
+            false,
+        ));
     }
 
     // Round-2 audit #13: the v15 partial-unique index (`idx_chunk_run_one_inprogress`,
@@ -628,15 +646,12 @@ pub(super) fn ensure_chunk_checkpoint_plan(
         state.open_chunk_run(progress.key(), &summary.run_id, &plan_hash, max_att, chunks)
     {
         if let Ok(Some((rid, _))) = progress.chunk_run() {
-            anyhow::bail!(
-                "export '{}': chunk checkpoint run '{}' still in progress (a concurrent run won the race); use `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
-                plan.export_name,
-                rid,
-                config_hint(config_path),
-                plan.export_name,
-                config_hint(config_path),
-                plan.export_name
-            );
+            return Err(chunk_run_unfinished(
+                &plan.export_name,
+                &rid,
+                config_path,
+                true,
+            ));
         }
         return Err(e);
     }
@@ -1624,5 +1639,19 @@ mod tests {
             idle.take(&cfg).is_err(),
             "a taken connection is no longer idle"
         );
+    }
+
+    #[test]
+    fn an_unfinished_chunk_run_is_refused_by_code_raced_or_not() {
+        let err = chunk_run_unfinished("orders", "r1", "", false);
+        crate::error::assert_coded(&err, "RIVET_STATE_CHUNK_RUN_UNFINISHED", 5);
+        let plain = format!("{err}");
+        assert!(
+            plain.contains("--config <CONFIG> --export orders --resume"),
+            "{plain}"
+        );
+        assert!(!plain.contains("won the race"));
+        let raced = format!("{}", chunk_run_unfinished("orders", "r1", "c.yaml", true));
+        assert!(raced.contains("(a concurrent run won the race)"), "{raced}");
     }
 }

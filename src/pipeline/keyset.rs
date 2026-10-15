@@ -78,17 +78,7 @@ fn rehydrate_keyset_pages_probed(
         // operator in a refusal loop; `state reset` drops the export_state row
         // (cursor included, which incremental-keyset needs cleared too) and the
         // next run does a fresh full pass.
-        anyhow::bail!(
-            "keyset resume: {} committed page part(s) are GONE from the destination \
-             ({}) — a gc/cleanup pass deleted them between attempts. Refusing to \
-             finalize a Success manifest naming deleted files (their rows would be \
-             silently absent). Reset this export's keyset state (`rivet state \
-             reset -c <config> --export {}`) so the whole range is re-read, \
-             or point the export at a fresh prefix.",
-            names.len(),
-            names.join(", "),
-            plan.export_name
-        );
+        return Err(committed_pages_gone(&plan.export_name, &names));
     }
     Ok(())
 }
@@ -703,8 +693,7 @@ fn run_keyset_parallel(
                     let _permit = crate::pipeline::governor::TaskPermit::acquire(sem_r);
                     // Test-only: a per-worker SQL error at the range's first page
                     // (Err path, not a crash) — the run fails after the drain.
-                    crate::test_hook::maybe_error_at_index("keyset_parallel_worker", ridx as i64)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    crate::test_hook::maybe_error_at_index("keyset_parallel_worker", ridx as i64)?;
                     // Test-only: a MID-RANGE error — fires only once this range has
                     // ALREADY made page(s) durable (`pages > 0`). The fixture #200-1
                     // needs: pre-failure pages are on disk but the range never
@@ -713,8 +702,7 @@ fn run_keyset_parallel(
                         crate::test_hook::maybe_error_at_index(
                             "keyset_parallel_worker_midrange",
                             ridx as i64,
-                        )
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        )?;
                     }
                     let base = format!(
                         "{}_{}_pk_w{}_{}.{}",
@@ -743,7 +731,13 @@ fn run_keyset_parallel(
                         });
                         fan_r.part(unit, p);
                     }
-                    let page = page.map_err(|e| anyhow::anyhow!("page {pages}: {e:#}"))?;
+                    let page = page.map_err(|e| {
+                        crate::error::recoded(
+                            &e,
+                            crate::error::codes::RUN_UNITS_FAILED,
+                            format!("page {pages}: {e:#}"),
+                        )
+                    })?;
                     let Some(page) = page else { break };
                     fan_r.observe(page.observed);
                     rmax = page.next_cursor.clone().or(rmax);
@@ -775,8 +769,13 @@ fn run_keyset_parallel(
                 // transaction (checkpoint runs only). A crash before this leaves the
                 // range `done=0` with no file_log rows — re-read on resume.
                 if let Some(sref) = sref_r {
-                    let st = crate::state::StateStore::open_at_ref(sref)
-                        .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
+                    let st = crate::state::StateStore::open_at_ref(sref).map_err(|e| {
+                        crate::error::recoded(
+                            &e,
+                            crate::error::codes::STATE_NOT_WRITABLE,
+                            format!("checkpoint commit: {e:#}"),
+                        )
+                    })?;
                     st.commit_keyset_range(
                         rid_r,
                         &plan_r.export_name,
@@ -785,7 +784,13 @@ fn run_keyset_parallel(
                         fmt_r,
                         Some(cmp_r),
                     )
-                    .map_err(|e| anyhow::anyhow!("checkpoint commit: {e:#}"))?;
+                    .map_err(|e| {
+                        crate::error::recoded(
+                            &e,
+                            crate::error::codes::STATE_NOT_WRITABLE,
+                            format!("checkpoint commit: {e:#}"),
+                        )
+                    })?;
                     // Project the in-flight `running` aggregate from file_log (#173):
                     // best-effort observability, never gates the checkpoint above.
                     if let Err(e) = st.project_running_aggregate(
@@ -837,11 +842,14 @@ fn run_keyset_parallel(
             cursor_high: None,
         },
         |errs| {
-            anyhow::anyhow!(
-                "export '{}': parallel keyset failed on {} range(s): {}",
-                plan.export_name,
-                errs.len(),
-                errs.join("; ")
+            crate::error::coded(
+                crate::error::codes::RUN_UNITS_FAILED,
+                format!(
+                    "export '{}': parallel keyset failed on {} range(s): {}",
+                    plan.export_name,
+                    errs.len(),
+                    errs.join("; ")
+                ),
             )
         },
     )?;
@@ -903,6 +911,23 @@ fn fan_out_collapsed(parallel: usize, total_ranges: usize) -> bool {
 }
 
 /// The seek bound after a page: `None` on a short (last) page, else its max key — refusing a missing or non-advancing one.
+/// The refusal of a keyset resume whose committed page parts `names` are gone from the destination.
+fn committed_pages_gone(export: &str, names: &[&str]) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::DEST_COMMITTED_PART_GONE,
+        format!(
+            "keyset resume: {} committed page part(s) are GONE from the destination \
+             ({}) — a gc/cleanup pass deleted them between attempts. Refusing to \
+             finalize a Success manifest naming deleted files (their rows would be \
+             silently absent). Reset this export's keyset state (`rivet state \
+             reset -c <config> --export {export}`) so the whole range is re-read, \
+             or point the export at a fresh prefix.",
+            names.len(),
+            names.join(", "),
+        ),
+    )
+}
+
 pub(crate) fn next_seek(
     prev: Option<&str>,
     rows: usize,
@@ -916,19 +941,22 @@ pub(crate) fn next_seek(
         return Ok(None);
     }
     let Some(next) = next else {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_PROBE_UNREADABLE,
             "{who}: keyset could not read the '{key}' value from the last row of page {page} \
              (NULL or unsupported type) — cannot advance safely (last readable key: {}). \
              The key must be NOT NULL and one of: integer, float, string, timestamp, date, uuid.",
             prev.unwrap_or("<none>"),
         );
     };
-    anyhow::ensure!(
-        prev != Some(next.as_str()),
-        "keyset page {page} ended on the same '{key}' value it started after ({next}): the key's \
-         rendering is coarser than its values (e.g. a TIMESTAMP(7..9) read at microseconds), so the \
-         seek cannot advance. Page on a unique key rivet reads exactly."
-    );
+    if prev == Some(next.as_str()) {
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_KEYSET_KEY_COARSE,
+            "keyset page {page} ended on the same '{key}' value it started after ({next}): the key's \
+             rendering is coarser than its values (e.g. a TIMESTAMP(7..9) read at microseconds), so the \
+             seek cannot advance. Page on a unique key rivet reads exactly."
+        );
+    }
     Ok(Some(next))
 }
 
@@ -1939,5 +1967,28 @@ mod tests {
             vec!["k_p0.parquet"],
             "the durable first part must survive the failure"
         );
+    }
+
+    /// `next_seek` and the resume's gone-parts refusal carry their codes; the resume walk itself
+    /// (a part deleted between attempts) is driven by the live suite.
+    #[test]
+    fn a_coarse_key_an_unreadable_key_and_gone_pages_are_refused_by_code() {
+        let ts = "2024-01-01 00:00:00.000001";
+        let err = next_seek(
+            Some(ts),
+            10,
+            10,
+            Some(ts.to_string()),
+            "ts",
+            3,
+            "export 'o'",
+        )
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_KEYSET_KEY_COARSE", 5);
+        let err = next_seek(None, 10, 10, None, "ts", 3, "export 'o'").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_PROBE_UNREADABLE", 5);
+        let err = committed_pages_gone("orders", &["orders_pk_w0_1.parquet"]);
+        crate::error::assert_coded(&err, "RIVET_DEST_COMMITTED_PART_GONE", 5);
+        assert!(format!("{err}").contains("--export orders`"), "{err}");
     }
 }
