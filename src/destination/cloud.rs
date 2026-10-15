@@ -413,59 +413,6 @@ impl<B: CloudBackend> CloudDestination<B> {
         }
     }
 
-    /// Every object under `prefix`, keys relative to the configured prefix.
-    fn list_under(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, prefix);
-        // opendal expects a trailing `/` for directory listings. For a
-        // bucket/container root the empty string is fine; for any non-empty
-        // prefix we add `/` if the caller didn't.
-        let listed = if full.is_empty() || full.ends_with('/') {
-            self.op.list_options(
-                &full,
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        } else {
-            self.op.list_options(
-                &format!("{}/", full),
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
-        };
-        let mut out = Vec::with_capacity(listed.len());
-        for entry in listed {
-            if entry.metadata().mode() != opendal::EntryMode::FILE {
-                continue;
-            }
-            // entry.path() returns a bucket-root-absolute key; strip our
-            // configured prefix so the returned `key` is comparable to
-            // values the caller passed to `write`.
-            let abs = entry.path().to_string();
-            let rel = abs
-                .strip_prefix(self.prefix.as_str())
-                .unwrap_or(abs.as_str())
-                .to_string();
-            out.push(super::ObjectMeta {
-                key: rel,
-                size_bytes: entry.metadata().content_length(),
-                // Dropped for a backend whose listing aliases something else into
-                // this field — see `LIST_MD5_IS_TRUSTWORTHY`. Size-only is the
-                // honest degrade; a wrong digest is worse than no digest, because
-                // the consumers treat a mismatch as corruption.
-                content_md5: if B::LIST_MD5_IS_TRUSTWORTHY {
-                    entry.metadata().content_md5().map(str::to_string)
-                } else {
-                    None
-                },
-            });
-        }
-        Ok(out)
-    }
-
     /// Upload one local part to `remote_key` under the prefix.
     fn write_part(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
@@ -539,8 +486,59 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     // `write`'s `remote_key` argument.
 
     fn list_prefix(&self, prefix: &str) -> Result<Vec<super::ObjectMeta>> {
-        self.list_under(prefix)
-            .map_err(|e| self.absent_container_or(e))
+        let full = format!("{}{}", self.prefix, prefix);
+        // opendal expects a trailing `/` for directory listings. For a
+        // bucket/container root the empty string is fine; for any non-empty
+        // prefix we add `/` if the caller didn't.
+        let listed = if full.is_empty() || full.ends_with('/') {
+            self.op
+                .list_options(
+                    &full,
+                    opendal::options::ListOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| self.absent_container_or(e.into()))?
+        } else {
+            self.op
+                .list_options(
+                    &format!("{}/", full),
+                    opendal::options::ListOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| self.absent_container_or(e.into()))?
+        };
+        let mut out = Vec::with_capacity(listed.len());
+        for entry in listed {
+            if entry.metadata().mode() != opendal::EntryMode::FILE {
+                continue;
+            }
+            // entry.path() returns a bucket-root-absolute key; strip our
+            // configured prefix so the returned `key` is comparable to
+            // values the caller passed to `write`.
+            let abs = entry.path().to_string();
+            let rel = abs
+                .strip_prefix(self.prefix.as_str())
+                .unwrap_or(abs.as_str())
+                .to_string();
+            out.push(super::ObjectMeta {
+                key: rel,
+                size_bytes: entry.metadata().content_length(),
+                // Dropped for a backend whose listing aliases something else into
+                // this field — see `LIST_MD5_IS_TRUSTWORTHY`. Size-only is the
+                // honest degrade; a wrong digest is worse than no digest, because
+                // the consumers treat a mismatch as corruption.
+                content_md5: if B::LIST_MD5_IS_TRUSTWORTHY {
+                    entry.metadata().content_md5().map(str::to_string)
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(out)
     }
 
     fn read(&self, key: &str) -> Result<Vec<u8>> {
@@ -553,9 +551,8 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
     }
 
     fn remove(&self, key: &str) -> Result<()> {
-        self.op
-            .delete(&format!("{}{}", self.prefix, key))
-            .map_err(|e| self.absent_container_or(e.into()))
+        self.op.delete(&format!("{}{}", self.prefix, key))?;
+        Ok(())
     }
 
     fn r#move(&self, from: &str, to: &str) -> Result<()> {
@@ -567,10 +564,9 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         // a clutter problem, not a correctness one.
         let from_full = format!("{}{}", self.prefix, from);
         let to_full = format!("{}{}", self.prefix, to);
-        self.op
-            .copy(&from_full, &to_full)
-            .and_then(|()| self.op.delete(&from_full))
-            .map_err(|e| self.absent_container_or(e.into()))
+        self.op.copy(&from_full, &to_full)?;
+        self.op.delete(&from_full)?;
+        Ok(())
     }
 
     fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
