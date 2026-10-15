@@ -320,8 +320,8 @@ scenarios:
   - id: refusal_source_cdc_foreign_checkpoint
     what: "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT: a checkpoint written against another server or stream"
     postgres: { na: "the identity verdict is enforced by the MySQL, SQL Server and Oracle streams (`IdentityVerdict::enforce`); the PostgreSQL position lives in the server's own slot, which no other server holds" }
-    mysql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mssql:    { gap: "asserted by its code only in live_cdc_replica (a MySQL failover); the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { test: a_checkpoint_of_another_server_is_refused_by_code_mysql }
+    mssql:    { test: a_checkpoint_of_another_database_is_refused_by_code_mssql }
     mongo:    { na: "the identity verdict is enforced by the MySQL, SQL Server and Oracle streams (`IdentityVerdict::enforce`); a MongoDB resume token is validated by the server it came from" }
     oracle:   { test: a_checkpoint_of_another_database_is_refused_by_code_oracle }
 

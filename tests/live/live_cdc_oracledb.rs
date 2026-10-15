@@ -1198,14 +1198,6 @@ fn oracle_cdc_corrupt_checkpoint_fails_loud_not_silently_absent() {
 }
 
 /// The checkpoint with `edit` applied to its JSON.
-/// Edit the JSON checkpoint at `ckpt` in place.
-pub(crate) fn rewrite_checkpoint(ckpt: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
-    let mut v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(ckpt).unwrap()).unwrap();
-    edit(&mut v);
-    std::fs::write(ckpt, v.to_string()).unwrap();
-}
-
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
 fn oracle_cdc_resume_past_log_retention_fails_loudly() {

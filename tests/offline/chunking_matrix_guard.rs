@@ -352,7 +352,8 @@ const MATRICES: &[(&str, usize)] = &[
     // truncate on SQL Server).
     // 96 -> 93 (2026-10-14): the Oracle log-gap, foreign-checkpoint and undecodable refusals are walked out of.
     // 93 -> 92 (2026-10-15): the SQL Server log-gap refusal is walked out of (both cells of one body).
-    ("docs/sabotage-matrix.yaml", 92),
+    // 92 -> 90 (2026-10-15): the MySQL and SQL Server foreign-checkpoint refusals are walked out of.
+    ("docs/sabotage-matrix.yaml", 90),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition
