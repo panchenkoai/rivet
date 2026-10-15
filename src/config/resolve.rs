@@ -27,7 +27,8 @@ pub fn resolve_vars(
         } else {
             match std::env::var(var_name) {
                 Ok(v) => v,
-                Err(_) => anyhow::bail!(
+                Err(_) => crate::config_bail!(
+                    crate::error::codes::CONFIG_SECRET_UNSET,
                     "'${{{var_name}}}' in the config is unresolved — set it with \
                      `--param {var_name}=<value>` (`-p`, which wins over the environment) or export \
                      the environment variable '{var_name}'. (A missing value would silently become \
@@ -48,7 +49,8 @@ pub fn resolve_vars(
         // error names the placeholder but never echoes the value (it may itself
         // be a secret).
         if value.contains('\0') {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "value for '${{{var_name}}}' contains a NUL byte; refusing to substitute it \
                  (check the parameter/environment source)"
             );
@@ -171,11 +173,14 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
         (s.as_str(), 1u64)
     };
     let value: f64 = num.parse().map_err(|_| {
-        anyhow::anyhow!(
-            "invalid file size: '{}' — expected a number with an optional unit \
-             B/KB/MB/GB (e.g. '512MB', '1.5GB', or a bare byte count like '1048576'); \
-             a fractional value is allowed and units are binary (KB = 1024 bytes)",
-            s
+        crate::error::coded(
+            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
+            format!(
+                "invalid file size: '{}' — expected a number with an optional unit \
+                 B/KB/MB/GB (e.g. '512MB', '1.5GB', or a bare byte count like '1048576'); \
+                 a fractional value is allowed and units are binary (KB = 1024 bytes)",
+                s
+            ),
         )
     })?;
     // Reject anything that lands on 0 bytes: the float→u64 cast saturates zero,
@@ -186,7 +191,8 @@ pub fn parse_file_size(s: &str) -> crate::error::Result<u64> {
     // 0 bytes (#19 bughunt). Fail loud like a non-numeric value.
     let bytes = (value * multiplier as f64) as u64;
     if bytes == 0 {
-        anyhow::bail!(
+        crate::config_bail!(
+            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
             "invalid file size: '{}' — must be at least 1 byte; a zero, negative, or \
              sub-byte rotation threshold would split the output after every row",
             s

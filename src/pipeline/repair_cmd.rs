@@ -159,8 +159,12 @@ fn execute_repair(
     // Without it we can re-export the data but cannot point the recorded state
     // at the fresh count, so `reconcile → repair → reconcile` could never
     // converge (audit finding #7).
-    let _run_lease =
-        super::chunked::claim_export_progress(state, &plan.export_name, "repair its chunks")?;
+    let _run_lease = super::chunked::claim_export_progress(
+        state,
+        &plan.export_name,
+        &plan.source.state_key(),
+        "repair its chunks",
+    )?;
     let run_id = state.claim(plan.progress_key())?.latest_chunk_run()?;
 
     // One summary across the whole repair (matches the original single
@@ -668,7 +672,7 @@ mod tests {
             actions: Vec::new(),
             skipped: Vec::new(),
         };
-        let held = super::super::chunked::try_run_lease(&run, &export)
+        let held = super::super::chunked::try_run_lease(&run, &export, &plan.source.state_key())
             .unwrap()
             .expect("the live run's lease");
         let err =

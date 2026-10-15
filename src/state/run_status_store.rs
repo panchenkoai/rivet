@@ -140,11 +140,11 @@ impl StateStore {
     }
 
     /// The newest `running` row of `export_name`: the run a held run lease belongs to.
-    pub fn newest_running_run(&self, export_name: &str) -> Result<Option<String>> {
+    pub fn newest_running_run(&self, export_name: &str, source: &str) -> Result<Option<String>> {
         self.query_opt(
             "SELECT run_id FROM run_status WHERE export_name = ?1 AND status = 'running' \
-             ORDER BY started_at DESC LIMIT 1",
-            &[export_name.into()],
+             AND (source = ?2 OR source IS NULL) ORDER BY started_at DESC LIMIT 1",
+            &[export_name.into(), source.into()],
             |r| r.text(0),
         )
     }
@@ -181,34 +181,53 @@ impl StateStore {
         })
     }
 
-    /// [`Self::begin_run`] by a run that holds the export's run lease: the export's dead `running` rows are stamped `interrupted` in the same transaction, so a refused begin leaves them as they were.
+    /// [`Self::begin_run`] by a run that holds the export's run lease on `source`: that source's dead `running` rows (and rows written before sources were recorded) are stamped `interrupted` in the same transaction, so a refused begin leaves them as they were.
     pub fn begin_run_under_lease(
         &self,
         run_id: &str,
         export_name: &str,
+        source: &str,
         prefix: &str,
         started_at: &str,
     ) -> Result<()> {
         self.transaction(|| {
-            self.interrupt_dead_runs(export_name, started_at)?;
-            self.begin_run(run_id, export_name, prefix, started_at)
+            self.interrupt_dead_runs(export_name, source, started_at)?;
+            self.begin_run(run_id, export_name, prefix, started_at)?;
+            self.record_run_source(run_id, source)
         })
     }
 
-    /// Stamp `interrupted` on every `running` row of `export_name` (run status and metrics), so no live run may own them; returns the run-status rows stamped.
-    pub fn interrupt_dead_runs(&self, export_name: &str, finished_at: &str) -> Result<usize> {
+    /// Record the source `run_id` reads, which scopes the run lease that closes its row if it dies.
+    pub fn record_run_source(&self, run_id: &str, source: &str) -> Result<()> {
+        self.execute(
+            "UPDATE run_status SET source = ?2 WHERE run_id = ?1",
+            &[run_id.into(), source.into()],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp `interrupted` on every `running` row of `export_name` reading `source` or recorded before sources were (run status, and the metrics of those runs or of runs with no status row); returns the run-status rows stamped.
+    pub fn interrupt_dead_runs(
+        &self,
+        export_name: &str,
+        source: &str,
+        finished_at: &str,
+    ) -> Result<usize> {
         self.transaction(|| {
-            let runs = self.execute(
-                "UPDATE run_status SET status = 'interrupted', finished_at = ?2 \
-                 WHERE export_name = ?1 AND status = 'running'",
-                &[export_name.into(), finished_at.into()],
-            )?;
             self.execute(
                 "UPDATE export_metrics SET status = 'interrupted' \
-                 WHERE export_name = ?1 AND status = 'running'",
-                &[export_name.into()],
+                 WHERE export_name = ?1 AND status = 'running' AND ( \
+                     run_id IN (SELECT run_id FROM run_status WHERE export_name = ?1 \
+                                AND status = 'running' AND (source = ?2 OR source IS NULL)) \
+                     OR run_id IS NULL \
+                     OR run_id NOT IN (SELECT run_id FROM run_status))",
+                &[export_name.into(), source.into()],
             )?;
-            Ok(runs)
+            self.execute(
+                "UPDATE run_status SET status = 'interrupted', finished_at = ?3 \
+                 WHERE export_name = ?1 AND status = 'running' AND (source = ?2 OR source IS NULL)",
+                &[export_name.into(), source.into(), finished_at.into()],
+            )
         })
     }
 
@@ -358,18 +377,22 @@ fn live_on_prefix(alias: &str, param: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A lease holder closes its export's dead `running` rows in both tables, and leaves finished rows and other exports alone.
+    /// A lease holder on one source closes its export's dead `running` rows of that source and of no recorded source, in both tables, and leaves finished rows, another source's live run and other exports alone.
     #[test]
-    fn the_dead_runs_of_an_export_are_stamped_interrupted_and_nothing_else() {
+    fn the_dead_runs_of_an_export_on_its_source_are_stamped_interrupted_and_nothing_else() {
         let s = StateStore::open_in_memory().unwrap();
-        for (run, export) in [
-            ("o1", "orders"),
-            ("o2", "orders"),
-            ("o3", "orders"),
-            ("u1", "users"),
+        for (run, export, source) in [
+            ("o1", "orders", Some("pg://a/db")),
+            ("o2", "orders", None),
+            ("o3", "orders", Some("pg://a/db")),
+            ("o4", "orders", Some("pg://b/db")),
+            ("u1", "users", Some("pg://a/db")),
         ] {
             s.begin_run(run, export, "file:///out", "2026-01-01T00:00:00Z")
                 .unwrap();
+            if let Some(source) = source {
+                s.record_run_source(run, source).unwrap();
+            }
             if run != "o3" {
                 s.project_running_aggregate(run, export, "full", "parquet")
                     .unwrap();
@@ -386,7 +409,7 @@ mod tests {
             .unwrap()
         };
         assert_eq!(
-            s.interrupt_dead_runs("orders", "2026-01-02T00:00:00Z")
+            s.interrupt_dead_runs("orders", "pg://a/db", "2026-01-02T00:00:00Z")
                 .unwrap(),
             2
         );
@@ -396,38 +419,55 @@ mod tests {
                 "o1=interrupted",
                 "o2=interrupted",
                 "o3=success",
+                "o4=running",
                 "u1=running"
             ]
         );
         assert_eq!(
             statuses("export_metrics"),
-            ["o1=interrupted", "o2=interrupted", "u1=running"]
+            [
+                "o1=interrupted",
+                "o2=interrupted",
+                "o4=running",
+                "u1=running"
+            ]
         );
         assert_eq!(
-            s.interrupt_dead_runs("orders", "2026-01-03T00:00:00Z")
+            s.interrupt_dead_runs("orders", "pg://a/db", "2026-01-03T00:00:00Z")
                 .unwrap(),
             0
         );
     }
 
-    /// The run a refusal names is the export's newest row still `running`: not a finished one, not another export's.
+    /// The run a refusal names is the export's newest row still `running` on its source: not a finished one, not another source's, not another export's.
     #[test]
     fn the_newest_running_run_of_an_export_is_its_own_latest_unfinished_row() {
         let s = StateStore::open_in_memory().unwrap();
-        assert_eq!(s.newest_running_run("orders").unwrap(), None);
+        assert_eq!(s.newest_running_run("orders", "pg://a/db").unwrap(), None);
         for (run, export, at) in [
             ("orders_1", "orders", "2026-01-01T00:00:00Z"),
             ("orders_2", "orders", "2026-01-02T00:00:00Z"),
             ("orders_3", "orders", "2026-01-03T00:00:00Z"),
+            ("orders_4", "orders", "2026-01-04T00:00:00Z"),
             ("users_9", "users", "2026-01-09T00:00:00Z"),
         ] {
             s.begin_run(run, export, "file:///out", at).unwrap();
+            s.record_run_source(run, "pg://a/db").unwrap();
         }
+        s.record_run_source("orders_4", "pg://b/db").unwrap();
         s.finish_run("orders_3", "success", "2026-01-03T00:01:00Z")
             .unwrap();
         assert_eq!(
-            s.newest_running_run("orders").unwrap().as_deref(),
+            s.newest_running_run("orders", "pg://a/db")
+                .unwrap()
+                .as_deref(),
             Some("orders_2")
+        );
+        assert_eq!(
+            s.newest_running_run("orders", "pg://b/db")
+                .unwrap()
+                .as_deref(),
+            Some("orders_4")
         );
     }
 

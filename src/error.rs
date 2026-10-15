@@ -431,6 +431,11 @@ impl std::fmt::Display for CodedError {
 
 impl std::error::Error for CodedError {}
 
+/// An error value carrying `code`, for `map_err` / `ok_or_else` / `Err(..)` sites.
+pub fn coded(code: Code, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(CodedError::new(code, message))
+}
+
 /// The stable `RIVET_*` error code for a failure, if one was tagged via
 /// [`CodedError`] anywhere in the anyhow context chain. `main` surfaces it as the
 /// JSON `code` field and a `[CODE]` prefix on the text error line.
@@ -614,6 +619,86 @@ pub mod codes {
     pub const CONFIG_COLUMN_OVERRIDE_CASE: Code = usage(
         "RIVET_CONFIG_COLUMN_OVERRIDE_CASE",
         "spell the `columns:` key exactly as the result set names the column",
+    );
+    /// The config file is missing or cannot be read.
+    pub const CONFIG_FILE_UNREADABLE: Code = environment(
+        "RIVET_CONFIG_FILE_UNREADABLE",
+        "check the config path and its read permission, or run `rivet init` to generate one",
+    );
+    /// The YAML does not parse, or names an unknown or misplaced key.
+    pub const CONFIG_YAML_INVALID: Code = usage(
+        "RIVET_CONFIG_YAML_INVALID",
+        "fix the YAML syntax or the key the message names, moving it to where the message shows",
+    );
+    /// The `source:` block names no connection method, more than one, or an incomplete one.
+    pub const CONFIG_SOURCE_CONNECTION_INVALID: Code = usage(
+        "RIVET_CONFIG_SOURCE_CONNECTION_INVALID",
+        "give `source:` exactly one connection method (`url_env`, `url`, `url_file` or complete host/user/database fields) and one password setting",
+    );
+    /// An environment variable, `--param` or file a config key points at is not there.
+    pub const CONFIG_SECRET_UNSET: Code = environment(
+        "RIVET_CONFIG_SECRET_UNSET",
+        "export the environment variable (or pass the `--param`) the message names, or make the named file readable",
+    );
+    /// An export does not name exactly one well-formed `query` / `query_file` / `table` / `tables`.
+    pub const CONFIG_EXPORT_SOURCE_INVALID: Code = usage(
+        "RIVET_CONFIG_EXPORT_SOURCE_INVALID",
+        "give the export exactly one of `query`, `query_file` (a relative path inside the config directory), `table` (`<name>` or `<schema>.<name>`) or `tables`",
+    );
+    /// A mode lacks a setting it requires, or a setting is set that only another mode takes.
+    pub const CONFIG_MODE_SETTING_INVALID: Code = usage(
+        "RIVET_CONFIG_MODE_SETTING_INVALID",
+        "add the setting the export's mode requires, or remove the setting the mode does not take, as the message names",
+    );
+    /// A cloud destination's credential settings contradict each other or are incomplete.
+    pub const CONFIG_DESTINATION_AUTH_INVALID: Code = usage(
+        "RIVET_CONFIG_DESTINATION_AUTH_INVALID",
+        "configure one complete auth mode for the destination (keys, a credentials file, or `allow_anonymous`) and drop the others",
+    );
+    /// A custom cloud `endpoint` that is neither loopback nor anonymous.
+    pub const CONFIG_DESTINATION_ENDPOINT_UNSAFE: Code = usage(
+        "RIVET_CONFIG_DESTINATION_ENDPOINT_UNSAFE",
+        "drop `endpoint:` to use the provider default, or point it at a loopback emulator with `allow_anonymous: true`",
+    );
+    /// A numeric, size, duration or level value outside what rivet accepts, or two sizing knobs set together.
+    pub const CONFIG_VALUE_OUT_OF_RANGE: Code = usage(
+        "RIVET_CONFIG_VALUE_OUT_OF_RANGE",
+        "set the value in the range or form the message names, and set only one of two mutually exclusive sizing knobs",
+    );
+    /// The captured-table list or the `cdc:` baseline of a `mode: cdc` export is malformed.
+    pub const CONFIG_CDC_SHAPE_INVALID: Code = usage(
+        "RIVET_CONFIG_CDC_SHAPE_INVALID",
+        "list each captured table once, in a shape this source and destination take, with at most one baseline per table",
+    );
+    /// `format: csv` with a compression codec or profile the CSV writer cannot apply.
+    pub const CONFIG_CSV_COMPRESSION_UNSUPPORTED: Code = usage(
+        "RIVET_CONFIG_CSV_COMPRESSION_UNSUPPORTED",
+        "use `format: parquet` for compression, or set `compression: none` / `compression_profile: none`",
+    );
+    /// An explicit enforced `source.tls.mode` next to a knob that disables verification.
+    pub const CONFIG_TLS_VERIFICATION_DOWNGRADE: Code = usage(
+        "RIVET_CONFIG_TLS_VERIFICATION_DOWNGRADE",
+        "drop the danger knob and trust a private CA with `tls.ca_file`, or omit the explicit `mode:` for a loopback dev container",
+    );
+    /// A `load:` block or override that does not fit the export or the target.
+    pub const CONFIG_LOAD_BLOCK_INVALID: Code = usage(
+        "RIVET_CONFIG_LOAD_BLOCK_INVALID",
+        "declare the warehouse in a top-level `load:` block and override only what the export and target take",
+    );
+    /// A name or path that becomes a destination path segment escapes it or embeds a scheme.
+    pub const CONFIG_PATH_UNSAFE: Code = usage(
+        "RIVET_CONFIG_PATH_UNSAFE",
+        "use a plain name and a bucket-relative path: no `/`, `\\`, `..`, NUL, leading `.` or URI scheme",
+    );
+    /// A declared `meta_columns.row_hash` list that is empty, repeats a column, or spans several tables.
+    pub const CONFIG_ROW_HASH_INVALID: Code = usage(
+        "RIVET_CONFIG_ROW_HASH_INVALID",
+        "list each column of one table once under `meta_columns.row_hash`, or use `row_hash: true`",
+    );
+    /// A table-qualified `columns:` key on a query export, or naming a table the export does not capture.
+    pub const CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN: Code = usage(
+        "RIVET_CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN",
+        "use a bare column key, or qualify it with a table this export captures",
     );
     /// A column whose mapping is lossy or unsupported, refused under `--strict`.
     pub const TYPE_UNSAFE_MAPPING: Code = usage(
@@ -876,6 +961,22 @@ pub mod codes {
         CONFIG_KEYSET_KEY_UUID_OVERRIDE,
         CONFIG_CURSOR_COLUMN_CASE,
         CONFIG_COLUMN_OVERRIDE_CASE,
+        CONFIG_FILE_UNREADABLE,
+        CONFIG_YAML_INVALID,
+        CONFIG_SOURCE_CONNECTION_INVALID,
+        CONFIG_SECRET_UNSET,
+        CONFIG_EXPORT_SOURCE_INVALID,
+        CONFIG_MODE_SETTING_INVALID,
+        CONFIG_DESTINATION_AUTH_INVALID,
+        CONFIG_DESTINATION_ENDPOINT_UNSAFE,
+        CONFIG_VALUE_OUT_OF_RANGE,
+        CONFIG_CDC_SHAPE_INVALID,
+        CONFIG_CSV_COMPRESSION_UNSUPPORTED,
+        CONFIG_TLS_VERIFICATION_DOWNGRADE,
+        CONFIG_LOAD_BLOCK_INVALID,
+        CONFIG_PATH_UNSAFE,
+        CONFIG_ROW_HASH_INVALID,
+        CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN,
         TYPE_UNSAFE_MAPPING,
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,

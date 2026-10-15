@@ -163,6 +163,7 @@ mod tests {
 
     fn tbl(rows: i64, bytes: i64, cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "s".into(),
             table: "t".into(),
