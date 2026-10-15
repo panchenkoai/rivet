@@ -1,0 +1,10 @@
+--- a/src/pipeline/chunked/detect.rs
++++ b/src/pipeline/chunked/detect.rs
+@@ -323,7 +323,6 @@
+     // NULL-keyed rows are excluded by `WHERE col BETWEEN min AND max` — refuse
+     // rather than drop them silently.
+     bail_if_null_keyed(src, base_query, chunk_column, export_name, source_type)?;
+-    bail_if_fractional(src, base_query, chunk_column, export_name)?;
+ 
+     let min_sql = crate::sql::aggregate_sql(source_type, "min", chunk_column, base_query);
+     let max_sql = crate::sql::aggregate_sql(source_type, "max", chunk_column, base_query);
