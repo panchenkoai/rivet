@@ -609,12 +609,20 @@ fn time_of_day_in_range(us: i64) -> Result<i64> {
     Ok(us)
 }
 
-/// The MySQL wording (batch and CDC) for a TIME outside one day, with the MySQL remedy.
-pub(crate) fn time_outside_day_refusal(us: i64) -> String {
+/// The MySQL wording (batch and CDC) for a TIME outside one day, without a remedy.
+pub(crate) fn time_outside_day(us: i64) -> String {
     format!(
         "mysql: TIME {} is outside 00:00..24:00, which a Parquet TIME cannot hold (MySQL TIME is a \
-         duration up to 838:59:59). Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
+         duration up to 838:59:59).",
         fmt_micros_as_time(us)
+    )
+}
+
+/// [`time_outside_day`] with the batch remedy: a cast in the export's query.
+pub(crate) fn time_outside_day_refusal(us: i64) -> String {
+    format!(
+        "{} Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
+        time_outside_day(us)
     )
 }
 
