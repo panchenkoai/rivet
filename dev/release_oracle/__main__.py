@@ -1563,53 +1563,17 @@ def _hold_gate_lock():
 
 
 def _warehouse_env() -> str:
-    """Fill the BigQuery/GCS env every leg and live test reads from dev/stand/registry.yaml where the shell left it empty, when a Google credential is at hand; the line saying which."""
-    from ..pytools.registry import bq_tmp, warehouse
+    """The BigQuery/GCS env from dev/stand/registry.yaml (dev/pytools/warehouse_env.py); the line saying which."""
+    from ..pytools import warehouse_env
 
-    if not run(["gcloud", "auth", "print-access-token"]).ok:
-        return ("BigQuery/GCS legs SKIP: no Google credential (`gcloud auth print-access-token` failed: "
-                "`gcloud auth login` and `gcloud auth application-default login`)")
-    project, bucket, location = warehouse()
-    for var, value in (("BQ_ORACLE_PROJECT", project), ("BQ_ORACLE_BUCKET", bucket), ("BQ_ORACLE_DATASET", bq_tmp("gate"))):
-        os.environ[var] = os.environ.get(var) or value
-    for var, value in (("BIGQUERY_TEST_PROJECT", os.environ["BQ_ORACLE_PROJECT"]),
-                       ("RIVET_TEST_GCS_BUCKET", os.environ["BQ_ORACLE_BUCKET"]), ("BIGQUERY_TEST_LOCATION", location)):
-        os.environ[var] = os.environ.get(var) or value
-    return f"warehouse: BigQuery {os.environ['BQ_ORACLE_PROJECT']} ({location}), GCS bucket {os.environ['BQ_ORACLE_BUCKET']}"
+    return warehouse_env.bigquery()
 
 
 def _snowflake_env() -> str:
-    """Fill the Snowflake env every live cell reads from dev/stand/registry.yaml where the shell left it empty, when the `snow` connection logs in and sees the schema; the line saying which."""
-    import json
-    import re
+    """The Snowflake env from dev/stand/registry.yaml (dev/pytools/warehouse_env.py); the line saying which."""
+    from ..pytools import warehouse_env
 
-    from ..pytools.registry import snowflake
-
-    sf = snowflake()
-    conn = os.environ.get("RIVET_SF_CONNECTION") or sf["connection"]
-    database = os.environ.get("RIVET_SF_DATABASE") or sf["database"]
-    schema = os.environ.get("RIVET_SF_SCHEMA") or sf["schema"]
-    probe = run(["snow", "sql", "-c", conn, "--format", "json", "-q",
-                 f"SHOW SCHEMAS LIKE '{schema}' IN DATABASE {database}"], timeout=120)
-    if not probe.ok:
-        why = " ".join(re.sub("[\u2500-\u257f]", " ", probe.stderr or probe.stdout or "").split())[:200]
-        return (f"Snowflake legs SKIP: the `snow` connection `{conn}` did not log in "
-                f"(`snow connection test -c {conn}`): {why}")
-    try:
-        found = json.loads(probe.stdout or "[]")
-    except json.JSONDecodeError:
-        found = []
-    if not found:
-        return f"Snowflake legs SKIP: no schema {database}.{schema} for the `snow` connection `{conn}`"
-    for var, value in (("RIVET_SF_CONNECTION", conn), ("RIVET_SF_WAREHOUSE", sf["warehouse"]),
-                       ("RIVET_SF_DATABASE", database), ("RIVET_SF_SCHEMA", schema),
-                       ("RIVET_SF_STORAGE_INTEGRATION", sf["storage_integration"]),
-                       ("SNOWFLAKE_TEST_CONNECTION", conn), ("SNOWFLAKE_TEST_DATABASE", database),
-                       ("SNOWFLAKE_TEST_SCHEMA", schema), ("RIVET_SF_TEST_WAREHOUSE", sf["warehouse"]),
-                       ("RIVET_SF_TEST_DATABASE", database), ("RIVET_SF_TEST_SCHEMA", schema)):
-        os.environ[var] = os.environ.get(var) or value
-    return (f"warehouse: Snowflake {os.environ['RIVET_SF_DATABASE']}.{os.environ['RIVET_SF_SCHEMA']} "
-            f"(connection {os.environ['RIVET_SF_CONNECTION']}, warehouse {os.environ['RIVET_SF_WAREHOUSE']})")
+    return warehouse_env.snowflake()
 
 
 def main(argv: list[str] | None = None) -> int:
