@@ -8,6 +8,14 @@
   `cdc.change_tables` and writes the instance it holds (the newest of two); a table without CDC gets
   the conventional name with the `sp_cdc_enable_table` call that creates it. **What to do:** nothing.
 
+- **A SQL Server password holding `@` reached the state database.** In the keyword/value URL form
+  (`sqlserver://host;user=sa;password=p@ss;…`) the `@` inside the password was read as the end of a
+  userinfo, so the source key rivet stores beside every cursor kept the password's tail (0.31.0 and
+  earlier). **Now** keyword passwords are masked before anything is cut from the URL. **What to do:**
+  if such a password was in use, the progress stored under the old key is not found and the next run
+  of an incremental export reads its table again; rotate that password, since the state database
+  held part of it.
+
 - **A MySQL CDC stream refused a `TIME` past 24 hours with the batch remedy, "cast it in a query",
   which a stream has no query for.** The check also ran by the column's native type, so a
   `columns: { col: string }` override could not carry the duration as text (0.31.0 and earlier).

@@ -1872,6 +1872,22 @@ seeds:
         na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
       oracle:
         na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+  - name: source-key-keyword-password-at
+    class: "a credential scrubber that cuts at a separator the secret may contain: an `@` inside a keyword/value password reads as the end of a userinfo, and the password's tail lands in persisted state"
+    history: "2026-10-15 - found by the keyword-value credential guard when run_status first stored the source key: `password=p@<secret>` left `<secret>;encrypt=true` in the key, through 0.31.0; fixed by masking keyword passwords before the userinfo is cut"
+    scope: source
+    patch: source-key-keyword-password-at/shared.patch
+    engines:
+      postgres:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      mysql:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      mssql:
+        cells: [lib:a_keyword_password_holding_an_at_sign_stays_out_of_the_source_key]
+      mongo:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      oracle:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
   - name: mongo-standalone-uncoded
     class: "a server error that names a missing deployment prerequisite is passed up as the driver's raw dump instead of the coded prerequisite refusal"
     history: "2026-10-14 - found by the by-hand CLI sweep (P6, row 808): `mode: cdc` on a standalone MongoDB exited 1 with `Error code 40573 … RawDocumentBuf { data: … }`, while `doctor` named it plainly, through 0.31.0; fixed by `names_standalone` in diagnose_stream_error"

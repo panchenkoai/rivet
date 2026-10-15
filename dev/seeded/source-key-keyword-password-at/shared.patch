@@ -1,0 +1,13 @@
+--- a/src/config/source.rs
++++ b/src/config/source.rs
+@@ -619,9 +619,7 @@
+ 
+ /// `engine://host:port/database` of `url`, credentials, query and fragment dropped; a keyword/value string keeps its pairs with the password masked.
+ pub(crate) fn source_state_key(source_type: SourceType, url: &str) -> String {
+-    // A keyword/value password may hold `@`, which would read as the end of a userinfo.
+-    let url = &crate::redact::redact_keyword_passwords(url);
+-    let rest = url.split_once("://").map_or(url.as_str(), |(_, r)| r);
++    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+     let rest = find_userinfo(url).map_or(rest, |(at, _)| &url[at + 1..]);
+     let at_host = rest.split(['?', '#']).next().unwrap_or(rest);
+     let key = format!("{source_type:?}://{}", at_host.trim_end_matches('/')).to_lowercase();
