@@ -166,17 +166,20 @@ fn cdc_entry_counts_the_snapshot_legs_oracle() {
 }
 
 /// Two holders of one export name and one table name on one PostgreSQL state, differing only in source, each under child processes: each entry counts the legs its own child ran.
-///
-/// The MySQL holder is paused in its drain (`cdc_after_open`) after its leg, so the PostgreSQL holder's
-/// leg lands on the shared state while the MySQL parent still waits for its children: a parent that
-/// took "the newest leg row by name" would count the other source's baseline.
 #[test]
 #[ignore = "live: requires postgres-cdc, mysql-cdc and RIVET_TEST_STATE_URL (postgres)"]
 fn cdc_entries_of_one_name_on_two_sources_count_their_own_legs() {
-    use mysql::prelude::Queryable as _;
     let Some(state) = pg_state_url() else {
         return;
     };
+    two_holders_count_their_own_legs(&state);
+}
+
+/// The MySQL holder pauses in its drain (`cdc_after_open`) after its leg, so the PostgreSQL holder's
+/// leg lands on the shared `state` while the MySQL parent still waits for its children: a parent that
+/// took "the newest leg row by name" would count the other source's baseline.
+fn two_holders_count_their_own_legs(state: &str) {
+    use mysql::prelude::Queryable as _;
     const PG_ROWS: i64 = 30;
     const MY_ROWS: i64 = 70;
     let name = unique_name("agg_two");
@@ -228,7 +231,7 @@ fn cdc_entries_of_one_name_on_two_sources_count_their_own_legs() {
     );
     let leg = format!("{name}__snapshot_{name}");
     let first_leg_landed = || {
-        postgres::Client::connect(&state, postgres::NoTls)
+        postgres::Client::connect(state, postgres::NoTls)
             .expect("the state server")
             .query_one(
                 "SELECT count(*) FROM export_metrics WHERE export_name = $1 AND status = 'success'",
@@ -244,7 +247,7 @@ fn cdc_entries_of_one_name_on_two_sources_count_their_own_legs() {
             first_doc.to_str().unwrap(),
         ],
         &[
-            ("RIVET_STATE_URL", state.as_str()),
+            ("RIVET_STATE_URL", state),
             ("RIVET_TEST_PAUSE_AT", "cdc_after_open:90000"),
         ],
     );
@@ -268,7 +271,7 @@ fn cdc_entries_of_one_name_on_two_sources_count_their_own_legs() {
             "--summary-output",
             second_doc.to_str().unwrap(),
         ],
-        &[("RIVET_STATE_URL", state.as_str())],
+        &[("RIVET_STATE_URL", state)],
     );
     assert!(
         out.status.success(),
