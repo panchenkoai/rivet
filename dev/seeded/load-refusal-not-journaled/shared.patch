@@ -1,0 +1,91 @@
+--- a/src/load/orchestrate.rs
++++ b/src/load/orchestrate.rs
+@@ -1220,21 +1220,14 @@
+         active_at_fetch: None,
+         marker_active: std::collections::HashSet::new(),
+     };
+-    // Everything the selection can stop on happens before any warehouse write, so every
+-    // stop is typed and journaled as `refused` here: untyped and unrecorded, the load read
+-    // as never attempted, and a `failed` row would have counted as rivet's own attempt.
+-    let inputs = match load::before_write(prepare_load(
++    let inputs = match prepare_load(
+         store,
+         job.plan,
+         job.state,
+         &target_fqtn,
+         job.allow_source_drift,
+-    )) {
+-        Err(e) => {
+-            ctx.record(&[], 0, load::ledger::ledger_status(&e));
+-            return Err(e);
+-        }
+-        Ok(Some(i))
++    )? {
++        Some(i)
+             if nothing_to_load(holds_whole_table_pass(job.plan, &i.runs), i.uris.is_empty()) =>
+         {
+             ctx.active_at_fetch = i.active_at_fetch.clone();
+@@ -1243,13 +1236,13 @@
+             ctx.record_empty_runs(&i.source_run_ids);
+             return Ok(None);
+         }
+-        Ok(Some(i)) => {
++        Some(i) => {
+             ctx.source_ident = i.source_ident.clone();
+             ctx.active_at_fetch = i.active_at_fetch.clone();
+             ctx.marker_active = i.marker_active.clone();
+             i
+         }
+-        Ok(None) => {
++        None => {
+             print_up_to_date(&job);
+             ctx.record_skip();
+             return Ok(None);
+--- a/src/preflight/mod.rs
++++ b/src/preflight/mod.rs
+@@ -757,33 +757,22 @@
+                         .map(|t| format!(" table '{t}'"))
+                         .unwrap_or_default()
+                 )),
+-                // The state DB not answering is the environment, not a missing spec.
+-                Err(e) => {
+-                    return Err(crate::error::recoded(
+-                        &e,
+-                        crate::error::codes::STATE_BACKEND_FAILED,
+-                        format!(
+-                            "export '{}': reading its load spec from the state DB: {e:#}",
+-                            export.name
+-                        ),
+-                    ));
+-                }
++                Err(e) => failures.push(format!(
++                    "export '{}': reading its load spec from the state DB: {e:#}",
++                    export.name
++                )),
+             }
+         }
+     }
+     if !failures.is_empty() {
+-        return Err(anyhow::Error::new(crate::error::Refused(
+-            crate::error::coded(
+-                crate::error::codes::LOAD_SPEC_MISSING,
+-                format!(
+-                    "{} export(s) could not be typed for the {} load, and a table that cannot \
+-                 be typed must not silently not-load:\n  - {}",
+-                    failures.len(),
+-                    target.label(),
+-                    failures.join("\n  - ")
+-                ),
+-            ),
+-        )));
++        crate::rivet_bail!(
++            crate::error::codes::LOAD_SPEC_MISSING,
++            "{} export(s) could not be typed for the {} load, and a table that cannot \
++             be typed must not silently not-load:\n  - {}",
++            failures.len(),
++            target.label(),
++            failures.join("\n  - ")
++        );
+     }
+     Ok((out, keys))
+ }
