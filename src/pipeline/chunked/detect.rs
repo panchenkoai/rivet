@@ -563,6 +563,72 @@ mod tests {
         }
     }
 
+    /// A source that describes one column, `k`, as `t`; every other call is unreachable here.
+    struct DescribedSource(crate::types::RivetType);
+
+    impl crate::source::Source for DescribedSource {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn query_scalar(&mut self, _sql: &str) -> Result<Option<String>> {
+            unreachable!()
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> Result<Vec<crate::types::TypeMapping>> {
+            Ok(vec![crate::types::TypeMapping {
+                column_name: "K".into(),
+                source_native_type: "double precision".into(),
+                rivet_type: self.0.clone(),
+                arrow_type: None,
+                fidelity: crate::types::TypeFidelity::Exact,
+                nullable: false,
+                warnings: vec![],
+                delivery: crate::types::Delivery::Native,
+            }])
+        }
+    }
+
+    #[test]
+    fn a_fractional_chunk_column_is_refused_by_code_naming_its_type() {
+        use crate::types::RivetType as T;
+        let err = bail_if_fractional(
+            &mut DescribedSource(T::Float64),
+            "SELECT k FROM t",
+            "k",
+            "e",
+        )
+        .expect_err("a float key is refused");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER")
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("chunk_column 'k' (the query returns it as double precision)"),
+            "{err:#}"
+        );
+        assert!(
+            bail_if_fractional(&mut DescribedSource(T::Int64), "SELECT k FROM t", "k", "e").is_ok()
+        );
+        assert!(
+            bail_if_fractional(
+                &mut DescribedSource(T::Float64),
+                "SELECT k FROM t",
+                "other",
+                "e"
+            )
+            .is_ok(),
+            "a column the query does not describe is left to the bound read"
+        );
+    }
+
     #[test]
     fn only_a_type_that_holds_fractions_is_refused_for_range_slicing() {
         use crate::types::RivetType as T;
