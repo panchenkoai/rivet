@@ -277,6 +277,54 @@ jobs:
           # the tap PAT from the origin URL.
           git -c http.https://github.com/.extraheader= push origin HEAD
 
+  # `rivet-cli` wheels on PyPI: the binaries of this release (the -glibc2.28 Linux assets and the
+  # macOS ones) packed by dev/pytools/pypi_wheels.py, for `pip install rivet-cli` and the Airflow
+  # provider's dependency. Off until the repository variable PYPI_TARGET names `testpypi` or
+  # `pypi`; the upload is Trusted Publishing from the GitHub environment of the same name, so the
+  # PyPI project's publisher must name this repository, `release.yml` and that environment.
+  pypi:
+    name: Publish rivet-cli wheels (${{ vars.PYPI_TARGET }})
+    needs: release
+    if: vars.PYPI_TARGET == 'testpypi' || vars.PYPI_TARGET == 'pypi'
+    runs-on: ubuntu-latest
+    environment: ${{ vars.PYPI_TARGET }}
+    permissions:
+      contents: read
+      id-token: write # Trusted Publishing: PyPI exchanges the OIDC token, no API token is stored
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+
+      - name: Download the release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Pack the wheels
+        run: python3 -m dev.pytools.pypi_wheels --tag "${RELEASE_TAG}" --dist artifacts --out wheels
+
+      - name: Check the wheels
+        run: |
+          python3 -m pip install --quiet twine
+          python3 -m twine check --strict wheels/*.whl
+
+      - name: Publish to TestPyPI
+        if: vars.PYPI_TARGET == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheels/
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI
+        if: vars.PYPI_TARGET == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheels/
+
   # Multi-arch Docker build using native runners.
   #
   # The previous setup built both archs on `ubuntu-latest` via QEMU
