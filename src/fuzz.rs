@@ -68,9 +68,10 @@ pub fn sql_query_text(data: &[u8]) {
     }
 }
 
-/// The secret redactors — every log line and error text passes through them, and that text quotes drivers, servers and operator input. Any UTF-8 text is rewritten or returned, never a panic.
+/// The secret redactors and the recovery-hint stripper — every log line and error text passes through them, and that text quotes drivers, servers and operator input. Any UTF-8 text is rewritten or returned, never a panic.
 pub fn redact_text(data: &[u8]) {
     if let Ok(text) = std::str::from_utf8(data) {
         let _ = crate::redact::redact_secrets(text);
+        let _ = crate::pipeline::strip_chunked_recovery_hint(text);
     }
 }

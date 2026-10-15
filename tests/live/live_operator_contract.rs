@@ -398,6 +398,17 @@ fn two_full_runs(rig: Rig, N: i64, after_ms: u64) {
     );
 }
 
+/// 2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND, naming the bucket.
+fn run_into_a_missing_bucket(rig: Rig, bucket: &str, envs: &[(&str, &str)]) {
+    let out = rig.cli_env(&["run"], envs);
+    assert_refused(&out, Refused::by_code("RIVET_DEST_CONTAINER_NOT_FOUND", 1));
+    assert!(
+        text(&out).contains(bucket),
+        "the refusal names the missing bucket `{bucket}`\n{}",
+        text(&out)
+    );
+}
+
 /// RESULTS 5: `validate` on a bucket that does not exist cannot verify (exit 1) and names the missing bucket.
 fn validate_on_a_missing_bucket(rig: Rig, envs: &[(&str, &str)]) {
     let out = rig.cli_env(&["validate"], envs);
@@ -934,6 +945,55 @@ fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
     s.rig.run_ok();
 }
 
+/// 2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name, and a run on the same source is refused by code.
+fn one_export_name_on_two_sources() {
+    let Some(state) = pg_state_url() else {
+        return;
+    };
+    let name = unique_name("oc_twosrc");
+    let (pg_table, _pg) = id_v_table(SqlEngine::Pg, "oc_twosrc", ROWS);
+    let (my_table, _my) = id_v_table(SqlEngine::Mysql, "oc_twosrc", ROWS);
+    let first = SqlEngine::Pg.rig(&pg_table).export_named(&name);
+    let other_source = SqlEngine::Mysql.rig(&my_table).export_named(&name);
+    let same_source = SqlEngine::Pg.rig(&pg_table).export_named(&name);
+    let on_state = [("RIVET_STATE_URL", state.as_str())];
+    let opened = |_: &Rig| {
+        let mut db = postgres::Client::connect(&state, postgres::NoTls).expect("the state server");
+        // Before the first run creates `run_status` the query fails: not open yet.
+        db.query_one(
+            "SELECT count(*) FROM run_status WHERE export_name = $1 AND status = 'running'",
+            &[&name],
+        )
+        .is_ok_and(|row| row.get::<_, i64>(0) > 0)
+    };
+    let (live, (beside, refused)) = first
+        .beside_a_live_run(
+            &[
+                ("RIVET_STATE_URL", state.as_str()),
+                ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:6000"),
+            ],
+            opened,
+            |_| {
+                (
+                    other_source.run_with_envs(&on_state),
+                    same_source.run_with_envs(&on_state),
+                )
+            },
+        )
+        .answered_while_alive();
+    assert!(
+        beside.status.success(),
+        "a run of `{name}` on another source runs beside the live one:\n{}",
+        String::from_utf8_lossy(&beside.stderr)
+    );
+    assert_refused(&refused, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    assert!(
+        live.status.success(),
+        "the live run delivers:\n{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+}
+
 /// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
 fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_live", 300);
@@ -1193,7 +1253,7 @@ fn mongo_resume_force() {
     );
 }
 
-/// The earlier night's finding: range chunking takes an Oracle `NUMBER(19)` primary key (scale 0) as an integer key.
+/// The earlier night's finding: range chunking takes an Oracle `NUMBER(19)` primary key (scale 0) as an integer key, and refuses a value past i64.
 #[cfg(feature = "oracle")]
 fn oracle_range_chunking_takes_a_number_19_key() {
     let (table, _guard) = id_v_table(SqlEngine::Oracle, "oc_n19", ROWS);
@@ -1203,6 +1263,15 @@ fn oracle_range_chunking_takes_a_number_19_key() {
         "range chunking refused an Oracle NUMBER(19) integer key (exit {:?})\n{}",
         out.status.code(),
         text(&out)
+    );
+    SqlEngine::Oracle.exec(&format!(
+        "INSERT INTO {table} (\"id\", \"v\") VALUES (9999999999999999999, 0)"
+    ));
+    let past = range_checkpoint_rig(SqlEngine::Oracle, &table).run();
+    assert!(
+        !past.status.success() && text(&past).contains("within the 64-bit range"),
+        "a NUMBER(19) key past the 64-bit range is refused, not sliced\n{}",
+        text(&past)
     );
 }
 
@@ -1825,6 +1894,12 @@ fn a_cursor_column_in_another_case_is_refused_by_code_oracle() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose postgres mysql postgres-state (RIVET_TEST_STATE_URL)"]
+fn one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same() {
+    one_export_name_on_two_sources();
+}
+
+#[test]
 #[ignore = "live: requires docker compose postgres"]
 fn a_second_concurrent_full_run_does_not_double_the_prefix_postgres() {
     concurrent_full_runs(SqlEngine::Pg);
@@ -2323,6 +2398,36 @@ fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_oracle() {
 
 #[test]
 #[ignore = "live: requires docker compose minio"]
+fn a_run_into_a_missing_bucket_is_refused_by_code_s3() {
+    require_alive(LiveService::Minio);
+    let bucket = unique_name("oc-runnobucket").replace('_', "-");
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_runnobucket", 3);
+    let rig = Rig::pg_batch(&table).dest_s3(&bucket, "p", MINIO_ENDPOINT);
+    run_into_a_missing_bucket(rig, &bucket, MINIO_ENV);
+}
+
+#[test]
+#[ignore = "live: requires docker compose fake-gcs"]
+fn a_run_into_a_missing_bucket_is_refused_by_code_gcs() {
+    require_alive(LiveService::FakeGcs);
+    let bucket = unique_name("oc_runnobucket");
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_runnobucket", 3);
+    let rig = Rig::pg_batch(&table).dest_gcs(&bucket, "p", FAKE_GCS_ENDPOINT);
+    run_into_a_missing_bucket(rig, &bucket, &[]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose azurite"]
+fn a_run_into_a_missing_bucket_is_refused_by_code_azure() {
+    require_alive(LiveService::Azurite);
+    let bucket = unique_name("oc-runnobucket").replace('_', "-");
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_runnobucket", 3);
+    let rig = Rig::pg_batch(&table).dest_azure(&bucket, "p");
+    run_into_a_missing_bucket(rig, &bucket, &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose minio"]
 fn validate_fails_on_a_missing_bucket_s3() {
     require_alive(LiveService::Minio);
     let rig = Rig::pg_batch("oc_nobucket").dest_s3(
@@ -2407,8 +2512,8 @@ fn a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle() {
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: docker compose oracle; open defect (range chunking refuses NUMBER(19)), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_range_chunking_takes_a_number_19_key_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle() {
     oracle_range_chunking_takes_a_number_19_key();
 }
 
@@ -3223,8 +3328,8 @@ fn the_config_init_writes_runs_cdc_mysql() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql (CDC); open defect (init derives the capture instance), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_init_cdc_writes_the_capture_instance_the_catalog_holds_mssql() {
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn init_cdc_writes_the_capture_instance_the_catalog_holds_mssql() {
     let _serial = cross_process_serial("mssql_cdc");
     let table = unique_name("oc_initc");
     let ci = format!("ci_{table}");

@@ -480,6 +480,74 @@ fn a_key_changed_across_the_partition_split_ends_at_its_latest_change() {
     );
 }
 
+/// An hourly base holding a `9999-12-31` sentinel and a pre-1960 row compacts in one
+/// MERGE per side outside BigQuery's partitioned days plus the days inside, not one per
+/// 166 days up to the sentinel (17,544 serial jobs before the fix), and every row ends at
+/// its latest change. Oracle: `bq`.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn an_hourly_base_with_an_end_of_time_sentinel_compacts_in_a_window_per_side() {
+    let Some(bq) = BqLive::from_env("compact_eot") else {
+        return;
+    };
+    let mut scn =
+        CdcScenario::mysql_with(
+            "compact_eot",
+            "id BIGINT PRIMARY KEY, v INT, created_at DATETIME NULL",
+            |r, t| {
+                r.cdc("backfill: auto")
+                    .also_batch_export("baseline", t, "full")
+                    .dest_gcs_live(&bq.bucket, &bq.prefix)
+                    .top_line(&bq.load_line(
+                        ", pk: [id], partition: { column: created_at, granularity: hour }",
+                    ))
+            },
+        );
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    scn.sql(&format!(
+        "INSERT INTO {table} (id, v, created_at) VALUES (1, 1, '2026-10-01 10:00:00'), \
+         (2, 2, '9999-12-31 00:00:00'), (3, 3, '1950-06-01 00:00:00')"
+    ));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(base_profile(&bq, &table).0, 3);
+
+    scn.sql(&format!("UPDATE {table} SET v = v * 10"));
+    scn.settle();
+    scn.rig.run_ok();
+    load_ok(&scn.rig);
+    assert_eq!(bq.read_bq_count(&changes), "3", "three changes buffered");
+
+    let (ok, said) = compact(&scn.rig, &[]);
+    assert!(
+        ok && said.contains("3 change row(s) merged") && said.contains("in 3 MERGE statement(s)"),
+        "one window below 1960, one inside, one past 2159: {said}"
+    );
+    for (id, v, at) in [
+        (1, 10, "2026-10-01 10:00:00"),
+        (2, 20, "9999-12-31 00:00:00"),
+        (3, 30, "1950-06-01 00:00:00"),
+    ] {
+        assert_eq!(
+            row_of(&bq, &table, id),
+            (Some(v), Some(at.to_string())),
+            "key {id} ends at its latest change"
+        );
+    }
+    assert_eq!(
+        base_profile(&bq, &table),
+        (3, 3, 0, 0, 6),
+        "three live rows"
+    );
+    assert!(
+        bq.read_bq_table_type(&changes).is_none(),
+        "the buffer is dropped after the merge"
+    );
+}
+
 /// A base-and-buffer table compacts only the partitions its changes name. An UPDATE that moves
 /// a row to another dated partition is written as a delete of the old row (carrying the old
 /// day into the buffer) and an insert of the new one, so `compact` reads both days and the

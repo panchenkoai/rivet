@@ -1808,6 +1808,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: missing-bucket-uncoded-on-write
+    class: "a store's \"not found\" on a write is passed up raw, so a bucket that does not exist reads as a failed upload with no code"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6, row 582): `rivet run` into a missing fake-gcs bucket exited 1 with opendal's `NotFound (persistent) at write` dump, while `head` already refused RIVET_DEST_CONTAINER_NOT_FOUND, through 0.31.0; fixed by `absent_container_or` on every write"
+    scope: source
+    patch: missing-bucket-uncoded-on-write/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_into_a_missing_bucket_is_refused_by_code_s3, a_run_into_a_missing_bucket_is_refused_by_code_gcs, a_run_into_a_missing_bucket_is_refused_by_code_azure]
+      mysql:
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
+      mssql:
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
+      mongo:
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
+      oracle:
+        na: "the write reaches the destination after the source is read; the source engine does not take part, graded by the postgres cells over MinIO, fake-gcs and Azurite"
   - name: collection-refusal-uncoded-on-run
     class: "one refusal is raised by two paths (the preflight and the export), and only one of them carries the code"
     history: "2026-10-14 - found by the by-hand CLI sweep (P6): `check` refused a missing MongoDB collection RIVET_SOURCE_COLLECTION_NOT_FOUND, `run` printed the same sentence with no code, through 0.31.0; fixed by one `refuse_a_missing_collection` for both"
@@ -1856,6 +1872,70 @@ seeds:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo]
       oracle:
         cells: [a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle]
+  - name: oracle-number19-not-integer
+    class: "an integer-family test drawn one step narrower than the type the engine uses for a 64-bit key, so the common key type is refused for range chunking"
+    history: "2026-10-06 - open defect (range chunking refused an Oracle NUMBER(19) primary key as not integer-family) through 0.31.0; fixed by one shared bound ORACLE_RANGE_INT_MAX_PRECISION = 19 for introspection, preflight and init"
+    scope: source
+    patch: oracle-number19-not-integer/shared.patch
+    engines:
+      postgres:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mysql:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mssql:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      mongo:
+        na: "NUMBER(p, 0) is Oracle's; the integer-family test of the other engines reads their own integer types"
+      oracle:
+        cells: [range_chunking_takes_a_number_19_key_and_refuses_one_past_64_bits_oracle]
+  - name: fractional-chunk-key-under-query
+    class: "a type guard the planner applies only when it can read a catalog, so the same key under `query:` is range-sliced and its fractional values are skipped with exit 0"
+    history: "2026-10-09 - open defect (a `double precision` chunk_column under `query:` delivered 40 of 43 rows, exit 0) through 0.31.0; fixed by `bail_if_fractional`, which reads the query's result type before the bounds"
+    scope: source
+    patch: fractional-chunk-key-under-query/shared.patch
+    engines:
+      postgres:
+        cells: [a_float_chunk_column_under_query_is_refused_by_code_postgres]
+      mysql:
+        na: "the run-time type read is one function for every engine (`Source::type_mappings`); the postgres cell grades it"
+      mssql:
+        na: "the run-time type read is one function for every engine (`Source::type_mappings`); the postgres cell grades it"
+      mongo:
+        na: "a Mongo export has no `mode: chunked`"
+      oracle:
+        na: "the run-time type read is one function for every engine (`Source::type_mappings`); the postgres cell grades it"
+  - name: init-capture-instance-derived
+    class: "a generated config derives the name of a server object by convention instead of reading the catalog that holds it, so the config names an object that does not exist"
+    history: "2026-10-07 - open defect (`rivet init --mode cdc` on SQL Server wrote `capture_instance: dbo_<table>` whatever cdc.change_tables held) through 0.31.0; fixed by reading cdc.change_tables in mssql::introspect"
+    scope: source
+    patch: init-capture-instance-derived/shared.patch
+    engines:
+      postgres:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+      mysql:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+      mssql:
+        cells: [init_cdc_writes_the_capture_instance_the_catalog_holds_mssql]
+      mongo:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+      oracle:
+        na: "the capture instance is SQL Server's CDC object; the other engines' init writes a slot, a server id or nothing it reads from a catalog"
+  - name: source-key-keyword-password-at
+    class: "a credential scrubber that cuts at a separator the secret may contain: an `@` inside a keyword/value password reads as the end of a userinfo, and the password's tail lands in persisted state"
+    history: "2026-10-15 - found by the keyword-value credential guard when run_status first stored the source key: `password=p@<secret>` left `<secret>;encrypt=true` in the key, through 0.31.0; fixed by masking keyword passwords before the userinfo is cut"
+    scope: source
+    patch: source-key-keyword-password-at/shared.patch
+    engines:
+      postgres:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      mysql:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      mssql:
+        cells: [lib:a_keyword_password_holding_an_at_sign_stays_out_of_the_source_key]
+      mongo:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
+      oracle:
+        na: "the `;user=…;password=…` URL form is SQL Server's; the other engines' passwords sit in a userinfo the key already drops"
   - name: mongo-standalone-uncoded
     class: "a server error that names a missing deployment prerequisite is passed up as the driver's raw dump instead of the coded prerequisite refusal"
     history: "2026-10-14 - found by the by-hand CLI sweep (P6, row 808): `mode: cdc` on a standalone MongoDB exited 1 with `Error code 40573 … RawDocumentBuf { data: … }`, while `doctor` named it plainly, through 0.31.0; fixed by `names_standalone` in diagnose_stream_error"
@@ -1872,6 +1952,22 @@ seeds:
         cells: [a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo]
       oracle:
         na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+  - name: run-lease-by-name-only
+    class: "a mutual-exclusion key coarser than the progress it protects, so exports that share a name but not a source refuse each other"
+    history: "2026-10-15 - gate class B on 93d8a5db: since #538 every run took `chunk-run:<export>`, and the shared-state deployment (configs of one export name on different sources, one PostgreSQL state) ran one export at a time; fixed by keying the lease by export and source (v36 records the source on run_status)"
+    scope: source
+    patch: run-lease-by-name-only/shared.patch
+    engines:
+      postgres:
+        cells: [one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same]
+      mysql:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
+      mssql:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
+      mongo:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
+      oracle:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"

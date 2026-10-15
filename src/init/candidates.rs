@@ -133,6 +133,7 @@ mod tests {
 
     fn table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
+            cdc_capture_instance: None,
             density: None,
             schema: "public".into(),
             table: "t".into(),
