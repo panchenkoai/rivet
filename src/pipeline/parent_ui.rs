@@ -424,6 +424,7 @@ impl Renderer {
                 // shared by an in-process transport, where this number IS
                 // this process's own counter.
                 dest_retries: _,
+                bytes_read: _,
             } => {
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.finalize(

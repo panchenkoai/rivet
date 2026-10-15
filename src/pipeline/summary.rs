@@ -544,6 +544,7 @@ impl RunSummary {
                 peak_rss_mb: self.peak_rss_mb,
                 error_message: self.error_message.clone(),
                 dest_retries: crate::destination::transient_retries_total(),
+                bytes_read: self.bytes_read,
             });
             return;
         }

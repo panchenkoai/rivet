@@ -949,6 +949,7 @@ fn today_the_exit_of_an_untyped_fold_follows_its_text_documents_two_requirements
 #[test]
 fn the_run_entry_is_what_the_product_serializes_plus_the_pending_keys() {
     let entry = rivet::state::RunAggregateEntry {
+        snapshot_rows: 0,
         export_name: "orders_cdc".into(),
         status: "failed".into(),
         run_id: "r".into(),

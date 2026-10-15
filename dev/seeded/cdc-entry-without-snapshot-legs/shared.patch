@@ -1,11 +1,11 @@
 --- a/src/pipeline/aggregate.rs
 +++ b/src/pipeline/aggregate.rs
-@@ -126,7 +126,7 @@
+@@ -127,7 +127,7 @@
      mut entry: RunAggregateEntry,
      legs: &[RunAggregateEntry],
  ) -> RunAggregateEntry {
 -    for leg in legs {
 +    for leg in legs.iter().take(0) {
          entry.rows += leg.rows;
+         entry.snapshot_rows += leg.rows;
          entry.files += leg.files;
-         entry.bytes += leg.bytes;

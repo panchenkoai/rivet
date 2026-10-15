@@ -60,10 +60,15 @@ fn the_entry_counts_the_snapshot_legs(mut scn: CdcScenario, extra: &[&str]) {
     }
     scn.settle();
     let doc = summary_of_run(&scn.rig, extra);
-    let (rows, files, bytes) = parquet_on_disk(&scn.rig.out_dir());
+    the_entry_is_the_disk(&doc, &scn.rig, ROWS);
+}
+
+/// The rig's CDC entry in `doc` counts the rows, parts and bytes on its disk (at least `seeded` rows), and no leg is a unit.
+fn the_entry_is_the_disk(doc: &serde_json::Value, rig: &Rig, seeded: i64) {
+    let (rows, files, bytes) = parquet_on_disk(&rig.out_dir());
     assert!(
-        rows >= ROWS,
-        "fixture: the snapshot leg wrote the {ROWS} seeded rows, the disk holds {rows}"
+        rows >= seeded,
+        "fixture: the snapshot leg wrote the {seeded} seeded rows, the disk holds {rows}"
     );
     let entries = doc["per_export"].as_array().expect("per_export[]");
     let named: Vec<&str> = entries
@@ -76,7 +81,7 @@ fn the_entry_counts_the_snapshot_legs(mut scn: CdcScenario, extra: &[&str]) {
     );
     let entry = entries
         .iter()
-        .find(|e| e["export_name"] == scn.rig.export_name())
+        .find(|e| e["export_name"] == rig.export_name())
         .unwrap_or_else(|| panic!("no entry for the CDC export in {named:?}"));
     assert_eq!(entry["status"], "success", "{entry}");
     assert_eq!(
@@ -158,4 +163,134 @@ fn cdc_entry_counts_the_snapshot_legs_oracle() {
         CdcScenario::oracle_with("agg_legs_ora", |r, _| r.cdc_line("initial: snapshot")),
         &[],
     );
+}
+
+/// Two holders of one export name and one table name on one PostgreSQL state, differing only in source, each under child processes: each entry counts the legs its own child ran.
+///
+/// The MySQL holder is paused in its drain (`cdc_after_open`) after its leg, so the PostgreSQL holder's
+/// leg lands on the shared state while the MySQL parent still waits for its children: a parent that
+/// took "the newest leg row by name" would count the other source's baseline.
+#[test]
+#[ignore = "live: requires postgres-cdc, mysql-cdc and RIVET_TEST_STATE_URL (postgres)"]
+fn cdc_entries_of_one_name_on_two_sources_count_their_own_legs() {
+    use mysql::prelude::Queryable as _;
+    let Some(state) = pg_state_url() else {
+        return;
+    };
+    const PG_ROWS: i64 = 30;
+    const MY_ROWS: i64 = 70;
+    let name = unique_name("agg_two");
+    let ids = |n: i64| -> String {
+        (1..=n)
+            .map(|i| format!("({i}, {i})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut pg =
+        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("postgres-cdc");
+    pg.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {name}; CREATE TABLE {name} (id BIGINT PRIMARY KEY, v BIGINT); \
+         INSERT INTO {name} (id, v) VALUES {}",
+        ids(PG_ROWS)
+    ))
+    .unwrap();
+    let _pg_table = PgTable::adopt_on(POSTGRES_CDC_URL, name.clone());
+    let slot = unique_name("agg_two_slot");
+    let _slot = Slot::new(slot.clone());
+    pg.execute(
+        "SELECT pg_create_logical_replication_slot($1, 'test_decoding')",
+        &[&slot],
+    )
+    .unwrap();
+    let mut my = cdc_conn();
+    my.query_drop(format!(
+        "CREATE TABLE {name} (id BIGINT PRIMARY KEY, v BIGINT)"
+    ))
+    .unwrap();
+    let _my_table = MysqlCdcTable(name.clone());
+    my.query_drop(format!(
+        "INSERT INTO {name} (id, v) VALUES {}",
+        ids(MY_ROWS)
+    ))
+    .unwrap();
+
+    let shape = |r: Rig, side: &str| {
+        r.export_named(&name)
+            .cdc_line("initial: snapshot")
+            .also_export(&format!("{name}_{side}"), "SELECT 1 AS x")
+    };
+    let first = shape(Rig::mysql_cdc(&name), "my");
+    let second = shape(Rig::pg_cdc(&name, &slot), "pg");
+    let docs = tempfile::tempdir().unwrap();
+    let (first_doc, second_doc) = (
+        docs.path().join("first.json"),
+        docs.path().join("second.json"),
+    );
+    let leg = format!("{name}__snapshot_{name}");
+    let first_leg_landed = || {
+        postgres::Client::connect(&state, postgres::NoTls)
+            .expect("the state server")
+            .query_one(
+                "SELECT count(*) FROM export_metrics WHERE export_name = $1 AND status = 'success'",
+                &[&leg],
+            )
+            .is_ok_and(|row| row.get::<_, i64>(0) > 0)
+    };
+
+    let mut live = first.spawn_args_env(
+        &[
+            "--parallel-export-processes",
+            "--summary-output",
+            first_doc.to_str().unwrap(),
+        ],
+        &[
+            ("RIVET_STATE_URL", state.as_str()),
+            ("RIVET_TEST_PAUSE_AT", "cdc_after_open:90000"),
+        ],
+    );
+    let t0 = std::time::Instant::now();
+    while !first_leg_landed() {
+        assert!(
+            std::process::Child::try_wait(&mut live)
+                .expect("try_wait")
+                .is_none(),
+            "fixture: the first holder ended before its snapshot leg was recorded"
+        );
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(120),
+            "fixture: the first holder's snapshot leg never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let out = second.run_args_env(
+        &[
+            "--parallel-export-processes",
+            "--summary-output",
+            second_doc.to_str().unwrap(),
+        ],
+        &[("RIVET_STATE_URL", state.as_str())],
+    );
+    assert!(
+        out.status.success(),
+        "the second holder runs beside the first:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::process::Child::try_wait(&mut live)
+            .expect("try_wait")
+            .is_none(),
+        "fixture: the first holder must still wait in its drain when the second's leg lands"
+    );
+    let said = live.wait_with_output().expect("reap the first holder");
+    assert!(
+        said.status.success(),
+        "the first holder delivers:\n{}",
+        String::from_utf8_lossy(&said.stderr)
+    );
+    let read = |p: &std::path::Path| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(p).expect("summary written"))
+            .expect("summary is JSON")
+    };
+    the_entry_is_the_disk(&read(&first_doc), &first, MY_ROWS);
+    the_entry_is_the_disk(&read(&second_doc), &second, PG_ROWS);
 }

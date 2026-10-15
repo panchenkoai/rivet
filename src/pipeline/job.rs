@@ -1757,10 +1757,14 @@ fn cdc_outcome_with_legs(
         .iter()
         .map(|(_, leg)| super::aggregate::entry_from_summary(leg))
         .collect();
-    let (result, mut summary) = match legs.into_iter().find_map(|(res, _)| res.err()) {
-        Some(e) => {
+    let failed_leg = legs
+        .into_iter()
+        .find_map(|(res, leg)| res.err().map(|e| (e, leg.run_id)));
+    let (result, mut summary) = match failed_leg {
+        Some((e, run_id)) => {
             let mut failed = synthetic_failed_summary(export_name, &e);
             failed.mode = "cdc".into();
+            failed.run_id = run_id;
             (Err(e), failed)
         }
         None => stream(),
@@ -2224,6 +2228,7 @@ mod snapshot_leg_tests {
     /// One finished run of `name` that wrote `rows` rows in `files` parts.
     fn wrote(name: &str, status: &str, rows: i64, files: usize) -> (Result<()>, RunSummary) {
         let summary = RunSummary {
+            run_id: format!("{name}_run"),
             export_name: name.into(),
             status: status.into(),
             total_rows: rows,
@@ -2292,6 +2297,10 @@ mod snapshot_leg_tests {
             ("pg_cdc", "failed", "cdc", 1040, 2)
         );
         assert_eq!(e.error_message.as_deref(), Some("pg_cdc__snapshot_b broke"));
+        assert_eq!(
+            e.run_id, "pg_cdc__snapshot_b_run",
+            "the run id names the failed leg's own metric row"
+        );
     }
 
     /// Without legs the stream's outcome is the export's, unchanged.
