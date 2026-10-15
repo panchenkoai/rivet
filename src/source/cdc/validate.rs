@@ -120,15 +120,22 @@ fn read_pos_column(body: Vec<u8>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch?;
-        let idx = batch
-            .schema()
-            .index_of("__pos")
-            .map_err(|_| anyhow::anyhow!("part has no __pos column — not a CDC output?"))?;
+        let idx = batch.schema().index_of("__pos").map_err(|_| {
+            crate::error::coded(
+                crate::error::codes::VALIDATE_UNVERIFIED,
+                "part has no __pos column — not a CDC output?".to_string(),
+            )
+        })?;
         let col = batch
             .column(idx)
             .as_any()
             .downcast_ref::<StringArray>()
-            .ok_or_else(|| anyhow::anyhow!("__pos column is not Utf8"))?;
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::VALIDATE_UNVERIFIED,
+                    "__pos column is not Utf8".to_string(),
+                )
+            })?;
         for i in 0..col.len() {
             if col.is_valid(i) {
                 out.push(col.value(i).to_string());

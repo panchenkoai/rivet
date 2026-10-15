@@ -532,7 +532,9 @@ impl PgChangeStream {
                         log::warn!("{why}");
                     }
                 }
-                RoutingVerdict::Never(why) => anyhow::bail!("{why}"),
+                RoutingVerdict::Never(why) => {
+                    crate::rivet_bail!(crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED, "{why}")
+                }
             }
         }
         Ok(())
@@ -918,11 +920,12 @@ impl PgChangeStream {
         replay(&mut self.spooled, |rec| {
             let (lsn, data) = decode_wire_row(rec)?;
             parse_test_decoding(&lsn, &data, &self.domains)?.ok_or_else(|| {
-                anyhow::anyhow!(
+                crate::error::coded(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                     "pg cdc spill: a spilled row decodes to no change, though only \
                      rows that decoded were spilled. The tail and the decoder \
                      disagree, and delivering the rest would move the transaction's \
-                     commit boundary onto the wrong row."
+                     commit boundary onto the wrong row.",
                 )
             })
         })
@@ -956,7 +959,10 @@ impl PgChangeStream {
     /// may now be readable WAL that a prior starved peek could not reach).
     fn advance_slot(&mut self, lsn: &str) -> Result<()> {
         if lsn.is_empty() || !lsn.bytes().all(|b| b.is_ascii_hexdigit() || b == b'/') {
-            anyhow::bail!("pg cdc: refusing to advance to a malformed LSN {lsn:?}");
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                "pg cdc: refusing to advance to a malformed LSN {lsn:?}"
+            );
         }
         // The postgres crate can't bind `&str` → `pg_lsn`, so the LSN is inlined.
         self.client.execute(
@@ -990,7 +996,7 @@ pub(crate) fn table_probe_refusal(
         )
         .into();
     }
-    anyhow::anyhow!("pg cdc: cannot read `{table}` ({said}); nothing was read or written.")
+    crate::source::cdc::table_unreadable("pg", table, said)
 }
 
 /// Why this server cannot host the drain: `wal_level` below `logical`, or a bounded drain on a standby.
@@ -1174,7 +1180,8 @@ fn encode_wire_row(lsn: &str, data: &str) -> Vec<u8> {
 /// event.
 fn decode_wire_row(rec: &[u8]) -> Result<(String, String)> {
     if rec.len() < 4 {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SPILL,
             "pg cdc spill: a record of {} bytes holds no frame",
             rec.len()
         );
@@ -1184,16 +1191,27 @@ fn decode_wire_row(rec: &[u8]) -> Result<(String, String)> {
         .checked_add(n)
         .filter(|e| *e <= rec.len())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "pg cdc spill: a record declares a {n}-byte lsn the {}-byte frame \
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SPILL,
+                format!(
+                    "pg cdc spill: a record declares a {n}-byte lsn the {}-byte frame \
                  does not hold",
-                rec.len()
+                    rec.len()
+                ),
             )
         })?;
-    let lsn = std::str::from_utf8(&rec[4..end])
-        .map_err(|e| anyhow::anyhow!("pg cdc spill: the lsn is not utf-8: {e}"))?;
-    let data = std::str::from_utf8(&rec[end..])
-        .map_err(|e| anyhow::anyhow!("pg cdc spill: the row is not utf-8: {e}"))?;
+    let lsn = std::str::from_utf8(&rec[4..end]).map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_SPILL,
+            format!("pg cdc spill: the lsn is not utf-8: {e}"),
+        )
+    })?;
+    let data = std::str::from_utf8(&rec[end..]).map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_SPILL,
+            format!("pg cdc spill: the row is not utf-8: {e}"),
+        )
+    })?;
     Ok((lsn.to_string(), data.to_string()))
 }
 
@@ -1268,7 +1286,12 @@ impl ChangeStream for PgChangeStream {
             .0
             .get("lsn")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("pg cdc ack: position missing 'lsn'"))?
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                    "pg cdc ack: position missing 'lsn'".to_string(),
+                )
+            })?
             .to_string();
         self.advance_slot(&lsn)?;
         self.owed_through = owed_after_ack(self.owed_through, parse_lsn(&lsn));
@@ -2310,7 +2333,10 @@ mod tests {
         assert_eq!(absent.to_string(), absent_table_refusal("orders"));
         for other in [Some("42501"), None] {
             let denied = table_probe_refusal("orders", other, "permission denied for table orders");
-            assert_eq!(crate::error::error_code(&denied), None);
+            assert_eq!(
+                crate::error::error_code(&denied),
+                Some("RIVET_SOURCE_QUERY_FAILED")
+            );
             assert_eq!(
                 denied.to_string(),
                 "pg cdc: cannot read `orders` (permission denied for table orders); nothing was \

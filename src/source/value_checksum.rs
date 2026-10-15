@@ -498,7 +498,8 @@ pub fn verify(source: &[u64], arrow: &[u64], schema: &SchemaRef) -> Result<()> {
     for (i, (a, b)) in source.iter().zip(arrow.iter()).enumerate() {
         if a != b {
             let col = schema.field(i).name();
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_VALUE_CONVERTER,
                 "value checksum mismatch in column '{col}': source={a} arrow={b} \
                  — the value converter changed a value between read and Arrow build"
             );
@@ -537,10 +538,12 @@ pub fn validate_recorded_checksums(
     // columns absent from `recorded` (enrichment / meta columns) are not compared.
     for rec in recorded {
         let want: u64 = rec.checksum.parse().map_err(|_| {
-            anyhow::anyhow!(
-                "value checksum: manifest column '{}' hash '{}' is not a u64",
-                rec.name,
-                rec.checksum
+            crate::error::coded(
+                crate::error::codes::DEST_CONTROL_ARTIFACT_INVALID,
+                format!(
+                    "value checksum: manifest column '{}' hash '{}' is not a u64",
+                    rec.name, rec.checksum
+                ),
             )
         })?;
         match actual.get(&rec.name) {
@@ -582,8 +585,12 @@ pub(crate) fn reread_column_checksums(
     for path in part_paths {
         // File::open failing (EMFILE, a permissions blip) is OPERATIONAL — the
         // verification could not run, so it must not be reported as corruption.
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("value checksum: open {}: {e}", path.display()))?;
+        let file = std::fs::File::open(path).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::VALIDATE_UNVERIFIED,
+                format!("value checksum: open {}: {e}", path.display()),
+            )
+        })?;
         // A part the manifest recorded as committed Parquet that will NOT decode
         // is post-write CORRUPTION — verified-wrong (Ok(Some), exit 3), not an
         // operational could-not-verify. Distinct from File::open above.
@@ -660,8 +667,12 @@ fn part_row_count_mismatch(
         .filter(|p| p.status == crate::manifest::PartStatus::Committed);
     for (part, path) in committed.zip(paths) {
         if manifest.format == crate::config::FormatType::Csv.label() {
-            let records = crate::format::csv::count_csv_records(path)
-                .map_err(|e| anyhow::anyhow!("part row count: read {}: {e}", part.path))?;
+            let records = crate::format::csv::count_csv_records(path).map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::VALIDATE_UNVERIFIED,
+                    format!("part row count: read {}: {e}", part.path),
+                )
+            })?;
             let actual = records.saturating_sub(1) as i64;
             if actual != part.rows {
                 return Ok(Some(format!(
@@ -671,8 +682,12 @@ fn part_row_count_mismatch(
             }
             continue;
         }
-        let file = std::fs::File::open(path)
-            .map_err(|e| anyhow::anyhow!("part row count: open {}: {e}", part.path))?;
+        let file = std::fs::File::open(path).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::VALIDATE_UNVERIFIED,
+                format!("part row count: open {}: {e}", part.path),
+            )
+        })?;
         // Footer only — `num_rows` lives in the file metadata, so this does not
         // decode a single value.
         let actual = match SerializedFileReader::new(file) {
@@ -1866,5 +1881,28 @@ mod tests {
             "value-checksum fold must cover every same-family split unit (canonical + siblings), \
              deduped, and never a foreign family"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    /// A converter mismatch is internal (exit 6); a manifest hash that is not a u64 is the
+    /// control-artifact refusal (exit 5).
+    #[test]
+    fn a_checksum_mismatch_and_a_malformed_manifest_hash_carry_their_codes() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, true)]));
+        let err = verify(&[1], &[2], &schema).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_VALUE_CONVERTER", 6);
+        let recorded = [crate::manifest::ColumnChecksum {
+            name: "c".into(),
+            checksum: "not-a-u64".into(),
+        }];
+        let err = validate_recorded_checksums(&recorded, &[], None, Fold::Sum).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_CONTROL_ARTIFACT_INVALID", 5);
     }
 }

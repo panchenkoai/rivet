@@ -31,17 +31,30 @@ pub(crate) trait Ora<T> {
 
 impl<T> Ora<T> for std::result::Result<T, oracledb::Error> {
     fn ora(self) -> Result<T> {
-        self.map_err(|e| {
-            let msg = format!("{e:?}");
-            match known_failure_hint(&msg) {
-                Some(hint) => anyhow::anyhow!("oracle: {msg}\n  hint: {hint}"),
-                None => anyhow::anyhow!("oracle: {msg}"),
-            }
-        })
+        self.map_err(|e| driver_failure(format!("{e:?}")))
     }
 }
 
 /// An actionable hint for failures whose cause rivet has measured.
+/// The driver's error as rivet's: the server's words kept, a known failure's hint appended, coded by phase.
+fn driver_failure(msg: String) -> anyhow::Error {
+    let code = driver_failure_code(&msg);
+    match known_failure_hint(&msg) {
+        Some(hint) => crate::error::coded(code, format!("oracle: {msg}\n  hint: {hint}")),
+        None => crate::error::coded(code, format!("oracle: {msg}")),
+    }
+}
+
+/// Connect-time failures (listener, credentials, a connection closed during setup) against statement-time ones.
+fn driver_failure_code(msg: &str) -> crate::error::Code {
+    if msg.contains("ORA-12") || msg.contains("ORA-01017") || msg.contains("unexpected end of file")
+    {
+        crate::error::codes::SOURCE_CONNECT_FAILED
+    } else {
+        crate::error::codes::SOURCE_QUERY_FAILED
+    }
+}
+
 fn known_failure_hint(msg: &str) -> Option<&'static str> {
     if msg.contains("unexpected end of file") {
         return Some(
@@ -101,28 +114,45 @@ pub(crate) fn parse_oracle_url(url: &str) -> Result<OracleUrl> {
         .get(..9)
         .filter(|scheme| scheme.eq_ignore_ascii_case("oracle://"))
         .map(|_| &url[9..])
-        .ok_or_else(|| anyhow::anyhow!("oracle: URL must start with oracle:// — {FORM}"))?;
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+                format!("oracle: URL must start with oracle:// — {FORM}"),
+            )
+        })?;
     // The authority ends at the first '/', '?' or '#': the same reading as the
     // credential redactor and the TLS gate, so all three see one host.
     let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-    let (userinfo, hostport) = authority
-        .rsplit_once('@')
-        .ok_or_else(|| anyhow::anyhow!("oracle: URL needs a user before the host — {FORM}"))?;
+    let (userinfo, hostport) = authority.rsplit_once('@').ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            format!("oracle: URL needs a user before the host — {FORM}"),
+        )
+    })?;
     let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
     let service = path
         .strip_prefix('/')
         .map(|p| p.split(['?', '#']).next().unwrap_or_default())
         .unwrap_or_default();
-    anyhow::ensure!(
-        !service.is_empty(),
-        "oracle: URL has no service name — {FORM}"
-    );
-    anyhow::ensure!(
-        !service.contains('/'),
-        "oracle: the service name {service:?} contains '/' — {FORM}"
-    );
+    if service.is_empty() {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            "oracle: URL has no service name — {FORM}"
+        )
+    }
+    if service.contains('/') {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            "oracle: the service name {service:?} contains '/' — {FORM}"
+        )
+    }
     let (host, port) = split_host_port(hostport)?;
-    anyhow::ensure!(!host.is_empty(), "oracle: URL has an empty host — {FORM}");
+    if host.is_empty() {
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            "oracle: URL has an empty host — {FORM}"
+        )
+    }
     let decode = |s: &str| {
         percent_encoding::percent_decode_str(s)
             .decode_utf8_lossy()
@@ -147,9 +177,12 @@ fn split_host_port(hostport: &str) -> Result<(&str, u16)> {
         },
     };
     let port = match port {
-        Some(p) => p
-            .parse::<u16>()
-            .map_err(|_| anyhow::anyhow!("oracle: invalid port {p:?} in URL"))?,
+        Some(p) => p.parse::<u16>().map_err(|_| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+                format!("oracle: invalid port {p:?} in URL"),
+            )
+        })?,
         None => 1521,
     };
     Ok((host, port))
@@ -161,7 +194,8 @@ fn connect_string(parts: &OracleUrl, tls: Option<&TlsConfig>) -> Result<String> 
     if let Some(t) = tls.filter(|_| enforced)
         && t.ca_file.is_some()
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_OPTION_UNSUPPORTED,
             "oracle: `tls.ca_file` is not supported yet — the Oracle driver verifies the server \
              certificate only against the public CA bundle compiled into it (not the system \
              trust store), so a certificate from a private CA cannot be verified; remove \
@@ -232,6 +266,18 @@ fn unique_alias(base: &str, names: &[&str]) -> String {
 
 /// A result column name an outer query cannot reference: the ROWID pseudo-column
 /// shadows it, or it cannot be written as a quoted identifier.
+/// Refuse a re-projected column whose name an outer query cannot reference; the alias is the remedy.
+fn alias_required(name: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::SOURCE_QUERY_COLUMN_UNREFERENCEABLE,
+        format!(
+            "oracle: column {name:?} must be re-read through a conversion, but that name \
+             cannot be referenced from an outer query — give it an alias in the \
+             `query:` (e.g. `... AS row_id`)"
+        ),
+    )
+}
+
 fn unreferenceable(name: &str) -> bool {
     name == "ROWID" || name.contains('"') || name.len() > 128
 }
@@ -418,12 +464,7 @@ impl OracleSource {
         } = select_list(&kinds);
         let sql = if rewritten {
             if let Some(m) = metas.iter().find(|m| unreferenceable(m.name())) {
-                anyhow::bail!(
-                    "oracle: column {:?} must be re-read through a conversion, but that name \
-                     cannot be referenced from an outer query — give it an alias in the \
-                     `query:` (e.g. `... AS row_id`)",
-                    m.name()
-                );
+                return Err(alias_required(m.name()));
             }
             format!("SELECT {} FROM ({query}) \"_rivet_p\"", cols.join(", "))
         } else {
@@ -437,12 +478,14 @@ impl OracleSource {
         if !objects.is_empty()
             && let Err(e) = self.describe(&sql)
         {
-            anyhow::ensure!(
-                !format!("{e:#}").contains("ORA-00932"),
-                "oracle: column(s) {objects:?} are object or collection types rivet cannot \
+            if format!("{e:#}").contains("ORA-00932") {
+                crate::rivet_bail!(
+                    crate::error::codes::TYPE_UNSAFE_MAPPING,
+                    "oracle: column(s) {objects:?} are object or collection types rivet cannot \
                  export (only XMLTYPE is re-read, as text); select their attributes in a \
                  `query:`, or leave them out"
-            );
+                )
+            }
             return Err(e);
         }
         Ok(Projection {
@@ -1133,5 +1176,44 @@ mod tests {
         );
         tls.mode = crate::config::TlsMode::Disable;
         assert_eq!(connect_string(&parts, Some(&tls)).unwrap(), "h:1522/S");
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+    use crate::config::{TlsConfig, TlsMode};
+
+    /// A malformed URL (usage), the driver's failures by phase (environment), an alias-less
+    /// re-read column (usage) and an unsupported `tls.ca_file` (usage) carry their codes.
+    #[test]
+    fn oracle_url_driver_alias_and_tls_refusals_carry_their_codes() {
+        let err = parse_oracle_url("oracle://h:1521/svc").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_SOURCE_URL_INVALID", 1);
+        // "no listener" is a transient failure to the retry classifier: environment, exit 2.
+        let err = driver_failure("ORA-12541: TNS:no listener".into());
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CONNECT_FAILED", 2);
+        let err = driver_failure("ORA-00942: table or view does not exist".into());
+        crate::error::assert_coded(&err, "RIVET_SOURCE_QUERY_FAILED", 1);
+        // A connection closed during setup is transient to the retry classifier: exit 2.
+        let err = driver_failure("unexpected end of file".into());
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CONNECT_FAILED", 2);
+        assert!(err.to_string().contains("hint:"), "{err}");
+        let err = alias_required("ROWID");
+        crate::error::assert_coded(&err, "RIVET_SOURCE_QUERY_COLUMN_UNREFERENCEABLE", 1);
+        let parts = OracleUrl {
+            user: "u".into(),
+            password: String::new(),
+            host: "h".into(),
+            port: 1521,
+            service: "s".into(),
+        };
+        let tls = TlsConfig {
+            mode: TlsMode::VerifyFull,
+            ca_file: Some("ca.pem".into()),
+            ..Default::default()
+        };
+        let err = connect_string(&parts, Some(&tls)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_SOURCE_OPTION_UNSUPPORTED", 1);
     }
 }

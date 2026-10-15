@@ -15,7 +15,7 @@ pub(crate) const RECOVER: &str = "Re-baseline the stream in one run: delete the 
      export does not re-baseline the stream.";
 
 /// A refusal of `code` whose text is `why`.
-fn refusal(code: crate::error::Code, why: String) -> anyhow::Error {
+fn refusal(code: crate::error::Code, why: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(crate::error::CodedError::new(code, why))
 }
 
@@ -30,8 +30,13 @@ pub(crate) fn log_gap(why: String) -> anyhow::Error {
 }
 
 /// Refuse a captured table whose rows left the source without change events (TRUNCATE, DROP): `SOURCE_CDC_TRUNCATED`, exit 5.
-pub(crate) fn truncated(why: String) -> anyhow::Error {
+pub(crate) fn truncated(why: impl Into<String>) -> anyhow::Error {
     refusal(crate::error::codes::SOURCE_CDC_TRUNCATED, why)
+}
+
+/// Refuse a log span this reader cannot decode into events, so the stream re-baselines past it: `SOURCE_CDC_UNDECODABLE`, exit 5.
+pub(crate) fn undecodable(why: String) -> anyhow::Error {
+    refusal(crate::error::codes::SOURCE_CDC_UNDECODABLE, why)
 }
 
 /// What a resume may do given the checkpoint's recorded identity and the server's.

@@ -521,7 +521,8 @@ impl MysqlChangeStream {
                 // candidate is inert (a view): electing the foreign table instead is
                 // what turned a hard refusal into `success, rows: 0`.
                 if !mine.is_empty() && !live_foreign.is_empty() {
-                    anyhow::bail!(
+                    crate::rivet_bail!(
+                        crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
                         "mysql cdc: `{cfg}` is unqualified, so it means the connection's \
                          own database (`{own_db_for_resolution}`) — but `{}` also holds a \
                          table of that name, and the binlog dump is server-wide, so its \
@@ -571,7 +572,7 @@ impl MysqlChangeStream {
                     .unwrap_or(None),
             };
             if let MysqlRoutingVerdict::Never(why) = classify_mysql_routing(cfg, row.as_deref()) {
-                anyhow::bail!("{why}");
+                crate::rivet_bail!(crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED, "{why}");
             }
         }
         Ok(())
@@ -639,7 +640,10 @@ impl MysqlChangeStream {
             "SET SESSION net_write_timeout = {DUMP_WRITE_TIMEOUT_SECS}"
         ))
         .map_err(|e| {
-            anyhow::anyhow!("mysql cdc: raising net_write_timeout on the binlog connection: {e}")
+            crate::error::coded(
+                crate::error::codes::SOURCE_QUERY_FAILED,
+                format!("mysql cdc: raising net_write_timeout on the binlog connection: {e}"),
+            )
         })?;
         let mut req = BinlogRequest::new(server_id)
             .with_filename(file.clone().into_bytes())
@@ -689,9 +693,12 @@ impl MysqlChangeStream {
         // produce it — without this, the mutant restoring `unwrap_or_default`
         // is equivalent on every test environment.
         crate::test_hook::maybe_fail_at("mysql_identity_query")?;
-        let uuid: String = c
-            .query_first("SELECT @@server_uuid")?
-            .ok_or_else(|| anyhow::anyhow!("mysql: server reported no @@server_uuid"))?;
+        let uuid: String = c.query_first("SELECT @@server_uuid")?.ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::SOURCE_CDC_PREREQUISITE,
+                "mysql: server reported no @@server_uuid".to_string(),
+            )
+        })?;
         let gtid: String = c.query_first("SELECT @@gtid_executed")?.unwrap_or_default();
         Ok((uuid, gtid))
     }
@@ -718,11 +725,11 @@ impl MysqlChangeStream {
             // The 8.2+ statement EXISTS and returned nothing ⇒ binlog is
             // definitively disabled — falling back would surface 8.4's
             // "SHOW MASTER STATUS" syntax error instead of the real cause.
-            Ok(None) => anyhow::bail!("mysql: binlog disabled (binlog status empty)"),
+            Ok(None) => return Err(binlog_disabled("binlog status empty")),
             // Err ⇒ pre-8.2 server without the new statement — legacy form.
-            Err(_) => c.query_first("SHOW MASTER STATUS")?.ok_or_else(|| {
-                anyhow::anyhow!("mysql: binlog disabled (SHOW MASTER STATUS empty)")
-            })?,
+            Err(_) => c
+                .query_first("SHOW MASTER STATUS")?
+                .ok_or_else(|| binlog_disabled("SHOW MASTER STATUS empty"))?,
         };
         let file: String = row.get(0).expect("binlog file column");
         let pos: u64 = row.get(1).expect("binlog pos column");
@@ -755,11 +762,15 @@ impl MysqlChangeStream {
         // foreign-server refusal (measured on a loaded CI runner). Refusing is
         // retryable and loud; a half-anchor is forever.
         let (uuid, gtid) = identity.as_ref().map_err(|e| {
-            anyhow::anyhow!(
-                "mysql cdc: could not record the server's identity for the new \
+            crate::error::recoded(
+                e,
+                crate::error::codes::SOURCE_QUERY_FAILED,
+                format!(
+                    "mysql cdc: could not record the server's identity for the new \
                  checkpoint ({e:#}) — refusing to write an UNVERIFIABLE anchor: a \
                  checkpoint without a server_uuid cannot be checked against a \
                  foreign server on resume"
+                ),
             )
         })?;
         Position::new(serde_json::json!({
@@ -1040,7 +1051,10 @@ impl MysqlChangeStream {
                         continue;
                     }
                     if let Some(why) = Self::bare_name_spans_databases(cfg, &self.own_db, &schema) {
-                        anyhow::bail!(why);
+                        crate::rivet_bail!(
+                            crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
+                            "{why}"
+                        );
                     }
                 }
                 // Provisional position; rewritten to the commit position at XID.
@@ -1171,7 +1185,9 @@ impl MysqlChangeStream {
                         &self.configured_tables,
                     )
                 }) {
-                    anyhow::bail!(xa_prepare_refusal_message(&ev.schema, &ev.table));
+                    return Err(crate::source::cdc::checkpoint_identity::undecodable(
+                        xa_prepare_refusal_message(&ev.schema, &ev.table),
+                    ));
                 }
                 // A SPILLED tail makes the "nothing of ours" verdict below
                 // unreachable honestly: the scan above covers only the in-memory
@@ -1183,7 +1199,11 @@ impl MysqlChangeStream {
                 // re-reads from the checkpoint), and the message names both facts
                 // the operator needs.
                 if let Some(rows) = self.tx.spilled_rows() {
-                    anyhow::bail!("{}", xa_prepare_spilled_tail_refusal_message(rows));
+                    crate::rivet_bail!(
+                        crate::error::codes::SOURCE_CDC_TRANSACTION_TOO_LARGE,
+                        "{}",
+                        xa_prepare_spilled_tail_refusal_message(rows)
+                    );
                 }
                 // Nothing of ours in the branch: drop it rather than leave it for the
                 // next commit to stamp and fuse. The sink would route these rows away,
@@ -1220,7 +1240,9 @@ impl MysqlChangeStream {
                 }) =>
             {
                 let target = statement_dml_target(&qe.query(), &qe.schema()).flatten();
-                anyhow::bail!(statement_dml_refusal_message(target.as_ref()));
+                return Err(crate::source::cdc::checkpoint_identity::undecodable(
+                    statement_dml_refusal_message(target.as_ref()),
+                ));
             }
             Some(EventData::QueryEvent(qe)) if is_commit_statement(&qe.query()) => {
                 if !self.close_transaction_at(log_pos) {
@@ -1353,7 +1375,10 @@ pub(crate) fn undecodable_rows_refusal_message(kind: UndecodableRows) -> String 
 }
 
 fn undecodable_rows_event_refusal(ev: &RowsEventData<'_>) -> anyhow::Error {
-    anyhow::anyhow!(undecodable_rows_refusal_message(classify_rows_event(ev)))
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
+        undecodable_rows_refusal_message(classify_rows_event(ev)),
+    ))
 }
 
 /// Refuse a captured table's rows event whose TABLE_MAP carries no column names (written under MINIMAL).
@@ -1373,15 +1398,16 @@ fn nameless_rows_refusal(schema: &str, table: &str, file: &str, log_pos: u64) ->
 }
 
 fn compressed_payload_refusal() -> anyhow::Error {
-    anyhow::anyhow!(
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
         "mysql cdc: encountered a Transaction_payload_event in the binlog — the source has \
          binlog_transaction_compression enabled (turned on after this run opened, or a compressed \
          span already in the binlog written while it was on), and this reader cannot expand it. \
          Skipping it would capture NOTHING for that transaction while the checkpoint advanced past \
          it — a silent data loss. Turn compression off for the replica rivet reads \
          (SET GLOBAL binlog_transaction_compression = OFF; and remove it from my.cnf), then \
-         re-run: the un-acked span is re-read from the checkpoint."
-    )
+         re-run: the un-acked span is re-read from the checkpoint.",
+    ))
 }
 
 /// Refuse to stream when the source packs transactions into
@@ -1439,7 +1465,7 @@ pub(crate) fn table_probe_refusal(table: &str, code: Option<u16>, said: &str) ->
         )
         .into();
     }
-    anyhow::anyhow!("mysql cdc: cannot read `{table}` ({said}); nothing was read or written.")
+    crate::source::cdc::table_unreadable("mysql", table, said)
 }
 
 /// A replica whose binlog omits replicated changes would capture nothing and report success.
@@ -1501,6 +1527,14 @@ fn binlog_compression_is_on(raw: Option<&str>) -> bool {
     )
 }
 
+/// The server keeps no binlog, so there is nothing to capture; `detail` is which status query said so.
+fn binlog_disabled(detail: &str) -> anyhow::Error {
+    anyhow::Error::new(crate::error::CodedError::new(
+        crate::error::codes::SOURCE_CDC_PREREQUISITE,
+        format!("mysql: binlog disabled ({detail})"),
+    ))
+}
+
 /// Dial through the batch path's [`super::dial_conn`], then refuse a proxy that cannot carry the binlog.
 fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     let mut conn = super::dial_conn(url, tls)?;
@@ -1509,7 +1543,8 @@ fn connect_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     // proxy here and fail with the fix, not a cryptic dump-protocol error or a hang.
     let kind = super::proxy::detect_proxy_on_conn(&mut conn);
     if kind.is_proxy() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
             "CDC cannot stream the binlog through {} — it does not proxy the MySQL \
              replication protocol (COM_BINLOG_DUMP). Point the source at the MySQL host \
              directly (the replication endpoint), not the proxy.",
@@ -3219,7 +3254,10 @@ mod refusal_text_tests {
         }
         for other in [Some(1142), None] {
             let denied = table_probe_refusal("orders", other, "SELECT command denied");
-            assert_eq!(crate::error::error_code(&denied), None);
+            assert_eq!(
+                crate::error::error_code(&denied),
+                Some("RIVET_SOURCE_QUERY_FAILED")
+            );
             assert_eq!(
                 denied.to_string(),
                 "mysql cdc: cannot read `orders` (SELECT command denied); nothing was read or written."
@@ -3370,6 +3408,38 @@ mod refusal_text_tests {
         assert!(
             bare.starts_with("mysql cdc: `orders` was written inside an XA transaction"),
             "{bare}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// An anchor refused because the identity query failed keeps the query's own code when it
+    /// has one, else the query-failed code; a server with no binlog is a prerequisite.
+    #[test]
+    fn an_unverifiable_anchor_and_a_disabled_binlog_are_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("c.ckpt");
+        let err = MysqlChangeStream::write_anchor(
+            &ckpt,
+            "binlog.000001",
+            4,
+            &Err(anyhow::anyhow!("boom")),
+        )
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_QUERY_FAILED", 1);
+        let inner = crate::error::coded(crate::error::codes::SOURCE_CDC_PREREQUISITE, "x");
+        let err =
+            MysqlChangeStream::write_anchor(&ckpt, "binlog.000001", 4, &Err(inner)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_PREREQUISITE", 1);
+        assert!(!ckpt.exists(), "a refused anchor writes nothing");
+        let err = binlog_disabled("binlog status empty");
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_PREREQUISITE", 1);
+        assert_eq!(
+            err.to_string(),
+            "mysql: binlog disabled (binlog status empty)"
         );
     }
 }

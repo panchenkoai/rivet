@@ -1077,6 +1077,15 @@ scenarios:
     mongo:    { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
     oracle:   { na: "the refusal is the destination's and does not depend on the source engine: the postgres column carries the row" }
 
+
+  - id: refusal_source_keyset_key_unordered
+    what: "RIVET_SOURCE_KEYSET_KEY_UNORDERED: a MongoDB `_id` span a `$gt` seek cannot page over (a NaN at either end, or more than one BSON type bracket) under `page_size` or `parallel`"
+    postgres: { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
+    mysql:    { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
+    mssql:    { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
+    mongo:    { gap: "asserted by its code offline (mongo: an_unseekable_id_span_and_an_undecodable_cursor_token_are_refused_by_code); the walk needs a collection seeded with two `_id` types under `page_size`: refuse twice, drop `page_size` and `parallel`, normalise `_id`, and one wrong remedy" }
+    oracle:   { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
+
   - id: edit_destination_path_cursor_stored_before_destinations_were_recorded
     what: "a cursor (incremental; MongoDB `resume`) whose row holds no destination (`export_state.destination` NULL, as rivet 0.31 and earlier wrote it): a run with the config unchanged continues and records where it delivers, and a destination moved after that is refused twice (RIVET_STATE_CURSOR_DESTINATION_MISMATCH)"
     postgres: { test: a_cursor_stored_before_destinations_were_recorded_continues_then_refuses_a_moved_destination_postgres }

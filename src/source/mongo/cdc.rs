@@ -282,15 +282,18 @@ pub(crate) fn until_current_bound(
             Some(e) => format!("the server answered: {e}"),
             None => "the server answered without an `operationTime`".to_string(),
         };
-        anyhow::anyhow!(
-            "mongo cdc: `until_current: true` needs the cluster time at open, and {cause}. \
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+            format!(
+                "mongo cdc: `until_current: true` needs the cluster time at open, and {cause}. \
              Unlike the SQL engines, a MongoDB change stream has no catch-up exit to fall \
              back on: without this bound the run would keep draining under any ongoing \
              writes and NEVER terminate, so continuing would hang rather than finish late. \
              Check the connection's permissions and that the source is a replica set / \
              sharded cluster (a standalone reports no operationTime and cannot serve change \
              streams at all), or set `until_current: false` to stream continuously."
-        )
+            ),
+        ))
     })
 }
 
@@ -302,9 +305,12 @@ pub(crate) fn until_current_bound(
 /// for the `until_current` bound. See the version-matrix live test that caught it.
 fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Result<Position> {
     let bson = mongodb::bson::to_bson(token)?;
-    let doc = bson
-        .as_document()
-        .ok_or_else(|| anyhow::anyhow!("mongodb cdc: resume token is not a BSON document"))?;
+    let doc = bson.as_document().ok_or_else(|| {
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+            "mongodb cdc: resume token is not a BSON document".to_string(),
+        ))
+    })?;
     let mut buf = Vec::new();
     doc.to_writer(&mut buf)?;
     let hex = super::bytes_to_hex(&buf);
@@ -315,7 +321,8 @@ fn encode_resume_token(token: &mongodb::change_stream::event::ResumeToken) -> Re
     // (Snowflake NULLS FIRST would crown it newest). Unreachable on supported
     // servers; refuse rather than mis-order silently if it ever appears.
     if data.is_none() && doc.get("_data").is_some() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_PREREQUISITE,
             "mongodb cdc: resume token `_data` is not a string (a pre-4.2 BinData \
              token?) — refusing to emit an unorderable __pos; every token from \
              this server has the same shape, so the remedy is upgrading the \
@@ -362,10 +369,12 @@ pub(crate) fn decode_resume_token(
             serde_json::json!({ "_data": data }),
         )?);
     }
-    anyhow::bail!(
-        "mongodb cdc: unrecognized resume-token checkpoint shape \
+    Err(crate::source::cdc::checkpoint_identity::checkpoint_invalid(
+        format!(
+            "mongodb cdc: unrecognized resume-token checkpoint shape \
          (expected an `rt` hex string or a `_data` string): {v}"
-    )
+        ),
+    ))
 }
 
 impl MongoChangeStream {
@@ -687,7 +696,8 @@ fn to_change_event(
         // A `replace` is a full-document overwrite — a row update in our model.
         OperationType::Update | OperationType::Replace => ChangeOp::Update,
         OperationType::Delete => ChangeOp::Delete,
-        other => anyhow::bail!(
+        other => crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
             "mongodb cdc: change operation {other:?} is collection/cluster level (drop, rename, \
              invalidate), not a row change — rivet streams document changes only"
         ),
@@ -867,7 +877,7 @@ fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
         ));
     }
     if names_oversize_event(&text) {
-        return anyhow::anyhow!(
+        return crate::source::cdc::checkpoint_identity::undecodable(format!(
             "mongodb cdc: a single change event exceeds MongoDB's 16 MB BSON limit — \
              the event carries the post-image, the pre-image and the envelope in ONE \
              document, so a document over roughly 8 MB can cross it on an update. \
@@ -880,7 +890,7 @@ fn diagnose_stream_error(e: mongodb::error::Error) -> anyhow::Error {
              does NOT unstick THIS event either — the pre-image was already recorded when \
              the change happened — though it does prevent the next one. Server error: {text}",
             crate::source::cdc::checkpoint_identity::RECOVER
-        );
+        ));
     }
     anyhow::Error::from(e)
 }
@@ -986,11 +996,11 @@ impl ChangeStream for MongoChangeStream {
                     continue;
                 }
                 OpClass::Invalidate => {
-                    return Some(Err(anyhow::anyhow!(
+                    return Some(Err(crate::source::cdc::checkpoint_identity::truncated(
                         "mongodb cdc: the change stream was INVALIDATED (the watched \
                          database was dropped, or a captured collection dropped/renamed). \
                          The resume token is no longer usable — re-create the capture from \
-                         a fresh checkpoint after confirming the source state."
+                         a fresh checkpoint after confirming the source state.",
                     )));
                 }
             }
@@ -1359,5 +1369,15 @@ mod refusal_text_tests {
             "{whole}"
         );
         assert!(whole.ends_with(RECOVER), "{whole}");
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    /// A checkpoint of a shape no rivet wrote is the checkpoint refusal (exit 5).
+    #[test]
+    fn an_unrecognised_resume_token_checkpoint_is_refused_by_code() {
+        let err = super::decode_resume_token(&serde_json::json!({ "foo": 1 })).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_CHECKPOINT_INVALID", 5);
     }
 }

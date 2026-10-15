@@ -482,7 +482,7 @@ impl ChangeEvent {
 /// A deferred decode error as the run's failure.
 fn raise_deferred(poison: &Option<String>) -> Result<()> {
     if let Some(poison) = poison {
-        anyhow::bail!("{poison}");
+        crate::rivet_bail!(crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED, "{poison}");
     }
     Ok(())
 }
@@ -1029,7 +1029,8 @@ impl CdcEngine {
     /// The engine a URL's scheme names — for `rivet cdc`, which has a URL and no `source.type`.
     pub(crate) fn from_url(url: &str) -> Result<Self> {
         let Some(t) = crate::config::SourceType::from_url_scheme(url) else {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_SOURCE_URL_INVALID,
                 "rivet cdc: unsupported source url — expected mysql:// / postgresql:// / sqlserver:// / mongodb:// / oracle://"
             )
         };
@@ -1124,9 +1125,12 @@ impl CdcEngine {
             }
             Self::Mysql | Self::Mssql | Self::Mongo | Self::Oracle => {
                 let ckpt = checkpoint.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
-                        self.label()
+                    crate::error::coded(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+                        format!(
+                            "{} cdc: an anchor needs cdc.checkpoint (no server-side anchor exists)",
+                            self.label()
+                        ),
                     )
                 })?;
                 if Position::load(ckpt)?.is_some() {
@@ -1445,9 +1449,10 @@ pub(crate) fn create_change_stream(
             configured_tables,
         } => {
             let ci = capture_instance.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
+                crate::error::coded(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "sqlserver cdc requires a capture instance: set `cdc.capture_instance:` on the \
-                     export (or `--capture-instance` with `rivet cdc`), e.g. dbo_orders"
+                     export (or `--capture-instance` with `rivet cdc`), e.g. dbo_orders",
                 )
             })?;
             // Resume from the checkpoint's position if one was persisted (SQL Server
@@ -1629,7 +1634,8 @@ impl<'s> CdcSchemaResolver<'s> {
                 "__op" | "__pos" | "__seq" | crate::enrich::DELETE_FLAG_COLUMN
             )
         }) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_RESERVED_COLUMN,
                 "cdc: `{table}` has a column named `{}`, which is one of the names rivet \
                  adds to every part (`__op`, `__pos`, `__seq`) or to the warehouse base \
                  (`__is_deleted`). Capturing it would put two fields of that name in one \
@@ -1723,12 +1729,21 @@ pub(crate) fn validate_table_ident(table: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
             "rivet cdc table must be a plain [schema.]table identifier (got {table:?}); \
              refusing to interpolate it into SQL"
         );
     }
     Ok(())
+}
+
+/// The CDC probe could not read a captured table for a reason the server named; nothing was read or written.
+pub(crate) fn table_unreadable(tag: &str, table: &str, said: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::SOURCE_QUERY_FAILED,
+        format!("{tag} cdc: cannot read `{table}` ({said}); nothing was read or written."),
+    )
 }
 
 /// Resolve a configured `cdc.checkpoint:` path.
@@ -3406,5 +3421,31 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use crate::error::assert_coded;
+
+    /// The shared CDC seams: an unknown URL scheme, an unsafe table identifier, an unreadable
+    /// table (the server's words kept), the undecodable seam, and a deferred cell poison.
+    #[test]
+    fn the_shared_cdc_refusals_carry_their_codes() {
+        let err = super::CdcEngine::from_url("foo://x").unwrap_err();
+        assert_coded(&err, "RIVET_CONFIG_SOURCE_URL_INVALID", 1);
+        let err = super::validate_table_ident("a;b").unwrap_err();
+        assert_coded(&err, "RIVET_CONFIG_EXPORT_SOURCE_INVALID", 1);
+        let err = super::table_unreadable("pg", "t", "permission denied for table t");
+        assert_coded(&err, "RIVET_SOURCE_QUERY_FAILED", 1);
+        assert_eq!(
+            err.to_string(),
+            "pg cdc: cannot read `t` (permission denied for table t); nothing was read or written."
+        );
+        let err = super::checkpoint_identity::undecodable("x".into());
+        assert_coded(&err, "RIVET_SOURCE_CDC_UNDECODABLE", 5);
+        let err = super::raise_deferred(&Some("column(s) [c] hold a value".into())).unwrap_err();
+        assert_coded(&err, "RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5);
+        assert!(super::raise_deferred(&None).is_ok());
     }
 }

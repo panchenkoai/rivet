@@ -381,7 +381,28 @@ pub(crate) fn split_key_list(joined: Option<String>) -> Option<Vec<String>> {
 /// The refusal for `source.type: oracle` in a build without the `oracle` feature.
 #[cfg_attr(feature = "oracle", allow(dead_code))]
 pub(crate) fn oracle_feature_missing() -> anyhow::Error {
-    anyhow::anyhow!("source.type: oracle — this rivet was built without the `oracle` feature")
+    crate::error::coded(
+        crate::error::codes::CONFIG_SOURCE_FEATURE_MISSING,
+        "source.type: oracle — this rivet was built without the `oracle` feature".to_string(),
+    )
+}
+
+/// The refusal every engine's schema probe raises when columns have no safe type mapping; `message` is the engine's own listing.
+pub(crate) fn unsafe_mapping_refusal(message: String) -> anyhow::Error {
+    crate::error::coded(crate::error::codes::TYPE_UNSAFE_MAPPING, message)
+}
+
+/// The async runtime a driver runs on, or an environment stop naming `engine` when the process cannot start one.
+pub(crate) fn driver_runtime(
+    engine: &str,
+    built: std::io::Result<tokio::runtime::Runtime>,
+) -> Result<tokio::runtime::Runtime> {
+    built.map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::SOURCE_RUNTIME_UNAVAILABLE,
+            format!("{engine}: tokio runtime build failed: {e}"),
+        )
+    })
 }
 
 /// A key column list, or `None` when the table has no key.
@@ -473,7 +494,8 @@ pub(crate) fn value_within_ceiling(
     if let Some(limit) = max_value_bytes
         && len > limit
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_VALUE_TOO_LARGE,
             "RIVET_VALUE_TOO_LARGE: column '{}' has a single value of {:.1} MB, exceeding the \
              per-value ceiling of {} MB. One oversized cell can OOM the process regardless of \
              batch size. Raise `tuning.max_value_mb` (or set it to 0 to disable the guard) if \
@@ -500,6 +522,25 @@ pub(crate) fn keyset_keys_primary_first(columns: &[(String, bool)]) -> Vec<Strin
         keys.extend(class.into_iter().cloned());
     }
     keys
+}
+
+#[cfg(test)]
+mod driver_runtime_tests {
+    #[test]
+    fn a_process_out_of_descriptors_is_an_environment_stop_not_an_internal_error() {
+        let emfile = std::io::Error::from_raw_os_error(24);
+        let err = super::driver_runtime("mssql", Err(emfile)).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_RUNTIME_UNAVAILABLE")
+        );
+        assert!(
+            matches!(crate::error::classify_exit(&err), 1 | 2),
+            "exit {}: running out of descriptors is the environment, not a bug",
+            crate::error::classify_exit(&err)
+        );
+        assert!(format!("{err:#}").starts_with("mssql: tokio runtime build failed: "));
+    }
 }
 
 #[cfg(test)]
@@ -625,7 +666,8 @@ pub(crate) fn verify_wire_columns(expected: &[&str], wire: &[&str]) -> anyhow::R
             .zip(wire)
             .any(|(e, w)| !e.eq_ignore_ascii_case(w))
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_COLUMNS_CHANGED_UNDER_READ,
             "the source returned columns [{}] but this export resolved [{}] — the table's \
              schema changed while the export was running (a DDL mid-export). Re-run the \
              export: a fresh run resolves the new schema.",
@@ -673,5 +715,24 @@ mod introspection_tests {
         assert!(intro.is_integer_column("ID"));
         assert!(intro.is_integer_column("User_Id"));
         assert!(!intro.is_integer_column("name"));
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// The shared source seams: a missing build feature, the unsafe-mapping refusal every engine
+    /// raises, the per-value ceiling, and a column list that changed under the read.
+    #[test]
+    fn the_shared_source_refusals_carry_their_codes() {
+        let err = oracle_feature_missing();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_SOURCE_FEATURE_MISSING", 1);
+        let err = unsafe_mapping_refusal("2 column(s) have no safe Rivet mapping".into());
+        crate::error::assert_coded(&err, "RIVET_TYPE_UNSAFE_MAPPING", 1);
+        let err = value_within_ceiling("c", 2, Some(1)).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_TOO_LARGE", 1);
+        let err = verify_wire_columns(&["a"], &["b"]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ", 1);
     }
 }

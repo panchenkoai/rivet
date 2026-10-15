@@ -584,9 +584,12 @@ fn mysql_run_export(
     } else {
         None
     });
-    let row_set = result
-        .iter()
-        .ok_or_else(|| anyhow::anyhow!("no result set"))?;
+    let row_set = result.iter().ok_or_else(|| {
+        anyhow::Error::new(crate::error::CodedError::new(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+            "no result set".to_string(),
+        ))
+    })?;
     let mut row_buf: Vec<mysql::Row> = Vec::with_capacity(ctl.target());
     let mut total_rows: usize = 0;
     let mut memory_cap_applied = false;

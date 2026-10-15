@@ -126,7 +126,8 @@ impl<'a> Reader<'a> {
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.i + n > self.b.len() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                 "pgoutput: message truncated — wanted {n} byte(s) at offset {}, have {}",
                 self.i,
                 self.b.len()
@@ -159,7 +160,10 @@ impl<'a> Reader<'a> {
             self.i += 1;
         }
         if self.i >= self.b.len() {
-            anyhow::bail!("pgoutput: unterminated string at offset {start}");
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                "pgoutput: unterminated string at offset {start}"
+            );
         }
         let s = String::from_utf8_lossy(&self.b[start..self.i]).into_owned();
         self.i += 1;
@@ -175,7 +179,10 @@ impl<'a> Reader<'a> {
                 tag @ (b't' | b'b') => {
                     let len = self.i32()?;
                     if len < 0 {
-                        anyhow::bail!("pgoutput: negative value length {len}");
+                        crate::rivet_bail!(
+                            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                            "pgoutput: negative value length {len}"
+                        );
                     }
                     let raw = self.take(len as usize)?.to_vec();
                     if tag == b'b' {
@@ -184,7 +191,8 @@ impl<'a> Reader<'a> {
                         Cell::Text(raw)
                     }
                 }
-                other => anyhow::bail!(
+                other => crate::rivet_bail!(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                     "pgoutput: unknown tuple cell tag {:?} — the protocol version \
                      may be newer than this decoder",
                     other as char
@@ -261,7 +269,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message> {
                 tag = r.u8()?;
             }
             if tag != b'N' {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                     "pgoutput: UPDATE without a new tuple (tag {:?})",
                     tag as char
                 );
@@ -276,7 +285,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message> {
             let relation_id = r.u32()?;
             let tag = r.u8()?;
             if tag != b'K' && tag != b'O' {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                     "pgoutput: DELETE without an old tuple (tag {:?})",
                     tag as char
                 );
@@ -313,7 +323,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Message> {
 fn expect_tag(r: &mut Reader<'_>, want: u8) -> Result<()> {
     let got = r.u8()?;
     if got != want {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
             "pgoutput: expected tuple tag {:?}, got {:?}",
             want as char,
             got as char
@@ -342,11 +353,18 @@ pub(crate) fn value_from_binary(
     use postgres_types::{FromSql, Type};
 
     let Some(ty) = Type::from_oid(oid) else {
-        anyhow::bail!("pgoutput: no PostgreSQL type for OID {oid}");
+        crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+            "pgoutput: no PostgreSQL type for OID {oid}"
+        );
     };
     fn de<'a, T: FromSql<'a>>(ty: &Type, raw: &'a [u8], what: &str) -> Result<T> {
-        T::from_sql(ty, raw)
-            .map_err(|e| anyhow::anyhow!("pgoutput: decoding {what} (oid {}): {e}", ty.oid()))
+        T::from_sql(ty, raw).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
+                format!("pgoutput: decoding {what} (oid {}): {e}", ty.oid()),
+            )
+        })
     }
     Ok(match oid {
         16 => V::Bool(de::<bool>(&ty, raw, "bool")?),
@@ -412,7 +430,8 @@ pub(crate) fn value_from_binary(
         1009 | 1014 | 1015 => array_of(de::<Vec<Option<String>>>(&ty, raw, "text[]")?, |v| {
             V::Bytes(v.into_bytes())
         }),
-        _ => anyhow::bail!(
+        _ => crate::rivet_bail!(
+            crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
             "pgoutput: column type `{}` (oid {oid}) has no binary decoder. Refusing \
              rather than passing the raw bytes through as text — an unmapped type \
              that ships as hex is a column every count and sum agrees with and no \
@@ -452,7 +471,12 @@ fn numeric_text(raw: &[u8]) -> Result<String> {
     numeric_wire_special_text(raw)
         .map(str::to_string)
         .or_else(|| numeric_wire_normalized_plain(raw))
-        .ok_or_else(|| anyhow::anyhow!("pgoutput: malformed numeric payload ({} bytes)", raw.len()))
+        .ok_or_else(|| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                format!("pgoutput: malformed numeric payload ({} bytes)", raw.len()),
+            )
+        })
 }
 
 /// The prefix rivet stamps on its own logical messages, so a barrier emitted by
@@ -529,7 +553,7 @@ pub(crate) struct Assembler {
     /// sibling DELETE yielded a one-row "transaction" that never existed. The
     /// at-least-once contract is transaction-atomic, so half of one is worse than
     /// none — and the caller is not the place to remember that.
-    poisoned: Option<String>,
+    poisoned: Option<(crate::error::Code, String)>,
 }
 
 struct RelationInfo {
@@ -559,17 +583,20 @@ impl Assembler {
         // A `Begin` clears the poison; everything else inside a poisoned
         // transaction is refused with the ORIGINAL cause, so the caller sees why
         // rather than a cascade of consequences.
-        if let Some(why) = self.poisoned.clone()
+        if let Some((code, why)) = self.poisoned.clone()
             && !matches!(msg, Message::Begin { .. })
         {
             if matches!(msg, Message::Commit { .. }) {
                 self.open.clear();
             }
-            anyhow::bail!("{why}");
+            crate::rivet_bail!(code, "{why}");
         }
         let out = self.push_inner(msg);
         if let Err(e) = &out {
-            self.poisoned = Some(format!("{e:#}"));
+            self.poisoned = Some((
+                crate::error::code_of(e).unwrap_or(crate::error::codes::INTERNAL_SOURCE_INVARIANT),
+                format!("{e:#}"),
+            ));
             self.open.clear();
         }
         out
@@ -584,7 +611,8 @@ impl Assembler {
                 // silently is how a partial transaction reaches the destination.
                 self.poisoned = None;
                 if !self.open.is_empty() {
-                    anyhow::bail!(
+                    crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                         "pgoutput: BEGIN with {} row(s) still open from an uncommitted \
                          transaction — refusing rather than shipping a partial one",
                         self.open.len()
@@ -728,14 +756,16 @@ impl Assembler {
     ) -> Result<Vec<crate::source::cdc::value::RivetValue>> {
         use crate::source::cdc::value::RivetValue as V;
         let Some(rel) = self.relations.get(&relation_id) else {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                 "pgoutput: a row referenced relation {relation_id} before its \
                  Relation message — the protocol sends one first, so this means a \
                  message was dropped"
             );
         };
         if cells.len() != rel.columns.len() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                 "pgoutput: {}.{}: a row image carries {} value(s) under {} column(s)",
                 rel.schema,
                 rel.table,
@@ -757,7 +787,8 @@ impl Assembler {
                 // carry one. Refusing is the only honest answer: writing the marker
                 // would put the words `unchanged-toast-datum` where data belongs,
                 // and writing NULL would erase a value that still exists.
-                Cell::ToastUnchanged => anyhow::bail!(
+                Cell::ToastUnchanged => crate::rivet_bail!(
+                    crate::error::codes::SOURCE_CDC_CELL_UNSUPPORTED,
                     "pgoutput: {}.{}: column `{}` is an unchanged TOAST value this \
                      UPDATE did not carry, and no pre-image holds it. Set REPLICA \
                      IDENTITY FULL on the table so the old row travels with the \
@@ -766,7 +797,8 @@ impl Assembler {
                     rel.table,
                     col.name
                 ),
-                Cell::Text(_) => anyhow::bail!(
+                Cell::Text(_) => crate::rivet_bail!(
+                    crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                     "pgoutput: {}.{}: column `{}` arrived in TEXT form. The slot must \
                      be read with `binary=true`; the text rendering is shaped by the \
                      session's datestyle/bytea_output/TimeZone, which is the defect \
@@ -1701,5 +1733,39 @@ mod tests {
             decode(&[b'I', 0, 0, 0, 1, b'N', 0, 1, b't', 0x7f, 0xff, 0xff, 0xff]).is_err(),
             "a length that exceeds the buffer must error, never read out of bounds"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    /// A truncated message and a row before its Relation are reader invariants (exit 6), and a
+    /// poisoned transaction re-raises the ORIGINAL cause with its code.
+    #[test]
+    fn protocol_invariants_and_a_poisoned_transaction_carry_their_codes() {
+        let err = decode(&[b'B', 0, 0]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_SOURCE_INVARIANT", 6);
+        let mut a = Assembler::default();
+        a.push(Message::Begin {
+            final_lsn: 1,
+            xid: 1,
+        })
+        .unwrap();
+        let err = a
+            .push(Message::Insert {
+                relation_id: 7,
+                after: vec![Cell::Null],
+            })
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_SOURCE_INVARIANT", 6);
+        let again = a
+            .push(Message::Commit {
+                commit_lsn: 2,
+                end_lsn: 3,
+            })
+            .unwrap_err();
+        crate::error::assert_coded(&again, "RIVET_INTERNAL_SOURCE_INVARIANT", 6);
+        assert_eq!(again.to_string(), format!("{err:#}"));
     }
 }
