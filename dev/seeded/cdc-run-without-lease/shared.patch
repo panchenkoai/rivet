@@ -1,0 +1,16 @@
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1775,13 +1775,6 @@
+         }
+         // The export's run lease for the whole stream, as a batch run holds it: a second
+         // run beside a live one is refused before it opens the source or writes anything.
+-        let _run_lease = match cdc_run_lease(state, &export.name) {
+-            Ok(lease) => lease,
+-            Err(e) => {
+-                let summary = synthetic_failed_summary(&export.name, &e);
+-                return (Err(e), summary);
+-            }
+-        };
+         // `initial: snapshot`: anchor first, then each pending table's full
+         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
+         // own metric + journal), then the drain below. A failed snapshot fails

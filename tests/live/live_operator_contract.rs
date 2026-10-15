@@ -884,6 +884,34 @@ fn pg_cdc_missing_table_leaves_no_slot(baseline: bool) {
 
 // (d) the exit-code contract
 
+/// A second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as `RIVET_STATE_RUN_IN_PROGRESS`, and the first delivers.
+fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
+    s.rig.run_ok();
+    for id in 1..=5 {
+        s.insert(id);
+    }
+    let opened = |r: &Rig| {
+        r.state_count(
+            "SELECT count(*) FROM run_status WHERE export_name = '{export}' AND status = 'running'",
+        ) > 0
+    };
+    let (first, second) = s
+        .rig
+        .beside_a_live_run(
+            &[("RIVET_TEST_PAUSE_AT", "cdc_after_open:6000")],
+            opened,
+            Rig::run,
+        )
+        .answered_while_alive();
+    assert!(
+        first.status.success(),
+        "the live stream finishes:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    s.rig.run_ok();
+}
+
 /// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
 fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_live", 300);
@@ -1933,6 +1961,46 @@ fn a_corrupt_cdc_checkpoint_is_refused_by_code_mssql() {
         }),
         Then::Refuses(CHECKPOINT_INVALID),
     );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql() {
+    second_cdc_run_beside_a_live_one(CdcScenario::mysql(
+        "oc_cdc2",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres() {
+    second_cdc_run_beside_a_live_one(CdcScenario::pg(
+        "oc_cdc2",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql() {
+    second_cdc_run_beside_a_live_one(CdcScenario::mssql(
+        "oc_cdc2",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+    ));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle() {
+    second_cdc_run_beside_a_live_one(CdcScenario::oracle_with("oc_cdc2", |r, _| r));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo() {
+    second_cdc_run_beside_a_live_one(CdcScenario::mongo_with("oc_cdc2", |r, _| r));
 }
 
 #[test]
