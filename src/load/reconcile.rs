@@ -27,7 +27,7 @@ use crate::destination::gcs::GcsStore;
 use crate::manifest::MANIFEST_MAX_BYTES;
 use crate::manifest::census::{ManifestCensus, dedupe_by_run_id, ensure_single_generation};
 use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, PartStatus, RunManifest};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 /// The reconciled row-count chain for one export's load, derived from the run
 /// manifests under its GCS prefix. `file_rows` is what the warehouse must end
@@ -86,10 +86,10 @@ pub fn fetch_manifests_keyed(
     store
         .read_each_within(&keys, MANIFEST_MAX_BYTES, |key, body| {
             let bytes = body.map_err(|sz| {
-                anyhow::anyhow!(
+                crate::error::coded(crate::error::codes::LOAD_STAGING_OBJECT_UNSAFE, format!(
                     "manifest {key} is at least {sz} bytes, over the {MANIFEST_MAX_BYTES}-byte cap — \
                      refusing to read a possibly-hostile manifest into memory (CWE-400)"
-                )
+                ))
             })?;
             let m = serde_json::from_slice::<RunManifest>(&bytes)
                 .with_context(|| format!("parsing manifest {key}"))?;
@@ -134,7 +134,8 @@ pub fn select_load_uris(
         .collect();
     let missing = runs_with_missing_parts(new, &all_parquet);
     if !missing.is_empty() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_RUN_NOT_LOADABLE,
             "run(s) {} declare parts that are no longer under {gcs_prefix} — refusing to load \
              rather than guess which files are theirs (the prefix may hold other runs' parts \
              or crash leftovers). Re-run the export, then load.",
@@ -568,7 +569,8 @@ pub fn ensure_single_export(keyed: &[(String, RunManifest)]) -> Result<()> {
         .collect();
     if names.len() > 1 {
         let listed: Vec<&str> = std::mem::take(&mut names).into_iter().collect();
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_SOURCES_SHARED,
             "the load prefix holds manifests from {} distinct exports ({}) — the load sums every \
              manifest under the prefix and cleanup wipes it recursively, so loading a shared \
              prefix would cross-contaminate the row count and could delete a sibling export's \
@@ -646,7 +648,8 @@ fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
         .collect();
     if sources.len() > 1 {
         let listed: Vec<&str> = sources.iter().map(String::as_str).collect();
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_SOURCES_SHARED,
             "the load prefix holds manifests from {} DIFFERENT SOURCES ({}) under one export \
              name. The warehouse table is named from the source table, so loading this prefix \
              puts one source's rows in the table and leaves the other's unloaded — and a second \
@@ -676,7 +679,8 @@ fn ensure_single_source(keyed: &[(String, RunManifest)]) -> Result<()> {
 /// `expected_rows` gate then checks against the warehouse's `COUNT(*)`.
 pub fn reconcile(manifests: &[RunManifest], allow_source_drift: bool) -> Result<LoadIntegrity> {
     if manifests.is_empty() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_RUN_NOT_LOADABLE,
             "no `{MANIFEST_FILENAME}` found under the export prefix — refusing to load \
              unverified files. A rivet export writes a manifest on success; its absence \
              means the run never completed (or points at the wrong prefix)."
@@ -690,7 +694,8 @@ pub fn reconcile(manifests: &[RunManifest], allow_source_drift: bool) -> Result<
     for m in manifests {
         // Completeness: only a `Success` run may be loaded.
         if m.status != ManifestStatus::Success {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_RUN_NOT_LOADABLE,
                 "manifest for run `{}` (export `{}`) is {:?}, not Success — refusing to load a \
                  partial export",
                 m.run_id,
@@ -701,12 +706,12 @@ pub fn reconcile(manifests: &[RunManifest], allow_source_drift: bool) -> Result<
         // Self-consistency: the recorded aggregates must match the committed
         // parts (a divergence is a writer bug, per OSS `validate_self_consistency`).
         m.validate_self_consistency().map_err(|e| {
-            anyhow::anyhow!(
+            crate::error::coded(crate::error::codes::LOAD_MANIFEST_INCONSISTENT, format!(
                 "manifest for run `{}` (export `{}`) is internally inconsistent: {e} — refusing \
                  to load",
                 m.run_id,
                 m.export_name
-            )
+            ))
         })?;
 
         let rows = u64::try_from(m.row_count).with_context(|| {
@@ -743,7 +748,8 @@ pub fn reconcile(manifests: &[RunManifest], allow_source_drift: bool) -> Result<
                 } else {
                     // The remedy is a config key, not a CLI flag — clap defines no such
                     // argument. Name where it goes, or the reader is still hunting.
-                    bail!(
+                    crate::rivet_bail!(
+                        crate::error::codes::LOAD_SOURCE_FILE_MISMATCH,
                         "source→file mismatch for run `{}` (export `{}`): source had {src} rows \
                          but {rows} were extracted — the extract dropped {} row(s). Investigate \
                          before loading; to accept it, set `allow_source_drift: true` in this \
@@ -1309,6 +1315,64 @@ mod tests {
         let err = reconcile(&[m], false).unwrap_err().to_string();
         assert!(err.contains("source→file mismatch"), "{err}");
         assert!(err.contains("dropped 20"), "{err}");
+    }
+
+    /// Every refusal of the manifests and parts a load would consume names its code and class.
+    #[test]
+    fn each_reconcile_refusal_carries_its_code() {
+        let code = |r: Result<LoadIntegrity>| {
+            let e = r.unwrap_err();
+            (
+                crate::error::error_code(&e),
+                crate::error::classify_exit(&e),
+            )
+        };
+        let refused = (Some("RIVET_LOAD_RUN_NOT_LOADABLE"), 5);
+        assert_eq!(code(reconcile(&[], false)), refused);
+        let mut partial = manifest("r1", 100, Some(100));
+        partial.status = ManifestStatus::Interrupted;
+        assert_eq!(code(reconcile(&[partial], false)), refused);
+        let mut lying = manifest("r1", 100, Some(100));
+        lying.row_count = 999;
+        assert_eq!(
+            code(reconcile(&[lying], false)),
+            (Some("RIVET_LOAD_MANIFEST_INCONSISTENT"), 3)
+        );
+        assert_eq!(
+            code(reconcile(&[manifest("r1", 100, Some(120))], false)),
+            (Some("RIVET_LOAD_SOURCE_FILE_MISMATCH"), 3)
+        );
+
+        let keyed = |m: RunManifest| ("gs://b/p/manifest-x.json".to_string(), m);
+        let mut customers = manifest("r2", 10, None);
+        customers.export_name = "customers".into();
+        let mut mysql = manifest("r3", 10, None);
+        mysql.source.engine = "mysql".into();
+        for pair in [
+            [keyed(manifest("r1", 10, None)), keyed(customers)],
+            [keyed(manifest("r1", 10, None)), keyed(mysql)],
+        ] {
+            let e = ensure_single_export(&pair).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&e),
+                Some("RIVET_LOAD_SOURCES_SHARED")
+            );
+        }
+
+        let (store, _g) = fs_store(&[]);
+        let gone = [keyed(manifest("r1", 10, None))];
+        let e = select_load_uris(&store, "gs://my-bucket/base", &gone).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_RUN_NOT_LOADABLE")
+        );
+        let big = vec![b' '; MANIFEST_MAX_BYTES as usize + 1];
+        let (store, _g) = fs_store(&[("base/manifest-r1.json", big)]);
+        let e = fetch_manifests_keyed(&store, "gs://my-bucket/base").unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_STAGING_OBJECT_UNSAFE")
+        );
     }
 
     #[test]

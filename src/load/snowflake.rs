@@ -18,7 +18,7 @@
 
 use super::TargetLoader;
 use crate::types::target::{SfType, TargetColumnSpec, TargetType};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::process::Command;
 
 /// Loads Rivet Parquet from GCS into Snowflake.
@@ -167,7 +167,8 @@ impl SnowflakeLoader {
             .output()
             .context("running `snow sql` — is the Snowflake CLI installed?")?;
         if !out.status.success() {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_WAREHOUSE_REJECTED,
                 "snow sql failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
@@ -188,12 +189,16 @@ impl TargetLoader for SnowflakeLoader {
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
         if uris.is_empty() {
-            bail!(
-                "the newest run of `{table}` exported 0 rows; emptying a Snowflake table to match \
-                 is not supported yet — TRUNCATE it by hand, or keep the previous rows knowingly"
-            );
+            return Err(super::refused(
+                crate::error::codes::LOAD_EMPTY_RUN_UNSUPPORTED,
+                format!(
+                    "the newest run of `{table}` exported 0 rows; emptying a Snowflake table to \
+                     match is not supported yet — TRUNCATE it by hand, or keep the previous rows \
+                     knowingly"
+                ),
+            ));
         }
-        let sql = self.build_materialize_sql(table, specs, uris)?;
+        let sql = super::before_write(self.build_materialize_sql(table, specs, uris))?;
         let result = self.run_snow(&sql)?;
         // ponytail: rows via COUNT(*); can become the COPY's `rows_loaded`
         // (metadata) behind this seam, no driver change.
@@ -208,7 +213,7 @@ impl TargetLoader for SnowflakeLoader {
         uris: &[String],
         _pk: &[String],
     ) -> Result<u64> {
-        let sql = self.build_append_changelog_sql(table, specs, uris)?;
+        let sql = super::before_write(self.build_append_changelog_sql(table, specs, uris))?;
         let result = self.run_snow(&sql)?;
         let before = extract_named(&result, "BEFORE_")
             .context("CDC load ran but the pre-append count (BEFORE_) could not be read")?;
@@ -491,7 +496,8 @@ pub(crate) fn partition_expr(
 ) -> Result<(crate::load::plan::PartitionKey, String)> {
     use crate::load::plan::{PartitionForm, PartitionKey};
     if spec.expiration_days.is_some() || spec.require_filter {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
             "export `{export}`: Snowflake has no partition expiry or partition filter — drop \
              `expiration_days` / `require_filter` from `partition`"
         );
@@ -501,7 +507,8 @@ pub(crate) fn partition_expr(
         granularity,
     } = &spec.form
     else {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
             "export `{export}`: Snowflake partitions by a date column only (`column` + \
              `granularity`); it has no `range` or `ingestion` partitions"
         );
@@ -511,7 +518,8 @@ pub(crate) fn partition_expr(
         t,
         TargetType::Snowflake(SfType::Date | SfType::TimestampTz | SfType::TimestampNtz)
     ) {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
             "export `{export}`: cannot partition on `{column}` ({}); Snowflake clusters a DATE \
              or TIMESTAMP column by time",
             crate::load::plan::base_type(&t)
@@ -604,13 +612,17 @@ fn strip_gcs_scheme(s: &str) -> &str {
 /// re-load stale/already-loaded runs and fail the count gate.
 fn copy_files_clause(gcs_url: &str, uris: &[String]) -> Result<String> {
     if uris.is_empty() {
-        bail!("Snowflake COPY: no Parquet URIs selected to load");
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_LOAD_INVARIANT,
+            "Snowflake COPY: no Parquet URIs selected to load"
+        );
     }
     // Snowflake caps an explicit FILES=() list at 1000 entries; a normal run is a
     // handful. Batching past that is a follow-up — fail loud rather than silently
     // fall back to a whole-prefix PATTERN (the bug this fix closes).
     if uris.len() > 1000 {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_FILE_LIMIT_EXCEEDED,
             "Snowflake COPY FILES=() caps at 1000 files, got {} — batch the load or reduce parallelism",
             uris.len()
         );
@@ -711,6 +723,35 @@ mod tests {
             .map(|i| format!("gs://b/p/f{i}.parquet"))
             .collect();
         assert!(copy_files_clause("gcs://b/p/", &many).is_err());
+    }
+
+    /// The Snowflake stops before any statement runs name their codes and stay refusals.
+    #[test]
+    fn each_snowflake_stop_before_the_copy_carries_its_code() {
+        let specs = [col("id", SfType::NumberPs(38, 0))];
+        let many: Vec<String> = (0..1001)
+            .map(|i| format!("gs://b/p/f{i}.parquet"))
+            .collect();
+        let l = adoption_loader();
+        for (uris, code, exit) in [
+            (Vec::new(), "RIVET_LOAD_EMPTY_RUN_UNSUPPORTED", 5),
+            (many, "RIVET_LOAD_FILE_LIMIT_EXCEEDED", 1),
+        ] {
+            let e = l.materialize("t", &specs, &uris).unwrap_err();
+            assert!(e.is::<crate::load::Refused>(), "{code}: {e:#}");
+            assert_eq!(
+                (
+                    crate::error::error_code(&e),
+                    crate::error::classify_exit(&e)
+                ),
+                (Some(code), exit)
+            );
+        }
+        let e = copy_files_clause("gcs://b/p/", &[]).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_INTERNAL_LOAD_INVARIANT")
+        );
     }
 
     #[test]

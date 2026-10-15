@@ -11,7 +11,7 @@
 //! `${VAR}` resolution. Both are gone: one parse, one resolver, no argv.
 
 use crate::types::target::{TargetColumnSpec, TargetType};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::config::load::HOURLY_LIFETIME_DAYS;
 use crate::config::load::MAX_TABLE_PARTITIONS;
@@ -221,7 +221,7 @@ impl LoadPlan {
     /// This table's plan-time refusal, as its own error.
     pub fn refused(&self) -> Result<()> {
         match &self.refusal {
-            Some(why) => bail!("{why}"),
+            Some(why) => crate::rivet_bail!(crate::error::codes::LOAD_LOOKALIKE_COLUMN, "{why}"),
             None => Ok(()),
         }
     }
@@ -289,7 +289,8 @@ fn resolve_load_prefix(
     let raw_prefix = dest.prefix.as_deref().unwrap_or("");
     let raw_base = raw_prefix.split("{partition}").next().unwrap_or(raw_prefix);
     if raw_base.contains("{date}") {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_STAGING_PREFIX_INVALID,
             "export `{}`: destination.prefix `{}` puts a day-specific `{{date}}` in the load base. \
              `rivet load` lists the LOAD-day prefix, so an export written on a different day (a \
              nightly export + an after-midnight load) lands under a different, EMPTY prefix and is \
@@ -304,7 +305,8 @@ fn resolve_load_prefix(
     let prefix = expanded.prefix.as_deref().unwrap_or("");
     let base = prefix.split("{partition}").next().unwrap_or(prefix);
     if base.contains('{') {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_STAGING_PREFIX_INVALID,
             "export `{}`: load prefix `{}` still has an unresolved placeholder after expansion — \
              `rivet load` cannot reconstruct which run's output to load (a `{{run_id}}` prefix is \
              run-specific). Drop the run-specific token from `destination.prefix`, or run \
@@ -360,7 +362,10 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
     // child (which resolved it) reported types for the real one.
     let cfg = crate::config::Config::load(config_path).context("parsing rivet config")?;
     if cfg.exports.is_empty() {
-        bail!("config has no exports");
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_NO_EXPORTS,
+            "config has no exports"
+        );
     }
 
     // The `load:` target from the same config, shared by every export.
@@ -445,7 +450,8 @@ pub fn check_spec_fit(plan: &LoadPlan) -> Result<()> {
             .iter()
             .find(|s| crate::load::cdc::is_reserved_column(&s.column_name))
     {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_RESERVED_COLUMN,
             "export `{}`: the source has a column named `{}`, which is a name rivet OWNS in \
              a `{}` load's changelog and base tables. Its values would not survive the merge \
              (and `__is_deleted` would switch on soft-delete semantics for rows the source \
@@ -458,14 +464,16 @@ pub fn check_spec_fit(plan: &LoadPlan) -> Result<()> {
     }
     let has = |c: &str| plan.specs.iter().any(|s| s.column_name == c);
     if let Some(m) = plan.pk.iter().find(|c| !has(c)) {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_KEY_COLUMN_INVALID,
             "export `{}`: primary-key column `{m}` {NOT_A_COLUMN} — the dedup view partitions \
              by it. fix `pk` in the export's `load:` block",
             plan.export_name
         );
     }
     if let Some(m) = plan.clustering.columns().iter().find(|c| !has(c)) {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_KEY_COLUMN_INVALID,
             "export `{}`: `cluster_by` column `{m}` {NOT_A_COLUMN}",
             plan.export_name
         );
@@ -537,7 +545,8 @@ fn build_plans_keyed(
         // Both warehouse loaders are GCS-only (Snowflake rewrites gs://→gcs://),
         // so refuse anything else loudly at plan time.
         if !load.target.reads_from(dest.destination_type) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_DESTINATION_TYPE_UNSUPPORTED,
                 "export `{}` has `load:` but its destination is `type: {}` — a {} load \
                  reads GCS only (Snowflake via storage integration, BigQuery via LOAD DATA; \
                  ClickHouse also reads S3 and Azure). Stage the export to a gcs destination, \
@@ -574,7 +583,8 @@ fn build_plans_keyed(
                 // rather than defaulted: a defaulted `Ok` would walk an
                 // unmappable column straight past `validate_specs`.
                 let (Some(target_type), Some(status)) = (c.target_type, c.target_status) else {
-                    bail!(
+                    crate::rivet_bail!(
+                        crate::error::codes::INTERNAL_LOAD_INVARIANT,
                         "export `{}` column `{}`: the type resolver returned no {} type — \
                          refusing to guess one",
                         export.name,
@@ -777,7 +787,8 @@ fn fold_lookalike_columns(
         return Ok((renames, Vec::new()));
     }
     if !load.target.renames_lookalikes() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_LOOKALIKE_COLUMN,
             "export `{export}`: column(s) {} have Cyrillic look-alike letters; only a BigQuery \
              load renames them — rename them in the source",
             renames
@@ -793,7 +804,8 @@ fn fold_lookalike_columns(
             .filter(|s| s.column_name.eq_ignore_ascii_case(latin))
             .count();
         if clash > 1 {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_LOOKALIKE_COLUMN,
                 "export `{export}`: column `{file}` has Cyrillic look-alike letters and would load \
                  as `{latin}`, which another column already is — rename one of them in the source"
             );
@@ -901,7 +913,8 @@ fn refuse_renamed_shape_column(
         .chain(cluster_by.iter().map(String::as_str));
     for col in shaped {
         if let Some((file, _)) = renames.iter().find(|(_, latin)| latin == col) {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_LOOKALIKE_COLUMN,
                 "export `{export}`: `{col}` partitions or clusters the table but its source \
                  column `{file}` has Cyrillic look-alike letters — rename it in the source, or, when it only clusters, set `cluster_by:` in the export's `load:` block to other columns or `none`"
             );
@@ -1031,7 +1044,8 @@ fn resolve_keys(
             }
             _ => "fix `pk` in the export's `load:` block",
         };
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_KEY_COLUMN_INVALID,
             "export `{export}`: primary-key column `{missing}` {NOT_A_COLUMN} — \
              the dedup view partitions by it. {fix}"
         );
@@ -1040,7 +1054,8 @@ fn resolve_keys(
         KeyColumns::None => Vec::new(),
         KeyColumns::Columns(cols) => {
             if bigquery && cols.len() > max {
-                bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::LOAD_KEY_COLUMN_INVALID,
                     "export `{export}`: `cluster_by` names {} columns; BigQuery clusters on at most {max}",
                     cols.len()
                 );
@@ -1048,8 +1063,12 @@ fn resolve_keys(
             for c in cols {
                 match type_of(c) {
                     None if fit == SpecFit::Deferred => {}
-                    None => bail!("export `{export}`: `cluster_by` column `{c}` {NOT_A_COLUMN}"),
-                    Some(t) if bigquery && !super::bigquery::clusterable(t) => bail!(
+                    None => crate::rivet_bail!(
+                        crate::error::codes::LOAD_KEY_COLUMN_INVALID,
+                        "export `{export}`: `cluster_by` column `{c}` {NOT_A_COLUMN}"
+                    ),
+                    Some(t) if bigquery && !super::bigquery::clusterable(t) => crate::rivet_bail!(
+                        crate::error::codes::LOAD_KEY_COLUMN_INVALID,
                         "export `{export}`: BigQuery cannot cluster on `{c}` ({t}); clusterable \
                          types are INT64, NUMERIC, BIGNUMERIC, STRING, BOOL, DATE, DATETIME, \
                          TIMESTAMP, GEOGRAPHY and RANGE"
@@ -1105,7 +1124,8 @@ fn resolve_partition(
     }
     let column_type = |c: &str| -> Result<TargetType> {
         if !super::is_safe_load_ident(c) {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
                 "export `{export}`: partition column `{}` is not a plain SQL identifier \
                  ([A-Za-z_][A-Za-z0-9_]*)",
                 c.escape_default()
@@ -1115,7 +1135,12 @@ fn resolve_partition(
             .iter()
             .find(|s| s.column_name == c)
             .map(|s| s.target_type.clone())
-            .with_context(|| format!("export `{export}`: partition column `{c}` {NOT_A_COLUMN}"))
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::LOAD_KEY_COLUMN_INVALID,
+                    format!("export `{export}`: partition column `{c}` {NOT_A_COLUMN}"),
+                )
+            })
     };
     let (key, expr) = match &load.target {
         LoadTarget::Bigquery { .. } => {
@@ -1255,7 +1280,8 @@ fn reject_duplicate_target_tables(plans: &[(&str, LoadMode)]) -> Result<()> {
         }
         for o in objects {
             if let Some(prior) = seen.insert(o.clone(), t) {
-                bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::LOAD_TARGET_COLLISION,
                     "two exports resolve to the same warehouse object `{o}` (load targets `{prior}` \
                      and `{t}`) — each would clobber the other (a full OVERWRITE vs a \
                      cdc/incremental append share the object and its ledger). Give each export \
@@ -1285,7 +1311,11 @@ pub fn source_engine(config_path: &str) -> Result<crate::load::cdc::SourceEngine
         SourceType::Mysql => Ok(SourceEngine::MySql),
         SourceType::Mssql => Ok(SourceEngine::SqlServer),
         SourceType::Mongo => Ok(SourceEngine::Mongo),
-        SourceType::Oracle => anyhow::bail!("{}", crate::config::load::ORACLE_CDC_NOT_LOADABLE),
+        SourceType::Oracle => crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
+            "{}",
+            crate::config::load::ORACLE_CDC_NOT_LOADABLE
+        ),
     }
 }
 
@@ -3351,5 +3381,118 @@ load: { target: bigquery, project: p, dataset: d, cluster_by: none }
         let snapshot = plan(false);
         assert_eq!(snapshot.mode, LoadMode::Full);
         assert_eq!(snapshot.cursor_column, None);
+    }
+
+    /// The code of a failed plan-time check.
+    fn code_of<T: std::fmt::Debug>(r: Result<T>) -> Option<&'static str> {
+        crate::error::error_code(&r.unwrap_err())
+    }
+
+    /// Every plan-time refusal names its code: keys, reserved and look-alike names,
+    /// colliding targets, the staging prefix and the destination type.
+    #[test]
+    fn each_plan_time_refusal_carries_its_code() {
+        let specs = [typed("id", BqType::Int64), typed("v", BqType::String)];
+        let keys = |extra| {
+            resolve_keys(
+                "e",
+                &load_with("bigquery", extra),
+                None,
+                &specs,
+                SpecFit::Strict,
+            )
+        };
+        for extra in [
+            serde_json::json!({ "pk": ["idd"] }),
+            serde_json::json!({ "cluster_by": ["nope"] }),
+            serde_json::json!({ "cluster_by": ["id", "v", "id", "v", "id"] }),
+        ] {
+            assert_eq!(code_of(keys(extra)), Some("RIVET_LOAD_KEY_COLUMN_INVALID"));
+        }
+        let partitioned = load_with(
+            "bigquery",
+            serde_json::json!({ "partition": { "column": "nope", "granularity": "day" } }),
+        );
+        let partition =
+            resolve_partition("e", &partitioned, LoadMode::Full, &specs, SpecFit::Strict);
+        assert_eq!(code_of(partition), Some("RIVET_LOAD_KEY_COLUMN_INVALID"));
+        let odd = load_with(
+            "bigquery",
+            serde_json::json!({ "partition": { "column": "a b", "granularity": "day" } }),
+        );
+        let partition = resolve_partition("e", &odd, LoadMode::Full, &specs, SpecFit::Strict);
+        assert_eq!(code_of(partition), Some("RIVET_LOAD_IDENTIFIER_UNSAFE"));
+
+        let mut one = vec![spec_named("\u{441}omment")];
+        let snowflake = load_with("snowflake", serde_json::json!({}));
+        assert_eq!(
+            code_of(fold_lookalike_columns("e", &snowflake, &mut one, no_action)),
+            Some("RIVET_LOAD_LOOKALIKE_COLUMN")
+        );
+        assert_eq!(
+            code_of(reject_duplicate_target_tables(&[
+                ("orders", LoadMode::Full),
+                ("orders", LoadMode::Full)
+            ])),
+            Some("RIVET_LOAD_TARGET_COLLISION")
+        );
+        let dest = |p: &str| crate::config::DestinationConfig {
+            prefix: Some(p.to_string()),
+            ..Default::default()
+        };
+        for prefix in ["exports/{date}/{export}/", "e/{run_id}/"] {
+            assert_eq!(
+                code_of(resolve_load_prefix(&dest(prefix), "orders", "bkt")),
+                Some("RIVET_LOAD_STAGING_PREFIX_INVALID")
+            );
+        }
+    }
+
+    /// A table refused at plan time keeps its code, and a whole config refused names its own.
+    #[test]
+    fn a_plan_refusal_and_a_config_refusal_carry_their_codes() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - { name: clash, table: clash, mode: cdc, format: parquet, destination: { type: gcs, bucket: b, prefix: c/ } }
+load: { target: bigquery, project: p, dataset: d, cluster_by: none, pk: [id] }
+"#,
+        )
+        .unwrap();
+        let reports = vec![report(
+            "clash",
+            vec![
+                col("id", TargetStatus::Ok),
+                col("comment", TargetStatus::Ok),
+                col("\u{441}omment", TargetStatus::Ok),
+            ],
+        )];
+        let plans = build_plans(&cfg, cfg.load.as_ref().unwrap(), reports).unwrap();
+        assert_eq!(
+            code_of(plans[0].refused()),
+            Some("RIVET_LOAD_LOOKALIKE_COLUMN")
+        );
+        let mut reserved = plans[0].clone();
+        reserved.specs.push(spec_named("__op"));
+        assert_eq!(
+            code_of(check_spec_fit(&reserved)),
+            Some("RIVET_LOAD_RESERVED_COLUMN")
+        );
+
+        let s3 = crate::config::Config::from_yaml(
+            r#"
+source: { type: postgres, url: "postgresql://localhost/test" }
+exports:
+  - { name: alpha, table: alpha, mode: full, format: parquet, destination: { type: s3, bucket: b1, prefix: a/ } }
+load: { target: bigquery, project: p, dataset: d }
+"#,
+        )
+        .unwrap();
+        let reports = vec![report("alpha", vec![col("id", TargetStatus::Ok)])];
+        assert_eq!(
+            code_of(build_plans(&s3, s3.load.as_ref().unwrap(), reports)),
+            Some("RIVET_LOAD_DESTINATION_TYPE_UNSUPPORTED")
+        );
     }
 }

@@ -87,6 +87,41 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_LOAD_LEASE_LOST_DURING_WRITE` | integrity | 3 | compare the warehouse table with the source before relying on it: another load or compact may have written it at the same time; the next `rivet load` loads the same runs again |
 | `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH` | refusal | 5 | add the export's new columns to the table (`ALTER TABLE … ADD COLUMN`) and re-run; do not rename it aside |
 | `RIVET_LOAD_TARGET_NOT_RIVETS` | refusal | 5 | the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table |
+| `RIVET_LOAD_IDENTIFIER_UNSAFE` | usage | 1 | rename the column or table in the source, or alias it in the export's `query:`, to a plain identifier ([A-Za-z_][A-Za-z0-9_]*) |
+| `RIVET_LOAD_KEY_COLUMN_INVALID` | usage | 1 | name only columns the export delivers, in a type and number the target takes, under `pk:` / `cluster_by:` / `partition:` in the export's `load:` block (or add the column to the export's SELECT), as the message names |
+| `RIVET_LOAD_PRIMARY_KEY_MISSING` | usage | 1 | declare the key under the export's `load:` block, e.g. `pk: [id]` |
+| `RIVET_LOAD_RESERVED_COLUMN` | usage | 1 | rename or exclude the column in the export's query, or load the table with `mode: full` |
+| `RIVET_LOAD_LOOKALIKE_COLUMN` | usage | 1 | rename the column with Cyrillic look-alike letters in the source to Latin letters, as the message names |
+| `RIVET_LOAD_TARGET_COLLISION` | usage | 1 | give each export its own `table:` or destination |
+| `RIVET_LOAD_STAGING_PREFIX_INVALID` | usage | 1 | set a non-empty `destination.prefix` with no `{date}` or `{run_id}` above `{partition}`, and a literal segment before `{partition}` |
+| `RIVET_LOAD_DESTINATION_TYPE_UNSUPPORTED` | usage | 1 | stage the export to a destination the target reads (GCS; ClickHouse also S3 and Azure), or drop the `load:` block |
+| `RIVET_LOAD_PARTITION_BUDGET_EXCEEDED` | usage | 1 | partition by a coarser `granularity`, or export a narrower range per run, as the message names |
+| `RIVET_LOAD_FILE_LIMIT_EXCEEDED` | usage | 1 | load after fewer runs, or write fewer, larger parts (lower the export's parallelism) |
+| `RIVET_LOAD_COLUMN_TYPE_UNSUPPORTED` | usage | 1 | CAST or drop the column in the export's `query:`, or add a `columns:` override to a type the target takes |
+| `RIVET_LOAD_TLS_CA_INVALID` | usage | 1 | point `load.ca_file` at a PEM bundle holding the server's CA certificate |
+| `RIVET_LOAD_EMPTY_RUN_UNSUPPORTED` | refusal | 5 | TRUNCATE the warehouse table by hand, or keep its previous rows knowingly; nothing was written |
+| `RIVET_LOAD_RUN_NOT_LOADABLE` | refusal | 5 | re-run the export so a complete run (a Success manifest and every part it declares) is under the prefix the load reads, then load |
+| `RIVET_LOAD_STAGING_OBJECT_UNSAFE` | refusal | 5 | investigate the staging bucket: remove the object the message names, then re-run the export and the load |
+| `RIVET_LOAD_SOURCES_SHARED` | refusal | 5 | give each export and each source its own destination prefix and its own target table |
+| `RIVET_LOAD_COLUMN_RESPELLED` | refusal | 5 | load the older runs by hand under the old spelling as the message describes, then delete their manifests; every run stays staged |
+| `RIVET_LOAD_TARGET_OBJECT_CONFLICT` | refusal | 5 | drop or rename the warehouse object the message names, or align the config with it; nothing was written |
+| `RIVET_LOAD_COMPACT_BASE_MISSING` | refusal | 5 | load the backfill first (the `cdc.backfill:` export builds the base), or drop the buffer to discard its changes |
+| `RIVET_LOAD_CHANGELOG_PARTITION_CHANGED` | refusal | 5 | keep the change log's partitioning in the config, or rebuild it as the message names (`rivet load --rebuild-changelog`, or by hand where policies must be kept) |
+| `RIVET_LOAD_BUFFER_NOT_COMPACTED` | refusal | 5 | run `rivet compact` first if the buffer belongs to the current base, or drop the buffer, then re-run the load |
+| `RIVET_LOAD_REBASELINE_OVER_CHANGES` | refusal | 5 | TRUNCATE the change log the message names, then re-run the same `rivet load` |
+| `RIVET_LOAD_TABLE_BUSY` | refusal | 5 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again |
+| `RIVET_LOAD_MANIFEST_INCONSISTENT` | integrity | 3 | investigate the run's manifest and parts before loading; re-run the export to replace them |
+| `RIVET_LOAD_SOURCE_FILE_MISMATCH` | integrity | 3 | investigate the extract before loading; to accept the drift, set `allow_source_drift: true` in the export's `load:` block |
+| `RIVET_LOAD_COPY_COUNT_MISMATCH` | integrity | 3 | compare the tables the message names before re-running; rivet left them for inspection |
+| `RIVET_LOAD_LEDGER_UNREADABLE` | environment | 2 if transient, else 1 | restore the state backend (lower `--pool` if workers could not reconnect), then re-run |
+| `RIVET_LOAD_RUN_LANDED_DURING_LOAD` | environment | 2 if transient, else 1 | run `rivet load` again: it types from the newest run |
+| `RIVET_LOAD_WAREHOUSE_AUTH_FAILED` | environment | 2 if transient, else 1 | renew the warehouse credentials (`gcloud auth application-default login`, a service-account key, or the target's connection settings) |
+| `RIVET_LOAD_WAREHOUSE_ACCESS_DENIED` | environment | 2 if transient, else 1 | grant the load's identity the warehouse permission the message names |
+| `RIVET_LOAD_WAREHOUSE_OBJECT_NOT_FOUND` | environment | 2 if transient, else 1 | create the dataset or database the load writes into, or correct the names of the `load:` target |
+| `RIVET_LOAD_WAREHOUSE_REJECTED` | environment | 2 if transient, else 1 | read the warehouse's reason in the message and fix what it names, then re-run |
+| `RIVET_LOAD_WAREHOUSE_UNAVAILABLE` | environment | 2 if transient, else 1 | re-run the load later; the warehouse answered with a transient failure on every retry |
+| `RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE` | internal | 6 | the warehouse answered in a shape rivet does not read — report it with the message |
+| `RIVET_INTERNAL_LOAD_INVARIANT` | internal | 6 | a load invariant did not hold — a bug; report it with the message |
 | `RIVET_VALIDATE_FAILED` | integrity | 3 | run `rivet validate` on the prefix and settle each failed part before loading it; the export itself completed |
 | `RIVET_VALIDATE_UNVERIFIED` | environment | 2 if transient, else 1 | restore read access to the destination and run `rivet validate`; the export itself completed |
 | `RIVET_INTERNAL_VALUE_CONVERTER` | internal | 6 | a value changed between the source and the written part — a bug; report it with the column's type |

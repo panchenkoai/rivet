@@ -88,7 +88,7 @@ use super::TargetLoader;
 use super::bq_rest::BigQueryApi;
 use crate::load::plan::{Clustering, Granularity, PartitionForm, PartitionKey, TablePartition};
 use crate::types::target::{BqType, TargetColumnSpec, TargetType};
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 // ── BigQuery ─────────────────────────────────────────────────────────────────
@@ -832,7 +832,12 @@ impl super::ShapeControl for BigQueryLoader {
         let api = self.api()?;
         let meta = api
             .table_metadata(&self.dataset, &changes)?
-            .ok_or_else(|| anyhow::anyhow!("`{}` is not a table", self.fqtn(&changes)))?;
+            .ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::LOAD_WAREHOUSE_OBJECT_NOT_FOUND,
+                    format!("`{}` is not a table", self.fqtn(&changes)),
+                )
+            })?;
         let props = parse_table_props(&meta);
         let row_policies = match api.row_access_policy_count(&self.dataset, &changes) {
             Ok(n) => n,
@@ -846,7 +851,10 @@ impl super::ShapeControl for BigQueryLoader {
             }
         };
         if let Some(why) = rebuild_policy_refusal(&self.fqtn(&changes), &props, row_policies) {
-            return Err(super::refused(why));
+            return Err(super::refused(
+                crate::error::codes::LOAD_CHANGELOG_PARTITION_CHANGED,
+                why,
+            ));
         }
         let before = self.count_rows(&changes)?;
         let copy = build_rebuild_copy_sql(
@@ -859,7 +867,8 @@ impl super::ShapeControl for BigQueryLoader {
         self.run_sql(&copy, "load", table)?;
         let after = self.count_rows(&rebuild)?;
         if after != before {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_COPY_COUNT_MISMATCH,
                 "`{}` holds {after} rows but `{}` holds {before} — the copy is left for \
                  inspection, nothing was swapped",
                 self.fqtn(&rebuild),
@@ -919,14 +928,16 @@ pub(crate) fn partition_expr(
                     format!("DATETIME_TRUNC(`{column}`, {g})")
                 }
                 (TargetType::BigQuery(BqType::Date), Granularity::Day) => format!("`{column}`"),
-                (TargetType::BigQuery(BqType::Date), Granularity::Hour) => bail!(
+                (TargetType::BigQuery(BqType::Date), Granularity::Hour) => crate::rivet_bail!(
+                    crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
                     "export `{export}`: `{column}` is a DATE, which has no hours — partition it \
                      by day, month or year"
                 ),
                 (TargetType::BigQuery(BqType::Date), _) => {
                     format!("DATE_TRUNC(`{column}`, {g})")
                 }
-                _ => bail!(
+                _ => crate::rivet_bail!(
+                    crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
                     "export `{export}`: cannot partition on `{column}` ({}); BigQuery partitions \
                      a DATE, DATETIME or TIMESTAMP column by time, or an INT64 column with `range`",
                     crate::load::plan::base_type(&t)
@@ -948,7 +959,8 @@ pub(crate) fn partition_expr(
         } => {
             let t = column_type(column)?;
             if t != TargetType::BigQuery(BqType::Int64) {
-                bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CONFIG_LOAD_PARTITION_UNSUPPORTED,
                     "export `{export}`: `range` partitions an INT64 column, and `{column}` is {}",
                     crate::load::plan::base_type(&t)
                 );

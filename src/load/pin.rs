@@ -128,9 +128,7 @@ pub(super) fn pin_plan_to_its_run(
             }
         }
     }
-    if let Some(refusal) = respelled_refusal(&plan.table, &run_id, &respelled) {
-        anyhow::bail!("{refusal}");
-    }
+    respelled_stop(&plan.table, &run_id, &respelled)?;
     let Some(target) = crate::types::target::ExportTarget::parse(plan.load.target.name()) else {
         return unpinned("unknown load target");
     };
@@ -147,6 +145,32 @@ pub(super) fn pin_plan_to_its_run(
     retyped.refused()?;
     retyped.pinned_run = Some(listing_pin(&newest_first, &run_id));
     Ok(retyped)
+}
+
+/// Stop a load that would read two spellings of one column, with [`respelled_refusal`]'s text.
+pub(super) fn respelled_stop(
+    table: &str,
+    pinned: &str,
+    respelled: &[(String, String, String)],
+) -> Result<()> {
+    match respelled_refusal(table, pinned, respelled) {
+        Some(refusal) => {
+            crate::rivet_bail!(crate::error::codes::LOAD_COLUMN_RESPELLED, "{refusal}")
+        }
+        None => Ok(()),
+    }
+}
+
+/// Stop a load whose listing holds runs newer than its pin, with [`late_runs_refusal`]'s text.
+pub(super) fn late_runs_stop(
+    table: &str,
+    runs: &[(String, crate::manifest::RunManifest)],
+    pin: Option<&(String, String)>,
+) -> Result<()> {
+    match late_runs_refusal(table, runs, pin) {
+        Some(why) => crate::rivet_bail!(crate::error::codes::LOAD_RUN_LANDED_DURING_LOAD, "{why}"),
+        None => Ok(()),
+    }
 }
 
 /// The pin `late_runs_refusal` checks: the pinned run id, bounded by the newest run the listing held.

@@ -437,6 +437,94 @@ scenarios:
     mongo:    { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
     oracle:   { na: "the refusal is the load target's and does not depend on the source engine: the postgres column carries the row" }
 
+  - id: refusal_load_buffer_not_compacted
+    what: "RIVET_LOAD_BUFFER_NOT_COMPACTED: a whole-table pass over a base whose buffer still holds older changes"
+    postgres: { gap: "asserted by its code offline (load::tests::the_pre_write_ownership_and_buffer_checks_carry_their_codes); the walk needs a BigQuery base-and-buffer load cell: refuse twice, `rivet compact`, drop the buffer, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_changelog_partition_changed
+    what: "RIVET_LOAD_CHANGELOG_PARTITION_CHANGED: a change log partitioned otherwise than the load declares"
+    postgres: { gap: "asserted by its code offline (load::tests::each_append_stop_carries_its_code); the walk needs a BigQuery load cell: refuse twice, `--rebuild-changelog`, the partition set back, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_column_respelled
+    what: "RIVET_LOAD_COLUMN_RESPELLED: a source column renamed between runs that are still unloaded"
+    postgres: { gap: "asserted by its code offline (live_only_decisions::each_load_glue_stop_carries_its_code); the walk needs a BigQuery load cell over two runs with two spellings and the manual remedy the text describes" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_compact_base_missing
+    what: "RIVET_LOAD_COMPACT_BASE_MISSING: `rivet compact` over a buffer whose base table does not exist"
+    postgres: { gap: "asserted by its code offline (compact::tests::each_compact_refusal_carries_its_code); the walk needs a BigQuery compact cell: refuse twice, load the backfill, drop the buffer, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_empty_run_unsupported
+    what: "RIVET_LOAD_EMPTY_RUN_UNSUPPORTED: the newest run of a Snowflake full load exported 0 rows"
+    postgres: { gap: "asserted by its code offline (snowflake::tests::each_snowflake_stop_before_the_copy_carries_its_code); the walk needs a Snowflake load cell: refuse twice, TRUNCATE by hand, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_rebaseline_over_changes
+    what: "RIVET_LOAD_REBASELINE_OVER_CHANGES: a CDC re-baseline snapshot over a change log that already holds changes"
+    postgres: { gap: "asserted by its code offline (live_only_decisions::each_load_glue_stop_carries_its_code); the walk needs a CDC load cell: refuse twice, TRUNCATE the change log, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_run_not_loadable
+    what: "RIVET_LOAD_RUN_NOT_LOADABLE: the runs to load are not complete under the prefix: no Success manifest, or parts gone"
+    postgres: { gap: "asserted by its code offline (reconcile::tests::each_reconcile_refusal_carries_its_code, load::tests::each_whole_table_stop_carries_its_code); the walk needs a load cell over a prefix with a part removed: refuse twice, re-run the export, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_sources_shared
+    what: "RIVET_LOAD_SOURCES_SHARED: a prefix or target table shared by two exports or two sources"
+    postgres: { gap: "asserted by its code offline (reconcile::tests::each_reconcile_refusal_carries_its_code); the walk needs a load cell over two exports on one prefix: refuse twice, a prefix each, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_staging_object_unsafe
+    what: "RIVET_LOAD_STAGING_OBJECT_UNSAFE: an object under the staging prefix a rivet export did not write"
+    postgres: { gap: "asserted by its code offline (reconcile, partition_budget and load tests); the walk needs a load cell with a planted object: refuse twice, remove it, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_table_busy
+    what: "RIVET_LOAD_TABLE_BUSY: another `rivet load` or `rivet compact` holds the table's lease"
+    postgres: { gap: "asserted by its code offline (live_only_decisions::each_load_glue_stop_carries_its_code); the walk needs a load beside a live load (`RIVET_TEST_PAUSE_AT`): refused while the other holds the lease, loaded once it ends" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
+  - id: refusal_load_target_object_conflict
+    what: "RIVET_LOAD_TARGET_OBJECT_CONFLICT: the warehouse object at the target name is not what the load writes (a view, another object, a table beside its change log)"
+    postgres: { gap: "asserted by its code offline (load::tests::each_whole_table_stop_carries_its_code and siblings); the walk needs a load cell: refuse twice, drop or rename the object, and one wrong remedy" }
+    mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+    oracle:   { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
+
   - id: corrupt_keyset_range_rows
     what: "the `keyset_range` rows of an unfinished parallel keyset run edited: the resume delivers the source or refuses"
     postgres: { gap: "not written: needs an unfinished parallel keyset run (the `keyset_parallel_worker` / `mongo_parallel_worker` crash points) and edits of its range rows" }

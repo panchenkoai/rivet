@@ -7,7 +7,8 @@
 /// test items, comments and literals. 673 on 2026-10-15, when the count widened from `bail!` alone
 /// (401 by the old count): a bare `bail!` rewritten as `anyhow!` no longer leaves the count.
 // 673 -> 554 (2026-10-15): every error site under `src/config/` carries a registered code (-119).
-const CEILING: usize = 554; // ratchet-pin: uncoded-bail-sites
+// 554 -> 459 (2026-10-15): every error site under `src/load/` carries a registered code (-95).
+const CEILING: usize = 459; // ratchet-pin: uncoded-bail-sites
 
 /// Occurrences of a bare `bail!(`, `ensure!(` or `anyhow!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {

@@ -45,14 +45,16 @@ pub(super) fn table_clustering<'a>(
 /// names get.
 pub(super) fn check_cluster_columns(cluster_by: &[String]) -> Result<()> {
     if cluster_by.len() > MAX_CLUSTER_COLUMNS {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_KEY_COLUMN_INVALID,
             "BigQuery allows at most {MAX_CLUSTER_COLUMNS} clustering columns, got {}",
             cluster_by.len()
         );
     }
     for c in cluster_by {
         if !crate::load::is_safe_load_ident(c) {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
                 "BigQuery load: clustering column `{}` is not a plain SQL identifier \
                  ([A-Za-z_][A-Za-z0-9_]*) — it splices into CLUSTER BY. Rename it.",
                 c.escape_default()
