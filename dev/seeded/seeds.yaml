@@ -1808,6 +1808,22 @@ seeds:
         cells:
         - an_incremental_timestamp_cursor_resumes_past_the_last_row
         - a_incremental_run_killed_at_each_point_recovers_oracle
+  - name: cursor-case-uncoded
+    class: "a refusal the product raises from the result set is never reached on an engine where the same config fails the query first, so that engine exits with the raw database error instead of the code"
+    history: "2026-10-14 - found by the by-hand CLI sweep (P6): `cursor_column` in another case was RIVET_CONFIG_CURSOR_COLUMN_CASE on MySQL and SQL Server but a raw 42703 / ORA-00904 on PostgreSQL and Oracle, through 0.31.0; fixed by `refuse_a_cursor_case_miss`"
+    scope: source
+    patch: cursor-case-uncoded/shared.patch
+    engines:
+      postgres:
+        cells: [a_cursor_column_in_another_case_is_refused_by_code_postgres]
+      mysql:
+        na: "the query runs here, since the engine matches a quoted identifier whatever its case, and the sink's schema check refuses before a byte is written; the seed removes only the probe after a failed query"
+      mssql:
+        na: "the query runs here, since the engine matches a quoted identifier whatever its case, and the sink's schema check refuses before a byte is written; the seed removes only the probe after a failed query"
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only, so it has no cursor column"
+      oracle:
+        cells: [a_cursor_column_in_another_case_is_refused_by_code_oracle]
   - name: cdc-run-without-lease
     class: "a `mode: cdc` run takes no run lease, so a second run beside a live stream reads and delivers the same changes again"
     history: "2026-10-14 - found by the by-hand CLI sweep (P2): duplicates on MySQL, SQL Server, Oracle, MongoDB CDC, an uncoded slot error on PostgreSQL, through 0.31.0; fixed by `cdc_run_lease`"
