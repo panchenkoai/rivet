@@ -10,6 +10,11 @@
   of an incremental export reads its table again; rotate that password, since the state database
   held part of it.
 
+- **`mode: cdc` on a standalone MongoDB failed with the driver's raw dump.** The run exited 1 with
+  `Error code 40573 … RawDocumentBuf { data: "7d00…" }` and no `RIVET_*` code (0.31.0 and earlier).
+  **Now** it is refused `RIVET_SOURCE_CDC_PREREQUISITE`, naming the standalone and the ways out (a
+  replica-set member, a one-member replica set, or `mode: full`). **What to do:** nothing.
+
 - **`rivet run` refused a MongoDB collection that does not exist without its code.** `rivet check`
   refused it `RIVET_SOURCE_COLLECTION_NOT_FOUND`; `rivet run` printed the same sentence with no
   `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
@@ -179,6 +184,7 @@
   - A state database or state directory that is read-only still refuses the run with
     `RIVET_STATE_NOT_WRITABLE` (exit 1), now also when it is the lease file that cannot be
     created.
+
 - **Fixed: a `mode: chunked` config the planner refuses on a large table is refused on a small
   one too.** PostgreSQL, MySQL, SQL Server and Oracle; exports with the `table:` shortcut.
   Reproduced on rivet 0.31.0 with PostgreSQL.
@@ -196,6 +202,7 @@
   - **What to do if a run now refuses:** follow the message: name an integer `chunk_column`,
     set `chunk_by_key:`, or use `mode: full`.
   - Unchanged: a config whose shape is valid still runs as one pass on a small table.
+
 - **Fixed: a `mode: chunked` export whose table fits in one chunk is refused as what it is
   beside an unfinished checkpoint run.** Applies to PostgreSQL, MySQL, SQL Server and Oracle.
   A `mode: chunked` export that sets none of `chunk_checkpoint`, `chunk_count`, `chunk_by_days`
@@ -215,6 +222,7 @@
     `chunked``, where it said `full`.
   - `rivet plan --format json` writes `"single_pass_of": "Chunked"` (or `"Keyset"`) in
     `resolved_plan` for such an export; the field is not part of the plan's checksum.
+
 - **Fixed: `rivet validate` no longer passes a prefix whose manifest is gone while `_SUCCESS`
   is there.** Every source and destination. Reproduced on rivet 0.31.0 with PostgreSQL and a
   local destination.
@@ -229,6 +237,7 @@
   - If `_SUCCESS` itself cannot be read (an I/O error, not absence), `validate` reports
     `RIVET_VERIFY_SUCCESS_READ_ERROR` and exits 1, where it exited 0.
   - Unchanged: a prefix with neither a manifest nor `_SUCCESS` is still `legacy_run`, exit 0.
+
 - **Fix: a `FROM` inside an SQL comment is no longer read as the table a `query:` reads.**
   PostgreSQL and SQL Server exports with a hand-written `query:`; the preflight probe of
   `rivet check` on every SQL engine. Reproduced on rivet 0.31.0 with PostgreSQL and SQL Server.
@@ -358,6 +367,7 @@
         it has no pooler in front of a logical server.
     - A setting an earlier release left behind stays on the pooled server connection until
       the pooler closes it (pgBouncer: `server_lifetime`, one hour by default) or is restarted.
+
 - **Fix: a `query:` holding a non-ASCII character no longer ends the run in a panic.**
   Applies to every source engine. Reproduced on rivet 0.31.0 with PostgreSQL, MySQL,
   SQL Server and MongoDB.
@@ -641,6 +651,7 @@
     the highest key of the ranges that commit after the upgrade, as 0.31 did. The state
     schema moves to v35 (`keyset_range.max_key`), so an older rivet no longer opens the
     state database.
+
 - **Breaking: a CDC stream that cannot continue exits 5 with a `RIVET_*` code, where it exited 1
   with none.** Applies to `mode: cdc` runs and `rivet cdc` on PostgreSQL, MySQL, SQL Server,
   MongoDB and Oracle.
@@ -664,6 +675,7 @@
   - Upgrading: a script or scheduler that matched exit 1 for these cases now sees exit 5
     (`refusal`: do not retry, follow the remedy in the message). `rivet schema errors` lists
     the three codes.
+
 - **Breaking: a run that fails before its first write leaves the destination as it was.**
   Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
   of a CDC export) on every source engine and on every destination that keeps objects at
@@ -695,6 +707,7 @@
     the marker alone decides, as before.
   - Upgrading: nothing to migrate. A prefix that 0.31 or earlier already re-marked as
     failed stays so until the next successful run writes its manifest and marker.
+
 - **Breaking: `--resume` over a complete prefix is refused by code, and `--resume --force`
   runs on every strategy.** Applies to `rivet run --resume` on every source engine.
   - Before, `--resume` into a prefix that holds `_SUCCESS` exited 1 with no code and said
@@ -711,6 +724,7 @@
     continue is refused as before ("nothing to continue; run without --resume").
   - A script that matched exit 1 or the old text of this refusal must match exit 5 or the
     code.
+
 - **Behaviour change: a CDC run that refuses a prerequisite leaves nothing behind, and
   `rivet doctor` agrees with `rivet run`.** Applies to `mode: cdc` and `rivet cdc` on
   PostgreSQL and MySQL.
@@ -732,12 +746,14 @@
     refused is reused as it is once the prerequisite is met; if the export was abandoned
     instead, drop the slot (`SELECT pg_drop_replication_slot('<slot>')`) or delete the
     checkpoint file.
+
 - **Behaviour change: `rivet cdc` to stdout emits each change once on PostgreSQL.** Before,
   a drain to stdout never advanced the slot, so every run printed every change since the slot
   was created, with or without `--checkpoint`, and the slot pinned WAL without bound. Now a
   drain acknowledges the last commit it printed when it ends. Upgrading: the first drain with
   this version prints the backlog the slot still holds once more, then the slot advances. A
   consumer that relied on each run re-printing the history must keep its own copy.
+
 - **Fix: PostgreSQL CDC with `rollover: 1` (`--rollover 1`) delivers the pending changes.**
   A bounded run leaves its drain barrier (a logical message) in the WAL; at `rollover: 1` the
   next run's one-change read window held only that message, and the run exited 0 with a
@@ -745,6 +761,7 @@
   same happened after N idle bounded runs in a row. Messages outside a transaction are now
   stepped over, up to the run's open-time bound. Upgrading: the first run with this version
   delivers what such a slot was holding.
+
 - **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
   Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
   - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture
@@ -764,6 +781,7 @@
     guess. This affects a table that had no captured change since its baseline while the
     cleanup job ran at least once, or whose capture instance was enabled just before the
     baseline. Re-baseline such a stream once, as the refusal says.
+
 - **Breaking: `rivet run --validate` exits non-zero when its validation fails.** Applies to
   every source engine and every destination that keeps objects at rest.
   - Before, a run whose end-of-run verification failed printed `validated: FAIL` and exited 0,
@@ -778,6 +796,7 @@
     the verdict is FAIL. The case to look for is `verify: content` on a destination that
     exposes no content checksum, such as a local path: those runs print `validated: FAIL`
     today and exit 0. Use `verify: size` there, or drop `--validate`.
+
 - **Breaking: a run over a state database it cannot write is refused, and a cursor that could
   not be stored fails the run.** Applies to `rivet run` and `rivet apply`, every batch mode
   and source engine.
@@ -800,6 +819,7 @@
     `Permission denied`), and commands that only read the state (`state show`, `metrics`).
   - Upgrading: nothing to do for a writable state. A deployment that ran on a read-only
     state and relied on exit 0 now sees exit 1.
+
 - **Breaking: a `RIVET_STATE_URL` that is not a PostgreSQL URL is refused.** Applies to every
   command that opens the state (`run`, `plan`, `apply`, `load`, `state`, `metrics`, ...).
   - Before, any value that did not start with `postgres` (a typo such as `postgre://`,
@@ -813,6 +833,7 @@
   - Upgrading: a deployment with such a value has been running on SQLite. After correcting
     the URL the PostgreSQL state is empty, so each incremental export starts with a full
     pass; to keep the stored cursors, unset the variable instead and keep the SQLite file.
+
 - **Breaking: `rivet plan` fails over a source it cannot read, and writes no plan.**
   Applies to every engine.
   - Before, when the preflight failed (no connection, a login the source rejects, a table that
@@ -825,6 +846,7 @@
     a failure; fix the connection, the credentials or the table name and plan again.
   - Upgrading: nothing to migrate. A plan file written by 0.31 or earlier over an unreadable
     source is still accepted by `rivet apply`, which fails on it as it did before.
+
 - **Breaking: `rivet validate` exits 1 on a bucket or container that does not exist.**
   Applies to `s3`, `gcs` and `azure` destinations.
   - Before, a destination whose bucket does not exist (a typo, another account) was reported
@@ -836,6 +858,7 @@
     (`run --resume`, `repair`, `reconcile`): a missing bucket is now
     `RIVET_DEST_CONTAINER_NOT_FOUND` there instead of "the object is absent". It costs one
     extra listing request (one result) per destination per process.
+
 - **Breaking: `rivet check` describes the plan `rivet run` builds.**
   Applies to `mode: chunked` on PostgreSQL, MySQL, SQL Server and Oracle, and to MongoDB.
   - Before, the `Strategy:` and `Mode:` lines were derived from the config alone. A
@@ -853,6 +876,7 @@
     it printed `Looks good` and exited 0.
   - Exit codes of `rivet check` are otherwise unchanged; a tool that parses the `strategy` or
     `mode` field sees the new values for the exports above.
+
 - **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**
   Applies to `mode: cdc` exports with `cdc.initial: snapshot` or `backfill:`, on every engine.
   - Before, a table removed from `tables:` and added again later kept its old baseline: the run
@@ -869,6 +893,7 @@
   - Upgrading: nothing to do and no state migration. The first run on the new version records
     the current table set without checking it, so a table that was removed and put back
     under 0.31 or earlier is not detected: re-baseline it as above if that happened.
+
 - **Breaking: a keyset run that a gate refused is read again, not adopted, by the next run.**
   Applies to `chunk_by_key` with `parallel: N` + `chunk_checkpoint: true`, and to
   `keyset_incremental: true` (sequential or parallel), when a `quality:` content rule
@@ -912,6 +937,7 @@
     <config> --export <name>` (range-chunk run), after which the next run is a full pass.
   - A switch after a run that FINISHED is unchanged: keyset then incremental on the same key
     still continues from the high-water.
+
 - **Breaking: a run without the checkpoint is refused beside an unfinished checkpoint run**
   (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5, nothing read or written), the same way a
   run of another mode is.
@@ -937,6 +963,7 @@
     (`RIVET_STATE_CHUNK_RUN_SUPERSEDED`, exit 5) until `rivet state reset-chunks -c <config>
     --export <name>`; the next run starts a fresh pass. Both paths were run with the 0.31.0 binary
     first and this version second.
+
 - **Fixed: an interrupted range-chunk run is resumed only by the source that opened it.** Two
   configs with one export name, one state database and different sources: when the first crashed
   after a chunk, the second resumed the first one's chunk windows over its own table (exit 0,
@@ -948,6 +975,7 @@
     `rivet state reset-chunks -c <config> --export <name>`, and the next run starts a fresh pass.
     Finished cursors and interrupted keyset runs carry over unchanged. Older binaries refuse a
     v34 state (`RIVET_STATE_SCHEMA_NEWER`).
+
 - **CDC memory: the events of one transaction share its commit position.** Closing a
   transaction copied its resume position, a JSON object, into every event (about 475 to 730
   bytes each), which was the largest single item on the heap of a large transaction. The
@@ -976,12 +1004,14 @@
     did for a table.
   - A stop before the write exits as what stopped it. `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH`
     now reaches the error line and exits 5 (it exited 1 with no code).
+
 - **A load that stops before writing never becomes the reason the next load overwrites.** The
   stale-buffer stop of a base-and-buffer load, and a staged part that vanished between the
   ledger read and the write, were recorded `failed`; the next `rivet load` then treated a table
   it had never loaded as its own and replaced it. They are recorded `refused`. The ownership
   question is also asked before the `writing` ledger row, so a load killed while refusing, or
   one whose state DB failed its closing write, leaves no row that claims the table.
+
 - **PostgreSQL CDC: a failed run no longer acknowledges the slot past what it wrote.** When a
   part rolled in the middle of a read window (most often through `rollover_memory_mb`) and a
   later part of the same run then failed to write, the run still advanced the slot's
@@ -991,6 +1021,7 @@
   - **Slots a failed run already advanced (0.31.0 and earlier):** the skipped transactions are
     no longer readable from the slot and upgrading does not bring them back. If a PostgreSQL CDC
     run failed while writing a part, compare that table with its source.
+
 - **ClickHouse load: a timestamp ClickHouse cannot hold is refused before the load's first
   statement, and that refusal no longer makes the table rivet's own.** The range check ran
   inside the insert of each part, after the `<table>__rivet_swap` table was created, and the
@@ -1022,6 +1053,7 @@
     detected.
   - An export whose `FROM` relation comes from a `--param` that changes between runs is now
     refused when it continues a stored cursor.
+
 - **Security: a password written in a keyword/value connection string is no longer printed or
   stored.** A PostgreSQL libpq string (`host=… user=… password=… dbname=…`) is accepted in
   `url:`; SQL Server ADO and JDBC-property strings (`…;Password=…;`, `…;PWD=…;`,
@@ -1054,6 +1086,7 @@
   - Upgrading: an export of this shape that delivered nothing now delivers the query's rows.
     An aliased query whose chunk column was not renamed delivers the same rows as before; only
     its probes are wrapped. Nothing stored in the state database changes.
+
 - **Breaking: PostgreSQL refuses a planner probe whose value it cannot read, instead of taking
   it for "no rows".** A range bound, a keyset boundary or the `keyset_incremental` ceiling of a
   type the adapter had no reader for came back as "no value". With `parallel:` and
@@ -1071,6 +1104,7 @@
     a warning (and delivered nothing with `keyset_incremental`). It now fails with the message
     above. Remove `parallel:`: the sequential keyset reads its cursor from the rows.
   - The refusal for a `numeric` or `real` `chunk_column:` under `query:` has the new text.
+
 - **Breaking: `rivet state reset` and `rivet state reset-chunks` refuse while a checkpointed run
   of the export is alive.** Before, both were accepted (exit 0) during the run. A
   `mode: chunked` export with `chunk_checkpoint: true` then finished with exit 0, `_SUCCESS`
@@ -1099,9 +1133,11 @@
     same way.
   - A destination that names `{partition}` without `partition_by:` is refused when it runs.
     Before, it wrote into a directory literally named `{partition}`. Remove the token.
+
 - **`destination: stdout` keeps its data under `--parallel-export-processes`.** `rivet run` and
   `rivet apply <config.yaml>` now run such a config in-process and warn that they did. Before,
   the parent dropped every byte its children wrote to stdout and exited 0 with empty output.
+
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.
@@ -1126,6 +1162,7 @@
     naming those cells (under `REPLICA IDENTITY FULL`, the old row minus its NULL cells).
   - An old-image cell rivet cannot decode refuses the run where the old image is written:
     the delete of a key change, and NDJSON `before`.
+
 - **PostgreSQL CDC warns about a table whose changes carry no old image.** This covers
   `REPLICA IDENTITY NOTHING`, a dropped `REPLICA IDENTITY USING INDEX` index, no primary key,
   and a `DEFERRABLE` primary key. On such a table
@@ -1133,6 +1170,7 @@
   names the table schema-qualified, with its remedy. The existing key-only-delete warning now
   names what each table's DELETE carries (its primary key, or its replica identity index's
   columns), instead of saying "the primary key" for every non-FULL table.
+
 - **CDC data-loss messages name a re-baseline you can follow.** The PostgreSQL slot-created
   warning and the refusals and warnings for a lost or unusable CDC position (dropped slot,
   purged binlog, change table past retention, deleted archive logs, a foreign or invalid
@@ -1147,6 +1185,7 @@
   `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT`, `_CHECKPOINT_INVALID`, `_LOG_GAP`, `_TRUNCATED`,
   `_UNDECODABLE` and `_CELL_UNSUPPORTED` say the same; the codes are unchanged. An alert that
   matches on the old wording (`re-snapshot`, `mode: full`) needs updating.
+
 - **Behaviour change: an export that continues past its last key loads by append.** Two
   kinds of export hold only the keys past the previous run: a MongoDB `mode: full` export
   with `source.mongo.page_size` and `source.mongo.resume: true`, and a `mode: chunked` export

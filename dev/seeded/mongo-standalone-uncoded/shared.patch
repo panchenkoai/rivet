@@ -1,0 +1,14 @@
+--- a/src/source/mongo/cdc.rs
++++ b/src/source/mongo/cdc.rs
+@@ -861,10 +861,7 @@
+         return crate::source::cdc::checkpoint_identity::log_gap(history_lost_message(&text));
+     }
+     if names_standalone(&text) {
+-        return anyhow::Error::new(crate::error::CodedError::new(
+-            crate::error::codes::SOURCE_CDC_PREREQUISITE,
+-            STANDALONE_MESSAGE,
+-        ));
++        return anyhow::Error::from(e);
+     }
+     if names_oversize_event(&text) {
+         return anyhow::anyhow!(
