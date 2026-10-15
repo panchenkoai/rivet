@@ -340,21 +340,18 @@ impl SourceConfig {
         // concrete value, and remind the operator that `url_env` is the
         // alternative path so they don't bounce.  See
         // `docs/getting-started.md` for the full onboarding flow.
-        let host = self.host.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "source: structured config is missing 'host'.\n  Hint: add `host: localhost` (or your DB host) under `source:` in rivet.yaml.\n  Or switch to URL-based config: `url_env: DATABASE_URL`."
-            )
-        })?;
-        let user = self.user.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "source: structured config is missing 'user'.\n  Hint: add `user: <username>` under `source:` in rivet.yaml."
-            )
-        })?;
-        let database = self.database.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "source: structured config is missing 'database'.\n  Hint: add `database: <dbname>` under `source:` in rivet.yaml."
-            )
-        })?;
+        let host = self
+            .host
+            .as_deref()
+            .ok_or_else(|| structured_field_missing("host"))?;
+        let user = self
+            .user
+            .as_deref()
+            .ok_or_else(|| structured_field_missing("user"))?;
+        let database = self
+            .database
+            .as_deref()
+            .ok_or_else(|| structured_field_missing("database"))?;
 
         // SecOps: keep the plaintext password inside a `Zeroizing<String>` until it
         // is spliced into the final URL, so the standalone password buffer is
@@ -363,7 +360,10 @@ impl SourceConfig {
         let password: zeroize::Zeroizing<String> =
             zeroize::Zeroizing::new(match (&self.password, &self.password_env) {
                 (Some(_), Some(_)) => {
-                    anyhow::bail!("source: specify 'password' or 'password_env', not both");
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
+                        "source: specify 'password' or 'password_env', not both"
+                    );
                 }
                 (Some(p), None) => {
                     static WARNED: std::sync::Once = std::sync::Once::new();
@@ -375,9 +375,12 @@ impl SourceConfig {
                     resolve_env_vars(p)?
                 }
                 (None, Some(env)) => std::env::var(env).map_err(|_| {
-                    anyhow::anyhow!(
-                        "source: env var '{0}' is not set (referenced by password_env).\n  Hint: export the value before running, e.g.\n      export {0}='your-database-password'",
-                        env
+                    crate::error::coded(
+                        crate::error::codes::CONFIG_SECRET_UNSET,
+                        format!(
+                            "source: env var '{0}' is not set (referenced by password_env).\n  Hint: export the value before running, e.g.\n      export {0}='your-database-password'",
+                            env
+                        ),
                     )
                 })?,
                 (None, None) => String::new(),
@@ -435,9 +438,7 @@ impl SourceConfig {
 
     pub fn resolve_url(&self) -> crate::error::Result<String> {
         if self.has_url_fields() && self.has_structured_fields() {
-            anyhow::bail!(
-                "source: pick either URL-based config (url/url_env/url_file) OR structured fields (host/user/database/port/password_env), not both.\n  Hint: remove whichever block you don't want; mixing the two is ambiguous."
-            );
+            return Err(mixed_connection_methods());
         }
 
         if self.has_structured_fields() {
@@ -464,9 +465,12 @@ impl SourceConfig {
             (Some(u), None, None) => (u.clone(), UrlSource::InlineYaml),
             (None, Some(env), None) => (
                 std::env::var(env).map_err(|_| {
-                    anyhow::anyhow!(
-                        "source: env var '{0}' is not set (referenced by url_env).\n  Hint: export the value before running, e.g.\n      export {0}='postgresql://user:pass@host:5432/dbname'\n  Or change `url_env: {0}` in your config to a different env var name.",
-                        env
+                    crate::error::coded(
+                        crate::error::codes::CONFIG_SECRET_UNSET,
+                        format!(
+                            "source: env var '{0}' is not set (referenced by url_env).\n  Hint: export the value before running, e.g.\n      export {0}='postgresql://user:pass@host:5432/dbname'\n  Or change `url_env: {0}` in your config to a different env var name.",
+                            env
+                        ),
                     )
                 })?,
                 UrlSource::EnvVar(env),
@@ -474,17 +478,19 @@ impl SourceConfig {
             (None, None, Some(file)) => (
                 std::fs::read_to_string(file)
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "source: cannot read url_file '{}': {}.\n  Hint: ensure the file exists and is readable; the file should contain only the URL on a single line.",
-                            file,
-                            e
+                        crate::error::coded(
+                            crate::error::codes::CONFIG_SECRET_UNSET,
+                            format!(
+                                "source: cannot read url_file '{}': {}.\n  Hint: ensure the file exists and is readable; the file should contain only the URL on a single line.",
+                                file, e
+                            ),
                         )
                     })?
                     .trim()
                     .to_string(),
                 UrlSource::File(file),
             ),
-            _ => anyhow::bail!(
+            _ => crate::config_bail!(crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
                 "source: configure exactly one connection method:\n  url_env: DATABASE_URL                          (URL from env var — recommended)\n  url: 'postgresql://user:pass@host:5432/db'      (inline — not recommended for committed configs)\n  url_file: /etc/rivet/source.url                 (URL from file — rotation-friendly)\n  host/user/database/...                          (structured fields under `source:`)"
             ),
         };
@@ -682,6 +688,29 @@ fn url_search_path(url: &str) -> String {
         .find(|c: char| c.is_whitespace() || matches!(c, '&' | '#'))
         .unwrap_or(value.len());
     value[..end].trim_matches(['\'', '"']).to_lowercase()
+}
+
+/// The structured `source:` block lacks `field` (`host`, `user` or `database`).
+pub(super) fn structured_field_missing(field: &str) -> anyhow::Error {
+    let hint = match field {
+        "host" => {
+            "add `host: localhost` (or your DB host) under `source:` in rivet.yaml.\n  Or switch to URL-based config: `url_env: DATABASE_URL`."
+        }
+        "user" => "add `user: <username>` under `source:` in rivet.yaml.",
+        _ => "add `database: <dbname>` under `source:` in rivet.yaml.",
+    };
+    crate::error::coded(
+        crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
+        format!("source: structured config is missing '{field}'.\n  Hint: {hint}"),
+    )
+}
+
+/// The `source:` block mixes a URL setting with structured fields.
+pub(super) fn mixed_connection_methods() -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
+        "source: pick either URL-based config (url/url_env/url_file) OR structured fields (host/user/database/port/password_env), not both.\n  Hint: remove whichever block you don't want; mixing the two is ambiguous.",
+    )
 }
 
 #[cfg(test)]

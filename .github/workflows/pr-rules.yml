@@ -27,6 +27,8 @@ jobs:
       - name: Self-tests
         run: |
           python3 dev/pytools/pr_ready.py --self-test
+          python3 dev/pytools/changelog.py --self-test
+          python3 dev/pytools/changelog.py check
           python3 dev/pytools/live_slot.py --self-test
       - name: Commits, PR title and body, added lines, raised ratchets, CHANGELOG
         # The checkout is the merge of the PR into the base branch: its first parent is the base tip the PR is

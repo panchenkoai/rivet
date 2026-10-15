@@ -2,13 +2,11 @@
 
 ## Unreleased
 
-- **A float `chunk_column` under `query:` lost its fractional keys with exit 0.** With `table:` the
-  planner refused a non-integer range key; with `query:` it could not read a catalog, only warned,
-  and integer `BETWEEN` windows skipped every key between two whole numbers (a `double precision` key
-  delivered 40 of 43 rows) (0.31.0 and earlier). **Now** the run reads the query's result type before
-  it plans the windows and refuses a float or scaled-decimal key with
-  `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER` (exit 1), the same code the `table:` refusal now carries.
-  **What to do:** use `chunk_by_key:` (keyset) or an integer column for such a key.
+- **`rivet init --mode cdc` on SQL Server named a capture instance that did not exist.** It wrote
+  `capture_instance: <schema>_<table>` by convention, so a table whose CDC was enabled under another
+  instance name got a config that failed on its first run (0.31.0 and earlier). **Now** init reads
+  `cdc.change_tables` and writes the instance it holds (the newest of two); a table without CDC gets
+  the conventional name with the `sp_cdc_enable_table` call that creates it. **What to do:** nothing.
 
 - **A SQL Server password holding `@` reached the state database.** In the keyword/value URL form
   (`sqlserver://host;user=sa;password=p@ss;…`) the `@` inside the password was read as the end of a

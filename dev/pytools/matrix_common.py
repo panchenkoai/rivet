@@ -136,6 +136,8 @@ _TS_RE = re.compile(rb"[0-9]{8}_[0-9]{6}(?:_[0-9]{3}(?:_[0-9]+_[0-9a-f]{16})?)?"
 # original instead of overwriting it. Anchored to `_chunk<N>_` so it can only
 # match this construction, never an arbitrary hex-looking path segment.
 _CHUNK_NONCE_RE = re.compile(rb"(_chunk[0-9]+)_[0-9a-f]{16}\b")
+#: The SQLite run-lease sidecar names the export's source by a hash, which depends on the stand's URL.
+_LEASE_SOURCE_RE = re.compile(rb"(\.lease-chunk-run-[^/]*)-[0-9a-f]{16}$")
 
 
 def normalize_bytes(data: bytes) -> bytes:
@@ -158,7 +160,10 @@ def normalize_bytes(data: bytes) -> bytes:
         # UNterminated last line is still a line, and `sed` still processed it.
         lines.pop()
     out = [
-        _CHUNK_NONCE_RE.sub(rb"\1", _TS_RE.sub(b"<TS>", _RUNID_RE.sub(b"<RUNID>", ln)))
+        _LEASE_SOURCE_RE.sub(
+            rb"\1-<SOURCE>",
+            _CHUNK_NONCE_RE.sub(rb"\1", _TS_RE.sub(b"<TS>", _RUNID_RE.sub(b"<RUNID>", ln))),
+        )
         for ln in lines
     ]
     out.sort()  # bytes compare as bytes: LC_COLLATE=C, by construction

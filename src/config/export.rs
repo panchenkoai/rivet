@@ -531,25 +531,8 @@ impl ExportConfig {
                 }
             }
             (None, Some(file)) => {
-                let file_path = std::path::Path::new(file);
                 // SecOps: block absolute paths and `..` traversal components.
-                if file_path.is_absolute() {
-                    anyhow::bail!(
-                        "export '{}': query_file must be a relative path: '{}'",
-                        self.name,
-                        file
-                    );
-                }
-                if file_path
-                    .components()
-                    .any(|c| c == std::path::Component::ParentDir)
-                {
-                    anyhow::bail!(
-                        "export '{}': query_file path must not contain '..': '{}'",
-                        self.name,
-                        file
-                    );
-                }
+                check_query_file_path(&self.name, file)?;
                 let joined = config_dir.join(file);
                 // Canonicalize-based check catches symlink-based evasion for files
                 // that already exist on disk.
@@ -558,7 +541,8 @@ impl ExportConfig {
                         .canonicalize()
                         .unwrap_or_else(|_| config_dir.to_path_buf());
                     if !canonical.starts_with(&base) {
-                        anyhow::bail!(
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                             "export '{}': query_file '{}' resolves outside the config directory",
                             self.name,
                             file
@@ -569,13 +553,15 @@ impl ExportConfig {
                 resolve_vars(&raw, params).map(|q| (q, Some(raw)))
             }
             (Some(_), Some(_)) => {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                     "export '{}': specify either 'query' or 'query_file', not both",
                     self.name
                 )
             }
             (None, None) => {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                     "export '{}': must specify exactly one of 'query', 'query_file', or 'table'",
                     self.name
                 )
@@ -584,6 +570,24 @@ impl ExportConfig {
         let wrappable = |q: &String| wrappable_query(q);
         Ok((wrappable(&q), written.as_ref().map(wrappable)))
     }
+}
+
+/// Refuse a `query_file` that is absolute or climbs out with `..`.
+pub(crate) fn check_query_file_path(export_name: &str, file: &str) -> crate::error::Result<()> {
+    let p = std::path::Path::new(file);
+    if p.is_absolute() {
+        crate::config_bail!(
+            crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
+            "export '{export_name}': query_file must be a relative path: '{file}'"
+        );
+    }
+    if p.components().any(|c| c == std::path::Component::ParentDir) {
+        crate::config_bail!(
+            crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
+            "export '{export_name}': query_file path must not contain '..': '{file}'"
+        );
+    }
+    Ok(())
 }
 
 /// Validate the value of the `table:` YAML shortcut.
@@ -602,27 +606,36 @@ pub(crate) fn validate_table_shortcut_ident(
 ) -> crate::error::Result<()> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        anyhow::bail!("export '{export_name}': 'table' is empty");
+        crate::config_bail!(
+            crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
+            "export '{export_name}': 'table' is empty"
+        );
     }
     let parts: Vec<&str> = trimmed.split('.').collect();
     if parts.len() > 2 {
-        anyhow::bail!(
+        crate::config_bail!(
+            crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
             "export '{export_name}': 'table' must be `<name>` or `<schema>.<name>` (got '{raw}')"
         );
     }
     for part in &parts {
         if part.is_empty() {
-            anyhow::bail!("export '{export_name}': 'table' has an empty segment in '{raw}'");
+            crate::config_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
+                "export '{export_name}': 'table' has an empty segment in '{raw}'"
+            );
         }
         let mut chars = part.chars();
         let first = chars.next().unwrap();
         if !(first.is_ascii_alphabetic() || first == '_') {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                 "export '{export_name}': 'table' segment '{part}' must start with a letter or underscore (use 'query:' for quoted identifiers)"
             );
         }
         if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                 "export '{export_name}': 'table' segment '{part}' contains non-identifier characters (use 'query:' for quoted identifiers)"
             );
         }
@@ -703,14 +716,16 @@ impl RowHash {
             return Ok(());
         };
         if cols.is_empty() {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_ROW_HASH_INVALID,
                 "export '{export_name}': meta_columns.row_hash is an empty list — that attests \
                  nothing. Use `row_hash: true` for every column, or name the columns to cover."
             );
         }
         let mut seen = std::collections::HashSet::new();
         if let Some(dup) = cols.iter().find(|c| !seen.insert(c.as_str())) {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_ROW_HASH_INVALID,
                 "export '{export_name}': meta_columns.row_hash lists '{dup}' twice — the covered \
                  set must be a set"
             );
@@ -741,9 +756,12 @@ impl SettleConfig {
 pub(crate) fn parse_settle_after(raw: &str) -> crate::error::Result<u64> {
     let s = raw.trim();
     let bad = || {
-        anyhow::anyhow!(
-            "settle.after `{raw}` is not a duration — use a positive number with a unit: \
-             `90s`, `30m`, `1h` or `2d`"
+        crate::error::coded(
+            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
+            format!(
+                "settle.after `{raw}` is not a duration — use a positive number with a unit: \
+                 `90s`, `30m`, `1h` or `2d`"
+            ),
         )
     };
     let unit = s.chars().last().ok_or_else(bad)?;
@@ -764,10 +782,14 @@ pub(crate) fn parse_settle_after(raw: &str) -> crate::error::Result<u64> {
         .and_then(|n| n.checked_mul(multiplier))
         .ok_or_else(bad)?;
     if secs == 0 {
-        anyhow::bail!("settle.after `{raw}` is zero — a settle window needs a positive age");
+        crate::config_bail!(
+            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
+            "settle.after `{raw}` is zero — a settle window needs a positive age"
+        );
     }
     if secs > i32::MAX as u64 {
-        anyhow::bail!(
+        crate::config_bail!(
+            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
             "settle.after `{raw}` exceeds {} seconds (~68 years), the largest age every source \
              can compute",
             i32::MAX

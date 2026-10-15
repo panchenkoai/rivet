@@ -401,7 +401,8 @@ pub fn refuse_backfill_type_conflict(
         if let Some(theirs) = cdc_for_table.get(col)
             && theirs != mine
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                 "export '{}': column '{col}' of table '{table}' is declared `{mine:?}` by its \
                  backfill export '{}' and `{theirs:?}` by the CDC export — the baseline and the \
                  stream write into one `<table>__changes`, so one column cannot have two types. \
@@ -750,14 +751,16 @@ impl Config {
         export: &ExportConfig,
     ) -> crate::error::Result<()> {
         match (&export.table, &export.tables) {
-            (None, None) => anyhow::bail!(
+            (None, None) => crate::config_bail!(
+                crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                 "export '{}': cdc mode requires `table:` (or `tables:` for a \
                  multi-table stream)",
                 export.name
             ),
             (None, Some(ts)) => {
                 if ts.is_empty() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                         "export '{}': `tables:` must list at least one table",
                         export.name
                     );
@@ -765,7 +768,8 @@ impl Config {
                 let mut seen = std::collections::HashSet::new();
                 for t in ts {
                     if !seen.insert(t.as_str()) {
-                        anyhow::bail!(
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                             "export '{}': duplicate table '{}' in `tables:`",
                             export.name,
                             t
@@ -784,7 +788,8 @@ impl Config {
                 if self.source.source_type != SourceType::Mongo
                     && let Some((a, b)) = overlapping_table_pair(ts)
                 {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                         "export '{}': `tables:` lists both '{}' and '{}', which can name \
                          the SAME relation — a bare name matches any schema, so every \
                          event routes to whichever is listed first and the other \
@@ -803,7 +808,8 @@ impl Config {
                 if export.destination.destination_type == DestinationType::Local
                     && let Some((a, b)) = super::case_colliding_table_pair(ts)
                 {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                         "export '{}': `tables:` lists '{}' and '{}', which differ only by \
                          letter case — on a local destination their directories are one \
                          directory on a case-insensitive filesystem (macOS, Windows), so \
@@ -824,7 +830,8 @@ impl Config {
                 // written for a streaming destination either, so the stream
                 // is the only artifact and nothing records the interleave.
                 if export.destination.destination_type == DestinationType::Stdout {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                         "export '{}': `tables:` cannot write to `destination: \
                          {{ type: stdout }}` — a stream has no per-table \
                          sub-prefix, so all {} tables would interleave into one \
@@ -836,7 +843,8 @@ impl Config {
                     );
                 }
                 if self.source.source_type == SourceType::Mssql {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                         "export '{}': `tables:` is not yet supported for SQL Server — \
                          its capture instances are per-table; use one cdc export per \
                          table (capture_instance each)",
@@ -856,7 +864,8 @@ impl Config {
         export: &ExportConfig,
     ) -> crate::error::Result<()> {
         if export.cdc.is_some() && export.mode != ExportMode::Cdc {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "export '{}': a `cdc:` block is only valid with `mode: cdc`",
                 export.name
             );
@@ -876,7 +885,8 @@ impl Config {
             if export.table.as_deref().is_some_and(clashes)
                 || export.tables.iter().flatten().any(|t| clashes(t))
             {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                     "export '{}': a table named 'snapshot' collides with the reserved \
                      `snapshot/` sub-prefix that a baseline (`cdc.initial: snapshot` or \
                      `cdc.backfill`) writes — rename the table or use a separate export \
@@ -895,7 +905,7 @@ impl Config {
         // mode, i.e. after the run has already started.
         // One predicate for both baselines (`initial:` and `backfill:`).
         if let Some(why) = baseline_checkpoint_refusal(export, self.source.source_type) {
-            anyhow::bail!(why);
+            crate::config_bail!(crate::error::codes::CONFIG_MODE_SETTING_INVALID, "{why}");
         }
 
         if self.source.source_type == SourceType::Oracle
@@ -918,7 +928,8 @@ impl Config {
             && cdc.backfill.is_some()
             && cdc.initial.is_some()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                 "export '{}': `cdc.initial:` and `cdc.backfill:` both describe the FIRST run's \
                  baseline — keep one. `initial: snapshot` synthesizes a single-stream full scan; \
                  `backfill:` borrows the read strategy of the batch export that already describes \
@@ -933,8 +944,9 @@ impl Config {
         if let Some(cdc) = &export.cdc
             && cdc.backfill.is_some()
         {
-            let pairs =
-                resolve_backfill(export, &self.exports).map_err(|why| anyhow::anyhow!(why))?;
+            let pairs = resolve_backfill(export, &self.exports).map_err(|why| {
+                crate::error::coded(crate::error::codes::CONFIG_CDC_SHAPE_INVALID, why)
+            })?;
             // A document store has no schema qualifier: `audit.events` is a
             // collection, not `events` in schema `audit`. The bare-name fold that
             // pairs `orders` with `public.orders` on SQL would pair two DIFFERENT
@@ -943,7 +955,8 @@ impl Config {
             if !self.source.source_type.is_sql() {
                 for (captured, recipe) in &pairs {
                     if recipe.table.as_deref() != Some(captured.as_str()) {
-                        anyhow::bail!(
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                             "export '{}': `cdc.backfill` paired collection '{captured}' with export \
                              '{}', which reads '{}' — a MongoDB collection name is literal (a dot \
                              is part of the name, not a schema), so the recipe must read exactly \
@@ -974,7 +987,8 @@ impl Config {
             // with one leaf cannot be typed apart: a recipe's `columns:` on either
             // would type both. Refuse rather than let the later recipe win silently.
             if let Some((a, b)) = same_leaf_typed_pair(&pairs) {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CDC_SHAPE_INVALID,
                     "export '{}': captured tables '{a}' and '{b}' share the leaf name and a \
                      recipe declares `columns:` — per-table column types are keyed \
                      `table.column` by the bare name, so one declaration would type both. \
@@ -1012,7 +1026,8 @@ impl Config {
                 .and_then(|c| c.checkpoint.as_ref())
                 .is_none()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "export '{}': {:?} `mode: cdc` requires `cdc.checkpoint:` — this engine has \
                  no server-side resume anchor, so without the checkpoint file each run \
                  re-anchors at the current position and silently loses every change \

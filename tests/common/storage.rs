@@ -422,6 +422,32 @@ fn urlencoding_path(name: &str) -> String {
         .collect()
 }
 
+/// Whether an azurite container exists, asked with the account key: an anonymous listing of a missing container is a 403, not a 404.
+fn azure_container_exists(container: &str) -> bool {
+    let out = Command::new("az")
+        .args([
+            "storage",
+            "container",
+            "exists",
+            "--name",
+            container,
+            "--connection-string",
+            AZURITE_CONN_STRING,
+        ])
+        .output()
+        .expect("failed to spawn `az` (the Azure CLI is a prerequisite of the Azurite cells)");
+    assert!(
+        out.status.success(),
+        "`az storage container exists --name {container}`:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("`az storage container exists` prints JSON");
+    said["exists"]
+        .as_bool()
+        .expect("`az storage container exists` answers {\"exists\": bool}")
+}
+
 /// Pull every blob under `prefix` in an azurite container (anonymous `List Blobs` and GET: the
 /// container is public-read, see [`ensure_azure_container`]), like [`minio_pull_prefix`]; a
 /// missing container pulls nothing.
@@ -444,7 +470,7 @@ pub fn azure_pull_prefix(
             ])
             .send()
             .expect("azure list request");
-        if resp.status() == 404 {
+        if resp.status() == 404 || (resp.status() == 403 && !azure_container_exists(container)) {
             return 0;
         }
         assert!(

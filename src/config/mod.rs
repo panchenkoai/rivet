@@ -101,12 +101,18 @@ impl Config {
         // can see *which* config the tool could not open.
         let contents = std::fs::read_to_string(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!(
-                    "config file '{}' not found.\n  Hint: check the path, or run `rivet init` to generate one.",
-                    path
+                crate::error::coded(
+                    crate::error::codes::CONFIG_FILE_UNREADABLE,
+                    format!(
+                        "config file '{}' not found.\n  Hint: check the path, or run `rivet init` to generate one.",
+                        path
+                    ),
                 )
             } else {
-                anyhow::anyhow!("cannot read config file '{}': {}", path, e)
+                crate::error::coded(
+                    crate::error::codes::CONFIG_FILE_UNREADABLE,
+                    format!("cannot read config file '{}': {}", path, e),
+                )
             }
         })?;
         // Warn about typo'd `--param` keys once per CLI invocation, using the
@@ -151,14 +157,15 @@ impl Config {
         if let Err(e) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(yaml) {
             let m = e.to_string();
             if let Some(hint) = Self::unquoted_template_brace_hint(yaml, &m) {
-                return Err(anyhow::anyhow!("{e}\n  {hint}"));
+                return Err(lints::yaml_invalid(format!("{e}\n  {hint}")));
             }
             // A TAB in indentation is the most common beginner YAML mistake; it
             // trips libyaml before serde ever sees a field, so it must be caught
             // here in the raw scan, not in `enhance_parse_error`.
             if let Some(hint) = Self::tab_indent_hint(yaml, &m) {
-                return Err(anyhow::anyhow!("{e}\n  {hint}"));
+                return Err(lints::yaml_invalid(format!("{e}\n  {hint}")));
             }
+            return Err(lints::yaml_invalid(m));
         }
         Self::check_misplaced_tuning_fields(yaml)?;
         Self::check_csv_compression(yaml)?;
@@ -170,7 +177,7 @@ impl Config {
             // layer later than the scanner errors caught above — so try the same
             // hint here before falling back to the generic field-typo enhancer.
             if let Some(hint) = Self::unquoted_template_brace_hint(yaml, &e.to_string()) {
-                anyhow::anyhow!("{e}\n  {hint}")
+                lints::yaml_invalid(format!("{e}\n  {hint}"))
             } else {
                 lints::enhance_parse_error(e)
             }
@@ -276,7 +283,8 @@ impl Config {
                 && let Some(ct) = CompressionType::from_label(codec)
                 && !format::compression_supported(FormatType::Csv, ct)
             {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CSV_COMPRESSION_UNSUPPORTED,
                     "export '{}': CSV output does not support compression: {}. \
                      CSV has no compression encoder, so the codec would be silently dropped \
                      while the manifest records it.\n  \
@@ -291,7 +299,8 @@ impl Config {
             if let Some(profile) = export.get("compression_profile").and_then(|c| c.as_str())
                 && profile != CompressionProfile::None.label()
             {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_CSV_COMPRESSION_UNSUPPORTED,
                     "export '{}': CSV output does not support compression_profile: {} \
                      (it resolves to a compression codec the CSV writer cannot apply).\n  \
                      Hint: use `format: parquet` for compression, or set `compression_profile: none`.",
@@ -352,7 +361,8 @@ impl Config {
         };
 
         if let Some(knob) = knob {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_TLS_VERIFICATION_DOWNGRADE,
                 "source.tls: {} disables certificate verification, silently downgrading the \
                  chosen `mode: {}` to trust-anything (MITM exposure — credentials and rows \
                  readable/forgeable on the wire).\n  \
@@ -386,7 +396,8 @@ impl Config {
                 .filter(|&f| source.get(f).is_some())
                 .collect();
             if !misplaced.is_empty() {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_YAML_INVALID,
                     "source: field(s) [{}] belong under 'source.tuning:', not directly under 'source:'. \
                      Example:\n  source:\n    tuning:\n      {}: <value>",
                     misplaced.join(", "),
@@ -407,7 +418,8 @@ impl Config {
                     .filter(|&f| export.get(f).is_some())
                     .collect();
                 if !misplaced.is_empty() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_YAML_INVALID,
                         "export '{}' (index {}): field(s) [{}] belong under 'exports[].tuning:', \
                          not directly in the export. Example:\n  exports:\n    - name: {}\n      tuning:\n        {}: <value>",
                         name,
@@ -490,7 +502,8 @@ impl Config {
             })
         };
         if let Some(site) = written {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_LOAD_BLOCK_INVALID,
                 "{site}: `base_buffer` needs `target: bigquery` — `rivet compact` is \
                  BigQuery-only in this release, so the base would never take its buffer. \
                  Drop the key to keep the changelog and its dedup view"
@@ -510,7 +523,8 @@ impl Config {
                 continue;
             }
             let Some(captured) = e.multiplex_tables() else {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_LOAD_BLOCK_INVALID,
                     "export '{}': `load.tables:` is for a `mode: cdc` export with `tables:` — \
                      this export has one unit, so its `load:` block already IS the table's",
                     e.name
@@ -518,7 +532,8 @@ impl Config {
             };
             for (t, sub) in &o.tables {
                 if !captured.iter().any(|c| c == t) {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_LOAD_BLOCK_INVALID,
                         "export '{}': `load.tables.{t}` names a table this export does not \
                          capture (tables: [{}])",
                         e.name,
@@ -526,7 +541,8 @@ impl Config {
                     );
                 }
                 if !sub.tables.is_empty() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_LOAD_BLOCK_INVALID,
                         "export '{}': `load.tables.{t}.tables` — a per-table block takes no \
                          `tables:` of its own",
                         e.name
@@ -538,7 +554,8 @@ impl Config {
             return Ok(());
         }
         if let Some(e) = self.exports.iter().find(|e| e.load.is_some()) {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_LOAD_BLOCK_INVALID,
                 "export '{}' has a `load:` override but the config has no top-level `load:` \
                  block — the warehouse (`target`, `project`/`dataset`, …) is declared once, at \
                  the top level; the export's block only overrides `pk`, `cluster_by`, \
@@ -681,7 +698,8 @@ impl Config {
             && t.batch_size.is_some()
             && t.batch_size_memory_mb.is_some()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "tuning: batch_size and batch_size_memory_mb are mutually exclusive. \
                  Prefer batch_size_memory_mb (rivet sizes the batch to a memory budget, \
                  adapting to row width); set batch_size only to pin an exact row count."
@@ -693,7 +711,8 @@ impl Config {
             // entirely.  Show the recommended path (`url_env`) up-front;
             // operators who actually want structured fields know to look
             // for them.
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
                 "source: no connection method configured. Add one of:\n  url_env: DATABASE_URL                          (URL from env var — recommended)\n  url: 'postgresql://user:pass@host:5432/db'      (inline — not recommended for committed configs)\n  url_file: /etc/rivet/source.url                 (URL from file — rotation-friendly)\n  host/user/database/...                          (structured fields under `source:`)"
             );
         }
@@ -708,7 +727,8 @@ impl Config {
             .filter(|u| u.is_some())
             .count();
             if url_count > 1 {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
                     "source: specify exactly one of 'url', 'url_env', or 'url_file' (got {} set).\n  Hint: pick one — `url_env` is recommended so credentials never enter the YAML.",
                     url_count
                 );
@@ -716,29 +736,22 @@ impl Config {
         }
 
         if self.source.has_url_fields() && self.source.has_structured_fields() {
-            anyhow::bail!(
-                "source: pick either URL-based config (url/url_env/url_file) OR structured fields (host/user/database/port/password_env), not both.\n  Hint: remove whichever block you don't want; mixing the two is ambiguous."
-            );
+            return Err(source::mixed_connection_methods());
         }
 
         if self.source.has_structured_fields() {
-            if self.source.host.is_none() {
-                anyhow::bail!(
-                    "source: structured config is missing 'host'.\n  Hint: add `host: localhost` (or your DB host) under `source:` in rivet.yaml.\n  Or switch to URL-based config: `url_env: DATABASE_URL`."
-                );
-            }
-            if self.source.user.is_none() {
-                anyhow::bail!(
-                    "source: structured config is missing 'user'.\n  Hint: add `user: <username>` under `source:` in rivet.yaml."
-                );
-            }
-            if self.source.database.is_none() {
-                anyhow::bail!(
-                    "source: structured config is missing 'database'.\n  Hint: add `database: <dbname>` under `source:` in rivet.yaml."
-                );
+            for (field, set) in [
+                ("host", self.source.host.is_some()),
+                ("user", self.source.user.is_some()),
+                ("database", self.source.database.is_some()),
+            ] {
+                if !set {
+                    return Err(source::structured_field_missing(field));
+                }
             }
             if self.source.password.is_some() && self.source.password_env.is_some() {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_SOURCE_CONNECTION_INVALID,
                     "source: specify 'password' OR 'password_env', not both.\n  Hint: prefer `password_env: DB_PASSWORD` so credentials never enter the YAML."
                 );
             }
@@ -751,7 +764,8 @@ impl Config {
     /// because effective tuning merges the source-level block.
     fn validate_export(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if export.chunk_dense {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "export '{}': `chunk_dense` was removed: it re-numbered rows per chunk and \
                  skipped or duplicated rows under concurrent writes. Use `chunk_by_key: \
                  <unique key>` (keyset), or `chunk_column:` range chunking on an integer key.",
@@ -781,7 +795,8 @@ impl Config {
         // Mirror the `query_file` `..`/absolute guard: reject at config-load,
         // accepting only a filename-safe charset.
         if !is_filename_safe_name(&export.name) {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_PATH_UNSAFE,
                 "export name '{}' is not filename-safe: it must not be absolute, contain \
                  '/', '\\', '..', a NUL, or start with '.' (the name is used in output paths \
                  and state keys). Use a plain identifier like `orders` or `daily_events`.",
@@ -798,7 +813,8 @@ impl Config {
         // dest_for_table (or the pre-write manifest FS probe) ever sees it.
         for t in export.tables.iter().flatten() {
             if !is_filename_safe_name(t) {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_PATH_UNSAFE,
                     "export '{}': tables entry '{}' is not filename-safe: it must not contain \
                      '/', '\\', '..', a NUL, or start with '.' (each table becomes a destination \
                      path segment).",
@@ -821,7 +837,8 @@ impl Config {
         // `row_hash: true` is unaffected: "every column" is meaningful for
         // whatever table the row came from.
         if export.meta_columns.row_hash.declared().is_some() && export.tables.is_some() {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_ROW_HASH_INVALID,
                 "export '{}': meta_columns.row_hash names one table's columns, so it cannot \
                  apply to a multi-table `tables:` stream. Give each table its own export \
                  (with `table:`), or use `row_hash: true` to cover every column of each.",
@@ -851,7 +868,8 @@ impl Config {
         ] {
             let (name, Some(v)) = field else { continue };
             if v.split(['/', '\\']).any(|seg| seg == "..") {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_PATH_UNSAFE,
                     "export '{}': destination {name} '{}' contains a `..` segment — the \
                      objects would land OUTSIDE the configured location and every later \
                      load/list would read an empty prefix as 'up to date'.",
@@ -860,7 +878,8 @@ impl Config {
                 );
             }
             if name == "prefix" && v.contains("://") {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_PATH_UNSAFE,
                     "export '{}': destination prefix '{}' embeds a URI scheme — `prefix:` \
                      is bucket-relative (the bucket comes from `bucket:`); a pasted \
                      `gs://...` doubles into a key the load layer never finds.",
@@ -871,12 +890,17 @@ impl Config {
         }
         if let Some(col) = export.partition_by.as_deref() {
             if col.trim().is_empty() {
-                anyhow::bail!("export '{}': partition_by must name a column", export.name);
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+                    "export '{}': partition_by must name a column",
+                    export.name
+                );
             }
             // #6: the column name becomes the Hive `col=value` path segment, so a
             // quoted DB column named `../x` would inject a traversal — filename-gate it.
             if !is_filename_safe_name(col) {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_PATH_UNSAFE,
                     "export '{}': partition_by column '{}' is not filename-safe: it must not \
                      contain '/', '\\', '..', a NUL, or start with '.' (it becomes a `col=value` \
                      destination path segment).",
@@ -885,7 +909,8 @@ impl Config {
                 );
             }
             if matches!(export.mode, ExportMode::TimeWindow | ExportMode::Cdc) {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "export '{}': partition_by is not compatible with `mode: {:?}` — it is a batch \
                      output-layout feature; partition a full/chunked/incremental export instead.",
                     export.name,
@@ -904,7 +929,8 @@ impl Config {
             // documented pattern) bypassed the guard and `cleanup_source` then wiped
             // the unloaded partitions.
             if export.load.is_some() || self.load.is_some() {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "export '{}': partition_by is not compatible with a `load:` block — a \
                      partitioned export writes one manifest per partition sub-prefix, but the \
                      warehouse loader would load only a single partition (and `cleanup_source` \
@@ -915,7 +941,8 @@ impl Config {
                 );
             }
             if export.chunk_by_key.is_some() {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "export '{}': partition_by is not compatible with chunk_by_key — keyset seek \
                      pagination over a partition bucket (a subquery around the table) is not \
                      supported. Use a range `chunk_column`, a smaller `partition_granularity`, \
@@ -934,7 +961,8 @@ impl Config {
                     .as_deref()
                     .is_some_and(|s| s.contains("{partition}"));
             if !has_token {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "export '{}': partition_by requires a '{{partition}}' token in destination.path \
                      or destination.prefix (otherwise every partition would overwrite the same prefix).",
                     export.name
@@ -950,7 +978,8 @@ impl Config {
         // with an explicit chunk_size — build.rs takes the memory budget and
         // silently drops chunk_size when both are set, mirroring the batch_size pair.
         if export.chunk_size_memory_mb.is_some() && export.chunk_size != default_chunk_size() {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "export '{}': chunk_size and chunk_size_memory_mb are mutually exclusive — \
                  chunk_size_memory_mb derives the window size from a memory budget, so an explicit \
                  chunk_size would be silently ignored. Set one or the other.",
@@ -964,7 +993,8 @@ impl Config {
             && t.batch_size.is_some()
             && t.batch_size_memory_mb.is_some()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "export '{}': effective tuning has both batch_size and batch_size_memory_mb (mutually exclusive)",
                 export.name
             );
@@ -973,7 +1003,8 @@ impl Config {
             && et.batch_size.is_some()
             && et.batch_size_memory_mb.is_some()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "export '{}': tuning.batch_size and tuning.batch_size_memory_mb are mutually exclusive",
                 export.name
             );
@@ -986,7 +1017,8 @@ impl Config {
         // Before the generic exactly-one counting: the `table:`/`tables:` pair
         // gets its specific message (the generic one doesn't mention `tables`).
         if export.table.is_some() && export.tables.is_some() {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                 "export '{}': `table:` and `tables:` are mutually exclusive — use \
                  `tables: [a, b]` for a multi-table stream",
                 export.name
@@ -1005,7 +1037,8 @@ impl Config {
         .filter(|b| **b)
         .count();
         if set_count == 0 {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                 "export '{}': specify exactly one of 'query', 'query_file', 'table', or 'tables'. \
                  Use table: <name> for a whole table (enables PK auto-chunking); \
                  query: \"SELECT …\" for an inline one-liner; \
@@ -1014,7 +1047,8 @@ impl Config {
             );
         }
         if set_count > 1 {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_EXPORT_SOURCE_INVALID,
                 "export '{}': specify exactly one of 'query', 'query_file', 'table', or 'tables' (got {} set)",
                 export.name,
                 set_count
@@ -1026,21 +1060,7 @@ impl Config {
         // symlink probe) in `ExportConfig::resolve_query` because the
         // file may have been swapped between validation and read.
         if let Some(file) = &export.query_file {
-            let p = std::path::Path::new(file);
-            if p.is_absolute() {
-                anyhow::bail!(
-                    "export '{}': query_file must be a relative path: '{}'",
-                    export.name,
-                    file
-                );
-            }
-            if p.components().any(|c| c == std::path::Component::ParentDir) {
-                anyhow::bail!(
-                    "export '{}': query_file path must not contain '..': '{}'",
-                    export.name,
-                    file
-                );
-            }
+            export::check_query_file_path(&export.name, file)?;
         }
         Ok(())
     }
@@ -1067,7 +1087,8 @@ impl Config {
             // credentials are sent. Everything else is rejected.
             let loopback = endpoint_host(endpoint).is_some_and(|host| is_loopback_host(&host));
             if !loopback && !export.destination.allow_anonymous {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_ENDPOINT_UNSAFE,
                     "export '{}': destination.endpoint '{}' points at a non-loopback host. \
                      A custom endpoint redirects every upload there — committing one is a \
                      data-exfiltration / cleartext-credential risk.\n  \
@@ -1085,7 +1106,8 @@ impl Config {
             let ak = export.destination.access_key_env.is_some();
             let sk = export.destination.secret_key_env.is_some();
             if ak != sk {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                     "export '{}': S3 requires both access_key_env and secret_key_env, or neither (use default AWS credential chain)",
                     export.name
                 );
@@ -1096,7 +1118,8 @@ impl Config {
             && export.destination.allow_anonymous
             && export.destination.credentials_file.is_some()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                 "export '{}': GCS allow_anonymous cannot be used together with credentials_file",
                 export.name
             );
@@ -1108,23 +1131,27 @@ impl Config {
             let has_sas = export.destination.sas_token_env.is_some();
             if export.destination.allow_anonymous {
                 if has_name || has_key || has_sas {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                         "export '{}': Azure allow_anonymous cannot be combined with account_name/account_key_env/sas_token_env",
                         export.name
                     );
                 }
             } else if has_key && has_sas {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                     "export '{}': Azure account_key_env and sas_token_env are mutually exclusive — pick one auth mode",
                     export.name
                 );
             } else if !has_name {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                     "export '{}': Azure requires account_name (plus account_key_env or sas_token_env), or allow_anonymous: true for Azurite",
                     export.name
                 );
             } else if !has_key && !has_sas {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                     "export '{}': Azure requires account_key_env or sas_token_env (or allow_anonymous: true for Azurite)",
                     export.name
                 );
@@ -1134,7 +1161,8 @@ impl Config {
         if let Some(cred_path) = &export.destination.credentials_file
             && !std::path::Path::new(cred_path).exists()
         {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_SECRET_UNSET,
                 "export '{}': credentials_file '{}' does not exist",
                 export.name,
                 cred_path
@@ -1147,10 +1175,12 @@ impl Config {
     fn validate_export_output(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if let Some(ref size_str) = export.max_file_size {
             parse_file_size(size_str).map_err(|_| {
-                anyhow::anyhow!(
-                    "export '{}': invalid max_file_size '{}'",
-                    export.name,
-                    size_str
+                crate::error::coded(
+                    crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
+                    format!(
+                        "export '{}': invalid max_file_size '{}'",
+                        export.name, size_str
+                    ),
                 )
             })?;
         }
@@ -1159,7 +1189,8 @@ impl Config {
             match export.compression {
                 CompressionType::Zstd => {
                     if !(1..=22).contains(&level) {
-                        anyhow::bail!(
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                             "export '{}': zstd compression_level must be 1..22, got {}",
                             export.name,
                             level
@@ -1171,7 +1202,8 @@ impl Config {
                     // accepted here but panics/errors at write time in
                     // GzipLevel::try_new (bug hunt 2026-08-09).
                     if level > 9 {
-                        anyhow::bail!(
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                             "export '{}': gzip compression_level must be 0..9, got {}",
                             export.name,
                             level
@@ -1179,7 +1211,8 @@ impl Config {
                     }
                 }
                 _ => {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                         "export '{}': compression_level is only supported for zstd and gzip",
                         export.name
                     );
@@ -1192,7 +1225,8 @@ impl Config {
     /// Each mode's own requirements (and `settle`, an incremental-only knob).
     fn validate_export_mode(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if export.settle.is_some() && export.mode != ExportMode::Incremental {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "export '{}': `settle` requires `mode: incremental` — it bounds the incremental \
                  cursor query and is silently ignored in `mode: {:?}`.\n  \
                  Hint: set `mode: incremental` with a `cursor_column`, or remove `settle`.",
@@ -1204,21 +1238,26 @@ impl Config {
         match export.mode {
             ExportMode::Incremental => {
                 if export.cursor_column.is_none() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': incremental mode requires cursor_column",
                         export.name
                     );
                 }
                 if let Some(settle) = &export.settle {
-                    settle
-                        .after_secs()
-                        .map_err(|e| anyhow::anyhow!("export '{}': {e:#}", export.name))?;
+                    settle.after_secs().map_err(|e| {
+                        crate::error::coded(
+                            crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
+                            format!("export '{}': {e:#}", export.name),
+                        )
+                    })?;
                     if settle
                         .column
                         .as_deref()
                         .is_some_and(|c| c.trim().is_empty())
                     {
-                        anyhow::bail!(
+                        crate::config_bail!(
+                            crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                             "export '{}': settle.column is empty — name a date/timestamp \
                              column, or omit it to settle on the cursor",
                             export.name
@@ -1228,7 +1267,8 @@ impl Config {
                 match export.incremental_cursor_mode {
                     IncrementalCursorMode::Coalesce => {
                         if export.cursor_fallback_column.is_none() {
-                            anyhow::bail!(
+                            crate::config_bail!(
+                                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                                 "export '{}': incremental_cursor_mode: coalesce requires cursor_fallback_column",
                                 export.name
                             );
@@ -1236,7 +1276,8 @@ impl Config {
                     }
                     IncrementalCursorMode::SingleColumn => {
                         if export.cursor_fallback_column.is_some() {
-                            anyhow::bail!(
+                            crate::config_bail!(
+                                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                                 "export '{}': cursor_fallback_column is only valid with incremental_cursor_mode: coalesce",
                                 export.name
                             );
@@ -1260,7 +1301,8 @@ impl Config {
                     || export.chunk_count.is_some()
                     || export.chunk_by_days.is_some();
                 if !has_strategy && export.table.is_none() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': chunked mode needs a chunking strategy. Pick one:\n  \
                          chunk_column: <int col>    range chunks on an integer column (most common)\n  \
                          chunk_by_key: <unique col>  keyset pagination when there's no integer PK\n  \
@@ -1275,7 +1317,8 @@ impl Config {
                 // either infinite-loop or produce no progress. QA backlog
                 // Task 5.1.
                 if export.chunk_size == 0 {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': chunked mode requires chunk_size >= 1 (got 0)",
                         export.name
                     );
@@ -1283,7 +1326,8 @@ impl Config {
                 // parallel == 0 means "spawn zero workers". Claiming tasks
                 // with no workers stalls the pipeline. QA backlog Task 5.1.
                 if export.parallel == 0 {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': chunked mode requires parallel >= 1 (got 0)",
                         export.name
                     );
@@ -1296,7 +1340,8 @@ impl Config {
                     );
                 }
                 if export.chunk_count.is_some() && export.chunk_by_days.is_some() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': chunk_count and chunk_by_days are mutually exclusive. \
                          Use chunk_count: N to split an integer range into N chunks; \
                          use chunk_by_days: D to bucket a date/timestamp column by D-day windows.",
@@ -1306,13 +1351,15 @@ impl Config {
             }
             ExportMode::TimeWindow => {
                 if export.time_column.is_none() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': time_window mode requires time_column",
                         export.name
                     );
                 }
                 if export.days_window.is_none() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                         "export '{}': time_window mode requires days_window",
                         export.name
                     );
@@ -1328,7 +1375,8 @@ impl Config {
     /// Knobs that only apply to another mode are refused, not silently ignored.
     fn validate_export_mode_knobs(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if export.tables.is_some() && export.mode != ExportMode::Cdc {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "export '{}': `tables:` is only valid with `mode: cdc` (batch exports \
                  are one query/table per export)",
                 export.name
@@ -1369,7 +1417,8 @@ impl Config {
                 None
             };
             if let Some(knob) = offending {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "export '{}': `{}` requires `mode: chunked` — it is silently ignored in \
                      `mode: {:?}`, which runs a single unbounded snapshot over the whole table \
                      instead of chunking (the source-pressure footgun chunked mode prevents).\n  \
@@ -1388,7 +1437,8 @@ impl Config {
         // `chunk_by_key`; with a range `chunk_column` there is no key to resume
         // from, so it would be silently ignored (roast 2026-08-09).
         if export.keyset_incremental && export.chunk_by_key.is_none() {
-            anyhow::bail!(
+            crate::config_bail!(
+                crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                 "export '{}': `keyset_incremental: true` requires `chunk_by_key:` (it continues \
                  from the last exported key) — it has no effect on a range `chunk_column` export.\n  \
                  Hint: set `chunk_by_key: <indexed unique key>`, or remove `keyset_incremental`.",
@@ -1411,7 +1461,8 @@ impl Config {
                     continue;
                 };
                 if export.query.is_some() || export.query_file.is_some() {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN,
                         "export '{}': qualified column override '{key}' needs a table-shaped \
                          export (`table:`/`tables:`), not a query",
                         export.name
@@ -1426,7 +1477,8 @@ impl Config {
                     .chain(export.tables.iter().flatten().map(|t| bare(t)))
                     .any(|t| t == tbl);
                 if !captures {
-                    anyhow::bail!(
+                    crate::config_bail!(
+                        crate::error::codes::CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN,
                         "export '{}': column override '{key}' names table '{tbl}', which this \
                          export does not capture — fix the table name or use a bare column key \
                          to apply it to every captured table",
@@ -1442,7 +1494,8 @@ impl Config {
     fn validate_export_chunk_by_days(&self, export: &ExportConfig) -> crate::error::Result<()> {
         if let Some(days) = export.chunk_by_days {
             if export.mode != ExportMode::Chunked {
-                anyhow::bail!(
+                crate::config_bail!(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
                     "export '{}': chunk_by_days requires mode: chunked",
                     export.name
                 );

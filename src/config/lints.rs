@@ -32,14 +32,19 @@ pub fn enhance_parse_error(err: serde_yaml_ng::Error) -> anyhow::Error {
         // Keep the original error's `Display` shape — VS Code, CI,
         // and humans all parse the leading `unknown field` token —
         // and just append the suggestion as a new line.
-        return anyhow::anyhow!("{raw}\n  Did you mean `{hint}`?");
+        return yaml_invalid(format!("{raw}\n  Did you mean `{hint}`?"));
     }
     if let Some(hint) = missing_field_hint(&raw) {
         // serde's bare `missing field \`x\`` says WHAT is missing but not how to
         // fix it. Append a remediation line, preserving the verbatim leading text.
-        return anyhow::anyhow!("{raw}\n  Hint: {hint}");
+        return yaml_invalid(format!("{raw}\n  Hint: {hint}"));
     }
-    err.into()
+    yaml_invalid(raw)
+}
+
+/// A YAML parse or shape error, coded `RIVET_CONFIG_YAML_INVALID`.
+pub(crate) fn yaml_invalid(message: impl Into<String>) -> anyhow::Error {
+    crate::error::coded(crate::error::codes::CONFIG_YAML_INVALID, message)
 }
 
 /// A remediation line for serde's `missing field \`x\`` errors on the few

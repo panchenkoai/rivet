@@ -93,6 +93,8 @@ checklist is what a maintainer fills out **before** pushing the tag.
 ## 5. Docs
 
 - [ ] README quickstart matches the CLI surface (`rivet --help`).
+- [ ] `python3 dev/pytools/changelog.py assemble` folded every `changelog.d/` fragment into
+      `## Unreleased`, and that section was renamed to the new version heading.
 - [ ] CHANGELOG updated under the new version heading.
 - [ ] Cloud smoke verification date in
       [docs/cloud-smoke-tests.md](cloud-smoke-tests.md) is current.
