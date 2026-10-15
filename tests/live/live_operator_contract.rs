@@ -2403,9 +2403,13 @@ fn check_refuses_a_collection_that_does_not_exist_as_run_does_mongo() {
         Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
     );
     assert!(
-        !run.status.success() && text(&run).contains(refusal),
-        "fixture: `run` refuses the absent collection\n{}",
+        text(&run).contains(refusal),
+        "`run` refuses the absent collection\n{}",
         text(&run)
+    );
+    assert_refused(
+        &run,
+        Refused::by_code("RIVET_SOURCE_COLLECTION_NOT_FOUND", 1),
     );
     let present = Rig::mongo_batch("t").source_url(&url);
     assert!(

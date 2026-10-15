@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`rivet run` refused a MongoDB collection that does not exist without its code.** `rivet check`
+  refused it `RIVET_SOURCE_COLLECTION_NOT_FOUND`; `rivet run` printed the same sentence with no
+  `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
+  carries the code. **What to do:** nothing.
+
 - **`rivet apply --pool` wrote its own lines into a `destination: stdout` export.** The predicted
   and actual makespan lines (and the wave headers of a multi-wave run) went to stdout, mixed into the
   exported CSV or JSON bytes (0.31.0 and earlier). **Now** they go to stderr, like every other run
