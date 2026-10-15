@@ -400,34 +400,39 @@ pub(crate) fn live_run_refusal(export: &str, run_id: Option<&str>, resumable: bo
     )
 }
 
-/// The key of an export's run lease: held by every run of the export, taken by every command that rewrites its stored progress or its destination.
-fn run_lease_key(export: &str) -> String {
-    format!("chunk-run:{export}")
+/// The key of an export's run lease on one source: held by every run of the export that reads `source`, taken by every command that rewrites its stored progress or its destination. The source enters as a hash, so a lease file name stays short and names no host.
+fn run_lease_key(export: &str, source: &str) -> String {
+    format!(
+        "chunk-run:{export}@{:016x}",
+        xxhash_rust::xxh3::xxh3_64(source.as_bytes())
+    )
 }
 
-/// `export`'s run lease, or `None` while a live process holds it.
+/// `export`'s run lease on `source`, or `None` while a live process holds it.
 pub(crate) fn try_run_lease<'s>(
     state: &'s StateStore,
     export: &str,
+    source: &str,
 ) -> Result<Option<crate::state::LoadLease<'s>>> {
-    state.try_load_lease(&run_lease_key(export))
+    state.try_load_lease(&run_lease_key(export, source))
 }
 
-/// How a refusal names the live run of `export`: by its run-status id, whose last field is the pid.
-pub(crate) fn live_run_label(state: &StateStore, export: &str) -> Result<String> {
-    Ok(match state.newest_running_run(export)? {
+/// How a refusal names the live run of `export` on `source`: by its run-status id, whose last field is the pid.
+pub(crate) fn live_run_label(state: &StateStore, export: &str, source: &str) -> Result<String> {
+    Ok(match state.newest_running_run(export, source)? {
         Some(run_id) => format!("run '{run_id}'"),
         None => "a run".to_string(),
     })
 }
 
-/// Take `export`'s run lease to rewrite its stored progress (`what`); refuse while a live run holds it.
+/// Take `export`'s run lease on `source` to rewrite its stored progress (`what`); refuse while a live run holds it.
 pub(crate) fn claim_export_progress<'s>(
     state: &'s StateStore,
     export: &str,
+    source: &str,
     what: &str,
 ) -> Result<crate::state::LoadLease<'s>> {
-    if let Some(lease) = try_run_lease(state, export)? {
+    if let Some(lease) = try_run_lease(state, export, source)? {
         return Ok(lease);
     }
     crate::rivet_bail!(
@@ -435,7 +440,7 @@ pub(crate) fn claim_export_progress<'s>(
         "export '{export}': cannot {what}: {} is in progress in a live rivet process, which \
          holds the export's run lease. Wait for it to finish, or stop that process (its pid \
          ends the run id), then repeat this command.",
-        live_run_label(state, export)?
+        live_run_label(state, export, source)?
     )
 }
 
@@ -445,7 +450,8 @@ pub(crate) fn claim_run<'s>(
     plan: &ResolvedRunPlan,
 ) -> Result<crate::state::LoadLease<'s>> {
     let export = &plan.export_name;
-    if let Some(lease) = try_run_lease(state, export)? {
+    let source = plan.source.state_key();
+    if let Some(lease) = try_run_lease(state, export, &source)? {
         return Ok(lease);
     }
     crate::rivet_bail!(
@@ -453,7 +459,7 @@ pub(crate) fn claim_run<'s>(
         "{}",
         live_run_refusal(
             export,
-            state.newest_running_run(export)?.as_deref(),
+            state.newest_running_run(export, &source)?.as_deref(),
             plan.strategy.is_resumable()
         )
     )
@@ -1498,8 +1504,9 @@ mod tests {
         );
         let plan = make_plan("orders");
         let lease = claim_run(&run, &plan).expect("a run takes the run lease");
+        let source = plan.source.state_key();
 
-        let unnamed = claim_export_progress(&cmd, "orders", "reset its state")
+        let unnamed = claim_export_progress(&cmd, "orders", &source, "reset its state")
             .err()
             .expect("refused while the run is alive");
         assert!(
@@ -1513,7 +1520,9 @@ mod tests {
             "2026-01-01T00:00:00Z",
         )
         .unwrap();
-        let err = claim_export_progress(&cmd, "orders", "reset its state")
+        run.record_run_source("orders_20260101T000000.000_4242", &source)
+            .unwrap();
+        let err = claim_export_progress(&cmd, "orders", &source, "reset its state")
             .err()
             .expect("refused while the run is alive");
         assert_eq!(
@@ -1528,13 +1537,23 @@ mod tests {
              command."
         );
         assert!(
-            claim_export_progress(&cmd, "invoices", "reset its state").is_ok(),
+            claim_export_progress(&cmd, "invoices", &source, "reset its state").is_ok(),
             "the lease is per export"
+        );
+        assert!(
+            claim_export_progress(
+                &cmd,
+                "orders",
+                "postgres://another.host/db",
+                "reset its state"
+            )
+            .is_ok(),
+            "the lease is per source"
         );
 
         drop(lease);
         assert!(
-            claim_export_progress(&cmd, "orders", "reset its state").is_ok(),
+            claim_export_progress(&cmd, "orders", &source, "reset its state").is_ok(),
             "admitted once the run has let go"
         );
     }

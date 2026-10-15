@@ -48,6 +48,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only; any other mode is refused when the config is read (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no cursor column" }
     oracle:   { test: a_cursor_column_in_another_case_is_refused_by_code_oracle }
 
+  - id: run_lease_per_source
+    what: "2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name; a run on the same source is refused RIVET_STATE_RUN_IN_PROGRESS (exit 5); the live run delivers"
+    postgres: { test: one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same }
+    mysql:    { na: "one cell holds the pair: the live run reads PostgreSQL and the run beside it MySQL; the lease key is one function for every engine (run_lease_key)" }
+    mssql:    { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
+    mongo:    { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
+    oracle:   { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
+
   - id: concurrent_full_runs
     what: "RESULTS 4: a second concurrent `full` run is refused, or the prefix holds each key once"
     postgres: { test: a_second_concurrent_full_run_does_not_double_the_prefix_postgres }

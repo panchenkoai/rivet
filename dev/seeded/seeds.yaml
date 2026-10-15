@@ -1904,6 +1904,22 @@ seeds:
         cells: [a_cdc_export_on_a_standalone_server_is_refused_by_code_mongo]
       oracle:
         na: "change streams on a standalone are MongoDB's; the SQL engines' CDC prerequisites have their own seeds"
+  - name: run-lease-by-name-only
+    class: "a mutual-exclusion key coarser than the progress it protects, so exports that share a name but not a source refuse each other"
+    history: "2026-10-15 - gate class B on 93d8a5db: since #538 every run took `chunk-run:<export>`, and the shared-state deployment (configs of one export name on different sources, one PostgreSQL state) ran one export at a time; fixed by keying the lease by export and source (v36 records the source on run_status)"
+    scope: source
+    patch: run-lease-by-name-only/shared.patch
+    engines:
+      postgres:
+        cells: [one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same]
+      mysql:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
+      mssql:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
+      mongo:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
+      oracle:
+        na: "the lease key is one function for every engine; the postgres cell runs a PostgreSQL and a MySQL export of one name"
   - name: pool-lines-on-stdout
     class: "a runner prints its own schedule or summary lines with `println!`, into the bytes of a `destination: stdout` export"
     history: "2026-10-14 - open defect (`rivet apply --pool` wrote its `Pool:` lines into a stdout export) through 0.31.0; fixed by printing them on stderr"
