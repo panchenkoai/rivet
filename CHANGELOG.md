@@ -172,7 +172,6 @@
   - A state database or state directory that is read-only still refuses the run with
     `RIVET_STATE_NOT_WRITABLE` (exit 1), now also when it is the lease file that cannot be
     created.
-
 - **Fixed: a `mode: chunked` config the planner refuses on a large table is refused on a small
   one too.** PostgreSQL, MySQL, SQL Server and Oracle; exports with the `table:` shortcut.
   Reproduced on rivet 0.31.0 with PostgreSQL.
@@ -190,7 +189,6 @@
   - **What to do if a run now refuses:** follow the message: name an integer `chunk_column`,
     set `chunk_by_key:`, or use `mode: full`.
   - Unchanged: a config whose shape is valid still runs as one pass on a small table.
-
 - **Fixed: a `mode: chunked` export whose table fits in one chunk is refused as what it is
   beside an unfinished checkpoint run.** Applies to PostgreSQL, MySQL, SQL Server and Oracle.
   A `mode: chunked` export that sets none of `chunk_checkpoint`, `chunk_count`, `chunk_by_days`
@@ -210,7 +208,6 @@
     `chunked``, where it said `full`.
   - `rivet plan --format json` writes `"single_pass_of": "Chunked"` (or `"Keyset"`) in
     `resolved_plan` for such an export; the field is not part of the plan's checksum.
-
 - **Fixed: `rivet validate` no longer passes a prefix whose manifest is gone while `_SUCCESS`
   is there.** Every source and destination. Reproduced on rivet 0.31.0 with PostgreSQL and a
   local destination.
@@ -225,7 +222,6 @@
   - If `_SUCCESS` itself cannot be read (an I/O error, not absence), `validate` reports
     `RIVET_VERIFY_SUCCESS_READ_ERROR` and exits 1, where it exited 0.
   - Unchanged: a prefix with neither a manifest nor `_SUCCESS` is still `legacy_run`, exit 0.
-
 - **Fix: a `FROM` inside an SQL comment is no longer read as the table a `query:` reads.**
   PostgreSQL and SQL Server exports with a hand-written `query:`; the preflight probe of
   `rivet check` on every SQL engine. Reproduced on rivet 0.31.0 with PostgreSQL and SQL Server.
@@ -355,7 +351,6 @@
         it has no pooler in front of a logical server.
     - A setting an earlier release left behind stays on the pooled server connection until
       the pooler closes it (pgBouncer: `server_lifetime`, one hour by default) or is restarted.
-
 - **Fix: a `query:` holding a non-ASCII character no longer ends the run in a panic.**
   Applies to every source engine. Reproduced on rivet 0.31.0 with PostgreSQL, MySQL,
   SQL Server and MongoDB.
@@ -639,7 +634,6 @@
     the highest key of the ranges that commit after the upgrade, as 0.31 did. The state
     schema moves to v35 (`keyset_range.max_key`), so an older rivet no longer opens the
     state database.
-
 - **Breaking: a CDC stream that cannot continue exits 5 with a `RIVET_*` code, where it exited 1
   with none.** Applies to `mode: cdc` runs and `rivet cdc` on PostgreSQL, MySQL, SQL Server,
   MongoDB and Oracle.
@@ -663,7 +657,6 @@
   - Upgrading: a script or scheduler that matched exit 1 for these cases now sees exit 5
     (`refusal`: do not retry, follow the remedy in the message). `rivet schema errors` lists
     the three codes.
-
 - **Breaking: a run that fails before its first write leaves the destination as it was.**
   Applies to every batch export (`full`, `incremental`, `chunked`, keyset, the snapshot leg
   of a CDC export) on every source engine and on every destination that keeps objects at
@@ -695,7 +688,6 @@
     the marker alone decides, as before.
   - Upgrading: nothing to migrate. A prefix that 0.31 or earlier already re-marked as
     failed stays so until the next successful run writes its manifest and marker.
-
 - **Breaking: `--resume` over a complete prefix is refused by code, and `--resume --force`
   runs on every strategy.** Applies to `rivet run --resume` on every source engine.
   - Before, `--resume` into a prefix that holds `_SUCCESS` exited 1 with no code and said
@@ -712,7 +704,6 @@
     continue is refused as before ("nothing to continue; run without --resume").
   - A script that matched exit 1 or the old text of this refusal must match exit 5 or the
     code.
-
 - **Behaviour change: a CDC run that refuses a prerequisite leaves nothing behind, and
   `rivet doctor` agrees with `rivet run`.** Applies to `mode: cdc` and `rivet cdc` on
   PostgreSQL and MySQL.
@@ -734,14 +725,12 @@
     refused is reused as it is once the prerequisite is met; if the export was abandoned
     instead, drop the slot (`SELECT pg_drop_replication_slot('<slot>')`) or delete the
     checkpoint file.
-
 - **Behaviour change: `rivet cdc` to stdout emits each change once on PostgreSQL.** Before,
   a drain to stdout never advanced the slot, so every run printed every change since the slot
   was created, with or without `--checkpoint`, and the slot pinned WAL without bound. Now a
   drain acknowledges the last commit it printed when it ends. Upgrading: the first drain with
   this version prints the backlog the slot still holds once more, then the slot advances. A
   consumer that relied on each run re-printing the history must keep its own copy.
-
 - **Fix: PostgreSQL CDC with `rollover: 1` (`--rollover 1`) delivers the pending changes.**
   A bounded run leaves its drain barrier (a logical message) in the WAL; at `rollover: 1` the
   next run's one-change read window held only that message, and the run exited 0 with a
@@ -749,7 +738,6 @@
   same happened after N idle bounded runs in a row. Messages outside a transaction are now
   stepped over, up to the run's open-time bound. Upgrading: the first run with this version
   delivers what such a slot was holding.
-
 - **Breaking: SQL Server CDC refuses a log gap from the first run after the baseline.**
   Applies to a `mode: cdc` SQL Server export with `cdc.initial: snapshot`.
   - Before, the checkpoint the baseline wrote (`"pinned": true`) could sit below the capture
@@ -769,7 +757,6 @@
     guess. This affects a table that had no captured change since its baseline while the
     cleanup job ran at least once, or whose capture instance was enabled just before the
     baseline. Re-baseline such a stream once, as the refusal says.
-
 - **Breaking: `rivet run --validate` exits non-zero when its validation fails.** Applies to
   every source engine and every destination that keeps objects at rest.
   - Before, a run whose end-of-run verification failed printed `validated: FAIL` and exited 0,
@@ -784,7 +771,6 @@
     the verdict is FAIL. The case to look for is `verify: content` on a destination that
     exposes no content checksum, such as a local path: those runs print `validated: FAIL`
     today and exit 0. Use `verify: size` there, or drop `--validate`.
-
 - **Breaking: a run over a state database it cannot write is refused, and a cursor that could
   not be stored fails the run.** Applies to `rivet run` and `rivet apply`, every batch mode
   and source engine.
@@ -807,7 +793,6 @@
     `Permission denied`), and commands that only read the state (`state show`, `metrics`).
   - Upgrading: nothing to do for a writable state. A deployment that ran on a read-only
     state and relied on exit 0 now sees exit 1.
-
 - **Breaking: a `RIVET_STATE_URL` that is not a PostgreSQL URL is refused.** Applies to every
   command that opens the state (`run`, `plan`, `apply`, `load`, `state`, `metrics`, ...).
   - Before, any value that did not start with `postgres` (a typo such as `postgre://`,
@@ -821,7 +806,6 @@
   - Upgrading: a deployment with such a value has been running on SQLite. After correcting
     the URL the PostgreSQL state is empty, so each incremental export starts with a full
     pass; to keep the stored cursors, unset the variable instead and keep the SQLite file.
-
 - **Breaking: `rivet plan` fails over a source it cannot read, and writes no plan.**
   Applies to every engine.
   - Before, when the preflight failed (no connection, a login the source rejects, a table that
@@ -834,7 +818,6 @@
     a failure; fix the connection, the credentials or the table name and plan again.
   - Upgrading: nothing to migrate. A plan file written by 0.31 or earlier over an unreadable
     source is still accepted by `rivet apply`, which fails on it as it did before.
-
 - **Breaking: `rivet validate` exits 1 on a bucket or container that does not exist.**
   Applies to `s3`, `gcs` and `azure` destinations.
   - Before, a destination whose bucket does not exist (a typo, another account) was reported
@@ -846,7 +829,6 @@
     (`run --resume`, `repair`, `reconcile`): a missing bucket is now
     `RIVET_DEST_CONTAINER_NOT_FOUND` there instead of "the object is absent". It costs one
     extra listing request (one result) per destination per process.
-
 - **Breaking: `rivet check` describes the plan `rivet run` builds.**
   Applies to `mode: chunked` on PostgreSQL, MySQL, SQL Server and Oracle, and to MongoDB.
   - Before, the `Strategy:` and `Mode:` lines were derived from the config alone. A
@@ -864,7 +846,6 @@
     it printed `Looks good` and exited 0.
   - Exit codes of `rivet check` are otherwise unchanged; a tool that parses the `strategy` or
     `mode` field sees the new values for the exports above.
-
 - **Breaking: a CDC table put back into `tables:` is refused until it is re-baselined.**
   Applies to `mode: cdc` exports with `cdc.initial: snapshot` or `backfill:`, on every engine.
   - Before, a table removed from `tables:` and added again later kept its old baseline: the run
@@ -881,7 +862,6 @@
   - Upgrading: nothing to do and no state migration. The first run on the new version records
     the current table set without checking it, so a table that was removed and put back
     under 0.31 or earlier is not detected: re-baseline it as above if that happened.
-
 - **Breaking: a keyset run that a gate refused is read again, not adopted, by the next run.**
   Applies to `chunk_by_key` with `parallel: N` + `chunk_checkpoint: true`, and to
   `keyset_incremental: true` (sequential or parallel), when a `quality:` content rule
@@ -925,7 +905,6 @@
     <config> --export <name>` (range-chunk run), after which the next run is a full pass.
   - A switch after a run that FINISHED is unchanged: keyset then incremental on the same key
     still continues from the high-water.
-
 - **Breaking: a run without the checkpoint is refused beside an unfinished checkpoint run**
   (`RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH`, exit 5, nothing read or written), the same way a
   run of another mode is.
@@ -951,7 +930,6 @@
     (`RIVET_STATE_CHUNK_RUN_SUPERSEDED`, exit 5) until `rivet state reset-chunks -c <config>
     --export <name>`; the next run starts a fresh pass. Both paths were run with the 0.31.0 binary
     first and this version second.
-
 - **Fixed: an interrupted range-chunk run is resumed only by the source that opened it.** Two
   configs with one export name, one state database and different sources: when the first crashed
   after a chunk, the second resumed the first one's chunk windows over its own table (exit 0,
@@ -963,7 +941,6 @@
     `rivet state reset-chunks -c <config> --export <name>`, and the next run starts a fresh pass.
     Finished cursors and interrupted keyset runs carry over unchanged. Older binaries refuse a
     v34 state (`RIVET_STATE_SCHEMA_NEWER`).
-
 - **CDC memory: the events of one transaction share its commit position.** Closing a
   transaction copied its resume position, a JSON object, into every event (about 475 to 730
   bytes each), which was the largest single item on the heap of a large transaction. The
@@ -992,14 +969,12 @@
     did for a table.
   - A stop before the write exits as what stopped it. `RIVET_LOAD_ADOPTION_COLUMN_MISMATCH`
     now reaches the error line and exits 5 (it exited 1 with no code).
-
 - **A load that stops before writing never becomes the reason the next load overwrites.** The
   stale-buffer stop of a base-and-buffer load, and a staged part that vanished between the
   ledger read and the write, were recorded `failed`; the next `rivet load` then treated a table
   it had never loaded as its own and replaced it. They are recorded `refused`. The ownership
   question is also asked before the `writing` ledger row, so a load killed while refusing, or
   one whose state DB failed its closing write, leaves no row that claims the table.
-
 - **PostgreSQL CDC: a failed run no longer acknowledges the slot past what it wrote.** When a
   part rolled in the middle of a read window (most often through `rollover_memory_mb`) and a
   later part of the same run then failed to write, the run still advanced the slot's
@@ -1009,7 +984,6 @@
   - **Slots a failed run already advanced (0.31.0 and earlier):** the skipped transactions are
     no longer readable from the slot and upgrading does not bring them back. If a PostgreSQL CDC
     run failed while writing a part, compare that table with its source.
-
 - **ClickHouse load: a timestamp ClickHouse cannot hold is refused before the load's first
   statement, and that refusal no longer makes the table rivet's own.** The range check ran
   inside the insert of each part, after the `<table>__rivet_swap` table was created, and the
@@ -1041,7 +1015,6 @@
     detected.
   - An export whose `FROM` relation comes from a `--param` that changes between runs is now
     refused when it continues a stored cursor.
-
 - **Security: a password written in a keyword/value connection string is no longer printed or
   stored.** A PostgreSQL libpq string (`host=… user=… password=… dbname=…`) is accepted in
   `url:`; SQL Server ADO and JDBC-property strings (`…;Password=…;`, `…;PWD=…;`,
@@ -1074,7 +1047,6 @@
   - Upgrading: an export of this shape that delivered nothing now delivers the query's rows.
     An aliased query whose chunk column was not renamed delivers the same rows as before; only
     its probes are wrapped. Nothing stored in the state database changes.
-
 - **Breaking: PostgreSQL refuses a planner probe whose value it cannot read, instead of taking
   it for "no rows".** A range bound, a keyset boundary or the `keyset_incremental` ceiling of a
   type the adapter had no reader for came back as "no value". With `parallel:` and
@@ -1092,7 +1064,6 @@
     a warning (and delivered nothing with `keyset_incremental`). It now fails with the message
     above. Remove `parallel:`: the sequential keyset reads its cursor from the rows.
   - The refusal for a `numeric` or `real` `chunk_column:` under `query:` has the new text.
-
 - **Breaking: `rivet state reset` and `rivet state reset-chunks` refuse while a checkpointed run
   of the export is alive.** Before, both were accepted (exit 0) during the run. A
   `mode: chunked` export with `chunk_checkpoint: true` then finished with exit 0, `_SUCCESS`
@@ -1121,11 +1092,9 @@
     same way.
   - A destination that names `{partition}` without `partition_by:` is refused when it runs.
     Before, it wrote into a directory literally named `{partition}`. Remove the token.
-
 - **`destination: stdout` keeps its data under `--parallel-export-processes`.** `rivet run` and
   `rivet apply <config.yaml>` now run such a config in-process and warn that they did. Before,
   the parent dropped every byte its children wrote to stdout and exited 0 with empty output.
-
 - **Breaking: CDC writes an UPDATE that changes the key as a delete of the old key and an insert
   of the new row** (ADR-0030, accepted), on PostgreSQL, MySQL and Oracle. SQL Server's change
   table already did this, and MongoDB's `_id` cannot change.
@@ -1150,7 +1119,6 @@
     naming those cells (under `REPLICA IDENTITY FULL`, the old row minus its NULL cells).
   - An old-image cell rivet cannot decode refuses the run where the old image is written:
     the delete of a key change, and NDJSON `before`.
-
 - **PostgreSQL CDC warns about a table whose changes carry no old image.** This covers
   `REPLICA IDENTITY NOTHING`, a dropped `REPLICA IDENTITY USING INDEX` index, no primary key,
   and a `DEFERRABLE` primary key. On such a table
@@ -1158,7 +1126,6 @@
   names the table schema-qualified, with its remedy. The existing key-only-delete warning now
   names what each table's DELETE carries (its primary key, or its replica identity index's
   columns), instead of saying "the primary key" for every non-FULL table.
-
 - **CDC data-loss messages name a re-baseline you can follow.** The PostgreSQL slot-created
   warning and the refusals and warnings for a lost or unusable CDC position (dropped slot,
   purged binlog, change table past retention, deleted archive logs, a foreign or invalid
@@ -1173,7 +1140,6 @@
   `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT`, `_CHECKPOINT_INVALID`, `_LOG_GAP`, `_TRUNCATED`,
   `_UNDECODABLE` and `_CELL_UNSUPPORTED` say the same; the codes are unchanged. An alert that
   matches on the old wording (`re-snapshot`, `mode: full`) needs updating.
-
 - **Behaviour change: an export that continues past its last key loads by append.** Two
   kinds of export hold only the keys past the previous run: a MongoDB `mode: full` export
   with `source.mongo.page_size` and `source.mongo.resume: true`, and a `mode: chunked` export
@@ -1289,7 +1255,6 @@
   the old row and an insert of the new one, with a warning naming both values: the delete
   carries the old partition into the buffer, so the MERGE reads it and the base keeps one row,
   in its new partition. A change to or from NULL is written as an update, as before.
-
 - **Breaking: MySQL CDC refuses an UPDATE without the row's previous value on a partitioned
   base-and-buffer table.** Without it (`binlog_row_image` not FULL) the old partition is
   unknown, so the run fails with `RIVET_SOURCE_CDC_PREREQUISITE` naming
@@ -1343,7 +1308,6 @@
   `type: mysql` with a `postgresql://` URL got as far as the driver. Config load now refuses the
   pair with `RIVET_CONFIG_SOURCE_URL_SCHEME_MISMATCH` (exit 1). A scheme rivet does not know
   (`jdbc:…`) is still left to the driver.
-
 - **Breaking: a `cursor_column` or `columns:` key that matches a result column only when case is
   ignored is refused.** MySQL and SQL Server (case-insensitive collations) run
   `cursor_column: updatedat` against a column the result set names `updatedAt`. rivet matched the
@@ -1352,14 +1316,12 @@
   refused when the schema arrives, naming the exact spelling (`RIVET_CONFIG_CURSOR_COLUMN_CASE`,
   `RIVET_CONFIG_COLUMN_OVERRIDE_CASE`, exit 1). This applies on every engine. A `columns:` key that
   names no column in any case still passes, because multi-table override maps rely on that.
-
 - **Breaking: a MySQL keyset key under a `uuid` column override is refused.** The override reads
   `BINARY(16)` as a 16-byte UUID, but the page cursor was rendered as hyphenated hex text, which
   MySQL compares against the raw bytes. Pages skipped and repeated rows while the run reported
   success. An explicit or auto-selected keyset key with that override now fails at plan time with
   `RIVET_CONFIG_KEYSET_KEY_UUID_OVERRIDE` (exit 1). PostgreSQL casts the literal to `uuid` and is
   unaffected.
-
 - **Breaking: a `columns:` override whose type the column's value cannot be read as is refused,
   not written as NULL.** On PostgreSQL and SQL Server, a `decimal(p,s)` override on an integer
   column produced a column that was entirely NULL, and on SQL Server a `uuid` override on
@@ -1367,14 +1329,12 @@
   under a `decimal` override are now scaled exactly, and SQL Server `uuid` text is parsed. Any
   other mismatch fails naming the column (`RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH`, exit 1). On
   MySQL, a `uuid` override now refuses a value it cannot parse instead of nulling it.
-
 - **Breaking: a PostgreSQL URL with a remote `host=` or `hostaddr=` query parameter needs TLS.** The
   plaintext gate looked only at the URL's authority, while the driver also dials the query's
   `hostaddr=` (in preference to the authority) and `host=`. So
   `postgresql://u:p@localhost/db?hostaddr=203.0.113.5` passed as loopback and sent credentials and
   rows to the remote address in cleartext. Every `host=`/`hostaddr=` value must now be loopback
   or a unix-socket path, or the connection needs a `tls:` block.
-
 - **Breaking: MySQL `TIME` outside 00:00–24:00 is refused, not written as garbage.** A table
   holding durations that exported with exit 0 before now fails every run. A MySQL `TIME` is a
   duration of up to ±838:59:59, and a Parquet `TIME` holds one day. `838:59:59` read back as
@@ -1400,14 +1360,12 @@
   timestamp range bound in `YYYY-MM-DD HH:MM:SS` form is read day-first under a British login
   (`DATEFORMAT dmy`), and a window exported 39 rows for 24. An ASCII bound is now a plain `'…'`
   literal and timestamps are sent in the `T` form, which does not depend on `DATEFORMAT`.
-
 - **Timestamp bounds keep their fraction and offset on PostgreSQL and SQL Server.** The probe that
   reads a range or keyset bound dropped the fraction on both engines, and the `+00` offset of a
   PostgreSQL `timestamptz`. Under a session in another zone the bound then named a different
   instant (measured on PostgreSQL in Asia/Tokyo: 999 of 1000 rows, then 1914 rows for 1499 ids).
   A SQL Server `DATETIME` bound was cut instead of rounded to its 1/300 s tick, and the newest row
   stayed behind (199 of 200).
-
 - **Every PostgreSQL connection rivet opens runs in UTC with ISO formats.** Only the export
   transaction was pinned (`SET LOCAL TimeZone = 'UTC'`). The sampler, the bound probes, `check`
   and `init` ran in the role's zone and `DateStyle`, so one run used two zones (the cause of the
@@ -1416,7 +1374,6 @@
   leak to other clients. Stored values do not move. Calendar arithmetic in your own `query:`
   (`current_date`, `ts::date` on a `timestamptz`) now counts UTC days everywhere, as it already
   did inside the export.
-
 - **A keyset crash anchor is resumed only by the runner shape that wrote it.** After a crash,
   changing `parallel:` made the other runner continue the anchor: 1501 of 2000 rows
   (sequential → parallel), or 2600 for 2000 (parallel → sequential). A plain keyset run now
@@ -1424,118 +1381,96 @@
   sequential crash is refused instead, because the sequential cursor had already moved past
   pages no manifest names (`RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED`, exit 5). Re-run
   once with `parallel: 1`.
-
 - **`--split` units no longer reuse a stale checkpoint.** A fresh `--split` re-run re-sampled its
   windows but kept each unit's keyset anchor and crashed chunk run, so units resumed against moved
   windows: 525000 rows over 450000 ids, or a plan-fingerprint refusal on every run. A unit that
   runs over a new window now drops both. `rivet state reset-chunks` (and `--stuck-checkpoints`)
   now also accept the `<export>#<n>` and `<parent>__<value>` names that the chunk refusals print
   for split units and `partition_by` children.
-
 - **A chunked resume re-exports a chunk whose part it cannot find.** Resuming into a prefix that
   held a foreign or stale manifest declared every recorded part without looking, so a part deleted
   between attempts was named in a `Success` manifest. A chunk whose part record was never written
   was skipped as completed and left out. Every resume now checks the destination and re-exports
   what it cannot account for.
-
 - **A chunk that fails and is retried within one run is counted once.** Its failed attempt's
   parts stayed in the `Success` manifest beside the retry's, so the chunk's leading rows appeared
   twice and `total_rows` counted them twice. Those parts are now pruned before the manifest is
   written. In the parallel checkpoint runner, a chunk that failed and then completed on retry
   still failed the run; now the chunk ledger alone decides. When chunks remain unfinished, the
   error names each one's last error.
-
 - **A MySQL `FLOAT` keyset key or cursor no longer re-reads its boundary row.** The saved value
   was the shortest `f32` text (`0.1`), which MySQL compares as a `DOUBLE` below the row's own
   `0.10000000149011612`, so every page boundary and every incremental run re-read the last row.
   The exact widened value is saved now.
-
 - **A `?` or `#` in a URL password no longer merges different servers into one cursor scope.** The
   state key cut the URL's query before removing the credentials, so
   `postgresql://app:k?9@h1/a` and `…@h2/b` both keyed as `postgres://app:k`. The two shared one
   incremental cursor and crash anchor, and a prefix of the password was stored in the state DB.
   Keys of well-formed URLs are unchanged, so no existing cursor moves. The same password shapes,
   and a `?password=` query parameter, are now redacted from `plan.json` too.
-
 - **PostgreSQL CDC decodes `DOMAIN` columns instead of writing NULL.** `test_decoding` labels a
   domain cell with the domain's name, so every integer, date or boolean domain column was NULL in
   the change log. The reader now resolves each domain to its base type at open (nested domains
   included).
-
 - **PostgreSQL CDC refuses a value it cannot decode instead of writing NULL.** A BC date, a
   `time '24:00:00'` or an unparseable value in `test_decoding` output became NULL with exit 0.
   It is now refused, like `infinity` already was. The reader also pins `TimeZone = 'UTC'`. Under a
   named server zone, an instant before that zone adopted a whole-minute offset rendered with a
   seconds offset (`+00:53:28`). That was refused on every later run as bad source data.
-
 - **SQL Server CDC refuses a captured value it has no decoder for.** An `xml` or `sql_variant`
   cell (and any other type without a decoder) was written as NULL with exit 0. It now fails with
   `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5). To go on, leave the column out of the capture
   instance.
-
 - **A DROP and ADD COLUMN of the same arity no longer fills the new column with a neighbour's
   value.** On PostgreSQL and SQL Server CDC, a missing column was read by position whenever the
   change image had as many columns as the schema. After `DROP a` + `ADD c`, older images put
   `b`'s value into `c`. They now leave `c` NULL. The CDC reference no longer claims that a column
   added while a run is open is captured: that run's values for it are dropped and acknowledged,
   so re-snapshot the table to recover them.
-
 - **MySQL CDC writes `YEAR 0000` as 0, not 1900**, as the batch path does. The binlog decoder
   adds 1900 to the stored byte, and 1900 is never a legal `YEAR`.
-
 - **SQL Server CDC advances a quiet table's checkpoint.** A table with no changes kept its
   checkpoint at its last captured LSN. Once the cleanup job moved the retention floor past that
   LSN, the next run failed with a log-gap refusal and asked for a re-snapshot, although nothing
   had been lost. After a clean drain, the checkpoint now moves to the bound read at the start of
   the run.
-
 - **The SQL Server CDC anchor is written in lowercase hex, like every change event's LSN.** The
   BigQuery and Snowflake dedup views order `__pos.lsn` as a case-sensitive string, so after a
   re-baseline an older event could outrank the new anchor and the view served the stale row.
   Anchors already written to a warehouse stay uppercase.
-
 - **MySQL CDC fails the resume when it cannot run its `GTID_SUBSET` check.** A failed query read
   as "contained" with no warning, which switched off the one identity check that catches a
   `RESET MASTER` on the same server. The query error now fails the resume. A checkpoint with a
   GTID set that gets no containment answer resumes with a warning.
-
 - **PostgreSQL `time '24:00:00'` and a `timestamp` `infinity` are refused in batch exports.**
   `24:00:00` wrapped to `00:00:00` with exit 0, and both checksum sides agreed. A
   `'infinity'::timestamp` (without time zone) panicked the process (exit 101, no summary). Both
   now fail with `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5), naming the column.
-
 - **A SQL Server `sql_variant` column is refused instead of crashing the export.** The driver
   cannot parse the type and panicked (exit 101; a release build aborts) on every export or type
   probe that touched it. rivet now asks the server for the result's column types first and
   refuses with `RIVET_SOURCE_VALUE_UNREPRESENTABLE`, naming a cast. If that probe is unavailable,
   the export runs as before.
-
 - **A `rivet load` of CDC base+buffer writes only the newest unloaded baseline.** If two
   baseline generations were waiting (a snapshot re-run after a crash, or a re-baseline before any
   load), both were written into the base: every key twice, with a count gate that grew to match.
   The older generation is now recorded as superseded and not read.
-
 - **`rivet load` no longer disowns its own table after a skip or refusal under the same run id.**
   An up-to-date skip or a pre-write refusal overwrote the ledger row that proved the table was
   rivet's, and the next load refused it as foreign ("drop or rename it"). A load whose source
   identity cannot be read from the ledger now refuses before writing. It used to skip the check
   that stops one source from replacing another's rows.
-
 - **A load pinned to an older run's columns no longer refuses the newer runs it listed.** The pin
   loads spec-less newer runs with the older run's columns, but it recorded the older run's finish
   time, so those same runs were refused as late on every retry.
-
 - **A partition column whose name contains `|` keeps its partition budget.** The footer note split
   on every `|`, so `rivet load` could not parse it and fell back to the row count. It could then
   refuse a part the writer had kept within budget. Notes written before the fix still parse.
-
 - **An incremental load after an idle run no longer fails.** A run that exported nothing after
   the first pass made the next `rivet load` fail with `no Parquet URIs to append`.
-
 - **Duplicates found before `unique_max_entries` is reached fail the run.** Once a unique column
   hit its cap, only the capped warning was emitted: ids `[1,1,2,3,4]` at cap 3 exited 0 with one
   duplicate already proven. It now fails as "at least N duplicate values".
-
 - **`rivet validate --depth full` no longer reports corruption on healthy exports with NULL
   keys.** On re-read, Parquet can leave stale values in leading NULL slots, and the keyed
   checksum hashed them. MySQL and SQL Server incremental exports whose nullable cursor sorts NULLs
@@ -1553,7 +1488,6 @@
 - **SQL Server chunked and keyset exports work for a `db_datareader` login.** The row estimate
   read `sys.dm_db_partition_stats`, which needs `VIEW DATABASE STATE`, so every chunked or keyset
   export by such a login failed. It now reads `sys.partitions`.
-
 - **A multi-export run exits with the most serious failure's class.** Ranking is now integrity >
   internal > refusal > schema drift > retryable > usage. A refusal (5) or internal error (6) used
   to lose to a retryable failure, so a scheduler retried a protective stop. A combined failure
@@ -1561,16 +1495,13 @@
   one mentioning "timeout" exited 2. A child that panicked (exit 101) was passed through as 101;
   it now counts as internal (6). A typed stop (integrity, drift, refusal) is never retried because
   its message contains a transient-sounding word.
-
 - **MongoDB `partition_by` is refused when the config is read.** `rivet check` passed it, and
   `rivet run` panicked while expanding partitions, taking every other export in the invocation
   with it. Now `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED`.
-
 - **`rivet check` grades a BigQuery `decimal` with more than 38 integer digits as Fail.**
   `BIGNUMERIC` holds at most 38 integer digits, so `decimal(50,0)`, MySQL `DECIMAL(65,0)` and
   PostgreSQL `numeric(76,0)` were reported OK, and the load then failed at BigQuery after the
   extract had run.
-
 - **Discovery reads the keys and indexes that really exist.** On SQL Server, a UNIQUE index over
   `(tenant_id NOT NULL, ext_ref NULL)` was taken for a single-column key on `tenant_id`, so
   keyset paging skipped rows at page boundaries with status success. A composite primary key
@@ -1578,13 +1509,11 @@
   counted a column as indexed when it sat in any position of any index. Only a column that leads
   a valid, complete btree counts now. Preflight no longer applies whole-table statistics to a
   partition-extended, `APPLY`, flashback or dblink read.
-
 - **`rivet init` gives CDC tables whose names collide distinct slots and checkpoints.** Names that
   reduce to the same identifier (`order-items` and `order_items`, `Orders` and `orders`,
   non-Latin names) got one checkpoint and one slot, and init's own config was refused with
   `RIVET_CONFIG_CDC_RESOURCE_CONFLICT`. Only colliding names get a hash suffix, so names that
   already worked keep their checkpoint and slot.
-
 - **Recovery advice that failed when followed has been corrected.** The chunked recovery block no
   longer chains `reset-chunks && run --resume`, which always failed. The rerun warning no longer
   sends a completed (`_SUCCESS`) prefix to `--resume`, which refuses it. The resume command in the
@@ -1595,13 +1524,10 @@
   that work, and the load-adoption refusal says `ALTER TABLE … ADD COLUMN` instead of renaming
   the table aside, which dropped its rows from the view. `--force` without `--resume` is described
   truthfully.
-
 - **The plaintext-state warning checks the host.** It stayed silent for a remote PostgreSQL state
   whose password or database name contained `localhost`.
-
 - **`rivet doctor` and `rivet check --type-report` honour the `mongo:` block**, and the MCP
   server's MySQL tools accept a URL with `sslmode=` again.
-
 - **Documentation: the exit-code table in `docs/reference/cli.md` lists 5 (refusal) and 6
   (internal).** The README's CDC quickstart says which sources get a first-run baseline, and the
   CDC reference describes the per-transaction caps and opt-in spilling. The `partition_by`
@@ -1622,7 +1548,6 @@
   network word such as `dns` — a scheduler retried a data-integrity failure. Every load-integrity
   gate now carries `RIVET_LOAD_COUNT_MISMATCH`, and an incremental base+buffer load no longer
   labels its failure "CDC".
-
 - **MySQL CDC writes a zero `TIMESTAMP` (`0000-00-00 00:00:00`) as NULL, not `1970-01-01`.** The
   binlog carries a zero TIMESTAMP as epoch 0, and the CDC decoder turned it into the epoch instant,
   while the batch path (and so every snapshot) wrote NULL: the same source value landed two ways in
@@ -1636,12 +1561,10 @@
   the ledger connection dropped first, the load wrote the table anyway and reported `LOAD OK`, and
   the next load refused that table as foreign for ever. The marker is now required — without it the
   load fails before the warehouse write, and the next load finishes the job.
-
 - **`rivet init` on Oracle keysets a table whose only key is a UNIQUE NOT NULL column.** It looked
   only for a primary key, so such a table (a common shape) fell to a full scan while the same table
   on MySQL — which reports that key as `PRI` — was keysetted. A single-column UNIQUE key on a NOT
   NULL column now stands in when there is no primary key, and is recorded as the load key.
-
 - **A Postgres state behind pgBouncer (transaction mode) keeps one run of an export at a
   time (state v31).** The run lease of a checkpointed export and the per-table lease of
   `rivet load` were session advisory locks. Behind a transaction-mode pooler two rivets
@@ -1651,7 +1574,6 @@
   that died on the same host is taken over at once; one that died on another host blocks
   the next run until its lease expires (`RIVET_STATE_LEASE_TTL_S`, default 30 s). A SQLite
   state is unchanged. The previous release cannot open a v31 state DB.
-
 - **Oracle CDC (preview), through LogMiner.** `mode: cdc` on an Oracle source now mines the
   redo logs from `CDB$ROOT` for the configured tables of one pluggable database
   (ADR-0037), with no GoldenGate licence. A run drains to the SCN current at its start and
@@ -1664,14 +1586,12 @@
   stops there until you re-anchor and re-snapshot. Continuous capture (`until_current: false`,
   `rivet cdc --stream`) is refused (`RIVET_CONFIG_CDC_CONTINUOUS_UNSUPPORTED`), and an Oracle
   CDC export under a `load:` block is refused when the config is read.
-
 - **On a shared Postgres state, the state server stamps when a run started.** Runs were
   ranked by the writer's own clock, so a run that crashed on a host whose clock ran ahead
   outranked the run that replaced it, and `rivet load --gc-orphans` kept treating the prefix
   as still being written until that clock caught up (cleanup deferred, nothing lost). The
   start is now `clock_timestamp()` on the state server; a SQLite state keeps the local
   clock, which is the only one it has.
-
 - **A timestamp ClickHouse cannot hold is refused, not clamped.** ClickHouse `DateTime64` holds
   1900-01-01 to 2299-12-31, and reading Parquet it clamps anything past that to the nearest end
   with no error (measured on 24.8: 9999-12-31 stored as 2299-12-31 23:00; the
@@ -1680,14 +1600,11 @@
   (`RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE`), or a timestamp column the footer cannot bound (no
   min/max statistics); an all-NULL row group no longer hides a value past the range in another. A load pulled through a named collection is not
   inspected yet; the type report says so.
-
 - **A MongoDB CDC export under a ClickHouse `load:` is refused when the config is read.** It was
   refused only by `rivet load`, after `rivet run` had extracted the whole stream.
-
 - **The type report no longer claims a bare `Decimal` for a negative-scale decimal on ClickHouse**
   (ClickHouse reads a bare `Decimal` as `Decimal(10, 0)`): it is declared `Decimal(p+|s|, 0)`,
   which holds the whole numbers exactly, and refused past precision 76.
-
 - **Two configs sharing a Postgres state DB no longer read each other's incremental cursor
   (state v30).** The cursor and the keyset crash anchor were keyed by the export name alone.
   Two configs with the same export name on one state DB — one template rolled out per
@@ -1697,7 +1614,6 @@
   between runs, a `{date}` path for one, keeps its cursor. A cursor written before v30 is
   continued by the first run of that export and by no other config. The previous release
   cannot open a v30 state DB; it says so and writes nothing.
-
 - **Breaking: two new exit codes, and failures carry a registered code.** A protective stop,
   where rivet refuses so as not to lose, duplicate or overwrite data, now exits **5**. A
   broken invariant, which is a bug, exits **6**. Codes 1–4 keep their meanings. Every coded
@@ -1711,14 +1627,12 @@
   batch at a time; an offline ratchet keeps the uncoded ones from growing. A scheduler that
   treated every non-zero exit as "fix the config" should now treat 5 as "a human decides"
   and 6 as "report it".
-
 - **The release gate now grades what rivet costs the source database.** It compared wall time
   and memory with the previous release, never the load on the source. A new stage exports the
   same table with both binaries on every engine and fails if rows scanned or temp spills grow
   past the previous release. Harm now also records PostgreSQL logical-decoding spill and decoded
   bytes and SQL Server logical reads and tempdb work tables. A live test proves on every engine
   that a CDC drain reads the change log and not the table.
-
 - **`max_file_size` holds on parquet exports again (#307).** Parquet writes bytes only when
   a row group closes, and a `rivet init` config sizes row groups automatically (~128 MB), so a
   256 KB cap produced one 1.1 MB part with no warning. Row groups are now capped at a quarter
@@ -1728,7 +1642,6 @@
   parts, which exposed a resume that duplicated the finished parts of a page interrupted
   mid-rotation when the cap changed between the crash and the resume; such a page is now
   re-read whole.
-
 - **Breaking: `chunk_dense` is removed.** It paged by `ROW_NUMBER() OVER (ORDER BY
   chunk_column)`, recomputed per chunk, so a concurrent insert or delete skipped or
   duplicated rows even on a unique key. Nobody used it. A config that still sets
@@ -1736,7 +1649,6 @@
   `chunk_column` range chunking; `chunk_dense: false` is still accepted. A chunked
   `plan.json` written by an older rivet fails `apply`'s integrity check; re-run
   `rivet plan`.
-
 - **CDC keeps each change part inside a load job's partition budget.** Under the `log_view`
   layout the change log is partitioned, and BigQuery writes at most 4,000 partitions per load
   job. The CDC drain wrote each flush as one part with no partition count in its footer, so a
@@ -1744,20 +1656,17 @@
   drain now cuts a flush at the budget and notes each part, like the batch writer (verified
   on MySQL, PostgreSQL and SQL Server). MongoDB's change parts carry no date column, and the
   run now says so instead of shipping them unbudgeted in silence.
-
 - **Chunked exports record their partition count in every part again.** The chunked,
   parallel-chunked and parallel-checkpoint runners closed each part without the
   `rivet.partition_buckets` footer note, so `rivet load` fell back to the part's min/max
   date span — a wider bound than the part really holds, which can refuse a load that fits.
   Every runner now closes parts the same way, and a live test reads every part's footer.
-
 - **SQL Server CDC refuses a checkpoint from another database or from before a restore.**
   The checkpoint held only an LSN, which every database accepts: pointed at another server's
   database, a run resumed there, exited 0 and captured nothing, skipping that database's
   changes. The checkpoint now records the database's `family_guid` and `recovery_fork_guid`.
   rivet refuses a different family (another database) or a changed fork (a `RESTORE`), and
   still follows an availability-group failover, whose replicas share both.
-
 - **A CDC run sends its notifications and says which batch settings it ignores.** A failed CDC
   run never reached `notifications:`, so an `on: [failure]` webhook stayed silent while the
   stream was down. It now fires like a batch run's. `quality:`, `parquet:`, `compression*`,
@@ -1766,61 +1675,50 @@
   naming the ones that were set. A CDC run now also records the source server it ran against
   (even when it fails) and the source-harm counters of its window, with the same DIAGNOSIS line
   a batch run prints.
-
 - **The release gate grades what it used to wave through.** A run that bypasses the
   run-integrity facade only warns in a release build, and the gate now fails on that warning.
   Without `cargo-llvm-cov` the offline battery still runs and is graded instead of skipping.
-
 - **Reading CDC from a replica is verified on every engine.** Live tests and release-gate rows
   now cover a PostgreSQL 16 standby (continuous mode; the default bounded mode still refuses,
   and its message no longer claims a standby cannot host a slot), a SQL Server read-scale
   availability group's readable secondary, and a MongoDB secondary, beside MySQL's re-logging
   replica. The CDC reference says, per engine, what the replica needs and what proves it.
-
 - **MySQL CDC refuses a replica that does not re-log what it applies.** With
   `log_replica_updates = OFF` (MySQL's default) a replica's binlog holds none of the primary's
   changes; reading it captured nothing and exited 0. rivet now refuses such a replica at start.
   MySQL only: the other engines have no such setting to get wrong.
-
 - **SQL Server incremental exports work on a legacy `DATETIME` cursor.** The saved boundary was
   rendered with six fractional digits, which `DATETIME` rejects, so every run after the first
   failed with `Conversion failed`. A rivet-rendered timestamp cursor is now typed `DATETIME2(7)`,
   and a `DATETIME` value is read to its nearest microsecond (its 1/300 s tick has no exact one) in
   batch and CDC alike, so the boundary row is not re-exported.
-
 - **`rivet compact` carries a column the source gained into the base.** After an `ADD COLUMN`
   at the source, the BigQuery MERGE named the new column while the base lacked it and failed
   with a raw `Unrecognized name`, on this and every later compact. The base now gets
   `ADD COLUMN IF NOT EXISTS` before any MERGE.
-
 - **CDC refuses a captured table or collection that was dropped.** MySQL skipped `DROP TABLE`
   and MongoDB skipped `drop`/`rename`/`dropDatabase`, so the destination kept the removed rows
   live and a table re-created under the same name continued the old history as one table. Both
   now fail naming the object and the recovery order; the same DDL on something nobody captures
   is still skipped.
-
 - **MySQL CDC refuses a change to a captured table that was logged as a SQL statement.** A
   writer session on `binlog_format=STATEMENT` (or MIXED) put its DML in the binlog as text,
   which the row reader skipped: the run exited 0 with the change missing. It now fails naming
   the table and the fix; the same statement on a table nobody captures is still skipped.
-
 - **Parallel keyset incremental no longer skips text keys the source collation ranks higher.**
   Whether anything lay past the anchor was decided by a byte compare in rivet while the source
   orders by its collation: on an `en_US` database 500 new keys `C…` after an anchor `b…` read as
   "nothing new" and the run exported 0 of them with status success. The source now answers the
   question itself (`MAX(key) … WHERE key > anchor`).
-
 - **`cleanup_source` no longer deletes parts an extract committed during the load.** The load
   checked for a running extract before appending, then deleted the whole prefix after it; an
   extract that started and committed in between lost its parts after the source position had
   moved past them (measured: 51 of 52 rows reached BigQuery). Cleanup now deletes exactly the
   files of runs already loaded (or superseded, on a full load) that nobody is writing.
-
 - **`on_schema_drift` now applies to CDC exports.** A CDC run never consulted it: a column
   retyped between runs wrote parts with different types into one prefix and exited 0 under
   `fail`. Each captured table's schema is now checked before the stream reads a change, so a
   refusal acknowledges nothing and switching to `warn` captures every deferred change.
-
 - **`rivet load` into ClickHouse (preview)** (ADR-0035; the loader started from
   @ssyusyukalov's #145). `load: { target: clickhouse, url, database, user,
   password_env }`, or `rivet init --clickhouse-url … --clickhouse-database …`. A
@@ -1832,7 +1730,6 @@
   rivet sends each part over HTTP; with `named_collection:` ClickHouse reads the
   bucket itself. The export may be staged on GCS, S3 or Azure. Not supported:
   MongoDB CDC, `partition:`, `layout: base_buffer`.
-
 - **`destination.oneshot_budget_mb`** (by @ssyusyukalov, #143): the RAM cap on
   single-PUT uploads, until now fixed at 64 MB, is configurable. On GCS and Azure a
   part that fits uploads in one PUT and gets a store-computed `Content-MD5` that
@@ -1841,7 +1738,6 @@
   measured 3–4.5× faster per part at 50 ms RTT). `0` streams every part. The cap
   is shared by every destination with the same value, including each table of a
   CDC export, so it never multiplies by table count.
-
 - **The one-shot upload budget no longer grows with every streamed part.** A part
   too big for the budget was refused, but the refusal credited its size back to the
   pool, so after one large streamed part the next one was read into memory whole:
@@ -1859,13 +1755,11 @@
   when it gained a part. Parts and manifests are still durable before the
   checkpoint and the ack. Peak RSS rises with the concurrency (+31% on the 60-table
   stand); `rollover_memory_mb` bounds the change buffer, not the process.
-
 - **MySQL CDC no longer fails when a flush outlasts the server's
   `net_write_timeout`** (60 s by default): the server dropped the binlog dump while
   rivet was uploading and the run ended in `CodecError { bytes remaining on stream }`
   (nothing was lost; the cycle was wasted). The binlog connection now sets a session
   `net_write_timeout` of 3600 s.
-
 - **`--parallel-exports` runs at most 16 exports at once** (it started one thread
   per export: a 150-table config opened 150 source and 150 state connections). The
   same pool now takes a lone CDC export's pending baseline snapshots, at most 16 at
@@ -1874,19 +1768,16 @@
   others finish (release builds; `release-min` aborts).
 - GCS: the ADC access token is minted once per identity per process, not once per
   destination (a multi-table CDC run opened one per table, ~0.4 s each).
-
 - **Internals behind the same behaviour** (refactor-3): the commit ledger is the only
   writer of a run's counters, and one `FanIn` owns every parallel runner's tail
   (keyset, chunked, Mongo, parallel checkpoint). Fixes a resume after a failed chunked
   run under-reporting rows (50 of 150) and a Mongo worker panic that lost a durable
   part. `rivet run --summary-output` into a missing directory, `apply` stopping at the
   first plan rejection, and a leaked progress channel after a panic are fixed on the way.
-
 - **A local multi-table CDC stream refuses tables that differ only by letter case**
   (`Orders` / `orders`): on a case-insensitive filesystem (macOS, Windows) their parts
   overwrote each other and the lost rows were permanent while `rivet validate` passed.
   Cloud prefixes are case-sensitive and keep both.
-
 - **README rewritten** around what rivet does: a diagram (sources → rivet → storage →
   warehouse, light and dark), six claims, and three quickstarts — batch, CDC, and the
   full `run` → `load` → `compact` cycle — each run as printed against a live stand.
@@ -2438,7 +2329,6 @@
   `cdc.checkpoint:` for any baseline (the file is the anchor); PostgreSQL does not (the slot
   is). The step-by-step operator cycle — anchor → backfill → load → delta → load, with the
   interruption points — is `docs/cdc-full-cycle.md`.
-
 - **`rivet init --mode cdc` over several tables scaffolds that shape**: one batch recipe per
   table (keyset where the table has a single-column keysettable key, range or `full`
   otherwise, always in the `table:` form — a name that cannot be a `table:` shortcut is left
@@ -2446,7 +2336,6 @@
   PostgreSQL `public` over two or more tables. Its next-steps epilogue ends in `rivet run`,
   not `rivet plan` (a CDC config has no batch plan to seal), and a per-table capture-only
   scaffold (SQL Server, MongoDB, a single table) says the baseline is yours.
-
 - **A load is typed from the spec of the run it consumes.** `rivet run` now records each
   run's columns and key under its run id as well as under the export name; `rivet load` pins
   every table's plan to the newest loadable run under its own prefix and rebuilds the DDL and
@@ -2460,16 +2349,13 @@
   a live run of one config's `users` is no longer declared dead by the other config's finished
   `users` run: supersession of a `running` row now needs a newer success under the same
   prefix, so `gc_orphans` keeps sparing the live writer's in-flight parts.
-
 - **A multiplex `tables:` stream's `load:` takes per-table overrides** — `load: { partition:
   { column: created_at, granularity: day }, tables: { customers: { partition: none },
   line_items: { pk: [id, line_no] } } }` on the export: each captured table's block is
   layered over the export's, over the top-level `load:`, so six tables through one binlog
   stream no longer share one partition column and one key. Names must be captured tables.
-
 - **`rivet plan` on a mixed config plans the batch exports and skips the rest, saying so** —
   it used to abort the whole config on the first `mode: cdc` export.
-
 - **A `backfill:` stream lands as a BASE TABLE plus a per-cycle buffer, and `rivet compact`
   merges the buffer.** The baseline legs now OVERWRITE a physical `<table>` — the source
   columns plus one service column, `__is_deleted BOOL`, written as `false` inside the baseline
@@ -2491,7 +2377,6 @@
   between MERGE and DROP included) and the batched loads are a release-gate cell
   (`warehouse_layout`) over `tests/live/live_cdc_compact.rs` and
   `tests/live/live_load_partition_batches.rs`.
-
 - **A wide history loads in daily partitions, in batches — never coarsened to `month`.**
   BigQuery writes at most 4,000 partitions per job; a 317M-row table with eleven years of
   `created_at` days refused to load under `granularity: day`. `rivet load` now packs the
@@ -2503,7 +2388,6 @@
   the read key — is refused before any job, naming the file. Every BigQuery job of a load now
   carries `rivet_op:load` (DDL, counts, staging and clone included) beside `rivet_table`, so
   cost sums per table per operation; `rivet_op:merge` is reserved for compaction.
-
 - **A shared state DB with same-named configs, made safe (state schema v29).** Four configs each
   exporting `users` — one per engine — on one Postgres state, run at once, is the deployment
   shape the shared-state docs recommend; three things broke under it. The baseline marker
@@ -2523,32 +2407,26 @@
   on MongoDB's `_id` before the pin could run. The whole shape — blessed, crashed at
   once, crashed in turn — is a release-gate cell (`shared_state_same_name`) over
   `tests/live/live_shared_state_same_name.rs`, CDC and batch cycles.
-
 - **A CDC run records its peak RSS.** `export_metrics.peak_rss_mb` was 0 for every CDC run
   (the partner's whole e2e ledger); the stream now keeps the same RSS bracket the batch tail
   does. Oracle: `a_backfill_cycle_anchors_then_captures_only_the_delta_on_the_next_run` reads
   the row back (RED at 0 before the fix).
-
 - **`rivet --version` names the commit** — `rivet 0.27.0 (9d4a662d5)`. A bug report names a
   version, and one version ships from many pre-release builds. `RIVET_GIT_SHA` overrides for
   a build without `.git` (Docker); `unknown` is the honest fallback, never a build failure.
-
 - **Log lines no longer duplicate the card block.** An interactive `rivet run` repaints its
   cards in place by walking the cursor up; a `WARN` written straight to stderr between two
   frames put the count off by one and the block was printed again into scrollback (seen as
   "three rows for one leg" on the partner's run — the data was never read twice). While a
   renderer owns the screen, `log` lines go through its channel and land above the block.
-
 - **The tmp-disk spill diagnosis says the counter is server-global.** `Created_tmp_disk_tables`
   counts every session on the server: the partner's baselines logged about one per SECOND of
   the production source's own traffic (45 in 42 s, 995 in 17 min), while ten keyset pages on a
   quiet stand log none (`mysql_keyset_pages_create_no_tmp_disk_tables`). The solo line no
   longer says "the source spilled to disk" as if the export did it.
-
 - **A recipe and its stream typing one column apart is refused at config load.** The check
   ran on every `rivet run`, after the anchor; it is a pure config decision and now fails
   `rivet validate` / `check` / `run` when the config is read, with the same message.
-
 - **`rivet doctor` keeps the CDC verdicts it already reached when a later probe fails.** Each
   engine's health probes appended to one list; a probe that died half-way (MySQL `SHOW BINARY
   LOGS` with `log_bin = 0`) replaced "log_bin is OFF — enable binary logging" with one generic
@@ -2597,7 +2475,6 @@
   (`range` / `ingestion` / the options are refused). The per-job Hive batching of the old
   export-`partition_by` loader path — unreachable since `partition_by` and `load:` exclude
   each other — is gone.
-
 - **A change log follows a written `partition:` / `cluster_by:`; `rivet load
   --rebuild-changelog` re-partitions it.** With the defaults (`partition` absent,
   `cluster_by: auto`) `<table>__changes` keeps whatever shape it has. Once the config writes
@@ -2609,20 +2486,17 @@
   that finds the remains of an interrupted swap (`<table>__changes__old` / `__rebuild`) stops
   before touching anything and says which to keep. A changed `expiration_days` is altered in
   place on the log as on the table.
-
 - **BigQuery load jobs are inserted under a client job id.** A `jobs.insert` that times
   out or is refused transiently is sent again with the same id, so the statement never runs
   twice: a repeat of an insert that did land answers `409 Already Exists`, and the job is
   fetched and polled instead — in the dataset's location (`datasets.get`), since a single-
   region job cannot be fetched by id alone. Previously such a timeout failed the load outright.
-
 - **A refused load never makes the table rivet's own.** A load that stops before touching
   the warehouse — a table rivet did not load, a shape that differs, a view under a full pass,
   a partition over budget, an interrupted rebuild's leftovers — is journaled as `refused`
   (`rivet state loads`), and only a load that reached the write (`failed` or `success`)
   counts for ownership. Previously the refusal's `failed` row made the foreign table rivet's
   own, and the next `rivet load` (a scheduler retry) overwrote or adopted it.
-
 - **An incremental load never overwrites a table that already exists.** A run with no
   cursor to resume from holds the whole table (the first run after `mode: full`, after
   `state reset`, or on a lost state DB). It lands as a plain `<table>` only when that name
@@ -2630,50 +2504,41 @@
   the run is appended to it, so rows the source has since deleted stay in the log. The
   overlap between the kept baseline and the re-read pass is at-least-once and the
   current-state view dedups it by key. Previously such a run replaced the table.
-
 - **An incremental whole-table run onto its own view joins the change log.** After
   `state reset`, or on a stateless cycle that re-selects the first run, the run is appended
   to `<table>__changes` at least once (the view keeps the latest row per key) instead of
   refusing "a full pass cannot be appended" on every later cycle.
-
 - **`pk: auto` forgets a key the export no longer reads.** A run that finds no source key
   (a `query:` export, a relation without one) clears the key an earlier run recorded, so the
   dedup view never partitions by a column of a table the export moved away from; a key
   `rivet init` recorded for a `query:` scaffold is kept. A `pk` column the export does not
   project is refused at plan time, not after the append.
-
 - **A 0.25.0 incremental cursor is attributed to its column.** `rivet state` rows written
   before v26 carry no cursor identity; a keyset run's was recovered from its metrics, an
   incremental run's was not — so a changed `cursor_column` compared the new column against
   the old value (on MySQL: exit 0, zero rows, every run). The incremental run's key
   descriptor (`export_metrics.key_descriptor_json`, v18+) now attributes it, and the switch
   is refused naming both columns and `state reset` (MT6).
-
 - **An unwritten `cluster_by` follows the table.** A full load onto its own table with
   `cluster_by` left at `auto` keeps the clustering the table has — a table an earlier
   release created unclustered is overwritten as it is, not refused after the upgrade. A
   written `cluster_by` still conflicts.
-
 - **`--rebuild-changelog` carries the log's properties.** The copy takes the description,
   labels, friendly name, table expiry and KMS key of the log; a log with column policy tags
   or row access policies is refused, since a copy carries neither.
-
 - **Partition budget and expiry corner cases.** A part without statistics no longer hides
   the span the other parts prove; an INT32-stored range column (PostgreSQL `integer`, MySQL
   `int`) is budgeted like INT64; `range` + `expiration_days` is refused when the config is
   read (BigQuery has no expiry for integer ranges); a change log partitioned on
   `_rivet_exported_at` — one value per run — never expires, like a load-date partition.
-
 - **A wrong host or port in `url:` is named as such.** Every engine reported the driver's
   text ("failed to lookup address information…", or MongoDB's whole topology dump); a
   connection that fails before the server answers now says `cannot resolve host <host> —
   check the host name in url:`, `nothing is listening on <host>:<port>`, or `no answer from
   <host>:<port>`, with the driver's text after it. MySQL dials at open, so the message comes
   from `rivet init` / `rivet run` start, not from the first query.
-
 - **`rivet init --include a b c`** — several globs after one `--include` / `--exclude`
   (the repeated form still works).
-
 - **`load: { pk, cluster_by }` default to the source primary key** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
   Both take `auto` (the default), `none`, or a column list. `pk: auto` is the primary key
   `rivet run` recorded, so an incremental / CDC load no longer needs `pk:` for a table with
@@ -2683,7 +2548,6 @@
   `<table>__changes` is now clustered on `cluster_by` rather than always on `pk`.
   `rivet init -o` records each scaffolded export's key too, so a `query:` export — which
   `rivet run` cannot read a key from — also gets one.
-
 - **An incremental export's first run lands as a plain table; the change log starts with the
   first delta.** A run that re-read the whole table (the first run, or one after `rivet state
   reset`) is loaded into `<table>` exactly like a full load. The first delta then renames that
@@ -2695,7 +2559,6 @@
   it without `initial: snapshot`. Previously the first append copied the table into the log
   with a billed `CREATE TABLE … AS SELECT`, and after a full → incremental switch that copy
   duplicated every row the first run had re-read.
-
 - **A load never touches a table it does not own.** A whole-table load onto an existing table
   proceeds only when the load ledger shows rivet loaded it and its partitioning and clustering
   match the config. A table rivet did not load, one whose shape differs (partitioned or
@@ -2705,7 +2568,6 @@
   keep one baseline. Without a ledger (a stateless load) the table's shape is the only
   evidence, and the load says so. On BigQuery row counts come from table metadata, so a table
   that requires a partition filter can be counted.
-
 - **`rivet load` no longer reads the source** ([ADR-0034](docs/adr/0034-load-table-spec.md)).
   A successful `rivet run` of an export in a config with a `load:` block records the
   column types it wrote and the source primary key in the state DB (schema v27,
@@ -2718,20 +2580,17 @@
   application keeps writing into after their insert, with no column that records it.
   With a separate settle column the cursor also stops below the first unsettled row, so
   an out-of-order commit is never skipped. MySQL, PostgreSQL and SQL Server.
-
 - **Fix: changing an export's cursor no longer exports nothing, silently.** The stored
   cursor was keyed by export name alone, so a new `cursor_column` (or keyset →
   incremental on another column) compared the new column against the old value — on
   MySQL a zero-row match with exit 0, on every run. The cursor's column is now recorded
   (state schema v26) and a mismatch fails naming both columns and `rivet state reset`;
   cursors written by keyset before v26 are recognised from the run history.
-
 - **Mode transitions are a contract** ([ADR-0033](docs/adr/0033-mode-transitions.md)): what
   an export inherits when it switches to incremental — a full pass after `full` /
   `time_window` / range `chunked`, a continuation on the same key after keyset, a loud
   refusal on a different column. `docs/mode-transition-matrix.yaml` covers 13 transitions
   on MySQL, PostgreSQL and SQL Server with live tests.
-
 - **Fix: the first incremental / CDC `rivet load` after a full load.** The full load left
   `<table>` as a table, and the incremental load's `CREATE OR REPLACE VIEW <table>`
   collided with it (and its view would have hidden the full-loaded rows). The load now
@@ -2745,7 +2604,6 @@
   signal); `finish-run` terminal-stamps a row you KNOW is dead (hard crash with
   no successful successor — nothing else can release it now that supersession
   is success-only). The cleanup refusal names the commands.
-
 - **CDC re-baseline loads now REFUSE instead of appending silently-wrong
   data.** A snapshot-carrying `rivet load` into a `<table>__changes` that
   already holds change rows hard-fails with a per-warehouse `TRUNCATE`
@@ -2753,14 +2611,12 @@
   changes (and no snapshot can express a PK deleted during the gap), so the
   view would silently keep serving pre-gap values. Stateless loads degrade to
   a note; an errored state store refuses (fail-safe).
-
 - **Snapshot legs are anchor-stamped.** On checkpointed MySQL/SQL
   Server/MongoDB flows the `initial: snapshot` parquet now carries constant
   `__pos` (the CDC anchor) and `__seq = -1` columns, so a re-baseline orders
   correctly in the warehouse dedup. PostgreSQL-without-a-checkpoint and
   pre-existing snapshots keep the legacy NULL shape. Anyone querying
   `__changes WHERE __pos IS NULL` to find baselines sees the new shape.
-
 - **`rivet validate` got stricter — previously-green runs can now exit 3.**
   CDC prefixes presence-check EVERY cycle's committed parts (the dataset is
   the union of run-unique manifests; deleting a historical part used to
@@ -2768,18 +2624,15 @@
   not decode as Parquet is VERIFIED-WRONG even when the manifest records no
   checksums. Budget accordingly: `--depth full` on a long CDC stream now
   honestly re-reads the accumulated history.
-
 - **Resume verifies the destination.** A chunked resume re-exports committed
   chunks whose parts were deleted between attempts (destination probe + the
   M8 rewrite path); a keyset resume REFUSES over a deleted committed page
   (naming `rivet state reset`) instead of finalizing Success over a hole.
-
 - **gc/census supersession requires a newer SUCCESS.** A failed or
   merely-running successor no longer retires a live run's marker; a failed
   run's parts are spared until a Success supersedes them (checkpoint resumes
   may still adopt them); dead `running` markers are retired via the
   terminal-ledger sweep once `finish-run`/the split stamp closes their rows.
-
 - **New refusals of previously-accepted configs** (each was a silent
   misbehaviour): `format: csv` under a `load:` block; `load:` on a non-GCS
   destination (it silently listed a same-named GCS bucket); destination
@@ -2787,19 +2640,16 @@
   `{date}`/`{run_id}` placeholders; equivalent checkpoint-path spellings; a
   MySQL CDC open whose server-identity query fails (no more unverifiable
   anchors); a MongoDB resume token whose `_data` is not a string.
-
 - **`rivet init` generates case-exact configs.** Mixed-case tables route
   through a quoted `query:` (a `CaseTwin`/`casetwin` twin used to silently
   export the WRONG table's rows), SELECT columns are quoted per engine (the
   same twin bug at column level), Mongo always emits `table:` (hyphenated
   collections get an honest SKIPPED comment), and `-o` refuses to overwrite
   an existing file.
-
 - **CSV: NULL and the empty string are distinct at last.** A present empty
   string renders as `""`; NULL stays the bare field (the PostgreSQL COPY
   convention). Existing consumers see different bytes for empty strings;
   DuckDB readers need `allow_quoted_nulls=false` to recover the distinction.
-
 - **Secrets scrubbed from more places.** URL query parameters carrying
   token/password/api-key/signature families are redacted in errors and logs;
   a Slack webhook delivery failure no longer prints the webhook URL (its
@@ -2823,7 +2673,6 @@
   "disable"). `bytes_read` metrics return to approximately the released DECODED-payload
   unit (the old +32/event constant is gone — percent-level on realistic rows)
   and stay comparable with batch exports.
-
 - **Opt-in transaction spilling (`RIVET_CDC_SPILL_DIR`).** A transaction past the
   cap can spill its tail to disk instead of failing (PostgreSQL/MySQL/SQL Server;
   MongoDB needs none by construction). Off by default: it moves the adapter's copy
@@ -2939,7 +2788,6 @@ that followed it:
   points at `rivet validate --depth full` — the check that does read the files.
   The one code path carrying the source count into the manifest was dead
   (`set_source_row_count` was cursor-gated); full/chunked runs now carry it.
-
 - **`rivet cdc --max-events` could wedge a checkpointed NDJSON run forever**:
   the cap broke on the event count alone, so a transaction longer than the cap
   held no commit boundary to checkpoint — every run re-read the same position
@@ -2947,13 +2795,11 @@ that followed it:
   boundary past N (the semantics the config field always documented), matching
   the file sink. Nothing was ever lost — the failure mode was no progress plus
   duplicates, never a skip.
-
 - **a corrupt/foreign CDC checkpoint no longer aborts the run** (fuzz find):
   a `_data` resume-token field sitting beside foreign keys reached an
   `unreachable!` panic inside the bson deserializer; with `panic = "abort"`
   that took the whole process down. The decoder now deserializes from `_data`
   alone and errors cleanly on every malformed shape.
-
 - **one broken view no longer fails every schema-wide MySQL `rivet init`**:
   a view whose base table is gone stays listed in the catalog with zero
   columns, and the MySQL arm of the schema scan — alone of the three engines —
@@ -2961,7 +2807,6 @@ that followed it:
   tolerance: skip exactly the listed-but-vanished shape, abort on any real
   error (a scan that shrugged off a connection drop would emit a silently
   truncated scaffold).
-
 - **the concurrency governor reads pressure the export cannot inflate**
   (0.24.5 carries the follow-through of the #229 rewrite): per-engine
   write/redo counters, idle canaries on all three engines asserting the #229
@@ -2970,7 +2815,6 @@ that followed it:
   `ParallelismAdjusted` record, and the pool-level canary — `apply --pool`
   with the governor armed, the exact field-incident combination, delivering
   every row with no walk toward the floor.
-
 - **multi-table SQL Server CDC capture** is exercised end to end (the first
   multi-table capture test, through the canonical Rig).
 - test-hook vocabulary grew a fourth primitive: `RIVET_TEST_PAUSE_AT`
@@ -3023,23 +2867,19 @@ changes a config or an output format.
   cursor from the committed parts and NEVER re-reads a committed page. Loss-safe by
   construction (a mid-page crash falls back to a recoverable dup, never a loss). NOT
   split-only — any keyset export with `chunk_checkpoint` was affected; `--split` forced it on.
-
 - **A `--pool --split` Full load could gap AND duplicate rows** across two split generations
   of equal size. The coherence guard only counted bottom/top/plain units; two generations at
   the same unit count but different boundaries, with an interior unit substituted from the
   older generation, passed it while the windows no longer tiled. Now a tiling check (the
   multiset of non-None lower bounds must equal the multiset of upper bounds) refuses it.
-
 - **Split siblings superseded each other's `running` markers**, so a later-started sibling
   finishing first made an earlier, still-live sibling look inactive — and a cross-host
   `rivet load --gc-orphans` then deleted the live sibling's in-flight parts. Concurrent
   split siblings are now excluded from supersession; a crash successor (same unit name)
   still supersedes correctly.
-
 - **A trailing split crash dropped the widened tail** on the parallel-keyset runner: a
   reconstruct after the top units hard-crashed widened the tail unit's window but resumed its
   stale, narrower ranges. The open tail now runs fresh when its ordinal left no manifest.
-
 - **`gc_orphans` deleted parts a chunk-checkpoint resume was reusing** — a Failed run's parts
   are adopted (not re-exported) by the resume, so they are now spared while a live run of the
   same export may be adopting them.
@@ -3073,40 +2913,32 @@ deleted — none of them changes a config or an output format.
   the `chrono-tz` feature, so `meta_columns.row_hash` errored on any temporal
   column. On a real MySQL config that cost 63 of 65 exports. The feature is on,
   and the type matrix now runs through every value consumer per engine.
-
 - **The uniqueness check silently skipped every value it could not render** —
   it reported "no duplicates" over rows it never examined. An unrenderable
   PRESENT value now fails the check loudly.
-
 - **An unreadable range bound exported ZERO rows as `success`.** A `min`/`max`
   the bound prober could not parse collapsed to an empty window instead of an
   error; a whole table could vanish behind a green run.
-
 - **A partial or filtered unique index was accepted as a keyset key.** Keyset
   pagination over `WHERE`-filtered index entries pages only the indexed subset;
   the planner now requires a full unique index (`indpred IS NULL` /
   `has_filter = 0`).
-
 - **`scale: 0` bypassed the lossy-down-scale guard** — a decimal column
   override to scale 0 truncated `1.05` to `1` silently, on both the i128 and
   i256 paths. Both twins now refuse, and both are tested.
-
 - **A NULL cursor cell froze the incremental cursor forever.** The cursor
   advanced from the last row of each batch; a NULL there kept the old boundary
   and every later run re-read from it. The cursor now advances from the last
   NON-NULL cell.
-
 - **SQL Server CDC dropped 100% of a table's events on a case-only name
   mismatch** while the checkpoint advanced past them. The adapter now resolves
   identity through `cdc.change_tables` and refuses a table the catalog spells
   differently — before the checkpoint moves.
-
 - **MySQL CDC captured NOTHING under `binlog_transaction_compression = ON`**
   and said nothing: the reader matches event types individually and a
   compressed transaction hides them all inside one `Transaction_payload_event`.
   Measured: anchor, insert two rows, resume ⇒ 0 of 2, empty stderr. The run now
   REFUSES with the setting named and the retention alternative spelled out.
-
 - **A deterministically failed chunk was retried to the attempt cap.** A
   permanent error (SQL syntax, missing column) burned every attempt with the
   same failure; `fail_chunk_task` now distinguishes retryable from permanent.
@@ -3117,16 +2949,13 @@ deleted — none of them changes a config or an output format.
   parts overwrote the manifest, making the previous good delivery unverifiable
   (`[RIVET_VERIFY_SUCCESS_STALE]`). It now leaves the prefix's manifest alone —
   and a skipped run that DID commit parts still describes them.
-
 - **`rivet apply` of a chunked plan ignored `on_schema_drift`** — the gate was
   wired into the single runner only. The runner-bypass class, again; the
   chunked path now runs the same drift check.
-
 - **`rivet check` blessed two configs `rivet plan` refuses** (`query:` +
   `chunk_size_memory_mb`, `query:` + `chunk_by_key`). The rule now lives in ONE
   function (`plan::build::chunked_without_table_error`) asked by both, so the
   preflight and the runner cannot drift apart again.
-
 - **`cleanup_source` deleted source rows without asking the run ledger** — a
   concurrent extract's in-flight prefix could be wiped. The wipe is now gated
   on the state store's run-status, like `gc_orphans`.
@@ -3137,14 +2966,12 @@ deleted — none of them changes a config or an output format.
   records the table shape each strategy decision was derived from — row
   estimate, key span, index — so a strategy is reproducible and auditable
   after the fact.
-
 - **The whole journey as one gate matrix:** `plan → apply → run → validate →
   load` across `pipeline × lifecycle × store × state × engine` (144 declared
   cells, 76 runnable, every `na` with a written reason), with the flag surface
   rotated per cell and `--rerun-failed`. `make release-oracle-full` assembles
   the environment and judges the release; the previous-release baseline is the
   DOWNLOADED asset, never a rebuilt parent.
-
 - **Independent read-back oracles in the live suite:** row counts, ids,
   per-column and schema claims verified through DuckDB — a decoder rivet does
   not link — instead of re-reading outputs with the code that wrote them.
@@ -3164,17 +2991,13 @@ changes a config or an output format.
   every count and sum check passed. Both the builder and the value checksum now
   parse the text form, because fixing only the builder would have turned correct
   exports into checksum failures.
-
 - **A dropped replication slot was silently recreated at the CURRENT WAL
   position** whenever no checkpoint was configured, skipping every change since
   the slot went away. It is now refused.
-
 - **`NaN` / `±Infinity` were nulled by a string column override** — the one path
   that could still carry them.
-
 - **SQL Server date-window literals depended on `DATEFORMAT`,** so a server not
   running `us_english` read every window wrong.
-
 - **The value checksum annihilated duplicates,** which meant `rivet validate`
   verified nothing on any table with repeated values.
 
@@ -3186,15 +3009,11 @@ changes a config or an output format.
   store held the parts and the source had moved past them. An operator reading
   that re-runs for changes the log no longer has. `run_to_files` now returns what
   it made durable alongside the outcome.
-
 - **The parallel-keyset and Mongo-parallel drains bailed ABOVE their own
   `record_part`,** handing the retry guard a zero while parts sat on disk.
-
 - **A resumed run's durable parts were hidden by a stale manifest** —
   rehydration ran only when no manifest existed.
-
 - **An unwritten manifest reported success.** It now fails the run.
-
 - **`rivet load` recorded an IN-FLIGHT run as consumed,** stranding every part
   that run wrote afterwards.
 
@@ -3204,12 +3023,10 @@ changes a config or an output format.
   chunk-checkpoint worker was handed an empty config path, which resolved to
   `./.rivet_state.db` — so a resumed run found its chunks complete and its file
   log empty, and declared a zero-part manifest over parquet already on disk.
-
 - **`mode: cdc` never expanded `{date}` in a destination.** Expansion is a side
   effect of building a plan, and the CDC path returns before `build_plan`, so the
   drain created a directory named, literally, `{date}` while `rivet validate`
   resolved the template to today's date and reported an empty destination.
-
 - **Concurrent writers into one local prefix deleted each other's staged
   files,** because each staged its write under a name derived from the final key
   alone.
@@ -3219,10 +3036,8 @@ changes a config or an output format.
 - **Shape tracking never worked on the PostgreSQL backend at all** — the code
   ran, runs succeeded, and `export_shape` stayed empty on one backend while
   filling on the other.
-
 - **Migration v21 was missing from the PostgreSQL ladder,** and nothing offline
   said so.
-
 - **Parallel writers against an empty backend killed each other's migrations.**
   They are now serialised.
 
@@ -3231,17 +3046,14 @@ changes a config or an output format.
 - **An independent read-back oracle.** Completeness claims across the live suite
   now go through DuckDB, a decoder rivet does not share, instead of re-reading
   outputs with the code that wrote them.
-
 - **A blessed-path gate cell:** `init → doctor → check → plan → apply → validate
   → reconcile` in ONE traversal, per engine × read strategy × store × state
   backend, asserting every artifact and comparing source, manifest and DuckDB.
   Measured before adding it: no test in the repository drove even three of those
   five subcommands in a single body.
-
 - **State-backend parity read by one decoder.** DuckDB attaches the SQLite file
   and the Postgres store in a single session, so a surviving difference is data
   rather than rendering.
-
 - **A full BigQuery cycle** in the gate: export to real GCS → load → verify by
   `bq query` → drop, with the drop verified rather than assumed.
 
@@ -3253,10 +3065,8 @@ changes a config or an output format.
   `i % 3 <> 0`). `seed-release` also named two engines and skipped SQL Server.
   All three SQL engines now produce a byte-identical fixture, verified by
   exporting each and hashing the parquet through DuckDB.
-
 - **`dbo.orders` had two owners** with incompatible schemas, one of which
   DROP+CREATEs; the init-time probe is now `dbo.planning_probe`.
-
 - **Three false-greens in the release gate:** an unreadable state-DB query
   scored as clean, the GCS concurrency leg rendered a verdict without counting
   rows and then deleted the evidence, and two empty parity profiles "agreed".
@@ -3273,7 +3083,6 @@ changes a config or an output format.
   compares export **families** — the snapshot leg folds to its parent
   (`manifest::snapshot_family`); a snapshot leg of a *different* export is
   still refused. Found live by a downstream re-extraction migration. (#138)
-
 - **Release oracle: the `cdc[mongo]` cell could never run.** The gate's mongo
   helper hardcoded in-container credentials the repo compose does not have
   (`mongo-rs` runs without auth), so every armed run died on "Authentication
@@ -3644,12 +3453,10 @@ changes a config or an output format.
   reads the cause and the exact resume point from the state DB alone, without
   re-querying the source. (`export_metrics` schema v18; older rows deserialize
   with the new fields defaulted.)
-
 - **`rivet plan` / `check` warn at plan time when a fixed `chunk_size` × row
   width is a heavy chunk** — before the windows execute, naming the escape
   (shrink `chunk_size`, or `chunk_size_memory_mb`), so a pathological memory
   plan is caught up front rather than mid-run.
-
 - **Canonical self-contained seeds** (`seeds/common/{postgres,mysql,mssql}.sql`,
   `seeds/mongo_seed.py`) — reproducible per-engine fixtures with a full type
   matrix, used by the dogfood and the release gate.
@@ -3674,19 +3481,15 @@ changes a config or an output format.
   `ARRAY<STRUCT<item T>>` (matching rivet's Parquet list encoding) with
   `enable_list_inference`, landing as `REPEATED RECORD{item}` with values
   intact.
-
 - **A `DECIMAL` keyset key is refused at plan time**, and a keyset/parallel
   request on a heterogeneous Mongo `_id` warns instead of silently paging a
   single BSON type bracket — closing a class of silent partial exports.
-
 - **Preflight no longer phantom-warns "heavy chunk" on a low-cardinality key.**
   A per-chunk scan estimate is clamped to the table's own row count, so a dense
   key (few distinct values, many rows each) no longer extrapolates more rows
   than the table holds.
-
 - **MySQL `ERROR 3024` (statement timeout) is wrapped with the actionable
   fix** instead of surfacing the raw driver error.
-
 - **`rivet init` fixes:** the SQL Server introspection `STRING_AGG`s are cast to
   `nvarchar(max)` so a wide table no longer trips `Msg 9829`; the full-mode
   rationale no longer claims "below 100K" on a table above the threshold.
@@ -3769,7 +3572,6 @@ and the three type oracles.
   against a real object store (delete_under/gc_orphans refuse the root, spare siblings, and
   still drain a scoped prefix). S3/Azure/local exports have no recursive-delete surface and
   were never exposed.
-
 - **Data DESTRUCTION #2 (GCS load cleanup, string-prefix over-delete):** `GcsStore::remove_all`
   passed the raw bucket-relative prefix to opendal, which matches by STRING prefix, so a
   post-load cleanup of `exports/orders` ALSO deleted `exports/orders_archive/…` and every
@@ -3779,51 +3581,42 @@ and the three type oracles.
   `dir_boundary` directory-scoping helper, so cleanup can never delete beyond what the load
   saw. RED-proven on the fs backend (opendal string-prefixes there too) — the prior test used
   a non-prefix sibling and never activated it.
-
 - **Silent CORRUPTION (Postgres CDC unchanged-TOAST datum):** an UPDATE that leaves an
   externally-stored TOAST column untouched renders it as the unquoted `unchanged-toast-datum`
   marker (the value is not in the WAL); rivet wrote that literal string into the column. It
   now recovers the real value from the `REPLICA IDENTITY FULL` pre-image by column name, or —
   when no pre-image value exists — fails loud naming the exact upstream fix, never fabricating
   the marker as data. Reproduced live (`SET STORAGE EXTERNAL` + an incompressible value).
-
 - **Silent-loss (chunked-checkpoint resume, `max_file_size` rotation siblings):** a resume
   whose prior manifest existed and whose parts were still present (all Skip decisions) orphaned
   every rotation SIBLING beyond the first from the finalize manifest — because chunk_task
   records only the first sibling's name — so the manifest-authoritative `rivet load` dropped
   their rows. A Skip now hydrates the manifest part unconditionally (it needs no chunk_task).
-
 - **`rivet validate` Form B was a no-op on the two chunk-checkpoint runners**, and the
   cross-shape CDC-vs-batch **manifest-overwrite guard was absent** on them — the resumable
   checkpoint runners bypassed both. Both are now wired in (per-runner coverage matrix, 0 gaps).
-
 - **CDC snapshot/stream schema parity (`meta_columns`):** batch-only `meta_columns`
   (`exported_at`/`row_hash`) injected on the `initial: snapshot` leg ONLY diverged the two
   legs' columns — both load into one `<table>__changes` — breaking the merged load view. The
   snapshot leg no longer inherits them, and a run-start warning notes CDC ignores meta_columns.
-
 - **CSV fidelity (naive TIMESTAMP vs instant TIMESTAMPTZ):** both rendered identically with no
   marker, so a consumer loading the instant on a non-UTC session read the UTC wall-clock as
   local and shifted every value. An instant now carries a trailing `Z`; a naive value stays
   bare — preserving the distinction rivet keeps in Parquet and the warehouse target types.
   Verified via DuckDB (`read_csv_auto` now types the instant column `TIMESTAMP WITH TIME ZONE`).
-
 - **Silent completeness break (quality gate on keyset / parallel-Mongo):** the
   `row_count_min` tripwire (exit 3) fired only on single/chunked, so a truncated keyset or
   parallel-Mongo extract — the runners auto-selected for LARGE tables — exited 0/success
   with the gate silently disarmed. The gate now runs for the Keyset strategy too.
-
 - **DoS of the trust oracle (`_SUCCESS`):** `parse_success_marker` no longer panics
   (`split_at` on a non-char-boundary) on a crafted 21-byte marker, and `rivet validate`
   now byte-caps the `_SUCCESS` read (CWE-400) the same way it caps `manifest.json` — both
   hardening the destination-writable control artifact against a planted payload.
-
 - **Check↔run footguns (fail loud, not crash mid-export):** a negative-scale decimal
   column (valid in the source + Arrow, unwritable in Parquet) is now refused at parquet
   writer creation with an actionable message instead of crashing mid-export; a
   `parquet.row_group_rows: 0` clamps to 1 instead of panicking; and `compression: lz4`
   emits the standard interoperable `LZ4_RAW` codec, not the deprecated Hadoop-framed LZ4.
-
 - **Silent-loss (Postgres incremental/keyset cursor on a non-UTC session):** the
   timestamptz cursor boundary was re-injected as an offset-less naive-UTC literal and
   PostgreSQL parses a naive literal in the SESSION TimeZone, so on any non-UTC session
@@ -3832,12 +3625,10 @@ and the three type oracles.
   window — invisible under the UTC test session. The read txn now pins
   `SET LOCAL TimeZone = 'UTC'` (mirroring the MySQL path); a west-of-UTC two-run live
   test proves the union loses nothing.
-
 - **Guardrail bypass (keyset / parallel-Mongo `on_schema_drift`):** keyset and
   parallel-Mongo exports own their own runners and never reached the drift gate, so an
   opted-in `on_schema_drift: fail` returned exit 0 on a drifted schema for the headline
   large-table path; the gate is now wired into both runners.
-
 - **Resource & robustness:** a `tuning:` block that omits `batch_size_memory_mb` no
   longer silently disables the profile's memory-driven per-batch cap (it was ~3×-ing
   Postgres per-batch RSS on wide tables); a user `max_batch_memory_mb` is clamped below
@@ -3853,21 +3644,17 @@ and the three type oracles.
   silently never loaded (and the source then cleaned up). Repair now routes through the
   shared manifest writer, updating the canonical file, the run-unique copy, and the
   `_SUCCESS` fingerprint together.
-
 - **Silent-loss (CSV, pre-1970 timestamps):** a microsecond timestamp before the epoch
   with a sub-second fraction rendered as an EMPTY cell (a signed-remainder wrap made
   `from_timestamp` reject it) while Parquet kept the value; fixed with Euclidean division.
-
 - **Silent-loss (chunked resume):** the M8 resume preamble quarantine-MOVED a part that a
   prior resume had durably committed (a `file_log` row) but that the stale destination
   manifest omitted — dropping the exact rows finalize rehydrates. It now consults the
   state DB (the source of truth) and never quarantines a file_log-recorded part.
-
 - **Silent-loss (warehouse load, shared prefix):** the load summed EVERY manifest under
   its prefix and cleanup wiped the prefix recursively, so two exports sharing a base
   prefix cross-contaminated the row count and could delete a sibling export's un-loaded
   parts; the load now refuses a prefix holding more than one export loudly.
-
 - **CSV header** column names are now RFC-4180 quoted like data cells — a curated-query
   alias containing a comma/quote (`AS "Amount, USD"`) no longer splits the header and
   mis-aligns every downstream reader.
@@ -3881,35 +3668,29 @@ and the three type oracles.
   manifest), chunked and keyset (resume reconstructs every committed part from the
   state `file_log`, rotation siblings included). Each is proven MANIFEST-DRIVEN, not by
   a parquet glob (the read that masked the class).
-
 - **Credential leak: the log/state redactors no longer echo a password** containing a
   raw `/ ? # @ :` or a stray query `@` (base64 secrets contain `/`). Both redactors were
   rewritten to a default-deny rule (userinfo ends at the last `@` before whitespace,
   user split on the first `:`) that never leaks.
-
 - **Security (warehouse load):** source-derived column, table, and primary-key names are
   refused unless a plain SQL identifier, and the Parquet URIs (from the live GCS listing)
   are refused if they carry a quote/backslash/control char — both are DDL/COPY/`FILES=()`
   injection surfaces spliced unescaped into executed warehouse SQL. The load-reconcile
   manifest read is byte-capped (CWE-400); Snowflake append `COPY` now uses `FORCE=TRUE` so
   at-least-once re-append is not silently deduped away.
-
 - **DoS: the PostgreSQL CDC `test_decoding` text decoder no longer aborts the process on
   hostile wire text.** Two char-boundary panics — the array-literal parser copying a
   backslash-escaped multibyte char, and the uuid/bytea hex decoder byte-slicing a
   non-ASCII value — would panic mid-CDC, and under the release `panic=abort` profile that
   aborts the whole run. Both are guarded; the `map_pg_value` totality proptest now draws
   the real type-name set so the uuid/bytea arms are actually exercised.
-
 - **Silent-loss (types):** a MSSQL `MONEY` past the f64-exact range, a PG/MySQL decimal
   scale under-declaration, and a PG temporal/uuid/bytea array column now FAIL loudly
   instead of shipping a rounded / truncated / all-NULL column; a MSSQL `time(7)` column's
   100ns-tick truncation is now surfaced in the type-report (the honesty sibling of the
   `datetime2` warning), not silently dropped past the value-checksum.
-
 - **Regression: MSSQL authentication** with a special-character password (broken by the
   0.21.0-era percent-encoding fix — MSSQL's hand-rolled URL parser never decoded it).
-
 - **Config validation** now rejects the accept-but-break combinations that formerly
   passed `rivet check` then failed or silently degraded at run (chunk knobs outside
   `mode: chunked`, `partition_by` with `cdc`/`time_window`/a `load:` block/a missing
@@ -3944,7 +3725,6 @@ and the three type oracles.
   `until_current: false` (config) or `--stream` (the `rivet cdc` CLI flag, which
   **replaces** `--until-current`). An explicit continuous run now logs a warning
   so the streaming choice is deliberate, never silent.
-
 - **SQL Server TLS backend switched to vendored OpenSSL.** `tiberius` now links
   its `vendored-openssl` backend instead of the pinned `rustls` 0.21, removing
   RUSTSEC-2026-0098/0099/0104 (and RUSTSEC-2025-0134) from the dependency tree
@@ -3986,7 +3766,6 @@ and the three type oracles.
   in-bound commit and the next scheduler cycle resumes from it (per-engine
   two-run defer-not-drop live tests; the PG variant's termination goes RED
   without the bound).
-
 - **PostgreSQL CDC bounded runs now reach the open bound in one pass, whatever
   the captured-data density.** The non-consuming `pg_logical_slot_peek_changes`
   always re-reads from the slot's un-acked position, and the slot only advances
@@ -4003,7 +3782,6 @@ and the three type oracles.
   regardless of density, and drain RSS stays at the documented O(rollover) (the
   earlier 3× peek escalation, which only covered the captured-marker case, is
   removed).
-
 - **PostgreSQL CDC: row-less transaction churn no longer pins the slot.** DDL
   churn decodes as empty `BEGIN`/`COMMIT` transactions: nothing reaches the
   sink, the sink never acks, and on an idle database the slot kept pinning WAL
@@ -4013,11 +3791,9 @@ and the three type oracles.
   by construction; a run that yielded data leaves acking to the sink, and its
   trailing empty span becomes the next run's zero-yield release. Engines with
   reader-independent retention (MySQL/SQL Server/MongoDB) need nothing.
-
 - **Bounded CDC on a PostgreSQL standby now fails with an actionable error**
   (`pg_current_wal_lsn()` is unavailable during recovery): stream continuously
   or point the source at the primary.
-
 - **PostgreSQL and SQL Server CDC no longer lose the tail of a large
   transaction across a crash.** Both adapters marked every change event
   `committed: true`, so a source transaction larger than `rollover` rolled +
@@ -4030,7 +3806,6 @@ and the three type oracles.
   only at the true commit boundary and a transaction is always one atomic unit
   ("never split a transaction across parts"). Pre-existing (not introduced by
   the `until_current` work); surfaced by an adversarial review.
-
 - **CDC: an oversized single transaction now bails loudly instead of risking
   OOM.** A transaction is buffered whole (never split across parts), so an
   outsized one grew the buffer unbounded. Every log/poll adapter
@@ -4118,7 +3893,6 @@ and the three type oracles.
   identical file names, and the local backend (`idempotent_overwrite`) silently
   overwrote the earlier run's part — an incremental delta's rows were lost (a live
   test lost 3 of 6). Now millisecond-stamped, matching the other writers.
-
 - **PostgreSQL CDC under a non-default database `datestyle` / `bytea_output`.**
   `test_decoding` renders values as TEXT in the polling session's format, and the
   CDC reader inherited the database default — so `datestyle='German, DMY'` nulled
@@ -4127,7 +3901,6 @@ and the three type oracles.
   datestyle='ISO, MDY'`, `bytea_output='hex'`, `intervalstyle='postgres'`), immune
   to the database default. Binary readers (MySQL binlog, SQL Server change tables,
   the batch binary protocol) were never affected.
-
 - **Warehouse `--target` preflight no longer over-promises decimal types.** The
   type resolver claimed native types the warehouse cannot hold: Snowflake
   `NUMBER(50,10)` (max precision 38) and ClickHouse `Decimal(80,2)` (max 76) were
@@ -4159,7 +3932,6 @@ and the three type oracles.
   *proves* the blow-up (PostgreSQL / SQL Server) and **warns** where it can only
   suspect it (MySQL — `information_schema.TABLE_ROWS` is too unreliable to prove),
   naming the fix in both: `chunk_dense: true`, `chunk_count: N`, or `mode: full`.
-
 - **SQL Server DATE / DATETIME scalars now render as ISO.** `chunk_by_days` and
   `mode: time_window` on an MSSQL DATE key failed the run — the `min`/`max` scalar
   came back as the driver's Debug representation, which the date parser could not
@@ -4171,12 +3943,10 @@ and the three type oracles.
   instead of range `chunk_column`. Keyset pages by rows
   (`WHERE pk > last ORDER BY pk LIMIT n`) and is immune to a sparse / huge / gappy
   key. No PK (or a composite PK) → range chunking as before.
-
 - **SQL keyset is now resumable via `chunk_checkpoint: true`** — it persists the
   last committed key and resumes there (crash recovery + incremental-by-key), the
   engine-agnostic mechanism previously reachable only for MongoDB. The
   immune-*and*-resumable shape for a large key over a flaky link.
-
 - **Post-mortem telemetry:** `export_metrics.chunk_key` records which column a run
   chunked on (the span / window count remain derivable from `chunk_task`).
 
@@ -4212,7 +3982,6 @@ and the three type oracles.
     harm metrics (`serverStatus`), TLS (`require_tls_or_loopback`), and full
     `doctor` / `check` / `plan` / `apply` support. Live-tested through the
     canonical `Rig` across a MongoDB **4.4 → 8.0** version matrix.
-
 - **Heterogeneous-`_id` warning + warehouse merge guidance.** A collection that
   mixes `_id` BSON types (int `1001` and string `"1001"`, or an ObjectId and its
   hex as a string) stringifies them to the same flat `_id` text — a downstream
@@ -4235,7 +4004,6 @@ and the three type oracles.
   Per-engine live conformance tests plus a `SUM(v)` source-vs-target
   reconciliation over an intra-transaction workload. Both `rivet cdc` outputs
   (NDJSON + Parquet) carry `__seq`.
-
 - **Config accepts an optional top-level `load:` block** for a downstream loader
   (the `rivet-pro` warehouse load): the load target lives in the same config so
   ONE file drives both export and load. Rivet does not interpret it — accepted
@@ -4360,7 +4128,6 @@ and the three type oracles.
   encoding shared by both sides; a new accessor per engine, enforced at compile time). An offline matrix
   guard pins the CDC fold to the builder across every covered type with hostile cells (overflow
   narrowing, wrong-width binary, arrays with inner NULLs, NaN, u64::MAX, 50-digit decimals).
-
 - **Batch exports now verify wire column NAMES against the resolved mapping on every decoded batch.**
   The probe ("ALTER between chunks") showed both sequential paths are server-serialized — PostgreSQL
   holds ACCESS SHARE across the export transaction (a mid-export `DROP COLUMN` measurably waited 3.7 s
@@ -4370,13 +4137,11 @@ and the three type oracles.
   connections, same-arity rename/reorder that no arity check can see) had no guard. All three engines'
   batch decoders now compare the wire's column names (case-insensitive) against the resolve-time
   mapping before decoding and fail loudly with the re-run recovery path.
-
 - **MySQL CDC maps images by name under `binlog_row_metadata=FULL`** (8.0.1+): the TABLE_MAP optional
   metadata carries every column name; with FULL on, a mid-window `DROP COLUMN` goes from loud failure
   to correct capture. Missing-name + matching-arity falls back positionally (a mid-window RENAME must
   not degrade values to NULL — the rename pin caught exactly that in the first cut). MINIMAL keeps the
   loud arity guard. The compose test stack sets FULL; recommended in production.
-
 - **Positional column mapping eliminated wherever the engine names its columns.** Ultrareview round 2
   found the class live (finding #41): a PostgreSQL DELETE under default REPLICA IDENTITY carries ONLY
   the key columns — with names in the wire text that the parser discarded — so a non-first/compound PK's
@@ -4390,7 +4155,6 @@ and the three type oracles.
   corruption class (#37/#41/#42) is unrepresentable on PG/MSSQL. MySQL binlog is nameless by protocol;
   its arity guard stays load-bearing (schema history remains the roadmap answer there). Live pins:
   non-first-PK delete, PK-changing update.
-
 - **Round-2 review nits fixed**: MySQL 8.4 + binlog-off now reports "binlog disabled" instead of a
   masked syntax error; the outcome gate scans all eight CDC test files and recognizes direct
   `Command::new(RIVET_BIN)` captures plus the newer read-back helpers; the soak script is
@@ -4399,7 +4163,6 @@ and the three type oracles.
   trailing newline had glued `.claude/` + `mutants.out/` into one pattern, un-ignoring `.claude/` —
   repaired and untracked; a contradictory golden comment corrected; the six surviving decimal mutants
   are documented as boundary-equivalent (mathematically unkillable).
-
 - **Negative-scenario sweep: five hostile families closed, two more findings.** Binary-level fuzz over
   the MySQL cell-fix layer found the enum-label parser PANICKING on malformed native strings and — worse
   — silently MOJIBAKE-ing every non-ASCII label (`ENUM('привіт')` byte-cast char-by-char; findings
@@ -4412,30 +4175,25 @@ and the three type oracles.
   YAML. Plus cargo-mutants' first harvest: the CSV decimal renderer and the negative-scale parse arms
   had zero test sensitivity — killed with targeted units (sign preservation, padding width, exact
   negative-scale rendering).
-
 - **`rivet validate` Form B now covers CDC prefixes.** The CDC manifest recorded
   `column_checksums: None`, so validate's value-checksum re-read silently skipped CDC outputs while
   reporting PASSED (finding #38). The sink already computed the arrow-side sum per column per part
   (Form A); it now XOR-accumulates them across parts into the manifest — the same combining rule the
   re-read applies — and a tampered part or recorded sum fails validation. Live-pinned, including the
   tamper case.
-
 - **MySQL 8.4 support: binlog coordinates via `SHOW BINARY LOG STATUS` with a legacy fallback.**
   8.4 removed `SHOW MASTER STATUS` (the version scout's first empirical catch — every anchor/pin path
   died on the first run); rivet now tries the 8.2+ form first and falls back for older servers. The
   full pilot flow (`initial: snapshot` → stream → idle) verified live against 8.4.10 AND 5.7.44.
-
 - **DDL inside a capture window fails loudly instead of silently misaligning values.** Binlog row
   events are positional and nameless; after a mid-window `DROP COLUMN a`, the pre-DDL event's `a`
   value landed in column `b` — silently, status success (observed live). The sink now refuses any
   event whose arity differs from the resolved schema, with the recovery path in the error
   (re-snapshot / reset the checkpoint past the DDL); no misaligned part reaches the destination.
   DDL between runs and mid-window RENAME are pinned as safe.
-
 - **Documented: CDC memory is O(largest transaction).** Measured ~1.4 KB RSS per buffered row
   (100k-row single transaction ≈ 170 MB, 300k ≈ 440 MB, linear) — bulk backfills belong in batched
   transactions or the batch path; transaction spilling is roadmap.
-
 - **Staff-review test program: seven verification classes added in one pass.** (1) Concurrent-writer
   model-based test — 4 threads × 250 randomized ops over shared keys; conservation (events == the
   writers' affected-row counts) and convergence (the documented merge reproduces the source's exact
@@ -4451,7 +4209,6 @@ and the three type oracles.
   char (`&frac[..4]` on emoji), so corrupt decimal wire text would crash the export; now rejects
   gracefully. (7) Observability contracts — `rivet doctor --json` must SEE the gremlins' fault states
   (purged-binlog checkpoint flagged; healthy baseline green).
-
 - **CDC golden suite: hand-calculated metrics over the batch fixture schemas.** The matrices prove
   CDC == batch; the goldens anchor CDC to ARITHMETIC — a deterministic insert/update/delete workload
   over golden copies of eight real batch-fixture schemas (decimal money, char(36) uuids,
@@ -4461,7 +4218,6 @@ and the three type oracles.
   sums, planned NULL profiles, distinct-set identities, deleted-id sets, manifest row counts. If batch
   and CDC ever drift TOGETHER, the matrices stay green — this suite does not. A row in the conformance
   matrix.
-
 - **Gremlin suite for CDC: real faults, not panics.** Five fault classes the `RIVET_TEST_PANIC_AT`
   matrix structurally cannot exercise (a panic unwinds and runs `Drop`; these do not): SIGKILL
   mid-drain, the binlog TCP stream cut after N bytes (toxiproxy `limit_data` — deterministic), a hard
@@ -4473,7 +4229,6 @@ and the three type oracles.
   leaves the SHARED job disabled and cascades into every other test). Each asserts the at-least-once
   contract from the outside: loud failure, then a healed retry whose union of parts holds every row —
   overlap allowed, gap never. All five are rows in the conformance matrix.
-
 - **Test harness: three standing hard gates distilled from the campaign.** (1) A CDC engine
   conformance gate (offline, plain `cargo test`) requiring every engine to carry every conformance
   case — resume, idle-first-run, crash-before-ack, type matrix, update/delete, initial snapshot,
@@ -4484,24 +4239,20 @@ and the three type oracles.
   (3) CI: nightly `cargo-mutants` over the CDC modules (surviving mutant = named test blind spot) and a
   per-PR schema-diff gate requiring every new config key to be named by a test (the worst campaign bugs
   lived at knob intersections).
-
 - **CDC: a transaction's commit boundary counts even when its last event lands on an uncaptured
   table.** MySQL marks only the LAST event of a transaction committed; the routing filter ran first, so
   a transaction ending on an unlisted table (audit-log-written-last — the common ORM shape) never
   advanced the checkpoint: the captured rows were re-read and re-written on every scheduler cycle until
   binlog retention killed the export. The boundary is recorded before routing now, on both the file sink
   and the NDJSON path. (Ultrareview finding; live + unit pinned.)
-
 - **CDC: schema-qualified `table:`/`tables:` entries route correctly.** `table: public.orders` — the
   shape the batch docs promote — compared verbatim against the adapter's bare table name, matched zero
   events, and produced a 0-row success. Qualified entries now match schema AND table; bare entries match
   the bare name. (Ultrareview finding.)
-
 - **`initial: snapshot`: a missing checkpoint with prior-run evidence fails loudly on MySQL/SQL Server
   too.** The finding-#28 fix covered only PostgreSQL; a deleted checkpoint file after a completed
   snapshot silently re-pinned MySQL at `SHOW MASTER STATUS` and SQL Server at max-LSN — the latter
   actively destroying its natural min-LSN over-read floor. (Ultrareview finding.)
-
 - **`initial: snapshot` no longer bypasses the vanished-slot protection.** The anchor step ran with
   `resume_expected=false` on EVERY run, so a dropped/invalidated PostgreSQL slot was silently recreated
   at the current position before the loud-failure path could fire — every change since the drop was
@@ -4509,7 +4260,6 @@ and the three type oracles.
   Resume evidence (a checkpoint position OR any completed `snapshot/_SUCCESS` marker) now makes a
   missing server-side anchor a loud error with the re-snapshot hint. Live:
   `pg_initial_snapshot_vanished_slot_fails_loudly_not_recreates`.
-
 - **PostgreSQL CDC: `timestamptz` no longer corrupts at a non-UTC session/database timezone.**
   `test_decoding` renders the instant in the POLLING SESSION's zone; the parser stripped the trailing
   offset and treated the wall-clock as UTC — a +9h value shift at an `Asia/Tokyo` default, and at any
@@ -4519,7 +4269,6 @@ and the three type oracles.
   MySQL global (TIMESTAMP → UTC instant, DATETIME → wall-clock) and an `Asia/Tokyo` PostgreSQL database
   default (`*_non_utc_*_matches_batch*`); CSV output parity is pinned separately
   (`cdc_csv_rendering_matches_batch_csv`).
-
 - **CDC fails loudly on `'NaN'::numeric` — exactly like batch.** A non-null decimal cell that cannot be
   represented in a Parquet decimal (PG NaN/±Infinity NUMERIC) previously became a silent NULL on the CDC
   path while the batch export failed loudly; both now fail identically, naming the payload. Hostile-value
@@ -4528,7 +4277,6 @@ and the three type oracles.
   byte-for-byte. UPDATE after-images and DELETE key-images are now pinned against post-update batch
   exports through the typed surface on all three engines
   (`*_cdc_update_and_delete_carry_full_types`).
-
 - **`cdc.initial: snapshot` — anchor-then-snapshot-then-stream in one run.** The safe
   incremental→CDC switch used to be operator choreography (create the anchor first, then a final batch
   catch-up, then CDC — get the order wrong and there's a silent gap, demonstrated live). It is now a
@@ -4539,14 +4287,12 @@ and the three type oracles.
   crash mid-snapshot re-snapshots on retry with the anchor intact; later runs skip straight to the
   drain. MySQL / SQL Server require `cdc.checkpoint:` with it (validated at load). Live (all three
   engines): `*_initial_snapshot_covers_preexisting_rows_then_streams`.
-
 - **CDC↔batch type parity is now TOTAL — arrays and Decimal256 close the last two gaps.** PostgreSQL
   arrays ride through CDC as real `List` columns (element field name/nullability matched for ArrayData
   equality; inner NULLs, quoted/escaped elements, and empty arrays preserved — the `test_decoding`
   literal is parsed, never passed through as text), and `NUMERIC`/`DECIMAL` above precision 38 build as
   `Decimal256` with the same digit-exact parse as `Decimal128`. The PostgreSQL matrix test drops its
   "everything but arrays" exception and now covers the full surface, `NUMERIC(60,10)` included.
-
 - **Table-qualified `columns:` override keys.** On a multi-table (schema-wide) export a bare key
   (`amount:`) applies to every captured table that has the column; a qualified key
   (`"orders.amount":`) targets one table and wins over the bare key there — same-named columns with
@@ -4556,7 +4302,6 @@ and the three type oracles.
   `types::overrides_for_table`). Live: `cdc_qualified_overrides_target_one_table_bare_applies_to_the_rest`;
   per-table type resolution under name collisions is separately pinned by
   `cdc_multi_table_same_column_name_different_types_resolve_per_table`.
-
 - **CDC slot multiplexing: `tables:` — several tables through ONE stream.** A `mode: cdc` export can now
   list `tables: [orders, users, …]` and capture them all through a single PostgreSQL slot / MySQL binlog
   connection with a single checkpoint, instead of one export (and one slot — PostgreSQL decodes the WAL
@@ -4601,23 +4346,19 @@ and the three type oracles.
   it caught the first fix attempt as a mismatch, exactly as designed. Fidelity note: the f64 hop is
   exact up to ~9×10¹¹ currency units (money's server range exceeds f64 integer precision above that).
   Money is back in the CDC type matrix. Regression (live): `mssql_money_values_survive_batch_and_cdc`.
-
 - **MySQL CDC: negative `MEDIUMINT` values no longer flip sign.** The binlog's 3-byte value arrives
   without 24-bit sign extension (0x800000 decoded as +8388608 instead of −8388608) — caught by the
   cross-oracle sweep, invisible until a negative mediumint entered the matrix. Sign-extended now;
   `mediumint unsigned` untouched.
-
 - **CDC honours `columns:` type overrides.** `resolve_cdc_columns` passed an empty override map, so the
   config's per-column declarations were silently ignored on the CDC path — e.g. the documented
   `bigint unsigned → "decimal(20,0)"` override for BigQuery-bound exports (BQ has no unsigned 64) only
   worked for batch. CDC now applies the same override surface; a multi-table export applies the map to
   every table. Regression (live): `cdc_column_overrides_apply_like_batch`.
-
 - **MySQL CDC: `SET` columns decode their binlog bitmask to the member labels.** The binlog delivers a
   SET as raw little-endian bitmask bytes; the sink rendered them as lossy text. The bitmask now maps to
   the comma-joined members in declaration order (`'x,z'`), exactly the server's own rendering — labels
   come from the same `information_schema.COLUMN_TYPE` enrichment ENUM uses.
-
 - **PostgreSQL CDC: a vanished slot with an existing checkpoint fails loudly.** `open()` used to
   re-create a missing slot unconditionally — correct on the first run, but on a *resume* (checkpoint
   present) a fresh slot anchors at the current position and silently skips everything since the drop.
@@ -4626,7 +4367,6 @@ and the three type oracles.
   never falls back to "start from current".
   Regressions (live): `pg_cdc_vanished_slot_with_checkpoint_fails_loudly_not_recreates`,
   `cdc_resume_from_missing_binlog_fails_loudly_not_silently`.
-
 - **CDC type matrices extended to the full contracted surface** — MySQL adds
   smallint/mediumint/int/int-unsigned/**bigint-unsigned (max value, → `Decimal(20,0)`)**/float/double/
   char/text/**SET**; PostgreSQL adds json (non-jsonb)/bpchar/varchar/real; SQL Server adds
@@ -4634,12 +4374,10 @@ and the three type oracles.
   batch. `MONEY`/`SMALLMONEY` are deliberately excluded: the **batch** export currently nulls their
   values (typed `decimal(19,4)`, value lost) — including them would "pass" on NULL == NULL and mask the
   loss; tracked as an open batch finding.
-
 - **Multi-table CDC to cloud destinations pinned end-to-end** against a real GCS API (fake-gcs):
   per-table `<prefix>/<table>/` keys for parts + `manifest.json` + `_SUCCESS`, and an explicit assert
   that the mangled flat-key shape can never return
   (`cdc_multi_table_to_gcs_lands_per_table_prefixes`).
-
 - **CDC all-types parity audit: eight per-column silent losses fixed, and the audit pinned as live
   tests.** One wide table per engine (the union of the official type matrices) exported both ways —
   batch and CDC — must produce byte-identical Arrow columns (`ArrayData` equality); SQL Server already
@@ -4661,14 +4399,12 @@ and the three type oracles.
     with MySQL's own `", "`/`": "` spacing so CDC and batch render one value identically. BIT/BINARY/ENUM
     need widths/labels the wire metadata lacks, so the CDC resolve enriches `source_native_type` from
     `information_schema.COLUMN_TYPE` (CDC-only; batch naming and its contracts untouched).
-
 - **PostgreSQL CDC: `uuid` and `bytea` values decode to raw bytes.** `test_decoding` renders a uuid as
   its 36-char hyphenated text and bytea as `\x…` hex; the parse forwarded both as text bytes, and the
   sink's `FixedSizeBinary(16)` builder — which accepts only exactly-16-byte values — silently degraded
   **100% of the uuid column to NULL** while every count/sum check still passed (caught by eye on a live
   GCS export). The parse now decodes both renderings to the same raw bytes the batch path produces.
   Regression: `uuid_and_bytea_decode_to_raw_bytes_not_their_text_rendering`.
-
 - **SQL Server CDC: schema/table resolved from `cdc.change_tables` metadata, not the capture-instance
   name.** The `<schema>_<table>` split-once heuristic mis-tagged every event when an instance was named
   after an underscored table (`product_catalog` → schema `product`, table `catalog`), so table routing
@@ -4677,7 +4413,6 @@ and the three type oracles.
   the fix recovered the full backlog from the change tables — no re-snapshot needed. The name heuristic
   remains only as a fallback when the metadata row is unreadable.
   Regression (live): `mssql_cdc_capture_instance_name_must_not_decide_the_table`.
-
 - **MySQL CDC: an idle first run now pins the resume position.** The checkpoint file was written only
   at a part commit, and a MySQL run without a checkpoint anchors to the *current* master position
   (`SHOW MASTER STATUS`). So a bounded first run that drained zero changes left no checkpoint, the next
@@ -4724,14 +4459,11 @@ schema bump is the version title only.
   a scheduler / CI step matches on the code, not the wording. Codes: `RIVET_CONFIG_NO_EXPORTS`,
   `RIVET_CONFIG_CHUNK_COUNT_INVALID`, `RIVET_CONFIG_CHUNK_BY_DAYS_INVALID`, `RIVET_CONFIG_DUPLICATE_EXPORT`,
   `RIVET_SOURCE_STATEMENT_TIMEOUT`.
-
 - **`--json` on the remaining inspect commands** — `metrics`, `state show`, `state files`, `state chunks`
   (the rest already had `--format json`). `state chunks --json` is a run-header + per-chunk `tasks[]` composite.
-
 - **Per-warning severity.** `rivet check`'s preflight warnings carry a `low` / `medium` / `high` severity:
   `check --json` emits `warnings: [{ severity, message }]` and the text path prefixes `[SEVERITY]`, so CI can
   gate on `high` and treat the rest as advisory.
-
 - **`doctor --json`** — `rivet doctor --json` emits `{ config_path, all_ok, checks: [{ name, ok, detail?,
   hint? }] }` for CI / cron that wants a structured health verdict instead of grepping `[OK]`/`[FAIL]` lines.
 
@@ -4779,16 +4511,13 @@ parallelism. This closes the OSS engine's loop: `init` → `plan` (annotates the
   ascending `wave:` order with a barrier between waves. Tables are independent, so a failed export does
   **not** block its wave-mates — `apply` collects failures, runs the rest, and exits non-zero
   (continue/isolate). A `.json` path still means the sealed single-artifact replay.
-
 - **Cost-gated within-wave parallelism** (`--parallel-export-processes`, or `parallel_export_processes:
   true`). The cheap exports — `parallel_safe: true` (cost class `Low`, and not flagged
   `isolate_on_source`) — run concurrently as separate processes; a heavier export runs alone in its wave
   (it already chunk-parallelizes internally), so two big tables never multiply load on the source.
-
 - **`rivet apply <config> --resume`** skips exports a prior run already completed (`_SUCCESS` present)
   and resumes incomplete chunked exports from their checkpoints, so recovering a partially-failed run
   does not redo the tables that already succeeded.
-
 - **`rivet plan` writes the advisory schedule into the config** and prints a compact one-line-per-export
   table (Wave | Export | Strategy | Rows | Verdict). `rivet init`'s next-steps surface the plan→apply path.
 
@@ -4796,14 +4525,11 @@ parallelism. This closes the OSS engine's loop: `init` → `plan` (annotates the
 
 - **Graded `rivet validate --depth light|sample|full`** with stable `RIVET_VERIFY_*` error codes — one
   per failure variant (JSON `code` + the pretty `[CODE]` prefix).
-
 - **Memory-aware `rivet check` verdict** — an unindexed large scan is DEGRADED (not UNSAFE) when the
   estimated peak RSS fits the budget; **`check --json`** emits the per-export verdict / strategy /
   warnings / recommended profile + parallel, not just the type report.
-
 - **`rivet plan` explains the strategy** — why this mode, chunk geometry, parallelism, RSS-budget fit,
   resumability and memory risk.
-
 - **Signed releases** — keyless cosign (Sigstore).
 
 ### Changed — multi-export console UX
@@ -4811,10 +4537,8 @@ parallelism. This closes the OSS engine's loop: `init` → `plan` (annotates the
 - **Strict aligned card table.** Per-export cards render as a table: the name plus every metric column
   (rows / files / size / duration / RSS) is fixed-width and aligned, and the name column is seeded
   wave-wide so it stays aligned across the cost gate's separate safe/lone batches.
-
 - **Chunk progress ticks per source batch, not only per chunk** — a wide first chunk (e.g. 250k rows /
   90 MB) no longer reads as idle while it streams; the bar shows rows/rate climbing throughout the read.
-
 - **Captured child stderr goes to a file artifact** (`rivet-child-stderr-<ts>.log`) with a one-line
   console pointer, instead of flooding the run summary with every child's per-export log.
 
@@ -4847,16 +4571,13 @@ table).
   driver values is compared against the built Arrow batch on every export; a mismatch fails the run loud,
   naming the column, instead of writing the corrupted batch. Catches the per-engine value converter
   (`build_array`).
-
 - **Form B — manifest-recorded checksum + `rivet validate` re-read (always-on).** The per-column `xxh3`
   is recorded in the manifest (`column_checksums`, name-keyed) and `rivet validate` re-reads the exported
   Parquet to re-verify it — catching an encoder fault or post-write / bit-rot corruption Form A cannot
   see. Live round-trip proven: export → validate passes → flip one byte → validate fails naming the column.
-
 - **Swap-resistant when keyed.** When the export has a cursor / key column, each cell hashes as
   `xxh3(key ‖ value)` (`checksum_key_column` in the manifest), so a value swapped between two rows — which
   an order-independent combine would otherwise miss — is caught.
-
 - **Visible coverage, never a silent "verified".** Types not yet covered (UUID / `FixedSizeBinary`, List,
   `Decimal256`, nanosecond timestamps) are logged once per export ("value checksum covers N/M columns;
   NOT checked: …") instead of contributing a silent zero that reads as verified.
@@ -4866,11 +4587,9 @@ table).
 - **Manifest stays back-compatible — `MANIFEST_VERSION` unchanged at 1.** `column_checksums` +
   `checksum_key_column` are additive Optional fields; older manifests omit them and newer readers tolerate
   their absence, so `rivet validate` keeps working across versions.
-
 - **Honest scope.** The guarantee is *decoded-value → file* for covered types, probabilistic (xxh3-64),
   with the DB-wire decode trusted (the same `FromSql` feeds both sides) — **not** byte-for-byte
   source→file. CSV exports get Form A only (the Parquet re-read is Parquet-only).
-
 - **Cost vs 0.14.1** (content_items, 1.93 M × 20 cols): +2.8% wall / +11.3% CPU / ~0 RSS. The dominant
   cost is the independent re-decode + passes, not the hashing — the I/O-bound export hides most of it on
   wall time.
@@ -4905,7 +4624,6 @@ operator-facing "what happens when X fails" documentation the CDC reference was 
   model (at-least-once; dedupe by primary key + `__op`; a partial run leaves no `_SUCCESS`), then
   per engine — PostgreSQL slot/disk (an abandoned slot pins WAL; `max_slot_wal_keep_size` bounds
   it), MySQL purged binlog (ERROR 1236 → re-snapshot), SQL Server retention + a stopped Agent.
-
 - **Reading from a replica** (no primary access), per engine: MySQL (`log_replica_updates`),
   PostgreSQL 16+ (logical decoding on a standby), SQL Server Always On readable secondary.
 
@@ -4937,24 +4655,20 @@ shows up in `rivet metrics` / `rivet journal` exactly like a batch one. This is 
   binlog, a PostgreSQL `test_decoding` logical slot, or SQL Server change tables, emitting
   `[__op, __pos]` + the source columns — typed, as the after-image (the key columns for a
   DELETE). `rivet init --mode cdc` scaffolds the config (incl. `--gcs-bucket` / `--s3-bucket`).
-
 - **At-least-once, resumable, crash-tested.** Durable position state per engine — a checkpoint
   file (MySQL / SQL Server) or slot advance (PostgreSQL) — written only after the part is
   durable (flush → checkpoint → ack). A crash before the checkpoint re-reads on resume and never
   loses a change; validated live per engine via a `RIVET_TEST_PANIC_AT` fault point.
-
 - **Full type parity with the batch export.** The CDC sink reuses `build_arrow_field`, so a
   captured column lands as the identical Arrow type a batch export produces — int widths,
   decimal precision/scale, JSON, UUID, naive **and tz-aware** timestamps — validated
   byte-for-byte against DuckDB, ClickHouse, and BigQuery and locked by a regression test
   (`mssql_cdc_full_type_matrix_matches_batch`).
-
 - **Same observability + commit seam as batch.** Each part uploads via the existing destination
   + content-MD5 + manifest + `_SUCCESS` path (so `--output gs://…` / `s3://…` works); a CDC run
   records an `export_metrics` row + a `run_journal` entry, so `rivet metrics` and `rivet journal`
   show it like a batch run. `mode: full` + `mode: cdc` of the same table run in parallel under
   one `rivet run`.
-
 - **Operational guardrails.** Per-engine permission/setup hints on a failed CDC start; fail-fast
   through a MySQL query proxy (ProxySQL / MaxScale can't carry the replication stream); a TLS
   gate on every adapter; `--table` identifier validation; memory-budget part rollover
@@ -4967,17 +4681,14 @@ shows up in `rivet metrics` / `rivet journal` exactly like a batch one. This is 
   entire retained change table each run (at-least-*everything*) because `open()` never consumed
   the checkpoint LSN. It now resumes from `fn_cdc_increment_lsn(checkpoint)`, guarded so
   nothing-new / nothing-captured skips the call instead of erroring.
-
 - **`fix(mssql)` — `datetimeoffset` was silently dropped in CDC and failed the export in batch.**
   Both paths read it via `try_get::<NaiveDateTime>` — the wrong type for a tz-aware column. CDC
   silently nulled the value; **a batch export errored out entirely on any `datetimeoffset`
   column** (the table was unexportable). Both now read it as the UTC instant and land it as a
   tz-aware Timestamp.
-
 - **`fix(cdc)` — SQL Server `uniqueidentifier` was dropped to NULL in CDC.** It was mapped to its
   36-char string, which doesn't fit the UUID `FixedSizeBinary(16)` column and silently became
   NULL; it now carries the 16 canonical bytes, matching the batch export.
-
 - **`fix(mssql)` — decimal precision now matches batch in CDC and `rivet check`.** The scan-free
   type probe skipped the `sys.columns` catalog hint the full export applies, so a SQL Server
   decimal resolved as the placeholder `DECIMAL(38,…)` instead of the declared `DECIMAL(18,4)`. A
@@ -5057,7 +4768,6 @@ harm counters.
   parallel, checkpoint / non-checkpoint) share one helper with single mode.
   Cross-mode caveat (a single→chunked baseline can log a one-time, self-healing
   drift) is documented in ADR-0021.
-
 - **`feat(check)` — `rivet check` warns when `chunk_size` would make one chunk
   query scan too much.** The source-harm lever the 0.12 A/B measured is how long
   a single chunk statement holds its snapshot / locks (SQL Server's longest
@@ -5067,7 +4777,6 @@ harm counters.
   EXPLAIN `width`, SQL Server `dm_db_partition_stats` — so no extra round-trip;
   MySQL is skipped (no trustworthy scan-free estimate). Advisory only; never
   blocks a run.
-
 - **`feat(metrics)` — every run persists an extended `export_metrics` row for
   post-hoc analysis.** Alongside the original 16 columns, the table now records
   15 more per-run signals: completeness (`files_committed`, `reconciled`,
@@ -5079,7 +4788,6 @@ harm counters.
   `destination_type`, `rivet_version`). Written on the `run` and `apply` paths
   and queryable via SQL; `rivet metrics` still prints the core row — these
   columns are for analysis, not the summary card.
-
 - **`feat(metrics)` — per-run source-harm deltas in a new `export_harm` table.**
   Each run brackets the source with an engine-specific counter snapshot and
   stores the delta per counter: PostgreSQL `pg_stat_database` (`pg_tup_returned`
@@ -5089,7 +4797,6 @@ harm counters.
   Best-effort observability — a failed or unavailable probe is logged and
   ignored, never affecting the run verdict. Captured on the `run` path; `apply`
   persists the metric row but skips the harm + `temp_bytes` probes.
-
 - **`feat(doctor)` — `rivet doctor` advises when a SQL Server login lacks
   `VIEW SERVER STATE`.** The harm probe reads `sys.dm_os_wait_stats`, which needs
   that permission; doctor now prints a `[note]` (never a `[FAIL]`) with the exact
@@ -5121,7 +4828,6 @@ harm counters.
   the whole table every run (a pilot re-dumped a 655k-row table 4× in two days,
   re-reading ~570k unchanged rows each time). Advisory comment only; the selected
   mode is unchanged.
-
 - **`feat(ux)` — the run summary nudges verification.** A successful run that
   wrote files but ran neither `--validate` nor `--reconcile` now shows an
   advisory `verify: not run — …` line, so skipping completeness checks is a
@@ -5139,14 +4845,12 @@ harm counters.
   `crate::scalar` leaf (the inbound mirror of `crate::sql`), and
   `RunSummary::render` became an ordered manifest of per-row providers — both
   gaining direct unit tests they previously lacked.
-
 - **`refactor(preflight, chunked)` — further deepening over the metrics-touched
   modules (no behaviour change).** `collect_warnings` became a declarative
   manifest (C1), the four chunked Detect arms dedup their plan-build and own the
   detect connection (C3/C4), and the mode-string + base-query were hoisted out of
   the per-engine `diagnose_*` paths (C2). A speculative chunk-range dedup token
   was reverted before shipping — no consumer (#6).
-
 - **`test` — metrics-persistence coverage.** New unit tests pin the
   summary→`MetricRow` builder and the harm-delta math (floor + name
   intersection); live tests prove the extended columns and per-engine
@@ -5269,11 +4973,9 @@ change below is behaviour-affecting.
   class 42 / MySQL 1146·1054·1142·1064 / MSSQL 208·207) is caught at preflight;
   operational/transient errors stay fail-soft. **CI that asserted `check` exits
   `0` on such a config must be updated.**
-
 - **`feat(ux/run)` — a failed `rivet run` against a closed port fails fast** (one
   connect attempt) instead of ~14 s of retry spam. Refused / no-route / DNS are
   treated as dead endpoints; resets and timeouts still retry.
-
 - **`feat(ux/init)` — local exports scaffold a per-export subdir**
   (`./output/<table>/`) so multi-table configs don't collide in one folder (and
   the double-count `_SUCCESS` WARN is gone).
@@ -5282,7 +4984,6 @@ change below is behaviour-affecting.
 
 - **`feat(ux/run)` — the success card shows the destination** (`output: file://…`)
   so you can see where the files landed without guessing.
-
 - **`docs` — three error/recovery GIFs + a "When something is wrong" section** in
   getting-started: `check` catching a missing table, a config-field "did you
   mean", and `doctor` reporting an unreachable source.
@@ -5292,18 +4993,14 @@ change below is behaviour-affecting.
 - **`feat(ux/init)` — scaffolds a *working* connection per source provenance**
   (`url_env` / `url_file` / inline) and ends with an on-voice next-steps ladder
   (`doctor` → `check` → `run`). Credentials are never written into the file.
-
 - **`feat(ux/check)` — friendlier preflight**: a plain access-path line (no raw
   EXPLAIN dump), a verdict legend, a next-step pointer, and no false `DEGRADED` on
   small tables.
-
 - **`feat(ux/cli)` — friendlier `--help`** (a getting-started map; internal
   Epic/Step labels dropped) and an `init` hint when `-c` is missing.
-
 - **`feat(ux/errors)` — config errors point at the fix**: corrected "did you mean"
   ranking (Levenshtein-first, so `export` → `exports`), missing-field hints, and a
   TAB-indentation hint.
-
 - **`feat(ux/run)` — a failed run carries doctor's connect-error category +
   remediation hint** (auth / TLS / connectivity), bridged via `.context()` so the
   typed cause and the retry-classifier substrings stay intact underneath.
@@ -5312,7 +5009,6 @@ change below is behaviour-affecting.
 
 - **`fix(ux/init)` — the scaffold's local-dest note fits 80 columns** (was
   wrapping mid-word in narrow terminals / GIFs).
-
 - **`docs(getting-started)` — the example summary card matches real number
   formatting** (`5,432`, `10,000`, `15 MB`).
 
@@ -5322,10 +5018,8 @@ change below is behaviour-affecting.
   (`PreflightSchemaError`, the ADR-0015 data-shape-seam pattern): one message
   template, three per-engine mappers, so the actionable sentence can no longer
   drift across PG / MySQL / MSSQL. Live-verified on all three engines.
-
 - **`chore(deps)` — postgres-protocol 0.6.12 / tokio-postgres 0.7.18**
   (RUSTSEC-2026-0178 / 0179 / 0180).
-
 - **`docs` — all instructional GIFs re-recorded** against the new behaviour
   (`-c` short form, the `output:` row, the friendlier scaffold/check). `doctor-gcs`
   and `pool-detect` are unchanged (need GCS ADC / the `pool` docker profile).
@@ -5368,7 +5062,6 @@ result against future regressions.
   computed by DuckDB (source via its Postgres/MySQL scanner). Exit `0`=PASS /
   `1`=FAIL, so it drops into `rivet run && verify_export && deploy`. Single dep
   (`pip install duckdb`). Recipe: `docs/recipes/verify-your-export.md`.
-
 - **`test` — Azure Blob (Azurite) live-test infrastructure** (`azurite` service in
   `docker-compose.yaml`, `LiveService::Azurite`, container-provisioning helper).
 
@@ -5380,7 +5073,6 @@ result against future regressions.
   OOM the builder first. Now `value_within_ceiling` bails with `RIVET_VALUE_TOO_LARGE`
   (naming the column) before allocation, in every engine. Defense-in-depth with the
   existing post-materialization sink guard.
-
 - **`docs` — SQL Server marked Beta + procurement advisory.** `tiberius` 0.12 pins
   `rustls` 0.21 → `rustls-webpki` 0.101 (RUSTSEC-2026-0098/0099/0104). No newer
   `tiberius` exists. The path is reachable **only** under `tls.mode: verify-ca|
@@ -5403,18 +5095,15 @@ result against future regressions.
   field (count, sums, distinct), neither side reading rivet's counters. Covers the
   multi-part chunked write path (20k rows → 5 files), **and a post-crash variant**:
   crash → resume → DuckDB's exactly-once (deduped) view still equals the source.
-
 - **`test(crash-soak)` — no fault point loses a row.** Sweeps the crash matrix; after
   `--resume`, the destination (re-read independently) holds every source id at least
   once, at-least-once being the only allowed surplus.
-
 - **`test` — closed the systemic self-oracle blind spot (31 tests).** The
   recovery/resume/chunked/cli/plan completeness suites trusted rivet's own
   `file_log`/summary/file-count counters; **every completeness test now re-reads the
   destination row content** — across PostgreSQL, MySQL, and SQL Server. A regression
   that drops/duplicates rows while keeping rivet's counters self-consistent (the
   shape of the original rotated-part loss) can no longer ship green.
-
 - **`docs` — documented the dense-chunking tied-column ordering hazard.** `chunk_dense`
   on a non-unique, concurrently-written `chunk_column` could in principle map an
   ordinal to a different physical row across independent per-chunk queries. Proven
@@ -5514,7 +5203,6 @@ with evidence before any code was forked. No public-API breaks.
   spill + buffer-pool memory pressure); SQL Server sums cumulative
   `Workfiles Created` + `Worktables Created` (sort/hash spill to tempdb). Both
   monotonic, so the governor's `cur > prev` contract is unchanged.
-
 - **`docs(tuning)` — `chunk_size` documented as the statement-duration lever.**
   Lowering `chunk_size` is the supported, measured way to keep each MySQL/SQL
   Server read short under a strict `statement_timeout` (one statement per chunk),
@@ -5543,7 +5231,6 @@ data loss into a clear error.
   remediation (NOT NULL column / `WHERE col IS NOT NULL` / `chunk_dense` /
   `mode: full`) rather than dropping rows. Detected on the live data, so a
   nullable column with zero actual NULLs is unaffected.
-
 - **`fix(redact)` — credentials could leak to stderr via the log sink.** The
   redaction module names "logs" in its scope, but enforcement was wired only at
   the error/summary call sites; the `env_logger` sink was bare, so a
@@ -5574,17 +5261,14 @@ data loss into a clear error.
   inherent high-watermark semantics (keyset is unaffected — its key is unique),
   now stated where keyset's uniqueness contract already lives (semantics.md
   "Known non-guarantees", config.md, the query builder).
-
 - **`refactor(config)`** — split the 379-line `Config::validate` into three
   cohesive, independently-testable validators (exports-list / source-connection
   / per-export). Behaviour-preserving; all 27 validation/secops tests green.
-
 - **`refactor(pipeline)`** — deleted `src/pipeline/child.rs`, a 461-line orphan
   fork never wired into the module tree (so never compiled, its tests never
   ran); its byte-identical `render_child_stderr` tests moved onto the live
   `parallel_children.rs`. Gave the parallel chunk drivers' mutex
   poison-recovery decision a single documented home (`chunked/poison.rs`).
-
 - **`test(csv)`** — pinned the float `NaN`/`±Infinity` CSV contract (emit the
   literal, never an empty cell that would conflate with NULL) with a
   characterization test + docs; verified correct-by-design.
@@ -5619,14 +5303,12 @@ data loss into a clear error.
   only what differs (row source + memory-cap formula). SQL Server gains the same
   first-batch memory-cap probe PG/MySQL have. No behaviour change — full live
   validation across all three engines (parity, recovery, type matrices).
-
 - **`feat(mssql)`** — the export now honours the source-safety `SourceTuning`
   knobs it previously ignored (it read only `batch_size`): **`lock_timeout`**
   (server-side `SET LOCK_TIMEOUT` so a blocked read fails fast), **`statement_timeout`**
   (client-side wall-clock budget — SQL Server has no statement-duration `SET`;
   live-verified to abort + retry), and **`throttle_ms`** (sleep between batches).
   Brings MSSQL to in-export tuning parity with the PG/MySQL engines.
-
 - **`feat(mssql)`** — the export now **streams**: it consumes the `tiberius`
   result set incrementally and emits one Arrow batch per `tuning.batch_size`
   rows instead of materialising the whole chunk (`into_first_result`). Peak RSS
@@ -5635,25 +5317,21 @@ data loss into a clear error.
   `mode: full`) gives few large files at low memory; `chunk_size` now controls
   file count, `batch_size` controls memory. Measured on 2 M heavy rows:
   `mode: full` went from a ~10 GB materialise (OOM) to **1 file at 171 MB**.
-
 - **`feat(mssql)`** — connection pooler / gateway detection (`MssqlProxyKind`):
   `@@SPID` drift across two queries → transaction-mode multiplexer (`Multiplexed`);
   `SERVERPROPERTY('EngineEdition')` 5/8 (or an Azure `@@VERSION` banner) →
   `AzureGateway`. One connect-time warning, mirroring PG (`pg_backend_pid` drift)
   and MySQL (`CONNECTION_ID()` drift). Pure classifier exhaustively unit-tested;
   live direct-connection guard in `live_pool_safety`.
-
 - **`test(mssql)`** — full live parity suites mirroring the PG/MySQL twins:
   `live_mssql_resume`, `live_mssql_chunked_recovery`, `live_mssql_crash_recovery`,
   `live_mssql_reconcile_repair`, `live_mssql_chunked`. Wired into the per-PR
   `e2e` job and Nightly (mssql service + seed step added to both).
-
 - **`docs(mssql)`** — `datetime2` sub-microsecond truncation documented as a
   tracked gap: rivet maps timestamps to microsecond, so a bare `datetime2`
   (precision 7 = 100 ns) incremental cursor lands one tick below the source max
   and re-exports the boundary row each run — use `datetime2(6)` or coarser.
   Reliability / type-mapping / tuning matrices gained SQL Server rows.
-
 - **`docs(mssql)`** — [Gentle SQL Server extraction](docs/best-practices/mssql-gentle-extraction.md)
   best-practice + copy-paste config (`rivet_mssql_gentle.yaml`): how to stay easy
   on both the source DB and the rivet worker. Documents the one MSSQL footgun —
@@ -5662,7 +5340,6 @@ data loss into a clear error.
   buffer multiple GB). Measured live on a 2 M-row heavy table: **2 759 MB →
   101 MB peak RSS (~27×) at the same wall time** by switching to `chunk_size`.
   Includes a row-width sizing table and the `environment: production` governor lever.
-
 - **`bench(mssql)`** — DBA-harm matrix for SQL Server
   ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md) +
   `mssql_db_bench.sh`): measured against live SQL Server 2022, rivet's chunked
@@ -5673,7 +5350,6 @@ data loss into a clear error.
   single query is **6.6 s** vs **~9 min** for sling/dlt scanning the table in one
   shot, and rivet holds **no** open transaction where **dlt holds one for ~8 min**
   (version-store / log-truncation hazard).
-
 - **`bench(mssql)`** — competitive performance matrix
   ([`REPORT_mssql.md`](docs/bench/reports/REPORT_mssql.md)) vs sling / dlt on
   live SQL Server 2022: rivet wins throughput on narrow-to-medium tables
@@ -5681,7 +5357,6 @@ data loss into a clear error.
   or competitive peak RSS on every table, including the wide ones. The one
   remaining gap is wall-time on heavy-text rows (the `tiberius` row decode), not
   memory.
-
 - **`test(mssql)`** — `bigquery_validates_mssql_type_matrix_parquet`: the SQL
   Server type matrix now also round-trips through live BigQuery (autoload types,
   microsecond TIME/TIMESTAMP, `uniqueidentifier`→BYTES, decimal sums). **All
@@ -5693,7 +5368,6 @@ data loss into a clear error.
 - **No config or API changes.** Existing PostgreSQL / MySQL / SQL Server exports
   are unaffected; the `AdaptiveBatchController` refactor is internal and fully
   re-validated on all three engines.
-
 - **SQL Server chunked exports open a fresh connection per chunk** (as the PG and
   MySQL engines do) and run the one-time pooler / gateway detection on each. On a
   many-chunk export that is real connection + auth churn — prefer a larger
@@ -5720,18 +5394,15 @@ data loss into a clear error.
   quoting `[col]`, cursor literal `N'…'`, `sys.*` chunk-planning introspection,
   preflight/doctor, and the `OPT-2` back-pressure governor (`Log Flush Waits`
   perfmon counter — the SQL Server analog of MySQL `Innodb_log_waits`).
-
 - **`feat(mssql)`** — export modes: `full` / snapshot, `incremental`, `chunked`
   (range + dense), and **keyset (seek)** via `chunk_by_key` for non-integer PKs
   (UUID / string). The keyset page builder emits the T-SQL
   `OFFSET 0 ROWS FETCH NEXT n ROWS ONLY` (T-SQL has no `LIMIT`).
-
 - **`feat(mssql)`** — type matrix → Arrow/Parquet, live-validated: int family,
   `bit`, `decimal`/`numeric` (scale recovered from the data, since `tiberius`
   drops declared precision), `real`/`float`, `money`, `date`, `time`,
   `datetime2`, `nvarchar`/`varchar`/`char`, `varbinary`, and `uniqueidentifier`
   → native Parquet `LogicalType::Uuid`. Unmapped types fail loud.
-
 - **`test(mssql)`** — `{duckdb,clickhouse}_validates_mssql_type_matrix_parquet`
   added to the type-roundtrip harness, the same oracle pattern as PG/MySQL; CI
   `test-type-validators` provisions and seeds the `mssql` service.
@@ -5743,7 +5414,6 @@ data loss into a clear error.
   MSSQL driver's unavoidable `tiberius → rustls 0.21` advisories are documented
   there with a reachability analysis (operator-specified server, pinned CA /
   `trust_cert`, no CRL checking); the gate still fails on every *fixable* vuln.
-
 - **`ci(deps)`** — added Dependabot for weekly grouped Rust + GitHub-Actions
   updates, so security patches flow in automatically and the accepted advisories
   retire themselves the day upstream ships a fix.
@@ -5774,7 +5444,6 @@ data loss into a clear error.
   `manifest.json` + `_SUCCESS`, so `--validate` and downstream consumers work
   per-partition with no new machinery. Orthogonal to `mode`: `mode: chunked`
   chunks *within* a partition. See [docs/partitioning.md](docs/partitioning.md).
-
 - **`feat(partition)`** — rows with a **NULL** partition value land in
   `col=__HIVE_DEFAULT_PARTITION__/` (Hive default-partition convention) so no
   row is silently dropped; the NULL bucket is queryable by Hive/Spark/DuckDB
@@ -5792,7 +5461,6 @@ data loss into a clear error.
   verify the index; partitioning rewrites the export into a `query:` subquery) —
   rejected up front. `plan` / `check` do not expand partitions yet (they show the
   parent as one un-partitioned job).
-
 - **Per-partition chunking trade-offs (source load, not correctness):** with
   `mode: chunked`, chunk windows come from the partition's key `[min,max]`, not
   its row count. A range key that is *dense/correlated* within the partition is
@@ -5808,7 +5476,6 @@ data loss into a clear error.
 - **`refactor(test)`** — the three hand-written full-field `ExportConfig` test
   fixtures are consolidated into one `config::sample_export()`; adding a config
   field is now a single-site edit.
-
 - **`refactor(sql)`** — dialect-aware SQL string helpers shared across layers
   (`parse_date_flexible`, `strip_select_star_from`, `aggregate_sql`) now live in
   the `sql` leaf module instead of being duplicated between `pipeline::chunked`,
@@ -5836,14 +5503,11 @@ data loss into a clear error.
   the query in `SELECT * FROM (base) WHERE …`, which hid the source table from
   the catalog-hint parser (PG omits NUMERIC precision from the wire), so the
   driver now resolves hints from the unwrapped base query.
-
 - **`fix(time_window)`** — same NUMERIC resolution for `time_window` (its
   `resolve_query` wraps too).
-
 - **`fix(types)`** — a list of an unsupported element type is itself reported
   `Unsupported` in `check`, matching what `run` does — no more `numeric[]`
   showing "compatible" in preflight then failing the run.
-
 - **`fix(check)`** — `check --type-report --strict` is now CSV-format-aware: a
   column CSV cannot serialize (e.g. `int[]`) is flagged at preflight using the
   exact predicate the CSV writer uses, instead of being called safe and then
@@ -5853,10 +5517,8 @@ data loss into a clear error.
 
 - **`fix(reconcile)`** — `reconcile` exits non-zero on a detected mismatch (the
   audit gate now gates; `unknown` warns).
-
 - **`fix(run)`** — `--reconcile` implies `--validate` again (ADR-0013
   subsumption restored).
-
 - **`fix(repair)`** — collision-proof chunk filenames (random nonce) so a
   `repair --execute` re-export can never overwrite the original part on a
   sub-second filename collision.
@@ -5868,11 +5530,9 @@ data loss into a clear error.
   while the file implements and calls it), ADR-0002 (module-visibility table
   out of sync with `lib.rs`), ADR-0014 (`uuid` listed as Arrow `Utf8`; it is
   `FixedSizeBinary(16)` + `arrow.uuid` / native `LogicalType::Uuid`).
-
 - **`docs(reference)`** — documented the `validate` and `schema` subcommands and
   `run --force`; added the `chunk_by_key` and `chunk_size_memory_mb` config
   fields.
-
 - **`docs(cli)`** — `rivet --help` now states that `run --reconcile` implies
   `--validate` and that `reconcile` exits non-zero on mismatch.
 
@@ -5882,7 +5542,6 @@ data loss into a clear error.
   replace hand-written struct literals across the runners; a query-wrapping
   runner must supply the unwrapped base, so the NUMERIC-hint regression cannot
   silently return.
-
 - **`test(governor)`** — the deadlock-when-chunks-fail regression now forces the
   failure at the destination-write stage (chunked `NUMERIC(p,s)` resolves and
   succeeds now, so the old "numeric has no safe mapping" premise no longer
@@ -5919,23 +5578,18 @@ data loss into a clear error.
   Per-export `target:` config + `rivet check --type-report --target <t>`
   prints the autoload-vs-native table and a ready-to-run recovery
   `CREATE TABLE … AS SELECT` over the staging table.
-
 - **`feat(types)`** — **Snowflake** target added and **live-verified**
   (`snowflake_validates_*` harness): json→TEXT/`PARSE_JSON`, uuid→BINARY/
   `HEX_ENCODE`+`REGEXP`, naive ts→NUMBER/`TO_TIMESTAMP_NTZ`, time→NUMBER/
   `TIME_FROM_PARTS`, list→VARIANT/`::ARRAY`, plus the `BINARY_AS_TEXT=FALSE`
   load-format requirement.
-
 - **`feat(types)`** — BigQuery type-recovery SQL (L5, post-load CTAS — BQ
   rejects declared native types on load) and array recovery via
   `--parquet_enable_list_inference` + `UNNEST`.
-
 - **`fix(types)`** — `Decimal256` parses straight into `i256`, removing the
   i128 ~38-digit bottleneck (now up to 76 digits).
-
 - **`feat(types)`** — MySQL `DECIMAL` precision/scale read from wire metadata
   (works for any query, unlike PG's catalog-only path).
-
 - **`fix(csv)`** — CSV fails loud on array / unsupported columns instead of
   writing a silent empty value; `uuid: string` and similar overrides honoured.
 
@@ -5946,19 +5600,16 @@ data loss into a clear error.
   listings — **no download**. Encodings are normalised to raw digest bytes so
   GCS base64 `md5Hash` and S3 hex ETag of the same content compare equal; an
   S3 multipart composite ETag or a checksum-less object degrades to size-only.
-
 - **`feat(destination)`** — small parts upload as a single PUT
   (`op.write`) so the store computes and stores a content checksum the listing
   exposes; this is the only way to get a `Content-MD5` on **Azure** (a single
   `Put Blob`, never `Put Block List`). A process-wide byte budget bounds the
   RAM held in one-shot buffers regardless of upload concurrency; larger parts
   stream (size-only).
-
 - **`feat(destination)`** — `Destination::write` returns `WriteOutcome`
   carrying the store's upload-response checksum; the commit path compares it to
   the locally computed MD5 for a fail-fast, no-round-trip transit-integrity
   check (catches a part corrupted in flight at write time).
-
 - **`feat(validate)`** — per-export **`verify: size | content`**. `content`
   fails validation for any part only size-verified, with an actionable message
   (lower `max_file_size` so parts fit a single PUT, or the backend exposes no
@@ -5972,14 +5623,12 @@ data loss into a clear error.
   (`Presence → Failure`) and chunked resume (`Presence → ResumeDecision`).
   Replaces two near-identical walks; destination verify now derives part
   presence from a single `list_prefix` instead of per-part HEADs.
-
 - **`refactor(validate)`** — `ManifestVerification.passed` is derived
   (`manifest_found` and no *fatal* failure — advisory `UntrackedObject` does
   not count) in one place, so a new failure variant is fatal by default rather
   than relying on every site to flip a bool. Per-run `parts_md5_verified`
   reports content coverage. The single-variant `IntegrityLevel` (a no-op after
   re-download verification was rejected) was removed.
-
 - **`refactor(pipeline)`** — part xxh3 fingerprint + MD5 computed in a single
   streamed read (`compute_part_checksums`).
 
@@ -6014,14 +5663,12 @@ data loss into a clear error.
   `chunked::run_chunked_sequential`, `chunked::run_chunked_parallel`,
   `chunked::sequential_checkpoint`, `chunked::parallel_checkpoint`)
   now share one body each instead of hand-copying. See ADR-0018.
-
 - **`fix(pipeline)`** — `chunked::parallel_checkpoint` previously
   populated `state.file_log` per chunk but never appended to
   `summary.manifest_parts`, so the cloud manifest (ADR-0012 M1) shipped
   empty for every `parallel>1 + chunk_checkpoint:true` run. Migration
   onto `commit::record_part` (with `state=None` in the drain to avoid
   double-writing the per-chunk durable file_log) closes the gap.
-
 - **`refactor(pipeline)`** — `pipeline::run_store::RunStore` is the
   builder facade for the post-finalize cursor + progression writes
   (`with_cursor` is fatal-on-error per ADR-0001 I3; `with_progression`
@@ -6029,7 +5676,6 @@ data loss into a clear error.
   ordering contract is now an interface property, not a convention.
   See ADR-0018. Schema-drift stays in `single.rs` because it's a
   policy state machine, not a persistence ordering.
-
 - **`refactor(tuning)`** — `tuning::Governor` extracts the OPT-2
   adaptive-concurrency loop out of an inline `thread::scope` closure
   in `chunked::exec::run_chunked_parallel`. The loop is now
@@ -6044,19 +5690,16 @@ data loss into a clear error.
   live worker/connection count within `[min_parallel, parallel]` — backing off
   under load, recovering when it eases. Decisions land in the run journal
   (`ParallelismAdjusted`). Read-only credentials suffice.
-
 - **`fix(pipeline)`** — **governor deadlock under chunk failure** (OPT-2):
   workers bumped the `completed` counter only on success, but the governor's
   exit condition was keyed on it — so any failing chunk left the governor
   spinning forever and `thread::scope` could never join. Workers now bump a
   separate `finished` counter on every exit path (success or failure).
-
 - **`test(pipeline)`** — **governor concurrent-write back-off** (OPT-2):
   deterministic live coverage of the closed-loop reaction to source pressure
   — a background `UPDATE`/`CHECKPOINT` writer drives `checkpoints_req` past
   the 80 ms sampler, and the governor's `backed off` log lines fire as
   expected.
-
 - **`feat(pipeline)`** — **MySQL keyset (seek) pagination** (OPT-4): tables with
   a UUID / string / composite (non-integer) PK now have a safe chunked shape via
   `chunk_by_key:` (auto-resolved on MySQL when there's no single-int PK but a
@@ -6064,7 +5707,6 @@ data loss into a clear error.
   (`WHERE key > last ORDER BY key LIMIT n`) — bounded RSS *and* bounded
   longest-query time, EXPLAIN-verified as an index range scan (never a
   full-scan + filesort). A non-indexed `chunk_by_key` is refused.
-
 - **`feat(pipeline)`** — **PG UUID-PK keyset via explicit `chunk_by_key:`**:
   `extract_last_cursor_value` learned the `FixedSizeBinary(16)` arm so PG
   `uuid` columns (ADR-0014 → arrow.uuid extension → native Parquet
@@ -6072,21 +5714,17 @@ data loss into a clear error.
   remains scoped to integer PKs (see ADR-0020 for the asymmetry rationale
   vs MySQL); operators with UUID-PK tables can opt into keyset paging by
   declaring `chunk_by_key: <uuid_col>`.
-
 - **`feat(sink)`** — **per-value size ceiling** (OPT-1): `tuning.max_value_mb`
   (default 256 MB; `0` disables) aborts with `RIVET_VALUE_TOO_LARGE` when a
   single text/JSON/blob cell would OOM the process — the average-based batch
   cap can't bound a lone giant value.
-
 - **`test(types)`** — **proptest MySQL value round-trip** (OPT-3): 1000
   randomized values per supported type prove Rivet's MySQL value-decoder
   contract under the property-testing fuzzer.
-
 - **`test(pipeline)`** — **subprocess crash coverage** (OPT-6): every chunked
   fault point (`after_chunk_file`, `after_chunk_complete`) now has crash-
   recovery coverage on the `parallel-export-processes` engine. Brings the two
   engines to per-fault symmetry.
-
 - **`feat(format)`** — **stable Parquet `created_by`** (OPT-5): pinned to a
   release-stable string so per-part `content_fingerprint` survives across
   builds and the manifest dedup token is reliable.
@@ -6106,7 +5744,6 @@ data loss into a clear error.
   live worker/connection count within `[min_parallel, parallel]` — backing off
   under load, recovering when it eases. Decisions land in the run journal
   (`ParallelismAdjusted`). Read-only credentials suffice.
-
 - **`feat(pipeline)`** — **MySQL keyset (seek) pagination** (OPT-4): tables with
   a UUID / string / composite (non-integer) PK now have a safe chunked shape via
   `chunk_by_key:` (auto-resolved on MySQL when there's no single-int PK but a
@@ -6114,7 +5751,6 @@ data loss into a clear error.
   (`WHERE key > last ORDER BY key LIMIT n`) — bounded RSS *and* bounded
   longest-query time, EXPLAIN-verified as an index range scan (never a
   full-scan + filesort). A non-indexed `chunk_by_key` is refused.
-
 - **`feat(sink)`** — **per-value size ceiling** (OPT-1): `tuning.max_value_mb`
   (default 256 MB; `0` disables) aborts with `RIVET_VALUE_TOO_LARGE` when a
   single text/JSON/blob cell would OOM the process — the average-based batch
@@ -6135,12 +5771,10 @@ data loss into a clear error.
   engines (DuckDB → native `UUID`, ClickHouse → `Nullable(UUID)`,
   BigQuery) load these without a cast. Enabled via the parquet
   `arrow_canonical_extension_types` feature. See `src/types/mapping.rs`.
-
 - **`test(types)`** — four-reader validator matrix: every PG/MySQL type
   round-trips through Parquet and is read back by DuckDB, ClickHouse,
   pyarrow, and (live) BigQuery to pin field metadata + row-group stats
   (`tests/type_roundtrip/`).
-
 - **`fix(types/mysql)`** — `UNSIGNED BIGINT` (UINT64) overflows `INT64`;
   now mapped to `Decimal128` so the full range survives.
 
@@ -6153,7 +5787,6 @@ data loss into a clear error.
   `validated: pass` line from the run summary. It now sets the flag like
   the other three export paths (regression test in
   `tests/live_chunked_recovery.rs`).
-
 - **`fix(preflight/doctor)`** — `rivet doctor` drops a `.rivet_doctor_probe`
   writability test object at the destination and never removes it. A
   subsequent `rivet run --validate` flagged it as an `untracked_object`
@@ -6169,7 +5802,6 @@ data loss into a clear error.
   catalog `btree` probe replaces the `EXPLAIN`-on-base-query heuristic, so
   an indexed PK reads as `ACCEPTABLE` with an `(indexed)` scan-type
   suffix.
-
 - **`polish(ux)`** — `rivet init` explains its mode choice inline
   (`# auto: ~N rows ≥ 100K threshold and chunk column 'id' is available`)
   and scales `chunk_size` to the row estimate; skipped incremental runs
@@ -6182,7 +5814,6 @@ data loss into a clear error.
 - **`docs`** — validated every command in the user-facing guides against
   the binary; fixed drift (the `file_log` state table, real `rivet doctor`
   output, the pilot walkthrough's missing `decimal(10,2)` override).
-
 - **`docs(gifs)`** — regenerated all instructional GIFs against current
   behavior (card UI, `(indexed)` scan type, `validated: pass`).
 
@@ -6196,7 +5827,6 @@ data loss into a clear error.
   finishes a run. Closes gaps #2 + #3 ("completed table must have
   manifest entries"; "summary totals derivable from manifest") from
   the release-checklist invariant audit.
-
 - **`test(invariants)`** — companion gates close gaps #1
   (`success && total_rows > 0 ⇒ files_committed > 0` — no rows
   extracted-then-dropped on the floor) and #4 (live test
@@ -6233,38 +5863,32 @@ data loss into a clear error.
   `introspect_pg_table_for_chunking` + `introspect_mysql_table_for_chunking`
   under a trait" suggestion — the two functions share a return type
   but no implementation logic (different catalogs, dialects, quirks).
-
 - **`docs(adr)`** — ADR-0016: Nullability propagation deferred to v0.8
   Phase A. Replaces the earlier "by design" dismissal of Gap #5 with
   an honest deferred-decision record; names the four
   `SourceColumn::simple(…, true)` hardcode sites, the per-query-shape
   resolvability matrix, the operator workaround, and the revisit
   trigger.
-
 - **`docs(adr)`** — ADR-0017: Per-runner durability ordering map.
   Documents the asymmetric file_log timing (four runners inline
   per part; `chunked_parallel` post-scope drain;
   `parallel_checkpoint` split sync-worker + post-scope), names the
   C3 live-test invariant that forced the split, and acknowledges
   the per-chunk `StateStore::open` smell that the split kept.
-
 - **`docs(adr)`** — ADR-0018: Builder facades for runner-level
   invariant ordering. Positive paper trail for `commit::record_part`
   + `RunStore`: why builder over single-method / type-state, why
   facades and not traits, what stays *outside* the facade (schema
   drift in single.rs, metrics in job.rs).
-
 - **`docs(adr)`** — ADR-0019: Governor as extracted policy with
   injectable `PressureSource`. Documents the testability win, why the
   trait lives in `tuning::` not `source::`, and the deadlock-class
   regression cover.
-
 - **`docs(adr)`** — ADR-0020: PostgreSQL UUID-PK chunking asymmetry
   vs MySQL. Two-layer gap: layer 1 (planner's PG-no-auto-keyset
   default — deferred design choice; `DECLARE CURSOR` is RAM-bounded
   but not wall-time-bounded) and layer 2 (sink runtime missing
   `FixedSizeBinary(16)` arm — closed in this release).
-
 - **`docs(CLAUDE.md)`** — added "Verify before publishing agent-walk
   claims" process rule: when an Agent(Explore, …) walk returns
   claims with specific file paths / line numbers, the next action
@@ -6296,23 +5920,19 @@ data loss into a clear error.
   `files_produced`, `status`, `format`, `compression`, `export_name`)
   from every `summary.json` produced by `rivet run`. Catches the class
   of regression where layout matches but row count is wrong.
-
 - **`test(query_matrix)`** — NEW. Fourth matrix. Pins PG `EXPLAIN
   (COSTS OFF)` plan shape per representative query. Catches operator
   query wrapped in subquery / CTE, planner dropping the PK index, sort
   steps appearing without intent.
-
 - **`test(gremlin)`** — added 5 new scenarios (G6–G10): `row_count_max`
   upper bound, `row_count_min` boundary inclusivity, NULL handling in
   `unique_columns`, chunked + sparse-ID quality, multi-export
   one-fails-others-continue.
-
 - **`test(soak_matrix)`** — NEW. Fifth matrix. Pins order-of-magnitude
   perf and memory thresholds on a 10k-row PG table per export mode
   (full / chunked / incremental). Catches "50x slower" / "10x memory"
   regressions; tunable thresholds, deliberately generous to avoid
   CI runner noise.
-
 - **`test(dev/matrices)`** — orchestrator + taxonomy (Surface /
   Execution / Resources / Compatibility layers) + shared `_common/lib/`
   for helpers used by ≥2 matrices. `run.sh --tier=pr|nightly|release`
@@ -6337,14 +5957,12 @@ data loss into a clear error.
   already does (shared OpenSSL stack the workspace already vendors).
   Net `Cargo.lock` reduction: drops `mysql-common-derive` +
   `darling` transitive macro deps.
-
 - **`fix(plan/build)`** — `mode: chunked` with the `table:` shortcut
   silently auto-resolved `chunk_column` from the primary key with
   no operator-visible signal (the log was `info!`, below the
   default `warn` level).  A typo'd `chunk_column` fell back to PK
   without any indication.  Elevated to `warn!` with "Set
   `chunk_column:` explicitly to silence."
-
 - **`fix(config)`** — `query_file: ../../../etc/passwd` passed
   `rivet check` and `rivet doctor` and was only caught at plan
   time inside `ExportConfig::resolve_query`.  Syntactic checks
@@ -6352,7 +5970,6 @@ data loss into a clear error.
   so check/doctor reject early at config-load.  `resolve_query`
   keeps its `canonicalize`-based symlink check for the read-time
   race.
-
 - **`fix(preflight/check)`** — `rivet check` previously skipped
   destination credential preflight: a config with
   `AWS_ACCESS_KEY_ID` unset returned rc=0 from check and died on
@@ -6370,11 +5987,9 @@ data loss into a clear error.
   exactly once in `Config::load_with_params`.  Adds
   `find_unused_params` as the testable kernel; 5 new unit tests
   pin used/unused/partial/mixed/None.
-
 - **`fix(config/models)`** — "source URL contains plaintext password
   — consider using url_env or url_file" warning emitted 3–4× per
   run.  Gated with `Once::call_once` so it fires once per process.
-
 - **`fix(source/mod)`** — same `Once::call_once` dedup applied to
   the "TLS is not enforced" warning.
 
@@ -6398,13 +6013,11 @@ cover that gap and are wired into CI so a regression of any kind
   (positive / negative / exact-count) on stderr+stdout per
   scenario, plus state sub-actions, type-report variants, journal
   flags, frozen-plan apply.
-
 - **`dev/cfg_matrix/`** [NEW] — **83 YAML fixtures** across 7 axes
   (source / TLS / export-mode / destination / edge / multi /
   negative) each probed with `doctor` + `check` + `plan`.  17
   msg-substring assertions pinning what the four config/preflight
   fixes above changed.
-
 - **`dev/path_matrix/`** [NEW] — **7 scenarios** that run `rivet
   run` and diff produced file layout against frozen, timestamp-
   normalized baselines.  Catches `_SUCCESS` drops, chunk naming
@@ -6412,7 +6025,6 @@ cover that gap and are wired into CI so a regression of any kind
   Subsequent commits added per-scenario data-accounting assertions
   from `summary.json` (rows / files / bytes / status) and EXPLAIN
   plan-shape pins per representative query.
-
 - **`dev/cross_version_matrix/`** [NEW] — `doctor` / `check` /
   `plan` against PG 12/13/14/15/16 + MySQL 5.7/8.0; asserts rc
   agreement across versions of the same engine.  Designed for CI
@@ -6425,7 +6037,6 @@ cover that gap and are wired into CI so a regression of any kind
   wire format of `plan.json` / `summary.json` so a future serde
   rename that breaks committed plan artifacts is caught before
   users hit it on disk.
-
 - **`tests/gremlin.rs`** — 5 new boundary scenarios (G6–G10):
   - **G6** `row_count_max` symmetric with `row_count_min` (catches
     "my predicate is wrong, daily summary returned 50 000 rows").
@@ -6464,14 +6075,12 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
 - **`fix(pipeline/apply)`** [F1] — `--force` now correctly bypasses the
   cursor-drift gate (previously the error message claimed it would,
   but the code never honoured the flag).
-
 - **`fix(pipeline/apply)`** [F13] — apply resolves state DB from the
   original config's directory (recorded in `PlanArtifact.config_path`
   at plan time), not the plan file's directory.  Storing a plan JSON
   separately from its config no longer produces bogus *cursor drift
   (current: None)* on every incremental apply.  Pre-0.7.5 artifacts
   fall back to the plan file's directory with a `WARN`.
-
 - **`feat(pipeline/summary)`** [F5] — every apply run records an
   `apply_context: { plan_id, forced, force_bypassed }` block in
   `summary.json`.  Closes the audit-trail gap surfaced by the 0.7.5
@@ -6483,37 +6092,28 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   double-encodes multi-byte UTF-8 codepoints.  Every error message
   containing an em-dash, Cyrillic, or any non-ASCII glyph passing
   through the redactor came out mojibaked.  Pinned by tests.
-
 - **`fix(preflight/doctor)`** [F-NEW-A] — `rivet doctor` exits
   non-zero when any probe fails.  Previously printed `[FAIL]` but
   exited 0 so cron/CI could not detect a broken environment by rc.
-
 - **`fix(config)`** [F11, F12] — config-file-not-found and YAML
   parse errors now name the file path.
-
 - **`fix(plan/artifact)`** [F8] — `apply` on a non-JSON file produces
   a Rivet-shaped message instead of the raw `expected ident at line
   1 column 2`.
-
 - **`fix(pipeline/apply)`** [F6] — stale-plan error switches to days
   + creation date for ages ≥ 48 h ("2334 days old (created 2020-01-01)")
   instead of "56035 hours old".
-
 - **`fix(plan)`** [F3] — `diagnostics.warnings` populates from
   `build_suggestion` when the verdict is non-Efficient and no specific
   warning was collected.  JSON consumers no longer see `DEGRADED`
   with `warnings: []`.
-
 - **`fix(plan/chunked)`** [F4] — chunked `row_estimate` is derived
   from `chunk_ranges` instead of `pg_class.reltuples` (stale before
   `ANALYZE`).  PG and MySQL artifacts of the same fixture now agree.
-
 - **`fix(config/resolve)`** [F10] — warns when `--param key=value`
   is passed but `${key}` never appears in the config.
-
 - **`fix(pipeline/run)`** [F-NEW-B] — `run --force` without `--resume`
   warns that the flag is a no-op in this combination.
-
 - **`feat(main)`** [F-NEW-F] — `env_logger` default level is now
   `warn` (was implicit `error`).  Every `log::warn!` surfaces by
   default; `RUST_LOG` still overrides.
@@ -6525,7 +6125,6 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   captures `stdout`, `stderr`, exit code, command line, and description.
   Used as a release gate: diff per-scenario rc between previous and
   next release before tagging.  See `dev/cli_matrix/README.md`.
-
 - **`ci`** — new `cli-matrix` job runs the harness against the docker
   compose fixtures on every PR and the nightly schedule.  Failures
   block merge.
@@ -6550,7 +6149,6 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   crashing — the token may still authenticate.  Closes the
   known-limitation note in `docs/cloud-destinations.md` § Known
   limitations.
-
 - **First-user-friendly error messages.**  Every config-layer
   and `rivet doctor` error a first-time operator hits now carries
   a `Hint:` line with a concrete next action — the exact `export
@@ -6560,19 +6158,16 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   `az storage container generate-sas` invocation for expired SAS,
   and so on.  The wording is pinned by 15 unit tests so dropping
   a hint accidentally trips CI.
-
 - **`docs/who-is-this-for.md`.**  Explicit Yes / No fit-check with
   named alternatives (Debezium, Airbyte, Fivetran, dbt, DuckDB,
   Trino) so visitors with the wrong problem leave fast and the
   ones who stay are pre-qualified.  Surfaced as a callout block
   at the top of the README.
-
 - **README reorganization.**  Workflow story (`init → doctor → check
   → plan → run → validate`) now precedes the dense benchmark
   methodology section.  Hero numbers stay in the headline; the
   cross-tool tables move below "Trust contracts" so first-time
   visitors see the product narrative before the speeds-and-feeds.
-
 - **Trust-documentation layer.**  Five new evergreen artifacts
   consolidate operator discipline that previously lived in
   individual maintainer's heads:
@@ -6594,7 +6189,6 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   new unit tests cover RFC3339 parsing, URL-encoded colons,
   threshold boundaries, the no-`se=` (stored-access-policy) path,
   and the wire path through the destination constructor.
-
 - **`feat(config/error-messages)`** — the most common first-run
   failures now carry actionable `Hint:` lines:
   - missing source block → "Add `url_env: DATABASE_URL`" with the
@@ -6607,7 +6201,6 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
     don't want; mixing the two is ambiguous";
   - structured config missing `host` / `user` / `database` → the
     concrete YAML edit and the URL-based alternative.
-
 - **`feat(preflight/doctor)`** — `source_error_hint` and
   `destination_error_hint` map a categorised error to a concrete
   next-step hint, printed below the failure line in `rivet doctor`.
@@ -6619,14 +6212,12 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   `aws s3 mb` / `gcloud storage buckets create` /
   `az storage container create` invocation, and connectivity
   errors (`region:` mismatch, bastion / VPN reminders).
-
 - **`docs(README)`** — new "Is this for you?" callout above
   `## Why Rivet`, linking to `docs/who-is-this-for.md`.  The
   "Source pressure, measured" benchmark section moves below
   "Trust contracts" so the workflow story comes first; the
   cross-reference in the Trust contracts table now uses
   `[Source pressure, measured](#…) below`.
-
 - **`docs(who-is-this-for)`** — new doc with explicit Yes / No
   rows and named alternatives (Debezium / Estuary / Materialize
   for CDC; Airbyte / Fivetran / Stitch for connector
@@ -6636,7 +6227,6 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   ClickHouse for query-time integration).  Edge-case section
   covers very-large dumps, weak primary keys, replication lag,
   SSH bastions, and stateless runners.
-
 - **`test`** — 15 new unit tests pin the error-message contract:
   5 in `src/config/tests.rs` (no-source-block, missing host with
   hint, missing url_env, missing password_env, mixed-fields), and
@@ -6646,20 +6236,17 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   guidance).  Existing `no_url_at_all_rejected` updated to assert
   the new `connection method` + `url_env` + `DATABASE_URL`
   wording.
-
 - **`docs(README)`** — new `## Core workflow` section between the
   30-second quickstart and "What Rivet is" surfaces the canonical
   command path (`init → doctor → check → plan → run → validate`,
   with `apply` and `reconcile`/`repair` branches).  Documentation
   table extended with rows for cloud smoke tests, release
   checklist, cloud permissions, and operator recipes.
-
 - **`docs(reliability-matrix)`** — new "Manual / release-gated
   coverage" section names the cloud backends with their
   last-verified dates and links to `docs/cloud-smoke-tests.md`.
   Resolves the long-standing tension between "what's in CI" and
   "what was hand-verified before publish".
-
 - **`docs(README index)`** — new "Trust contracts" rows for cloud
   smoke tests, release checklist, and cloud permissions; new
   "Operator recipes" sub-section under Production.
@@ -6670,27 +6257,22 @@ target by design.  See `dev/cli_matrix/expected_rc.txt` and
   `se=` expiry value is now decoded alongside `%3A` / `%3a` (colon), so
   timezone offsets like `+00:00` in tokens from `az … -o tsv` parse
   correctly.
-
 - **`fix(destination/azure)`** — Near-expiry threshold comparison changed from
   `<` to `<=`: a token whose remaining validity is exactly 60 minutes now
   correctly triggers the `NearExpiry` warning (previously slipped through as
   `Healthy`).
-
 - **`fix(preflight/doctor)`** — `categorize_dest_error` now returns the
   dedicated `"sas expired"` category before the generic `"auth error"` check.
   Prior ordering let the token-keyword match in `"auth error"` win and route
   expired-SAS errors to the wrong hint.
-
 - **`fix(preflight/doctor)`** — `destination_error_hint` signature simplified:
   the unused `err: &anyhow::Error` parameter (formerly `_err`) has been
   removed; the Azure SAS guard is now the `"sas expired"` match arm instead
   of a pre-match string scan.
-
 - **`test`** — direct test for `categorize_dest_error` category ordering: pins
   that an expired-SAS error message returns `"sas expired"`, not `"auth
   error"`, with a descriptive assertion message that calls out the
   load-bearing nature of the ordering.
-
 - **`chore`** — `cargo update`: 20 packages refreshed including openssl 0.10.80,
   serde_json 1.0.150, mysql_common 0.37.2, winnow 1.0.3, tokio 1.50.0.
 
@@ -6730,20 +6312,16 @@ for a future minor.
   `DestinationConfig`, `TuningConfig`, `TlsConfig`, every nested enum).
   The schema embeds the binary's `CARGO_PKG_VERSION` in its `title` so
   drift is detectable by inspection.
-
 - **`feat(cli)`** — new `rivet schema config` subcommand.  Output
   format: pretty-printed JSON Schema (draft 2020-12), trailing newline.
-
 - **`docs(examples)`** — `examples/pg_full_local.yaml` now carries a
   `# yaml-language-server: $schema=…` header so editor validation is
   on by default for any operator who runs that example.
-
 - **`test`** — `tests/schema_drift.rs` pins the in-tree schema artifact
   to the runtime output; CI fails when a Config change forgets to
   regenerate the schema.  Three guard checks: byte-equality vs the
   generated schema, byte-equality between primary and `latest/`
   mirrors, and `CARGO_PKG_VERSION` presence in the title.
-
 - **`feat(config)`** — strict-mode YAML parsing (P1.2).  Eleven
   Config-tree structs now carry `#[serde(deny_unknown_fields)]`:
   `Config`, `SourceConfig`, `TlsConfig`, `ExportConfig`,
@@ -6752,7 +6330,6 @@ for a future minor.
   silent-drop typos (`acccess_key_env`, `database_name`, `profil`,
   `expoorts`) now fail fast at parse time.  The schema artifact
   reflects this: 11 new `"additionalProperties": false` declarations.
-
 - **`feat(config)`** — did-you-mean suggestions on parse errors
   (P1.2).  New `crate::config::lints` module post-processes serde's
   `unknown field` error and appends a one-line `Did you mean \`X\`?`
@@ -6761,31 +6338,26 @@ for a future minor.
   `closest_match` heuristic prefers prefix/suffix matches (so
   `database_name` correctly suggests `database`) but stays
   conservative — no suggestion is shown when nothing is close enough.
-
 - **`docs(examples)`** — new `examples/README.md` clarifies that the
   YAML files are CLI sample configs, not `cargo run --example`
   targets, lists each file's source/mode/destination at a glance,
   and points operators to `demo/` for turn-key Docker setups
   (roadmap P1.1; physical directory move deferred to preserve URLs
   already linked from blog posts and external docs).
-
 - **`test`** — `tests/config_parse_errors.rs` pins the
   unknown-field + did-you-mean contract across every level operators
   can mistype (top-level, `source:`, `exports[]`, `destination:`,
   `tuning:`), plus the absence of a suggestion when nothing is
   close enough, plus the preservation of the existing dedicated
   misplaced-tuning hint.
-
 - **`ci`** — bump `actions/checkout`, `actions/upload-artifact`, and
   `actions/download-artifact` from v4 → v5 for Node 24 compatibility
   (the Node 20 runtime is on the GitHub deprecation path).  No
   behavior change for the workflow shape itself.
-
 - **`ci`** — `Swatinem/rust-cache@v2` now also caches the `fmt` job's
   toolchain extraction (with `cache-targets: false` since `cargo fmt`
   never touches `target/`).  Small win — one fewer cold-start cost
   on a PR push.
-
 - **`ci(release)`** — Docker image now built on **native amd64 + arm64
   runners** instead of QEMU-emulated arm64.  The `docker-build`
   matrix pushes per-arch digests (`name=…,push-by-digest=true`); a
@@ -6808,7 +6380,6 @@ for a future minor.
 - **`rivet validate --date / --run-id / --prefix`** — re-verify a prior run
   without re-running the export.  Lifts the implicit "today only" anchor
   that previously made `rivet validate` blind to yesterday's `{date}` prefix.
-
 - **Shared placeholder resolver** (`crate::destination::placeholder`) — one
   module substitutes `{date}` / `{export}` / `{table}` / `{run_id}` for
   every command that resolves a destination prefix (`run`, `doctor`,
@@ -6827,16 +6398,13 @@ for a future minor.
   - Resolved physical prefix is surfaced in both pretty and JSON output
     (`resolved_prefix`) so operators can confirm at a glance which bytes
     were checked.  Hard-failure error messages include it too.
-
 - **`refactor(destination)`** — new `destination::placeholder` module with
   `PlaceholderContext::{for_today, for_date, with_run_id}` and
   `expand_destination(dest, &ctx)`.  Old `plan::build::expand_destination_templates`
   becomes a thin wrapper that delegates to the new module.
-
 - **`test`** — `tests/validate_historical.rs` regression-tests the anchor
   scenario: "run happened yesterday, validate runs today, `--date` still
   hits the correct physical prefix".
-
 - **`feat(redact)`** — credential redaction is now a defined invariant
   (P0.3).  New `crate::redact` module strips
   `scheme://user:password@host` userinfo from any string about to land
@@ -6846,17 +6414,14 @@ for a future minor.
   `eprintln!` path, and validate's hard-failure messages.  Covers
   `summary.json` / `summary.md`, `.rivet_state.db` journal,
   Slack / webhook payloads, and CLI stderr.
-
 - **`docs(security)`** — SECURITY.md "Redaction in errors and artifacts"
   rewritten: explicit list of redacted paths, known limitations
   (third-party driver output, in-memory secrets, shapes outside the
   URL userinfo pattern), and the test files that pin the contract.
-
 - **`test`** — `tests/redaction_invariant.rs` proves the redactor is
   idempotent, doesn't damage non-URL prose, walks `anyhow::Context`
   chains, and that `summary.json` / `summary.md` written via the
   public run-report writer never carry the URL-embedded password.
-
 - **`feat(destination/azure)`** — Azure SAS-token auth (P0.4).  New
   `sas_token_env` field on the destination config alongside the
   existing `account_key_env`.  Mutually exclusive with `account_key_env`
@@ -6875,7 +6440,6 @@ for a future minor.
     account_name: mystorageacct
     sas_token_env: AZURE_STORAGE_SAS_TOKEN
   ```
-
 - **`docs(cloud-destinations)`** — new `docs/cloud-destinations.md`
   consolidates the local / S3 / GCS / Azure auth-and-output contract
   in one place: shared output contract (`manifest.json` + `_SUCCESS`),
@@ -6888,11 +6452,8 @@ for a future minor.
 ### Highlights
 
 - **Azure Blob Storage destination** (new) — third cloud target after S3 / GCS, opendal-backed, full M1–M9 trust-contract parity (manifest + `_SUCCESS` + resume + quarantine).  Verified end-to-end against a real Azure account (`belgiumcentral`).
-
 - **AWS S3 STS / SSO / IAM Identity Center / AssumeRole / MFA** support via `session_token_env`.  Verified against a real S3 bucket.
-
 - **Cross-cloud bug fix**: `rivet validate` and `rivet doctor` now substitute `{date}` / `{export}` / `{table}` placeholders in `destination.prefix` (previously only `rivet run` did, so validate/doctor mis-read prefixes with templates).
-
 - **Cohesion pass** on `DestinationConfig`: `#[derive(Default)]` + `..Default::default()` in test fixtures.  Adding a new optional field now touches ~5 helper functions, not ~28 init sites.
 
 ### Azure Blob Storage
@@ -6908,17 +6469,11 @@ destination:
 ```
 
 - **`feat(destination/azure)`** — new `AzureDestination` (write / list / read / head / move) on top of `opendal::services::Azblob`.  Same `RetryLayer` and `FinalizeOnClose` capability profile as GCS/S3.  Server-side copy + delete fallback for `r#move` (opendal 0.55 returns Unsupported on `rename` for Azure Blob — same as S3/GCS).
-
 - **`feat(config)`** — new `account_name` (public string) and `account_key_env` (env-var name) fields on `DestinationConfig`.  Key is wrapped in `Zeroizing<String>` on read — same SecOps treatment as `access_key_env`.
-
 - **`feat(destination/azure)`** — endpoint is auto-derived from `account_name` (`https://<account_name>.blob.core.windows.net`); explicit `endpoint:` still wins (needed for Azurite, sovereign clouds, custom DNS).
-
 - **`feat(config)`** — `allow_anonymous: true` for [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite) emulator and public read-only containers.  Refuses to combine with explicit `account_name` / `account_key_env`.
-
 - **`feat(pipeline/finalize)`** — manifest's `destination.uri` field renders as `az://<container>/<prefix>` (HDFS / azcopy convention).
-
 - **`feat(preflight/doctor)`** — Azure-aware label (`Azure(<container>)`) and error category (`container not found`).
-
 - **`docs(cloud-auth.md)`** — new Azure section: Path A (account_key) + Path B (Azurite) + troubleshooting + use-case recommendations.  Reserved 0.7.2 surface documented: SAS token, service principal, managed identity, connection string — all additive, no breaking changes.
 
 Not in 0.7.1 (planned for 0.7.2, additive):
@@ -6937,7 +6492,6 @@ because the verifier looked at the literal template, not the substituted
 `runs/{date}/{export}/.rivet_doctor_probe`.
 
 - **`fix(validate)`** — `run_validate_command` now applies `{date}`/`{export}`/`{table}` substitution via `plan::build::expand_destination_templates` before constructing the destination.  Same expansion `rivet run` already used.
-
 - **`fix(doctor)`** — same substitution applied at the `check_destination_auth` probe site so doctor no longer leaves literal-template stub objects in cloud buckets.
 - This is **cross-cloud** — the bug affected S3 / GCS / Azure equally.  No engine-specific code touched.
 - The substitution uses **today's UTC date**.  If validate is invoked the day after a run, the operator should inline the absolute prefix in config; a planned `--run-id` / `--date` flag (0.7.2) will allow re-targeting historical runs.
@@ -6945,9 +6499,7 @@ because the verifier looked at the literal template, not the substituted
 ### Cohesion pass on `DestinationConfig`
 
 - **`refactor(config)`** — `#[derive(Default)]` on `DestinationType` (Local) and `DestinationConfig`.
-
 - **`refactor(destination/s3)`** — extracted `read_credential_env(env_name, label) -> Result<Zeroizing<String>>` helper, used in all three credential paths (access key, secret key, session token).  Trimmed the 13-line inline IMDS warning down to a 4-line pointer at `docs/cloud-auth.md`.
-
 - **`refactor(tests)`** — all 28 literal `DestinationConfig { ... }` init sites across `pipeline/*`, `plan/*`, `destination/*`, `preflight/*`, and integration tests converted to `..Default::default()`.  Net **−227 lines**.
 
 ### AWS S3 — STS/SSO/AssumeRole/MFA support + auth-flow docs
@@ -7019,7 +6571,6 @@ breaking existing automation.
   - Failures to write are non-fatal (ADR-0001 §I7): the pipeline keeps
     its exit code and the resume hint is still surfaced to stderr even
     when disk-full prevents the report from landing.
-
 - **`feat(cli)`** — the stderr run-summary block is followed by a
   `report:` line pointing at the on-disk Markdown, and (on a failed run
   with at least one committed file) a `resume:` line containing a
@@ -7038,16 +6589,13 @@ breaking existing automation.
     the xxh3 of the just-written `manifest.json` bytes.  An orchestrator
     can poll `_SUCCESS` (cheap GET) to detect manifest changes between
     runs (ADR-0012 §M2).
-
 - **M1/M2 ordering**: parts before manifest; manifest before `_SUCCESS`.
   Both writes use the destination's atomic-PUT path (S3 / GCS) or
   `fs::copy` (local).  `_SUCCESS` is written iff `status: success`.
-
 - **M3 fingerprints**: schema fingerprint (`xxh3` over sorted
   `[{name, type}]`) and per-part content fingerprint (`xxh3` over the
   written bytes) — both `xxh3:<16-hex>` shape, prefix reserved so future
   sha256/blake3 hashers can coexist without a schema break.
-
 - **M4 atomicity**: a given `run_id` produces exactly one manifest;
   resumed runs that complete additional parts write a fresh manifest
   atomically (server-side replace on cloud, `rename` on local) — never
@@ -7064,12 +6612,10 @@ breaking existing automation.
   - Surfaces self-consistency violations (declared `row_count` vs
     actual sum, duplicate `part_id`, unsupported `manifest_version`).
   - Lists the prefix and flags untracked surplus objects.
-
 - **M6 legacy fallback**: when no manifest is present at the prefix
   (pre-0.7.0 export), the report carries `legacy_run: true` so an
   operator sees the reduced assurance explicitly — silent fallback is
   forbidden.
-
 - **`feat(rivet validate)`** — new standalone subcommand:
   `rivet validate [--config path] [--export name] [--format pretty|json]`
   re-runs the same M5/M6 checks against an existing destination
@@ -7104,12 +6650,10 @@ breaking existing automation.
     clean for the new write.
   - Untracked surplus objects (under prefix but not in manifest) are
     quarantined too, never deleted.
-
 - **M9 quarantine** is best-effort per ADR (`Destination::r#move` —
   `fs::rename` on local, server-side rewrite + delete on S3/GCS).
   Failures are logged at WARN and never fatal — a clutter problem
   is never escalated to an extraction failure.
-
 - **`feat(--force)`** — new safety override on `rivet run`.
   Required when `--resume`'s gate refuses to start (destination prefix
   already has `_SUCCESS` from a prior completed run).  Per ADR-0013
@@ -7122,7 +6666,6 @@ breaking existing automation.
 - **`rivet run`** flags: `--validate`, `--reconcile`, `--resume`,
   `--force` — pinned by ADR-0013 acceptance criterion.  M5/M6/M8/M9
   land entirely under existing flags; no new trust noun on `run`.
-
 - **`rivet validate`** is the only new top-level subcommand.  Standalone
   driver for the manifest-verify flow (ADR-0013 "Subcommand carveouts").
 - An anchor test in `tests/trust_artifacts_integration.rs` §24 pins
@@ -7172,7 +6715,6 @@ unaware of the manifest, which is most of its operator value.
   - Source: `src/pipeline/report.rs`. Failures to write are non-fatal: the
     pipeline keeps its exit code and the resume hint is still surfaced to
     stderr even when disk-full prevents the report from landing.
-
 - **`feat(cli)`** — the stderr run-summary block is now followed by a
   `report:` line pointing at the on-disk Markdown, and (when the run failed
   after committing at least one file) a `resume:` line containing a
@@ -7222,31 +6764,25 @@ steelman re-run that gives every competitor its best plausible config.
   from the catalog and resolves the schema automatically.
   `source.environment` lets a single config carry per-environment defaults
   without YAML anchors.
-
 - **`feat(chunked)`** — `chunk_column` is auto-resolved from the primary
   key on the `table:` shortcut. No more manually copying the PK name into
   the YAML.
-
 - **`feat(chunked)`** — `chunk_size_memory_mb` (memory-budgeted chunk
   sizing) + a small-table escape path that runs sub-threshold tables in a
   single chunk instead of forcing the planner to emit a one-row range.
-
 - **`feat(source)`** — `work_mem`-aware `FETCH` cap on the Postgres server
   side cursor. The longest single SQL statement Rivet issues on a 2 M-row
   wide table is now **0.19s** (`FETCH 142 FROM _rive`) instead of the
   multi-second hold that `FETCH FORWARD 10000` produced under tight
   `work_mem`. Run summary now includes `pg_temp_bytes` so an operator can
   see how much spill the export caused.
-
 - **`feat(mysql)`** — full chunking parity with Postgres: auto-resolved
   `chunk_column` from the PK + `chunk_size_memory_mb` derived from
   `information_schema.TABLES.AVG_ROW_LENGTH` (with a `/3` correction
   above 8 KB to compensate InnoDB's BLOB inflation).
-
 - **`feat(mysql)`** — batch-memory-aware `row_buf` cap. RSS on the wide
   MySQL `content_items` fixture no longer scales with chunk size: peak RSS
   stays at **280 MB** regardless of `chunk_size_memory_mb` setting.
-
 - **`feat(mysql)`** — `MysqlProxyKind` 4-signal classifier identifies
   ProxySQL, MaxScale, and generic multiplexers at connect time and emits
   the pool-safety warning before the export starts (mirrors the existing
@@ -7260,11 +6796,9 @@ steelman re-run that gives every competitor its best plausible config.
   count against the hard-coded default, so adaptive batch sizing could
   declare the cursor exhausted one batch early on tables whose row width
   triggered an early `work_mem` cap.
-
 - **`fix(lib)`** — drop the blanket `#[allow(dead_code)]` on the
   `preflight` module by exposing it as `pub mod`. Eliminates 30+ legitimate
   dead-code warnings that the blanket allow was hiding.
-
 - **`fix(clippy)`** — struct-init shorthand for `TuningConfig` across
   live tests (no behavior change).
 
@@ -7272,28 +6806,22 @@ steelman re-run that gives every competitor its best plausible config.
 
 - **`refactor(mcp)`** — extract the MCP server into the `rivet-mcp` binary
   (see "Breaking / packaging" above).
-
 - **`refactor(cli)`** — split the ~1000-line `src/cli/mod.rs` into
   `args.rs` / `validate.rs` / `params.rs` / `dispatch.rs` so each file owns
   a single concern.
-
 - **`refactor(tuning)`** — split the 678-line `src/tuning.rs` into
   `tuning/{profile,memory,adaptive}.rs`. `next_adaptive_batch_size` from
   0.5.3 stays a pure function, now in `adaptive.rs`.
-
 - **`refactor(chunked)`** — split the 661-line `pipeline/chunked/mod.rs`
   into sibling `sequential_checkpoint.rs` + `parallel_checkpoint.rs`,
   with chunk math extracted to `math.rs`. Cuts the largest pipeline file
   by ~75%.
-
 - **`refactor(source)`** — extract Arrow-conversion machinery into
   `source/postgres/arrow_convert.rs` and `source/mysql/arrow_convert.rs`,
   leaving the `mod.rs` files focused on transport / cursor / chunking.
-
 - **`refactor(chunked)`** — drop the subquery wrap on min/max/COUNT
   boundary queries for the `table:` shortcut. Eliminates a planner
   pessimization on tables with a partial index on the chunk column.
-
 - **`refactor(mysql)`** — `AVG_ROW_LENGTH / 3` correction above 8 KB to
   compensate InnoDB BLOB inflation. Wide-MySQL `chunk_size_memory_mb`
   derivations are now within ~10% of measured per-row width.
@@ -7306,12 +6834,10 @@ steelman re-run that gives every competitor its best plausible config.
   `live_mysql_resume`, `live_mysql_retry_and_faults`,
   `live_mysql_schema_drift`, `live_mysql_chunked`. The MySQL twin of
   `live_oltp_load` validates retry / streaming under concurrent INSERTs.
-
 - **`test(chunked)`** — parallel checkpoint recovery (cases C3, C4) +
   panic hooks in the parallel worker so a `panic!()` inside `BatchSink`
   no longer leaks a thread, the run aborts cleanly, and the checkpoint
   state machine is in a resumable state.
-
 - **`ci`** — ProxySQL added to `docker-compose.yaml` (`pool` profile) and
   wired into `.github/workflows/nightly-live.yml` alongside the existing
   pgBouncer coverage.
@@ -7327,13 +6853,11 @@ steelman re-run that gives every competitor its best plausible config.
   counter deltas (`pg_stat_database`, `Innodb_rows_read`, `processlist`).
   Rivet: PG 0.19s / 443 MB peak, MySQL 9s / 280 MB peak, 0 / 22 + 0 / 17
   table failures.
-
 - **`bench(steelman)`** — second report that re-runs every competitor at
   its best plausible configuration (e.g. `odbc2parquet --batch-size-memory
   256MiB --sequential-fetching`, narrow-table `--column-length-limit`).
   On narrow tables the gap closes substantially; on wide `content_items`
   Rivet's edge survives (~58× peak RSS, ~700× longest single query).
-
 - **`bench(odbc2parquet)`** — numbers refreshed against v11.0.0 (was
   v6.0.7). Wall improved ~15% on the full suite; architectural shape
   unchanged.
@@ -7345,21 +6869,17 @@ steelman re-run that gives every competitor its best plausible config.
   / manual breakdown), `docs/reference/compatibility.md` (exact PG 12–16,
   MySQL 5.7 / 8.0 versions exercised), `SECURITY.md § Sensitive local
   artifacts`, all linked from the README "Trust contracts" table.
-
 - **Onboarding funnel consolidation** — one canonical document per stage:
   `getting-started.md` (first run), `docs/concepts.md` (glossary),
   `docs/pilot/README.md` (operator runbook). Removed parallel
   `pilot/quickstart-postgres.md` + `pilot/quickstart-mysql.md` whose
   content was duplicated from `getting-started.md`.
-
 - **Architecture refresh** — `docs/architecture.md` updated for the
   `tuning/` and `chunked/` splits and the new `rivet-mcp` binary.
-
 - **GIFs** — all 12 default scenarios (and the opt-in `pool-detect`)
   re-rendered against the 0.6.0 binary. New `coalesce-cursor.gif` shows
   `incremental_cursor_mode: coalesce` correctly tracking 30 late-arriving
   rows whose `updated_at` is `NULL`.
-
 - **README** — claims now back-linked to measured numbers (the
   "Source pressure, measured" table is generated from
   `docs/bench/reports/REPORT_*.md`).
@@ -7383,7 +6903,6 @@ new unit/CI coverage, and ADR-documented design decisions. The CLI surface
   connection is returned clean even on unwind. Regression test
   `pg_panic_in_sink_releases_cursor_and_aborts_txn` exercises the panic
   path via `std::panic::catch_unwind`.
-
 - **`fix(adaptive)`** — call `pg_stat_clear_snapshot()` before each
   `checkpoints_req` sample. PostgreSQL caches the stats snapshot at
   transaction start, so every adaptive sample inside the cursor txn was
@@ -7392,7 +6911,6 @@ new unit/CI coverage, and ADR-documented design decisions. The CLI surface
   now actually reacts (verified end-to-end: a 200K-row content_items
   export under WAL pressure goes from `batches=40 min=5000 max=5000` to
   `batches=121 min=500 max=5000` with `adaptive: true`).
-
 - **`fix(test)`** — `live_oltp_load.rs` had a long-standing precondition
   bug: `SELECT *` on a `NUMERIC(12,2)` column loses precision metadata in
   the subquery wrap. Tests now declare an explicit `amount` decimal
@@ -7406,26 +6924,22 @@ new unit/CI coverage, and ADR-documented design decisions. The CLI surface
   instead of a `(bool, bool, u64)` tuple. Positional destructuring made
   the two booleans easy to confuse; named accessors (`is_transient`,
   `needs_reconnect`, `extra_delay_ms`) are now used at every call site.
-
 - **`refactor(source)`** — `Source::export` packs its 5 read-only
   parameters into a named `ExportRequest` struct. Call sites read like
   `ExportRequest { query, incremental, cursor, tuning, column_overrides }`
   instead of relying on positional order.
-
 - **`refactor(journal)`** — `RunJournal`, `RunEvent`, `JournalEntry`, and
   `PlanSnapshot` move out of `pipeline::journal` to a new top-level
   `crate::journal`. This eliminates a layering inversion where
   `state::journal_store` was importing from `pipeline::*` (state →
   pipeline is the wrong direction). The `From<&ResolvedRunPlan>` impl
   moves to `pipeline/summary.rs` beside its sole caller.
-
 - **`refactor(adaptive)`** — `next_adaptive_batch_size` extracted into a
   pure function in `tuning.rs` and shared between `PostgresSource` and
   `MysqlSource`. The shrink/grow decision is now unit-testable without a
   live database (6 unit tests covering floor, ceiling, oscillation
   convergence). `ADAPTIVE_SAMPLE_INTERVAL` and `ADAPTIVE_MIN_BATCH`
   promoted to public constants in `tuning`.
-
 - **`refactor(sink)`** — `pipeline/sink.rs` converted to `pipeline/sink/`
   with `extract_last_cursor_value` and its 11 Arrow-type tests moved into
   `pipeline/sink/cursor.rs`. `sink/mod.rs` drops from 1525 → 1295 LOC.
@@ -7469,7 +6983,6 @@ new unit/CI coverage, and ADR-documented design decisions. The CLI surface
   in-process `thread::scope` engine (chunked-single-table) vs the
   subprocess engine (`parallel_children`) as a deliberate split, with
   the conditions that would trigger unification.
-
 - **ADR-0011** — "`Source: Send` not `Sync`": records that the
   `Mutex<Client>` prototype produced a measured 1.7× slowdown on a
   4-thread chunked export, so per-worker connections remain the right
@@ -7488,18 +7001,14 @@ one end-to-end test that verifies observable behavior, not just exit code.
 
 - **`tests/live_init.rs`** (I1–I5) — schema-wide discovery, single-table init,
   `--out` flag, MySQL init, unreachable-URL error message.
-
 - **`tests/live_init_extended.rs`** (IE1–IE5) — `--source-env`, `--source-file`,
   `--schema`, `--discover` JSON artifact, unset env var error.
-
 - **`tests/live_plan_apply.rs`** (PA-L1–PA-L8) — plan+apply round-trips (full +
   chunked), credential redaction, staleness gate, `--force`, missing plan file,
   `--param` substitution with DB row-count verification.
-
 - **`tests/live_reconcile_repair.rs`** (RR1–RR6 + RR4b) — reconcile pretty/JSON/file
   output, repair dry-run, `--execute`, `--format json`, and `--report` flag
   exercising the precomputed reconcile JSON path.
-
 - **`tests/live_cli_flags.rs`** (31 tests) — `rivet run`, `rivet check`,
   `rivet doctor`, `rivet state`, `rivet metrics`, `rivet journal`, `rivet completions`.
 
@@ -7540,12 +7049,10 @@ changes are tests, documentation, and benchmark infrastructure.
   on empty tables, exhausted incremental cursors, `unique_max_entries` cap
   warning, `auto_shrink` + quality gate correctness, and crash-before-quality-check
   recovery.
-
 - **`tests/live_chunked_recovery.rs`** (C1–C2) — chunked pipeline crash+resume
   matrix. C1: crash after `complete_chunk_task` → resume skips completed chunk,
   no duplicates. C2: crash after file written but before commit → chunk 0 stuck
   in `running` → resume resets and re-runs it (at-least-once delivery documented).
-
 - **Chunk-level fault injection** (`src/test_hook.rs`, `src/pipeline/chunked/mod.rs`)
   — new `maybe_panic_at_chunk("after_chunk_file", N)` and
   `maybe_panic_at_chunk("after_chunk_complete", N)` hooks, matching
@@ -7654,9 +7161,7 @@ tuning:
 Rivet measures the actual Arrow buffer footprint of each batch using `get_array_memory_size()`. When a batch exceeds the limit:
 
 - **`warn`** — logs the actual size, the limit, and a suggested `batch_size`. Export continues.
-
 - **`fail`** — returns an error immediately. Use in CI to block oversized batches.
-
 - **`auto_shrink`** — splits the batch in half recursively until each sub-batch fits, then writes them individually. Transparent to the rest of the pipeline — row count and output are identical.
 
 The warning includes an actionable suggestion:
@@ -7698,7 +7203,6 @@ When the cap is reached, a `Warn` issue is emitted and tracking stops for that c
 `rivet init` now includes a `parquet:` block in the generated YAML for every chunked export and any full-mode export estimated at more than 100 k rows. The block is pre-filled with the right strategy and a schema-aware target:
 
 - **Narrow tables** (fewer than 5 text/JSON/bytea columns) → `target_row_group_mb: 128`
-
 - **Wide tables** (5 or more text/JSON/bytea columns) → `target_row_group_mb: 64`
 
 ```yaml
@@ -7776,11 +7280,8 @@ exports:
 **Complex types — Postgres and MySQL:**
 
 - **Enum** (`pg: enum`, `mysql: ENUM/SET`) — written as `Utf8`.
-
 - **Interval** (`pg: INTERVAL`) — written as `Utf8` ISO 8601 string (`P1Y2M3D`, `PT0S`).
-
 - **Arrays / lists** (`pg: _text`, `_int8`, etc.) — written as Arrow `List(inner_type)`; BigQuery `REPEATED <inner>`.
-
 - **MySQL TIME/TIME2** — written as `Time64(Microsecond)`.
 
 **Unsupported-column errors** now collect all unmappable columns before returning (previously failed on the first one).
@@ -7834,31 +7335,22 @@ For simple single-table `SELECT … FROM rel` queries, `rivet` now looks up `NUM
 ### Changed
 
 - **`rivet run --resume`** — when `--resume` is specified but no in-progress chunk checkpoint exists (e.g. after `reset-chunks` already cleared it), the run now starts fresh with a warning instead of exiting with an error. The previous workflow `reset-chunks && rivet run --resume` now works correctly.
-
 - **`rivet init` unbounded DECIMAL** — see above; `decimal(38,18)` + `# REVIEW:` replaces the old commented-out `# TODO` line.
 
 ### Fixed
 
 - **`memory_threshold_mb` defaults** — `balanced` profile now defaults to 4096 MB and `safe` to 2048 MB (was 0 = disabled). Prevents unbounded RSS growth on wide-row tables without any config change.
-
 - **Retry safety guard** — transient-error retry fails fast when `dest.write()` already succeeded in a previous attempt. Prevents silent duplicate-row writes on retry.
-
 - **PG state backend — migrate_pg** — migration runner now verifies the final schema version after migration and cleans up superseded version rows (parity with SQLite behaviour).
-
 - **PG state backend — password in logs** — PostgreSQL URLs are redacted in all log and error messages. Passwords containing `@` are handled correctly via `rfind('@')`.
-
 - **`chunk_count` validation** — `chunk_count: 0` is now rejected at plan-build time (would have caused a division by zero at run time). `chunk_count` combined with `chunk_dense: true` or `chunk_by_days` is also rejected (the options are mutually exclusive; previously `chunk_count` was silently ignored when either of the other two was set).
-
 - **MySQL `--parallel-exports` connection exhaustion** — the `mysql` crate's default connection pool eagerly opens `min=10` connections per pool. With many exports running simultaneously each pool was created at startup, causing `Too many connections` when N×10 exceeded MySQL's `max_connections` (default 151). The pool is now configured with `min=1` so connections are opened lazily on demand.
 
 ### Performance
 
 - **BufWriter 256 KB** — temp-file write buffer increased from 8 KB to 256 KB (32× fewer `write` syscalls per batch). −37% User CPU on a 1.5 M-row benchmark.
-
 - **Inline cursor extraction** — `ExportSink` extracts the cursor value inline and frees all column buffers immediately after `on_batch` returns. Saves one full batch worth of RAM during post-run state writes.
-
 - **`insert_chunk_tasks` batch transaction** — chunk task initialisation wraps all INSERTs in a single SQLite transaction (one WAL sync). Eliminates quadratic I/O on large chunk counts.
-
 - **Quality unique tracking** — `HashSet<String>` → `HashSet<u64>` (xxh3-64). Eliminates one heap-allocated `String` per non-null row per tracked column in the hot path.
 
 ### Compatibility
@@ -8120,13 +7612,11 @@ Surfaced by the new fuzz suites (`tests/planner_fuzz.rs`,
   and panicked when the cursor column reached the BIGINT upper bound. Fixed
   with saturating arithmetic and an explicit exit when `end == i64::MAX`.
   (`src/pipeline/chunked/math.rs`)
-
 - **`build_time_window_query` on `days_window: u32::MAX`** — naive
   `now - Duration::days(u32::MAX as i64)` walks back ~12 million years and
   falls outside chrono's representable range. Replaced with
   `Duration::try_days().and_then(checked_sub_signed)` saturating at
   `DateTime::MIN_UTC`. (`src/plan/mod.rs`)
-
 - **CSV writer on pathological `Date32` values** — `NaiveDate + Duration::days(i64)`
   panicked for values near `i32::MAX` (roughly 1.5 million years from
   1970-01-01). Uses `checked_add_signed` with a fallback to an empty cell
@@ -8162,7 +7652,6 @@ the new `docs/reference/testing.md` for the file-level map and
 
 - **1096 offline tests** across 21 integration files + inline unit modules.
   Runs on every PR via `cargo test`.
-
 - **46 live tests** across 10 `tests/live_*.rs` binaries exercising the full
   `rivet` binary against the docker-compose stack (Postgres 16 + MySQL 8 +
   MinIO + fake-gcs + Toxiproxy). Gated by `#[ignore]`; activated with
@@ -8273,20 +7762,16 @@ Addresses the findings from the credential-leak review (see commit 08c16f2).
   helper (`escape_pg_literal`) that escapes both `'` and `\` regardless of
   `standard_conforming_strings`. Injection-attempt tests (`'; DROP TABLE …`,
   `O'Brien`, backslash payloads) now live in `src/source/query.rs`.
-
 - **AWS_PROFILE env mutation is serialized.** Parallel exports with
   differing `aws_profile` values no longer race — a `static Mutex` plus an
   RAII guard scopes the override and restores the previous value on drop.
-
 - **Secrets wrapped in `zeroize::Zeroizing<String>`:** AWS access/secret
   keys, GCS `client_secret` / `refresh_token` / OAuth POST body, and the
   resolved DB password. Heap buffers are zeroed on drop.
-
 - **GCS 4xx response body no longer propagates into anyhow errors.**
   Google's `/token` endpoint occasionally echoes back `client_id` /
   `client_secret` on failure; this was landing in `summary.error_message`
   (SQLite) and Slack notifications.
-
 - **`executing query: …` lowered from `info` to `debug`** in both source
   drivers, so `RUST_LOG=info` (the common CI / docs setting) no longer
   surfaces SQL text that can contain `${VAR}`-expanded secrets.
@@ -8377,14 +7862,11 @@ Security patch release — closes five advisories raised against `v0.3.0` by
 
 - **RUSTSEC-2026-0098** — `rustls-webpki` name constraints for URI names were
   incorrectly accepted. `rustls-webpki` 0.103.10 → 0.103.12.
-
 - **RUSTSEC-2026-0099** — `rustls-webpki` name constraints accepted for
   wildcard DNS names (similar to CVE-2025-61727). Same bump.
-
 - **RUSTSEC-2025-0119** — `number_prefix` unmaintained. Fixed by bumping
   `indicatif` 0.17 → 0.18, which migrated to the maintained `unit-prefix`.
   `number_prefix` is no longer in `Cargo.lock`.
-
 - **RUSTSEC-2026-0097** (×3) — `rand` unsound under custom `log::Log` that
   calls `rand::rng()` in the reseed path. Fixed by the transitive bump
   `rand` 0.8.5 / 0.9.2 / 0.10.0 → 0.8.6 / 0.9.4 / 0.10.1.
@@ -8426,17 +7908,11 @@ Source-aware planning release — Epics A–I plus credential-hardening follow-u
 ### New features
 
 - **Source-aware extraction prioritization** (Epic A, [ADR-0006](docs/adr/0006-source-aware-prioritization.md)) — `rivet plan` now emits per-export `priority_score` / `priority_class` / `cost_class` / `risk_class` / `recommended_wave` plus explainable `reasons[]`. Multi-export plans embed a full campaign view with ordered exports, grouped waves, and `source_group` collision warnings. Pretty and JSON output.
-
 - **Metadata-driven discovery** (Epic B) — `rivet init --discover -o out.json` emits a machine-readable artifact with ranked cursor + chunk candidates, nullability, total bytes, and automatic `coalesce` fallback hints when the best cursor is NULL-able.
-
 - **Composite cursor** (Epic D, [ADR-0007](docs/adr/0007-cursor-policy-contracts.md)) — `incremental_cursor_mode: coalesce` progresses on `COALESCE(primary, fallback)` for tables with a nullable `updated_at`. Synthetic `_rivet_coalesced_cursor` column is stripped before Parquet/CSV write (CC5). Single-level SQL with outer `ORDER BY` so the last batch carries the max coalesced value (CC6).
-
 - **Partition / window reconciliation** (Epic F, [ADR-0009](docs/adr/0009-reconcile-and-repair-contracts.md)) — new `rivet reconcile -c <cfg> -e <export>` re-counts every chunk partition on the source and emits a structured `ReconcileReport`. Requires `chunk_checkpoint: true` (v1).
-
 - **Committed / verified progression** (Epic G, [ADR-0008](docs/adr/0008-export-progression.md)) — new schema v4 migration for `export_progression` table plus `rivet state progression` command that surfaces both boundaries per export.
-
 - **Targeted repair** (Epic H) — `rivet repair -c <cfg> -e <export> [--report rec.json] [--execute]` derives a `RepairPlan` from a `ReconcileReport` and re-runs only the flagged chunk ranges. New files land alongside originals; committed boundary is not re-stamped (RR4).
-
 - **Historical recommendation refinement** (Epic I) — `rivet plan` folds the last ~20 rows of `export_metrics` into scoring with bounded contribution (≤ ~15 points combined). Adds `high_retry_rate_history`, `recent_failure_history`, `slow_history` reason kinds.
 
 ### Security / hardening
@@ -8490,7 +7966,6 @@ Source-aware planning release — Epics A–I plus credential-hardening follow-u
 ### Fixes
 
 - **Docker image:** install `build-essential` in the builder stage so `tikv-jemalloc-sys` can run `make` (slim images previously failed with `ENOENT` during `cargo build --release --locked`).
-
 - **`.dockerignore`** — ignore `target/`, `.git/`, `.github/` so `docker build` / `buildx` context stays small.
 
 ### Documentation
@@ -8606,9 +8081,7 @@ WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
 ### New features
 
 - **Homebrew tap** — `brew install panchenkoai/rivet/rivet-cli`
-
 - **Docker image** — `ghcr.io/panchenkoai/rivet`
-
 - **`cargo install rivet-cli`** — published to crates.io (crate renamed from `rivet` which was already taken)
 
 ### Fixes
@@ -8628,10 +8101,8 @@ WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
 
 - **Split `pipeline.rs` (2447 lines) into `pipeline/` module** with 7 focused submodules:
   `chunked`, `cli`, `mod` (orchestration), `retry`, `single`, `sink`, `validate`.
-
 - **Split `config.rs` (1708 lines) into `config/` module** with 4 submodules:
   `models`, `resolve`, `tests`, `mod` (validation & loading).
-
 - **Split `preflight.rs` (1425 lines) into `preflight/` module** with 5 submodules:
   `analysis`, `doctor`, `mod` (orchestration), `mysql`, `postgres`.
 - All public API paths unchanged — external callers unaffected.
@@ -8641,22 +8112,17 @@ WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
 - **Export failures now propagate to CLI exit code**: `run_export_job` returns
   `Result<()>` and failures are collected; `rivet run` exits with non-zero when
   any export fails (critical for CI, cron, and orchestrators).
-
 - **SQLite migration errors are fatal**: `migrate()` returns `Result` and
   `StateStore::open()` fails if any migration step errors, preventing silent
   partial schema states.
-
 - **Typed error classification**: `classify_error` now checks Postgres `SqlState`
   codes and MySQL numeric error codes before falling back to string matching,
   giving more precise transient-vs-permanent classification for retries.
-
 - **Replaced production `unwrap()` calls** with `expect()` and descriptive messages
   across `pipeline/`, `config/`, `state.rs`, `format/csv.rs`, and `source/`.
-
 - **Versioned SQLite schema migrations**: `schema_version` table tracks applied
   migrations; new databases start at v3, legacy databases are detected and upgraded
   automatically.  Future schema changes only require adding a new migration entry.
-
 - **Graceful mutex poison handling**: parallel chunked workers use
   `unwrap_or_else(|e| e.into_inner())` instead of `expect()`, preventing
   cascading panics if a worker thread panics.
@@ -8668,7 +8134,6 @@ WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
   `write_literal`, `is_multiple_of`, unused-import, and needless-borrow lints.
 - Added `// SAFETY:` documentation on the sole `unsafe` block (`resource.rs` macOS RSS).
 - Added crate-level `//!` documentation to `lib.rs`.
-
 - **Tuning `profile_name()` now returns the configured profile** rather than
   inferring from numeric fields, ensuring metrics and logs match the YAML config.
 
@@ -8677,11 +8142,9 @@ WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
 - **Streaming cloud uploads**: S3, GCS, and stdout destinations now use
   `std::io::copy` instead of loading entire temporary files into RAM. Memory
   footprint during upload is O(buffer) instead of O(file_size).
-
 - **Early `drop(rows)` in Postgres source**: raw `Vec<Row>` is freed
   immediately after conversion to Arrow `RecordBatch`, reducing transient
   memory overlap.
-
 - **jemalloc** (`tikv-jemallocator`) added as an optional default-on allocator.
   jemalloc aggressively returns freed pages to the OS, reducing peak RSS by
   ~30–40% at smaller batch sizes compared to the system allocator.
@@ -8715,7 +8178,6 @@ WHERE ordered_at >= '2023-01-01' AND ordered_at < '2024-01-01'
 - **USER_GUIDE.md**: added jemalloc section, memory optimization tips, streaming
   upload notes, misplaced tuning field detection, troubleshooting section,
   documented `--export` and `--last` flags for `metrics` and `state files`.
-
 - **README.md**: added stdout destination to config reference.
 
 ### Packaging
