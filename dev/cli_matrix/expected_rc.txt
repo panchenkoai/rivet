@@ -20,7 +20,7 @@ my_validate 0
 pg_apply_chunked 0
 pg_apply_corrupt 1
 pg_apply_drift_force 0
-pg_apply_drift_no_force 1
+pg_apply_drift_no_force 5
 pg_apply_full 0
 pg_apply_incr 0
 pg_apply_json_errors 1
@@ -28,7 +28,7 @@ pg_apply_legacy_frozen 0
 pg_apply_missing 1
 pg_apply_no_arg 2
 pg_apply_stale_force 0
-pg_apply_stale_no_force 1
+pg_apply_stale_no_force 5
 pg_check_chunked 0
 pg_check_full 0
 pg_check_incr 0
