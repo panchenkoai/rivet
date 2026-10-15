@@ -130,7 +130,8 @@ fn enforce_sas_expiry(token: &str) -> Result<()> {
             // CONTRACT: preflight/doctor.rs::categorize_dest_error matches on
             // "already expired" + "sas" to assign the "sas expired" category.
             // Keep those words present if this message is ever rephrased.
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::DEST_CREDENTIALS_INVALID,
                 "Azure SAS token already expired (se={}). Generate a new SAS and re-export.",
                 expires_at.to_rfc3339()
             )
@@ -159,8 +160,12 @@ pub struct AzureBackend;
 /// underlying heap buffer is zeroed on drop. OpenDAL stores its own copy
 /// inside reqsign; this wrapper only protects our transient handle.
 fn read_credential_env(env_name: &str, label: &str) -> Result<zeroize::Zeroizing<String>> {
-    let value = std::env::var(env_name)
-        .map_err(|_| anyhow::anyhow!("env var '{}' not set for Azure {}", env_name, label))?;
+    let value = std::env::var(env_name).map_err(|_| {
+        crate::error::coded(
+            crate::error::codes::CONFIG_SECRET_UNSET,
+            format!("env var '{}' not set for Azure {}", env_name, label),
+        )
+    })?;
     Ok(zeroize::Zeroizing::new(value))
 }
 
@@ -172,7 +177,10 @@ impl CloudBackend for AzureBackend {
         // existing `bucket` config field rather than introducing a second
         // synonym at the YAML layer.
         let container = config.bucket.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("Azure destination requires 'bucket' (container name)")
+            crate::error::coded(
+                crate::error::codes::CONFIG_DESTINATION_SETTING_MISSING,
+                "Azure destination requires 'bucket' (container name)",
+            )
         })?;
 
         let mut builder = Azblob::default().container(container);
@@ -205,9 +213,7 @@ impl CloudBackend for AzureBackend {
             log::info!("Azure: allow_anonymous (Azurite emulator or public container)");
         } else {
             let account_name = config.account_name.as_deref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Azure destination requires 'account_name' (or 'allow_anonymous: true' for Azurite)"
-                )
+                crate::error::coded(crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID, "Azure destination requires 'account_name' (or 'allow_anonymous: true' for Azurite)")
             })?;
             builder = builder.account_name(account_name);
 
@@ -215,7 +221,8 @@ impl CloudBackend for AzureBackend {
             // set means the operator copy-pasted two auth blocks and we
             // can't safely pick one — fail loud.
             match (&config.account_key_env, &config.sas_token_env) {
-                (Some(_), Some(_)) => anyhow::bail!(
+                (Some(_), Some(_)) => crate::rivet_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                     "Azure destination: 'account_key_env' and 'sas_token_env' are mutually exclusive — pick one auth mode"
                 ),
                 (Some(env_name), None) => {
@@ -238,7 +245,8 @@ impl CloudBackend for AzureBackend {
                     enforce_sas_expiry(token)?;
                     builder = builder.sas_token(token);
                 }
-                (None, None) => anyhow::bail!(
+                (None, None) => crate::rivet_bail!(
+                    crate::error::codes::CONFIG_DESTINATION_AUTH_INVALID,
                     "Azure destination requires 'account_key_env' or 'sas_token_env' (or 'allow_anonymous: true' for Azurite)"
                 ),
             }
@@ -589,6 +597,28 @@ sas_token_env: AZURE_STORAGE_SAS_TOKEN
             }
             other => panic!("expected NearExpiry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn an_expired_sas_and_a_doubled_auth_block_are_refused_by_code() {
+        let err = enforce_sas_expiry("sv=2021-08-06&se=2024-01-01T00:00:00Z&sig=fake").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_CREDENTIALS_INVALID", 1);
+        let cfg = DestinationConfig {
+            destination_type: crate::config::DestinationType::Azure,
+            bucket: Some("c".into()),
+            account_name: Some("acct".into()),
+            account_key_env: Some("RIVET_TEST_AZ_KEY".into()),
+            sas_token_env: Some("RIVET_TEST_AZ_SAS".into()),
+            ..Default::default()
+        };
+        let err = AzureBackend::build_operator(&cfg).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_DESTINATION_AUTH_INVALID", 1);
+        let err = AzureBackend::build_operator(&DestinationConfig {
+            destination_type: crate::config::DestinationType::Azure,
+            ..Default::default()
+        })
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_DESTINATION_SETTING_MISSING", 1);
     }
 
     #[test]

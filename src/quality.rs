@@ -64,7 +64,8 @@ pub fn validate_quality_columns(config: &QualityConfig, available: &[String]) ->
         return Ok(());
     }
     missing.sort_unstable();
-    anyhow::bail!(
+    crate::rivet_bail!(
+        crate::error::codes::CONFIG_QUALITY_COLUMN_UNKNOWN,
         "quality check references column(s) not produced by the export: {}. \
          Available columns: {}. \
          Fix the column name(s) under `quality:` or add them to the query.",
@@ -641,6 +642,7 @@ mod tests {
         let available = vec!["id".to_string(), "name".to_string()];
         let err =
             validate_quality_columns(&cfg, &available).expect_err("ghost column must be rejected");
+        crate::error::assert_coded(&err, "RIVET_CONFIG_QUALITY_COLUMN_UNKNOWN", 1);
         let msg = format!("{err:#}");
         assert!(msg.contains("ghost"), "names the offending column: {msg}");
         assert!(

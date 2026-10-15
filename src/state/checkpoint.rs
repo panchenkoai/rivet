@@ -360,7 +360,10 @@ impl StateStore {
                         &[&now, &run_id],
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("state(pg): claim chunk: {}", super::pg_detail(&e))
+                        crate::error::coded(
+                            crate::error::codes::STATE_BACKEND_FAILED,
+                            format!("state(pg): claim chunk: {}", super::pg_detail(&e)),
+                        )
                     })?;
                 Ok(rows.first().map(|row| (row.get(0), row.get(1), row.get(2))))
             }

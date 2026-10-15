@@ -135,10 +135,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
     let columns: Vec<ColumnInfo> = agg.as_deref().map(parse_columns_agg).unwrap_or_default();
 
     if columns.is_empty() {
-        anyhow::bail!(
-            "Table '{schema}.{table}' not found or has no columns. \
-             Check the table name and that the user has SELECT privilege."
-        );
+        return Err(super::table_not_found(&format!("{schema}.{table}")));
     }
 
     Ok(TableInfo {

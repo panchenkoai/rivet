@@ -107,10 +107,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
     )?;
 
     if col_rows.is_empty() {
-        anyhow::bail!(
-            "Table '{schema}.{table}' not found or has no columns. \
-             Check the table name and that the user has SELECT privilege."
-        );
+        return Err(super::table_not_found(&format!("{schema}.{table}")));
     }
 
     let columns = col_rows

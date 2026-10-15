@@ -147,7 +147,12 @@ pub(crate) fn run_each<T: Sync, R: Send>(
         effective_pool(None, items.len()),
         || Some(()),
         |_, _, item| f(item),
-        |_| anyhow::anyhow!("a worker panicked while running this item"),
+        |_| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                "a worker panicked while running this item",
+            )
+        },
     )
 }
 

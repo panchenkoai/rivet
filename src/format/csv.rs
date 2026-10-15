@@ -32,7 +32,8 @@ impl super::Format for CsvFormat {
             .iter()
             .find(|f| !csv_serializable(f.data_type()))
         {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_FORMAT_COLUMN_UNSUPPORTED,
                 "CSV cannot serialize column '{}' (Arrow type {:?}); use `format: parquet` \
                  or drop the column from the query",
                 field.name(),
@@ -371,7 +372,8 @@ fn write_csv_value(writer: &mut dyn Write, array: &dyn Array, idx: usize) -> Res
             // Defensive: `create_writer` rejects unsupported types up front, so
             // this should be unreachable. Bail rather than silently skip if a
             // new type slips through.
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::INTERNAL_DEST_INVARIANT,
                 "CSV: no serializer for Arrow type {other:?} (column should have been rejected at writer creation)"
             );
         }
@@ -958,5 +960,28 @@ mod tests {
                 "pre-1970 micros={micros} must render {want:?}, not an empty/other cell"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn a_column_csv_cannot_serialize_is_refused_by_code() {
+        use crate::format::Format as _;
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new(
+            "tags",
+            DataType::List(std::sync::Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                true,
+            ))),
+            true,
+        )]));
+        let err = super::CsvFormat
+            .create_writer(&schema, Box::new(Vec::<u8>::new()))
+            .err()
+            .expect("a list column has no CSV cell");
+        crate::error::assert_coded(&err, "RIVET_CONFIG_FORMAT_COLUMN_UNSUPPORTED", 1);
     }
 }

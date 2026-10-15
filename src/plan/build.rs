@@ -95,7 +95,8 @@ pub(crate) fn build_plan_on(
     // friendly message behind a confusing "no query" error (bughunt MED: the
     // dogfood MED-5 message was unreachable for the tables: shape).
     if export.mode == ExportMode::Cdc {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::PLAN_NOTHING_TO_PLAN,
             "export '{}': cdc mode has no batch plan — CDC exports stream changes continuously and \
              are run with `rivet run` (or the `rivet cdc` subcommand), not `rivet plan` / `rivet \
              apply`. Plan the batch exports separately, or run this one with `rivet run`.",
@@ -167,9 +168,12 @@ pub(crate) fn build_plan_on(
         ExportMode::Full => full_strategy(config, export),
         ExportMode::Incremental => {
             let primary_column = export.cursor_column.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': incremental mode requires 'cursor_column'",
-                    export.name
+                crate::error::coded(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+                    format!(
+                        "export '{}': incremental mode requires 'cursor_column'",
+                        export.name
+                    ),
                 )
             })?;
             let fallback_column = export.cursor_fallback_column.clone();
@@ -195,15 +199,21 @@ pub(crate) fn build_plan_on(
         }
         ExportMode::TimeWindow => {
             let column = export.time_column.clone().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': time_window mode requires 'time_column'",
-                    export.name
+                crate::error::coded(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+                    format!(
+                        "export '{}': time_window mode requires 'time_column'",
+                        export.name
+                    ),
                 )
             })?;
             let days_window = export.days_window.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "export '{}': time_window mode requires 'days_window'",
-                    export.name
+                crate::error::coded(
+                    crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+                    format!(
+                        "export '{}': time_window mode requires 'days_window'",
+                        export.name
+                    ),
                 )
             })?;
             ExtractionStrategy::TimeWindow {
@@ -460,10 +470,15 @@ fn resolve_chunked_strategy(
     // between the introspected and non-introspected paths.
     if let Some(count) = export.chunk_count {
         if count == 0 {
-            anyhow::bail!("export '{}': chunk_count must be >= 1 (got 0)", export.name);
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_CHUNK_COUNT_INVALID,
+                "export '{}': chunk_count must be >= 1 (got 0)",
+                export.name
+            );
         }
         if export.chunk_by_days.is_some() {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                 "export '{}': chunk_count and chunk_by_days are mutually exclusive",
                 export.name
             );
@@ -480,7 +495,8 @@ fn resolve_chunked_strategy(
             (export.chunk_count.is_some(), "chunk_count"),
         ] {
             if conflict {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CONFIG_VALUE_OUT_OF_RANGE,
                     "export '{}': chunk_by_key and {} are mutually exclusive",
                     export.name,
                     name
@@ -532,7 +548,8 @@ fn resolve_chunked_strategy(
     // `chunked_without_table_error` so the PREFLIGHT can ask the same question
     // — `rivet check` used to bless configs this bails on (see that function).
     let Some(tbl) = export.table.as_ref() else {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_MODE_SETTING_INVALID,
             "{}",
             chunked_without_table_error(export)
                 .expect("no `table:` in chunked mode past the fast path is always an error")
@@ -540,7 +557,8 @@ fn resolve_chunked_strategy(
     };
 
     if config.source.source_type == crate::config::SourceType::Mongo {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED,
             "chunked mode is not supported for MongoDB — use `mode: full` (the whole \
              collection is read as `_id` + `document` JSON)"
         );
@@ -600,10 +618,14 @@ fn resolve_chunked_strategy(
             ));
         }
         Err(e) => {
-            return Err(anyhow::anyhow!(
-                "export '{}': chunked-mode introspection probe failed: {e}. \
-                 Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
-                export.name
+            return Err(crate::error::recoded(
+                &e,
+                crate::error::codes::PLAN_SOURCE_UNREADABLE,
+                format!(
+                    "export '{}': chunked-mode introspection probe failed: {e}. \
+                     Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
+                    export.name
+                ),
             ));
         }
     };
@@ -805,7 +827,8 @@ fn validated_implicit_key<'a>(
             Ok(ImplicitKey::UniqueKey(key))
         }
         Some(key) => Ok(key),
-        None => anyhow::bail!(
+        None => crate::rivet_bail!(
+            crate::error::codes::PLAN_CHUNK_KEY_UNUSABLE,
             "export '{}': chunked mode found no safe shape on {} — no single-integer PK \
              to range-chunk and no single-column UNIQUE/PRIMARY key to keyset-page. \
              Set `chunk_column:` (integer) or `chunk_by_key:` (unique key) explicitly, \
@@ -874,7 +897,8 @@ fn chunked_strategy_from_introspection(
     // refuse otherwise rather than emit a full-scan + filesort `ORDER BY` query.
     if let Some(key) = export.chunk_by_key.as_deref() {
         if !introspection.is_usable_keyset_key(key) {
-            anyhow::bail!(
+            crate::rivet_bail!(
+                crate::error::codes::PLAN_CHUNK_KEY_UNUSABLE,
                 "export '{}': chunk_by_key '{}' is not a usable keyset key on {} — it must be a \
                  single-column, NOT NULL, UNIQUE or PRIMARY key WHOSE TYPE the keyset cursor can \
                  read ({}). A `decimal`/`numeric` \
@@ -2102,6 +2126,7 @@ mod tests {
         let err =
             resolve(SourceType::Postgres, &e, &i).expect_err("unusable chunk_by_key must refuse");
         assert!(err.to_string().contains("not a usable keyset key"));
+        crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_UNUSABLE", 1);
 
         // Memory-budget chunk_size: 100 MB at 1024 B/row = 102_400 rows — the
         // exact value pins the *,/ arithmetic; a 0-byte estimate must fall back
@@ -2131,6 +2156,7 @@ mod tests {
         let err =
             resolve(SourceType::Postgres, &e, &i).expect_err("PG must not auto-keyset (ADR-0020)");
         assert!(err.to_string().contains("no safe shape"));
+        crate::error::assert_coded(&err, "RIVET_PLAN_CHUNK_KEY_UNUSABLE", 1);
     }
 
     #[test]

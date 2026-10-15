@@ -53,7 +53,12 @@ pub(crate) fn parse_scalar_i64(raw: &str) -> crate::error::Result<i64> {
     let t = raw.trim();
     t.parse::<i64>()
         .or_else(|_| t.parse::<f64>().map(|x| x as i64))
-        .map_err(|_| anyhow::anyhow!("invalid numeric scalar: {:?}", t))
+        .map_err(|_| {
+            crate::error::coded(
+                crate::error::codes::INTERNAL_RUN_INVARIANT,
+                format!("invalid numeric scalar: {:?}", t),
+            )
+        })
 }
 
 #[cfg(test)]

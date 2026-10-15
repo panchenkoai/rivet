@@ -59,7 +59,10 @@ fn pg_config_ssl_forced(url: &str) -> Result<postgres::Config> {
     // sslmode the operator wrote parseable; the connector decides verification.
     let cleaned = crate::config::url::strip_url_query_key(url, "sslmode");
     let mut config = postgres::Config::from_str(&cleaned).map_err(|e| {
-        anyhow::anyhow!("postgres: cannot parse source URL for TLS enforcement: {e}")
+        crate::error::coded(
+            crate::error::codes::CONFIG_SOURCE_URL_INVALID,
+            format!("postgres: cannot parse source URL for TLS enforcement: {e}"),
+        )
     })?;
     config.ssl_mode(postgres::config::SslMode::Require);
     Ok(config)

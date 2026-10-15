@@ -319,9 +319,12 @@ impl ServiceAccountKey {
         // SecOps: an encoding failure must not carry the library's error text
         // upward — see `encoding_key` for why the underlying error is dropped.
         let token = jsonwebtoken::encode(&header, claims, &key).map_err(|_| {
-            anyhow::anyhow!(
-                "service account {}: signing the token assertion failed",
-                self.client_email
+            crate::error::coded(
+                crate::error::codes::DEST_CREDENTIALS_INVALID,
+                format!(
+                    "service account {}: signing the token assertion failed",
+                    self.client_email
+                ),
             )
         })?;
         Ok(Zeroizing::new(token))
@@ -336,9 +339,12 @@ impl ServiceAccountKey {
     /// at fault, which is everything an operator needs to fix it.
     fn encoding_key(&self) -> Result<jsonwebtoken::EncodingKey> {
         jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key_pem.as_bytes()).map_err(|_| {
-            anyhow::anyhow!(
-                "service account {}: `private_key` is not a PEM-encoded RSA private key",
-                self.client_email
+            crate::error::coded(
+                crate::error::codes::DEST_CREDENTIALS_INVALID,
+                format!(
+                    "service account {}: `private_key` is not a PEM-encoded RSA private key",
+                    self.client_email
+                ),
             )
         })
     }
@@ -462,7 +468,11 @@ impl AdcUserTokenLoader {
             // Do NOT surface the raw response body: Google's OAuth error responses
             // echo back the submitted `client_id` / `client_secret` in some failure
             // modes, which would end up in `summary.error_message` → SQLite / Slack.
-            anyhow::bail!("ADC token request failed (HTTP {})", status);
+            crate::rivet_bail!(
+                crate::error::codes::DEST_CREDENTIALS_INVALID,
+                "ADC token request failed (HTTP {})",
+                status
+            );
         }
 
         let payload = resp.text().await.context("reading token response")?;
@@ -597,7 +607,8 @@ pub(crate) fn load_adc_credentials() -> Result<Option<AdcCredentials>> {
     if let Ok(p) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
         && !std::path::Path::new(&p).exists()
     {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_SECRET_UNSET,
             "GOOGLE_APPLICATION_CREDENTIALS is set to '{p}', but no file exists there — \
              fix the path (or unset the variable to fall back to gcloud ADC)"
         );
@@ -664,15 +675,24 @@ pub(crate) fn parse_adc_file(data: &str) -> Result<Option<AdcCredentials>> {
 }
 
 fn parse_authorized_user(adc: AdcFile) -> Result<AdcCredentials> {
-    let client_id = adc
-        .client_id
-        .ok_or_else(|| anyhow::anyhow!("ADC authorized_user: missing client_id"))?;
-    let client_secret = adc
-        .client_secret
-        .ok_or_else(|| anyhow::anyhow!("ADC authorized_user: missing client_secret"))?;
-    let refresh_token = adc
-        .refresh_token
-        .ok_or_else(|| anyhow::anyhow!("ADC authorized_user: missing refresh_token"))?;
+    let client_id = adc.client_id.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::DEST_CREDENTIALS_INVALID,
+            "ADC authorized_user: missing client_id",
+        )
+    })?;
+    let client_secret = adc.client_secret.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::DEST_CREDENTIALS_INVALID,
+            "ADC authorized_user: missing client_secret",
+        )
+    })?;
+    let refresh_token = adc.refresh_token.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::DEST_CREDENTIALS_INVALID,
+            "ADC authorized_user: missing refresh_token",
+        )
+    })?;
     Ok(AdcCredentials::User(UserCredentials {
         client_id,
         client_secret: Zeroizing::new(client_secret),
@@ -682,12 +702,18 @@ fn parse_authorized_user(adc: AdcFile) -> Result<AdcCredentials> {
 }
 
 fn parse_service_account(adc: AdcFile) -> Result<AdcCredentials> {
-    let client_email = adc
-        .client_email
-        .ok_or_else(|| anyhow::anyhow!("ADC service_account: missing client_email"))?;
-    let private_key = adc
-        .private_key
-        .ok_or_else(|| anyhow::anyhow!("ADC service_account: missing private_key"))?;
+    let client_email = adc.client_email.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::DEST_CREDENTIALS_INVALID,
+            "ADC service_account: missing client_email",
+        )
+    })?;
+    let private_key = adc.private_key.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::DEST_CREDENTIALS_INVALID,
+            "ADC service_account: missing private_key",
+        )
+    })?;
     let key = ServiceAccountKey {
         client_email,
         private_key_pem: Zeroizing::new(private_key),
@@ -819,7 +845,11 @@ impl BlockingAdcTokenSource {
             // Do NOT surface the raw body: Google's OAuth error responses echo
             // the submitted client_id/client_secret in some failure modes, and
             // this message reaches `summary.error_message` → SQLite / Slack.
-            anyhow::bail!("ADC token request failed (HTTP {})", resp.status());
+            crate::rivet_bail!(
+                crate::error::codes::DEST_CREDENTIALS_INVALID,
+                "ADC token request failed (HTTP {})",
+                resp.status()
+            );
         }
 
         let payload = resp.text().context("reading token response")?;
@@ -1650,5 +1680,40 @@ qPSokX7fAC0Ku7S5xJe4XfPd
             1,
             "{WORKERS} concurrent callers on a cold cache must share one mint"
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    fn adc(cred_type: &str) -> AdcFile {
+        AdcFile {
+            cred_type: cred_type.into(),
+            client_id: None,
+            client_secret: None,
+            refresh_token: None,
+            quota_project_id: None,
+            client_email: None,
+            private_key: None,
+            token_uri: None,
+        }
+    }
+
+    #[test]
+    fn an_incomplete_adc_file_and_a_non_pem_key_are_refused_by_code() {
+        let err = parse_authorized_user(adc("authorized_user")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_CREDENTIALS_INVALID", 1);
+        let mut sa = adc("service_account");
+        sa.client_email = Some("sa@example.iam.gserviceaccount.com".into());
+        let err = parse_service_account(sa).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_CREDENTIALS_INVALID", 1);
+        let key = ServiceAccountKey {
+            client_email: "sa@example.iam.gserviceaccount.com".into(),
+            private_key_pem: Zeroizing::new("not a key".into()),
+            token_uri: "https://oauth2.googleapis.com/token".into(),
+        };
+        let err = key.encoding_key().err().expect("not a PEM key");
+        crate::error::assert_coded(&err, "RIVET_DEST_CREDENTIALS_INVALID", 1);
     }
 }

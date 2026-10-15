@@ -15,31 +15,44 @@ pub(super) fn validate_cli(cmd: &Commands) -> Result<()> {
     match cmd {
         Commands::Run(a) => {
             if a.parallel_exports && a.parallel_export_processes {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::CLI_OPTION_UNSUPPORTED,
                     "--parallel-exports and --parallel-export-processes are mutually exclusive; \
                      choose one parallelism mode"
                 );
             }
         }
         Commands::Plan(a) if matches!(a.format, PlanFormat::Pretty) && a.output.is_some() => {
-            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
+                "--output requires --format json (output is ignored in pretty mode)"
+            );
         }
         Commands::Reconcile {
             format: ReconcileFormat::Pretty,
             output: Some(_),
             ..
         } => {
-            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
+                "--output requires --format json (output is ignored in pretty mode)"
+            );
         }
         Commands::Validate(a)
             if matches!(a.format, ValidateFormat::Pretty) && a.output.is_some() =>
         {
-            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
+                "--output requires --format json (output is ignored in pretty mode)"
+            );
         }
         Commands::Repair(a)
             if matches!(a.format, ReconcileFormat::Pretty) && a.output.is_some() =>
         {
-            anyhow::bail!("--output requires --format json (output is ignored in pretty mode)");
+            crate::rivet_bail!(
+                crate::error::codes::CLI_OPTION_UNSUPPORTED,
+                "--output requires --format json (output is ignored in pretty mode)"
+            );
         }
         _ => {}
     }

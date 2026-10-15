@@ -990,7 +990,8 @@ pub fn guard_manifest_mode(
         return Ok(());
     };
     if existing_mode != new_mode {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::DEST_PREFIX_MODE_MISMATCH,
             "destination already holds a '{existing_mode}' manifest (run_id {run}); refusing to \
              overwrite it with a '{new_mode}' manifest — a batch export and a CDC export sharing \
              one prefix silently destroy each other's audit trail. Give this export its own \
@@ -1070,9 +1071,9 @@ mod mode_guard_tests {
         )
         .unwrap();
         guard_manifest_mode(dest.as_ref(), "batch").expect("same shape re-run allowed");
-        let err = guard_manifest_mode(dest.as_ref(), "cdc")
-            .unwrap_err()
-            .to_string();
+        let err = guard_manifest_mode(dest.as_ref(), "cdc").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_PREFIX_MODE_MISMATCH", 5);
+        let err = err.to_string();
         assert!(err.contains("refusing to"), "loud refusal: {err}");
         assert!(
             err.contains("exports/<table>/cdc/"),

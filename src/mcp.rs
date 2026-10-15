@@ -76,13 +76,15 @@ fn dispatch(
         "tools/list" => Ok(json!({ "tools": tools_list() })),
 
         "tools/call" => {
-            let params = msg
-                .get("params")
-                .ok_or_else(|| anyhow::anyhow!("missing params"))?;
-            let name = params
-                .get("name")
-                .and_then(|n| n.as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing tool name"))?;
+            let params = msg.get("params").ok_or_else(|| {
+                crate::error::coded(crate::error::codes::MCP_REQUEST_INVALID, "missing params")
+            })?;
+            let name = params.get("name").and_then(|n| n.as_str()).ok_or_else(|| {
+                crate::error::coded(
+                    crate::error::codes::MCP_REQUEST_INVALID,
+                    "missing tool name",
+                )
+            })?;
             let args = params.get("arguments").unwrap_or(&Value::Null);
             // Per MCP spec, tool execution errors are text content, not JSON-RPC errors.
             Ok(match call_tool(name, args, pg_url, mysql_url) {
@@ -95,7 +97,10 @@ fn dispatch(
             })
         }
 
-        _ => Err(anyhow::anyhow!("unknown method: {method}")),
+        _ => Err(crate::error::coded(
+            crate::error::codes::MCP_REQUEST_INVALID,
+            format!("unknown method: {method}"),
+        )),
     }
 }
 
@@ -199,18 +204,29 @@ fn call_tool(
         }
         "pgbouncer_pools" => text(pgbouncer_query("SHOW POOLS")),
         "pgbouncer_stats" => text(pgbouncer_query("SHOW STATS")),
-        other => Err(anyhow::anyhow!("unknown tool: {other}")),
+        other => Err(crate::error::coded(
+            crate::error::codes::MCP_REQUEST_INVALID,
+            format!("unknown tool: {other}"),
+        )),
     }
 }
 
 fn require_pg(url: Option<&str>) -> anyhow::Result<&str> {
     url.ok_or_else(|| {
-        anyhow::anyhow!("no Postgres URL configured — pass --pg-url or set DATABASE_URL")
+        crate::error::coded(
+            crate::error::codes::CONFIG_SECRET_UNSET,
+            "no Postgres URL configured — pass --pg-url or set DATABASE_URL",
+        )
     })
 }
 
 fn require_mysql(url: Option<&str>) -> anyhow::Result<&str> {
-    url.ok_or_else(|| anyhow::anyhow!("no MySQL URL configured — pass --mysql-url"))
+    url.ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::CONFIG_SECRET_UNSET,
+            "no MySQL URL configured — pass --mysql-url",
+        )
+    })
 }
 
 fn text(result: anyhow::Result<String>) -> anyhow::Result<Value> {
@@ -437,9 +453,12 @@ fn mysql_processlist(url: &str) -> anyhow::Result<String> {
         .iter()
         .map(|c| c.name_str().to_string())
         .collect();
-    let row_set = result
-        .iter()
-        .ok_or_else(|| anyhow::anyhow!("no result set"))?;
+    let row_set = result.iter().ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+            "no result set",
+        )
+    })?;
     let rows: Vec<Vec<String>> = row_set
         .filter_map(|r| r.ok())
         .map(|row| {
@@ -538,9 +557,12 @@ fn mysql_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> 
         .iter()
         .map(|c| c.name_str().to_string())
         .collect();
-    let row_set = result
-        .iter()
-        .ok_or_else(|| anyhow::anyhow!("no result set"))?;
+    let row_set = result.iter().ok_or_else(|| {
+        crate::error::coded(
+            crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+            "no result set",
+        )
+    })?;
     let rows: Vec<Vec<String>> = row_set
         .filter_map(|r| r.ok())
         .map(|row| {
@@ -565,9 +587,10 @@ fn mysql_table_stats(url: &str, schema: Option<&str>) -> anyhow::Result<String> 
 
 fn pgbouncer_query(sql: &str) -> anyhow::Result<String> {
     let admin_url = std::env::var("PGBOUNCER_ADMIN_URL").map_err(|_| {
-        anyhow::anyhow!(
+        crate::error::coded(
+            crate::error::codes::CONFIG_SECRET_UNSET,
             "PGBOUNCER_ADMIN_URL not set. \
-             Example: postgresql://pgbouncer@127.0.0.1:6432/pgbouncer"
+             Example: postgresql://pgbouncer@127.0.0.1:6432/pgbouncer",
         )
     })?;
     let mut client = pg_connect(&admin_url)?;
@@ -776,5 +799,18 @@ mod tests {
             sent(queries),
             [BEGIN_PINNED, pg_table_stats_sql(None), "COMMIT"]
         );
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn an_unknown_method_or_tool_is_refused_by_code() {
+        let err = super::dispatch("nope", &serde_json::json!({}), None, None).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_MCP_REQUEST_INVALID", 1);
+        let err = super::dispatch("tools/call", &serde_json::json!({}), None, None).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_MCP_REQUEST_INVALID", 1);
+        let err = super::call_tool("nope", &serde_json::Value::Null, None, None).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_MCP_REQUEST_INVALID", 1);
     }
 }

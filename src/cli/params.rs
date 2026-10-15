@@ -21,10 +21,13 @@ pub(super) fn parse_params(raw: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::with_capacity(raw.len());
     for s in raw {
         let (k, v) = s.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!(
-                "invalid --param '{}' — expected KEY=VALUE (the '=' is missing). \
+            crate::error::coded(
+                crate::error::codes::CLI_VALUE_INVALID,
+                format!(
+                    "invalid --param '{}' — expected KEY=VALUE (the '=' is missing). \
                  Example: --param table=orders",
-                s
+                    s
+                ),
             )
         })?;
         map.insert(k.to_string(), v.to_string());
@@ -49,17 +52,28 @@ pub(super) fn resolve_init_source(
         return Ok((url, SourceProvenance::Inline));
     }
     if let Some(var) = source_env {
-        let url = std::env::var(&var)
-            .map_err(|_| anyhow::anyhow!("--source-env '{}' is not set in the environment", var))?;
+        let url = std::env::var(&var).map_err(|_| {
+            crate::error::coded(
+                crate::error::codes::CONFIG_SECRET_UNSET,
+                format!("--source-env '{}' is not set in the environment", var),
+            )
+        })?;
         return Ok((url, SourceProvenance::Env(var)));
     }
     if let Some(path) = source_file {
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| anyhow::anyhow!("cannot read --source-file '{}': {}", path, e))?;
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            crate::error::coded(
+                crate::error::codes::CLI_INPUT_UNREADABLE,
+                format!("cannot read --source-file '{}': {}", path, e),
+            )
+        })?;
         return Ok((raw.trim().to_string(), SourceProvenance::File(path)));
     }
     // Unreachable: clap ArgGroup enforces `required = true`.
-    anyhow::bail!("--source, --source-env, or --source-file is required")
+    crate::rivet_bail!(
+        crate::error::codes::CLI_OPTION_UNSUPPORTED,
+        "--source, --source-env, or --source-file is required"
+    )
 }
 
 #[cfg(test)]
@@ -128,5 +142,14 @@ mod tests {
         let output = serde_json::json!({"error": format!("{err:#}")}).to_string();
         let parsed: serde_json::Value = serde_json::from_str(&output).expect("must be valid JSON");
         assert_eq!(parsed["error"], "connection refused");
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    #[test]
+    fn a_param_without_an_equals_sign_is_refused_by_code() {
+        let err = super::parse_params(&["table".to_string()]).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_VALUE_INVALID", 1);
     }
 }

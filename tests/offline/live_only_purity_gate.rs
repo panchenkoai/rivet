@@ -219,7 +219,7 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     // .has_target_fail()`, plus the `+=` it guarded) moved out to the pure
     // `TargetFailTally::add_export`, where the in-diff gate's `+=` → `*=`/`-=`
     // mutants are graded instead of MISSED.
-    ("src/preflight/mod.rs::check", 2, 0, 5, 1),
+    ("src/preflight/mod.rs::check", 1, 0, 5, 1),
 ]; // ratchet-pin: end
 
 // ── reading the live-only set out of the mutation config ─────────────────

@@ -101,7 +101,11 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             if json {
                 print_doctor_json(config_path, false, &checks);
             }
-            anyhow::bail!("doctor: config check failed (see output above)")
+            return Err(crate::error::recoded(
+                &e,
+                crate::error::codes::CLI_PREFLIGHT_FAILED,
+                "doctor: config check failed (see output above)",
+            ));
         }
     };
 
@@ -264,7 +268,8 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
             // signal wins (source/destination arms run before this).
             if transient_detail.is_none()
                 && let Some(detail) = &c.detail
-                && crate::error::retry::classify_error(&anyhow::anyhow!("{detail}")).is_transient()
+                && crate::error::retry::classify_error(&anyhow::Error::msg(detail.clone()))
+                    .is_transient()
             {
                 transient_detail = Some(detail.clone());
             }
@@ -299,10 +304,14 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
 /// exiting Generic (1) (dogfood LOW).
 fn doctor_failure_error(transient_detail: Option<String>) -> anyhow::Error {
     match transient_detail {
-        Some(detail) => anyhow::anyhow!(
-            "doctor: preflight failed on a transient error (see output above): {detail}"
+        Some(detail) => crate::error::coded(
+            crate::error::codes::CLI_PREFLIGHT_UNVERIFIED,
+            format!("doctor: preflight failed on a transient error (see output above): {detail}"),
         ),
-        None => anyhow::anyhow!("doctor: one or more preflight checks failed (see output above)"),
+        None => crate::error::coded(
+            crate::error::codes::CLI_PREFLIGHT_FAILED,
+            "doctor: one or more preflight checks failed (see output above)",
+        ),
     }
 }
 
@@ -883,6 +892,17 @@ mod tests {
                 "TLS handshake failed. Set `tls.ca_file: /path/to/ca-bundle.pem` if your DB uses a private CA, or `tls.mode: require` to encrypt without verifying the certificate; if the server has no TLS at all, `tls.mode: disable` (trusted networks only)."
             )
         );
+    }
+
+    #[test]
+    fn doctor_stops_carry_their_codes() {
+        let err = doctor_failure_error(None);
+        crate::error::assert_coded(&err, "RIVET_CLI_PREFLIGHT_FAILED", 1);
+        let err = doctor_failure_error(Some("connection refused (os error 61)".to_string()));
+        crate::error::assert_coded(&err, "RIVET_CLI_PREFLIGHT_UNVERIFIED", 2);
+        // A config that does not load keeps the config error's own code.
+        let err = doctor("/nonexistent/rivet-doctor-test.yaml", false).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CONFIG_FILE_UNREADABLE", 1);
     }
 
     #[test]

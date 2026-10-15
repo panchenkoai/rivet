@@ -15,7 +15,10 @@
 // 339 -> 153 (2026-10-15): every error site under `src/source/` (the five engines and the shared
 // CDC, spill, checksum and validate modules) carries a registered code (-186).
 // 153 -> 152 (2026-10-15): main merged, bringing the fractional range-chunk key refusal (-1).
-const CEILING: usize = 152; // ratchet-pin: uncoded-bail-sites
+// 152 -> 0 (2026-10-15): every remaining site (cli, destination, plan, init, state, preflight,
+// enrich, format, manifest, mcp, types, connect, scalar, workers, the seed tool) carries a
+// registered code (-152). The ceiling stays 0: a new bare `bail!` / `ensure!` / `anyhow!` fails.
+const CEILING: usize = 0; // ratchet-pin: uncoded-bail-sites
 
 /// Occurrences of a bare `bail!(`, `ensure!(` or `anyhow!(` (not `rivet_bail!` / `config_bail!`) in `text`.
 fn bare_bails(text: &str) -> usize {
@@ -216,13 +219,18 @@ fn uncoded_sites() -> usize {
 fn uncoded_bails_only_shrink() {
     let n = uncoded_sites();
     assert!(
-        n <= CEILING,
-        "{n} uncoded error sites, ceiling {CEILING}: a new failure must carry a registered \
-         code — `rivet_bail!(codes::…, …)`, adding the code to src/error.rs"
-    );
-    assert!(
         n == CEILING,
-        "{n} uncoded error sites, below the ceiling {CEILING}: lower CEILING to {n} to bank it"
+        "{}",
+        if n > CEILING {
+            format!(
+                "{n} uncoded error sites, ceiling {CEILING}: a new failure must carry a registered \
+                 code — `rivet_bail!(codes::…, …)`, adding the code to src/error.rs"
+            )
+        } else {
+            format!(
+                "{n} uncoded error sites, below the ceiling {CEILING}: lower CEILING to {n} to bank it"
+            )
+        }
     );
 }
 
