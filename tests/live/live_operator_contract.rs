@@ -2802,6 +2802,115 @@ fn a_cell_the_stream_cannot_carry_is_refused_by_code_postgres() {
     );
 }
 
+/// The walk out of a refused captured cell on an engine whose stream keeps no server-side position: `s` is baselined with one drained change, `hostile` writes the cell, the checkpoint deleted alone is refused under the baseline, each of `named` delivers as printed, and `leave_out` (the column dropped at the source, last since it cannot be undone) with the re-baseline recipe delivers the source.
+fn a_captured_cell_is_refused_by_code_and_walked_out(
+    mut s: CdcScenario,
+    hostile: &str,
+    code: Refused<'static>,
+    named: Vec<Remedy<'static>>,
+    leave_out: impl FnOnce() + 'static,
+) {
+    s.insert(1);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(2);
+    s.settle();
+    s.rig.run_ok();
+    s.sql(hostile);
+    s.settle();
+    let mut remedies = vec![deletes_only_the_checkpoint(Then::Refuses(
+        CHECKPOINT_INVALID,
+    ))];
+    remedies.extend(named);
+    remedies.push(Remedy::new(
+        "leave the column out of the capture",
+        Then::DeliversTheSource,
+        move |r| {
+            leave_out();
+            apply_rebaseline_remedy(r, true)
+        },
+    ));
+    s.rig
+        .refuses_twice_and_walks_out(&["run"], &[], code, remedies);
+}
+
+/// `ALTER TABLE .. DROP COLUMN` on the MySQL CDC instance, for a remedy closure.
+fn mysql_cdc_drop_column(table: &str, column: &str) {
+    use mysql::prelude::Queryable as _;
+    cdc_conn()
+        .query_drop(format!("ALTER TABLE {table} DROP COLUMN {column}"))
+        .expect("leave the column out at the source");
+}
+
+/// MySQL: a `BIT(64)` with bit 63 set, past the stream's Int64 column, is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; "map the column to decimal(20,0)" (a `columns:` override) delivers the stream as it stands, and the column dropped at the source with the re-baseline recipe delivers the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_cell_the_stream_cannot_carry_is_refused_by_code_mysql() {
+    let s = CdcScenario::mysql_with(
+        "oc_bit",
+        "id BIGINT PRIMARY KEY, v BIGINT, b BIT(64)",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    let table = s.table.clone();
+    let hostile = format!("INSERT INTO {table} VALUES (3, 3, b'1{}')", "0".repeat(63));
+    a_captured_cell_is_refused_by_code_and_walked_out(
+        s,
+        &hostile,
+        Refused::by_code("RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5),
+        vec![Remedy::new(
+            "map the column to decimal(20,0)",
+            Then::DeliversTheSource,
+            |r| r.rebuilt(|rig| rig.export_line("columns: { b: \"decimal(20,0)\" }")),
+        )],
+        move || mysql_cdc_drop_column(&table, "b"),
+    );
+}
+
+/// MySQL: a `TIME` past 24 hours (`800:00:00`), a duration no Parquet TIME holds, is refused as `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the column declared `string` in `columns:` carries it as text, and the column left out of the capture with the re-baseline recipe delivers the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_time_past_a_day_in_a_stream_is_refused_by_code_and_both_remedies_deliver_mysql() {
+    let s = CdcScenario::mysql_with(
+        "oc_time",
+        "id BIGINT PRIMARY KEY, v BIGINT, t TIME",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    let table = s.table.clone();
+    let hostile = format!("INSERT INTO {table} VALUES (3, 3, '800:00:00')");
+    a_captured_cell_is_refused_by_code_and_walked_out(
+        s,
+        &hostile,
+        Refused::by_code("RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5),
+        vec![Remedy::new(
+            "declare the column `string` in `columns:`",
+            Then::DeliversTheSource,
+            |r| r.rebuilt(|rig| rig.export_line("columns: { t: string }")),
+        )],
+        move || mysql_cdc_drop_column(&table, "t"),
+    );
+}
+
+/// SQL Server: a `MONEY` past the f64-exact range (1e12, which tiberius delivers rounded) is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the column dropped at the source and the re-baseline recipe deliver the source.
+#[test]
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_cell_the_stream_cannot_carry_is_refused_by_code_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    let s = CdcScenario::mssql_with(
+        "oc_money",
+        "id BIGINT PRIMARY KEY, v BIGINT, m MONEY",
+        |r, _| r.cdc("initial: snapshot"),
+    );
+    let table = s.table.clone();
+    let hostile = format!("INSERT INTO dbo.{table} VALUES (3, 3, 1000000000000.0)");
+    a_captured_cell_is_refused_by_code_and_walked_out(
+        s,
+        &hostile,
+        Refused::by_code("RIVET_SOURCE_CDC_CELL_UNSUPPORTED", 5),
+        vec![],
+        move || mssql_cdc_exec(&format!("ALTER TABLE dbo.{table} DROP COLUMN m")),
+    );
+}
+
 /// A checkpoint whose `field` names another server is refused as `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the re-baseline recipe as printed delivers the source.
 fn a_checkpoint_of_another_server_is_refused_by_code(mut s: CdcScenario, field: &str) {
     s.insert(1);

@@ -1,0 +1,122 @@
+diff --git a/src/pipeline/cdc/sink.rs b/src/pipeline/cdc/sink.rs
+index facea4ff..adb0c378 100644
+--- a/src/pipeline/cdc/sink.rs
++++ b/src/pipeline/cdc/sink.rs
+@@ -914,9 +914,7 @@ fn flush(
+         // Engine/native-type cell normalisation (e.g. MySQL binlog quirks: BIT
+         // bytes, ENUM indexes, epoch-text TIMESTAMPs, NUL-trimmed BINARY) —
+         // computed once per column, applied per cell.
+-        // The planned type, as `ensure_schema` declared it (after the three meta columns).
+-        let dt = schema.field(arrays.len()).data_type();
+-        let fix = value::mysql_cell_fix(engine, &m.source_native_type).filter(|f| f.applies_to(dt));
++        let fix = value::mysql_cell_fix(engine, &m.source_native_type);
+         // after-image for insert/update; before-image (the key) for delete.
+         // Finding #41: a NAMED key-only image (PG DELETE) maps by COLUMN NAME
+         // into the resolved schema — positional mapping put a non-first PK's
+@@ -926,6 +924,8 @@ fn flush(
+         // one names-Arc (same TABLE_MAP / same wire session), so resolve this
+         // column's image index once and reuse it by pointer identity.
+         let memo = image_name_memo(events, &m.column_name);
++        // The planned type, as `ensure_schema` declared it (after the three meta columns).
++        let dt = schema.field(arrays.len()).data_type();
+         let refuse = |r: value::CellRefusal| {
+             r.into_error(&m.column_name, dt, overridden.contains(&m.column_name))
+         };
+diff --git a/src/source/cdc/value.rs b/src/source/cdc/value.rs
+index 96202555..6e1e8740 100644
+--- a/src/source/cdc/value.rs
++++ b/src/source/cdc/value.rs
+@@ -861,12 +861,6 @@ fn parse_enum_labels(native: &str) -> Vec<String> {
+ 
+ impl MysqlCellFix {
+     /// The value the typed column needs for wire value `v`, or why the wire value has no reading.
+-    /// Whether the fix concerns the planned column type: the TIME check guards a Time64 column only, so a `string` override carries a duration as text.
+-    pub(crate) fn applies_to(&self, dt: &DataType) -> bool {
+-        !matches!(self, MysqlCellFix::TimeOfDay)
+-            || matches!(dt, DataType::Time64(TimeUnit::Microsecond))
+-    }
+-
+     pub(crate) fn apply(&self, v: &RivetValue) -> Result<RivetValue, FixRefusal> {
+         use RivetValue as V;
+         Ok(match (self, v) {
+@@ -913,13 +907,7 @@ impl MysqlCellFix {
+             (MysqlCellFix::SetLabels(labels), V::UInt(u)) => set_labels(labels, *u),
+             (MysqlCellFix::TimeOfDay, V::TimeMicros(us)) if !crate::types::is_time_of_day(*us) => {
+                 return Err(FixRefusal {
+-                    reason: format!(
+-                        "{} A stream has no query to cast it in: declare the column `string` in \
+-                         `columns:` to carry it as text, or leave the column out of the capture, \
+-                         then: {}",
+-                        crate::source::mysql::time_outside_day(*us),
+-                        crate::source::cdc::checkpoint_identity::RECOVER
+-                    ),
++                    reason: crate::source::mysql::time_outside_day_refusal(*us),
+                     code: Some(crate::error::codes::SOURCE_VALUE_UNREPRESENTABLE),
+                 });
+             }
+@@ -2001,19 +1989,8 @@ mod tests {
+         assert!(
+             err.reason
+                 .starts_with("mysql: TIME 838:59:59.000000 is outside 00:00..24:00")
+-                && err
+-                    .reason
+-                    .contains("declare the column `string` in `columns:`")
+-                && err
+-                    .reason
+-                    .contains("leave the column out of the capture, then: Re-baseline")
+-                && !err.reason.contains("Cast it in a query"),
+-            "a stream names the remedies it has, not the batch cast: {err:?}"
+-        );
+-        assert!(
+-            t.applies_to(&DataType::Time64(TimeUnit::Microsecond))
+-                && !t.applies_to(&DataType::Utf8),
+-            "the TIME check guards a Time64 column only"
++                && err.reason.contains("CAST(col AS CHAR)"),
++            "{err:?}"
+         );
+         assert_eq!(
+             t.apply(&V::TimeMicros(1)).unwrap(),
+diff --git a/src/source/mysql/arrow_convert.rs b/src/source/mysql/arrow_convert.rs
+index 87c8a632..fe215224 100644
+--- a/src/source/mysql/arrow_convert.rs
++++ b/src/source/mysql/arrow_convert.rs
+@@ -609,23 +609,15 @@ fn time_of_day_in_range(us: i64) -> Result<i64> {
+     Ok(us)
+ }
+ 
+-/// The MySQL wording (batch and CDC) for a TIME outside one day, without a remedy.
+-pub(crate) fn time_outside_day(us: i64) -> String {
++/// The MySQL wording (batch and CDC) for a TIME outside one day, with the MySQL remedy.
++pub(crate) fn time_outside_day_refusal(us: i64) -> String {
+     format!(
+         "mysql: TIME {} is outside 00:00..24:00, which a Parquet TIME cannot hold (MySQL TIME is a \
+-         duration up to 838:59:59).",
++         duration up to 838:59:59). Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
+         fmt_micros_as_time(us)
+     )
+ }
+ 
+-/// [`time_outside_day`] with the batch remedy: a cast in the export's query.
+-pub(crate) fn time_outside_day_refusal(us: i64) -> String {
+-    format!(
+-        "{} Cast it in a query, e.g. TIME_TO_SEC(col) or CAST(col AS CHAR)",
+-        time_outside_day(us)
+-    )
+-}
+-
+ /// `[-]H:MM:SS.ffffff` for a message.
+ fn fmt_micros_as_time(us: i64) -> String {
+     let (sign, a) = if us.is_negative() {
+diff --git a/src/source/mysql/mod.rs b/src/source/mysql/mod.rs
+index dfb2df26..53de350d 100644
+--- a/src/source/mysql/mod.rs
++++ b/src/source/mysql/mod.rs
+@@ -19,7 +19,7 @@
+ //!   is exhaustively unit-tested in isolation (no live MySQL needed).
+ 
+ mod arrow_convert;
+-pub(crate) use arrow_convert::time_outside_day;
++pub(crate) use arrow_convert::time_outside_day_refusal;
+ pub(crate) mod cdc;
+ mod proxy;
+ 

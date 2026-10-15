@@ -360,10 +360,10 @@ scenarios:
   - id: refusal_source_cdc_cell_unsupported
     what: "RIVET_SOURCE_CDC_CELL_UNSUPPORTED: a captured cell of a type the stream cannot carry"
     postgres: { test: a_cell_the_stream_cannot_carry_is_refused_by_code_postgres }
-    mysql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mssql:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    mongo:    { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
-    oracle:   { gap: "asserted by its code, once, in live_cdc; the walk is not written: refuse twice, the re-baseline recipe of the text applied literally (delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, `cdc.initial: snapshot`), and one wrong remedy, as a CdcScenario cell (SQL Server and Oracle in their serial groups)" }
+    mysql:    { test: a_cell_the_stream_cannot_carry_is_refused_by_code_mysql }
+    mssql:    { test: a_cell_the_stream_cannot_carry_is_refused_by_code_mssql }
+    mongo:    { na: "a MongoDB change row is two text cells (`_id` as text, `document` as JSON text; `change_event` in src/source/mongo/cdc.rs) and a text column reads any bytes, so the sink's `build_column` has no Mongo cell to refuse" }
+    oracle:   { na: "the server rounds a NUMBER to its declared scale at insert and refuses one past its precision, so every mined NUMBER text fits its Decimal column; BINARY_FLOAT/BINARY_DOUBLE NaN and Infinity are Float values; a date is mined in `SYYYY` form and parses; the sink's `build_column` has no Oracle cell to refuse (a redo whose text `decode` cannot read is the undecodable class, refusal_source_cdc_undecodable)" }
 
   - id: refusal_source_value_unrepresentable
     what: "RIVET_SOURCE_VALUE_UNREPRESENTABLE: a source value the output type cannot hold"

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A MySQL CDC stream refused a `TIME` past 24 hours with the batch remedy, "cast it in a query",
+  which a stream has no query for.** The check also ran by the column's native type, so a
+  `columns: { col: string }` override could not carry the duration as text (0.31.0 and earlier).
+  **Now** the refusal (`RIVET_SOURCE_VALUE_UNREPRESENTABLE`, exit 5) names the two remedies a stream
+  has: the column declared `string` in `columns:`, which carries the value as text
+  (`800:00:00.000000`), or the column left out of the capture followed by the re-baseline recipe.
+  **What to do:** nothing.
+
 - **`mode: cdc` on a standalone MongoDB failed with the driver's raw dump.** The run exited 1 with
   `Error code 40573 … RawDocumentBuf { data: "7d00…" }` and no `RIVET_*` code (0.31.0 and earlier).
   **Now** it is refused `RIVET_SOURCE_CDC_PREREQUISITE`, naming the standalone and the ways out (a
