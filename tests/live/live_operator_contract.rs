@@ -2500,6 +2500,53 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
     );
 }
 
+/// A checkpoint whose `field` names another server is refused as `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` (exit 5) on every run; the checkpoint deleted alone is refused under the baseline; the re-baseline recipe as printed delivers the source.
+fn a_checkpoint_of_another_server_is_refused_by_code(mut s: CdcScenario, field: &str) {
+    s.insert(1);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(2);
+    s.settle();
+    s.rig.run_ok();
+    s.insert(3);
+    s.settle();
+    rewrite_checkpoint(&s.rig.checkpoint(), |v| {
+        v[field] = "00000000-0000-0000-0000-000000000000".into()
+    });
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT", 5),
+        vec![
+            deletes_only_the_checkpoint(Then::Refuses(CHECKPOINT_INVALID)),
+            rebaseline(true),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_checkpoint_of_another_server_is_refused_by_code_mysql() {
+    a_checkpoint_of_another_server_is_refused_by_code(
+        CdcScenario::mysql_with("oc_foreign", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot")
+        }),
+        "server_uuid",
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_checkpoint_of_another_database_is_refused_by_code_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    a_checkpoint_of_another_server_is_refused_by_code(
+        CdcScenario::mssql_with("oc_foreign", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+            r.cdc("initial: snapshot")
+        }),
+        "family_guid",
+    );
+}
+
 /// RESULTS 17 (Oracle): a checkpoint whose SCN the retained redo no longer reaches is refused as `RIVET_SOURCE_CDC_LOG_GAP` (exit 5) on every run; the re-baseline delivers the source.
 #[cfg(feature = "oracle")]
 #[test]
@@ -2507,9 +2554,7 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
 fn a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     let s = oracle_stream_with_a_change_waiting("oc_ogap", |r| r);
-    crate::live_cdc_oracledb::rewrite_checkpoint(&s.rig.checkpoint(), |v| {
-        v["low_water"] = "1".into()
-    });
+    rewrite_checkpoint(&s.rig.checkpoint(), |v| v["low_water"] = "1".into());
     oracle_walk_out_of(s, "RIVET_SOURCE_CDC_LOG_GAP");
 }
 
@@ -2520,7 +2565,7 @@ fn a_checkpoint_past_the_retained_redo_is_refused_by_code_oracle() {
 fn a_checkpoint_of_another_database_is_refused_by_code_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     let s = oracle_stream_with_a_change_waiting("oc_odbid", |r| r);
-    crate::live_cdc_oracledb::rewrite_checkpoint(&s.rig.checkpoint(), |v| v["dbid"] = "1".into());
+    rewrite_checkpoint(&s.rig.checkpoint(), |v| v["dbid"] = "1".into());
     oracle_walk_out_of(s, "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT");
 }
 
