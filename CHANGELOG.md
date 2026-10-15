@@ -7,6 +7,14 @@
   `RIVET_*` code (exit 1) (0.31.0 and earlier). **Now** both raise it through one function and `run`
   carries the code. **What to do:** nothing.
 
+- **A `cursor_column` spelled in another case than its column failed with the raw database error on
+  PostgreSQL and Oracle.** MySQL and SQL Server refused it with `RIVET_CONFIG_CURSOR_COLUMN_CASE`; on
+  PostgreSQL and Oracle the quoted name failed the query first, so the run exited 1 with
+  `column "UPDATED_AT" does not exist` / `ORA-00904` and no code (0.31.0 and earlier). **Now** a failed
+  incremental query reads the column names of the export's query, and a cursor that matches one only
+  when case is ignored is refused with `RIVET_CONFIG_CURSOR_COLUMN_CASE` on every engine, naming the
+  spelling to use. **What to do:** nothing.
+
 - **Two `rivet run`s of one `mode: cdc` export at once both delivered the stream.** A batch run
   holds the export's run lease and a second run beside it is refused; a CDC run took no lease, so
   the second read the same changes again (MySQL, SQL Server, Oracle and MongoDB delivered duplicate
