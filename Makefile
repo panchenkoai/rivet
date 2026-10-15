@@ -82,9 +82,11 @@ test-types-snowflake:
 sweep-test-db:
 	$(PY) -m dev.pytools.sweep test-cruft
 
-# Also drops every disposable BigQuery dataset (rivet_tmp_*) — never while a gate or live run is in flight.
+# Also the cloud: BigQuery rivet_tmp_* datasets and rivet_e2e tables, and GCS test-bucket objects,
+# older than cloud_ttl_hours (dev/stand/registry.yaml); keeps the bucket lifecycle rule and the
+# datasets' default table expiration at that age. By age, so a run in flight elsewhere is safe.
 sweep-test-cloud:
-	$(PY) -m dev.pytools.sweep test-cruft --bigquery
+	$(PY) -m dev.pytools.sweep test-cruft --cloud
 
 # Multi-hour soak on the CDC stand (NOT a release gate): sustained writes on all four engines,
 # batch + CDC runs on a schedule, graded by an independent journal. See dev/soak/README.md.
@@ -98,9 +100,9 @@ soak:
 # FIRST so an interrupted prior run never pollutes the shared `rivet` DB, and
 # again after a green run so no orphaned replication slot keeps pinning WAL.
 # Requires `docker compose up -d` (postgres + mysql + the validator containers).
-test-live: sweep-test-db
+test-live: sweep-test-db sweep-test-cloud
 	$(LIVE) cargo nextest run --run-ignored all
-	@$(MAKE) --no-print-directory sweep-test-db
+	@$(MAKE) --no-print-directory sweep-test-db sweep-test-cloud
 
 # ── Fixture seed ────────────────────────────────────────────────────────────
 # Regenerate the shared live-test dataset (orders/users/events/page_views/
@@ -331,7 +333,7 @@ release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regressio
 	@# The releases a client still runs (dev/release_oracle/field_state.py FIELD_VERSIONS), beside the baseline.
 	@$(PY) -m dev.release_oracle.field_state --fetch $(PREV_RELEASE_DIR)/field
 
-release-oracle-full: release-oracle-prev-bin sweep-test-db  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
+release-oracle-full: release-oracle-prev-bin sweep-test-db sweep-test-cloud  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
 	@# The gate grades `target/release/rivet`. A stale one grades yesterday's
 	@# code, and `cargo package` poisons the fingerprints so cargo reports
 	@# `Fresh` on a binary that predates your edits — drop the snapshot first.
@@ -346,8 +348,9 @@ release-oracle-full: release-oracle-prev-bin sweep-test-db  ## Release gate with
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
 	 $(LIVE_ALL) env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle $(ARGS)
-	@# A gate that passed leaves the stand swept too: no orphaned slot pins WAL into the next run.
-	@$(MAKE) --no-print-directory sweep-test-db
+	@# A gate that passed leaves the stand and the cloud swept too: no orphaned slot pins WAL into
+	@# the next run, and no test output stays billed in storage.
+	@$(MAKE) --no-print-directory sweep-test-db sweep-test-cloud
 
 release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckdb-type goldens. Deliberate: a golden must be written by rivet's own code, never edited by hand.
 	@rm -rf target/package
