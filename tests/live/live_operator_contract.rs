@@ -933,6 +933,56 @@ fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
     s.rig.run_ok();
 }
 
+/// 2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name, and a run on the same source is refused by code.
+fn one_export_name_on_two_sources() {
+    let Some(state) = pg_state_url() else {
+        return;
+    };
+    let name = unique_name("oc_twosrc");
+    let (pg_table, _pg) = id_v_table(SqlEngine::Pg, "oc_twosrc", ROWS);
+    let (my_table, _my) = id_v_table(SqlEngine::Mysql, "oc_twosrc", ROWS);
+    let first = SqlEngine::Pg.rig(&pg_table).export_named(&name);
+    let other_source = SqlEngine::Mysql.rig(&my_table).export_named(&name);
+    let same_source = SqlEngine::Pg.rig(&pg_table).export_named(&name);
+    let on_state = [("RIVET_STATE_URL", state.as_str())];
+    let opened = |_: &Rig| {
+        let mut db = postgres::Client::connect(&state, postgres::NoTls).expect("the state server");
+        db.query_one(
+            "SELECT count(*) FROM run_status WHERE export_name = $1 AND status = 'running'",
+            &[&name],
+        )
+        .expect("read run_status")
+        .get::<_, i64>(0)
+            > 0
+    };
+    let (live, (beside, refused)) = first
+        .beside_a_live_run(
+            &[
+                ("RIVET_STATE_URL", state.as_str()),
+                ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:6000"),
+            ],
+            opened,
+            |_| {
+                (
+                    other_source.run_with_envs(&on_state),
+                    same_source.run_with_envs(&on_state),
+                )
+            },
+        )
+        .answered_while_alive();
+    assert!(
+        beside.status.success(),
+        "a run of `{name}` on another source runs beside the live one:\n{}",
+        String::from_utf8_lossy(&beside.stderr)
+    );
+    assert_refused(&refused, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    assert!(
+        live.status.success(),
+        "the live run delivers:\n{}",
+        String::from_utf8_lossy(&live.stderr)
+    );
+}
+
 /// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
 fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_live", 300);
@@ -1821,6 +1871,12 @@ fn a_cursor_column_in_another_case_is_refused_by_code_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn a_cursor_column_in_another_case_is_refused_by_code_oracle() {
     cursor_column_in_another_case(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres mysql postgres-state (RIVET_TEST_STATE_URL)"]
+fn one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same() {
+    one_export_name_on_two_sources();
 }
 
 #[test]
