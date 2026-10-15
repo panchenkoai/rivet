@@ -169,6 +169,12 @@ def work_dir() -> Path:
     return _WORK
 
 
+def cell_export(path: Path) -> str:
+    """A gate cell's export name, unique per cell and per run: the cell's path (config suffix dropped) and its parent's name."""
+    path = path.with_suffix("") if path.suffix in (".yaml", ".yml") else path
+    return f"{path.name}_{path.parent.name}"
+
+
 class Scope:
     """One engine version's namespace: every dir, prefix and name a cell mints carries both."""
 
@@ -782,7 +788,7 @@ def _export_local(
         f"  type: {engine}\n"
         f"  url_env: ORACLE_URL{tls_block}\n"
         f"exports:\n"
-        f"  - name: {table}\n"
+        f"  - name: {cell_export(yaml_path)}\n"
         f"    table: {table}\n"
         f"{key_block}\n"
         f"    format: {fmt}\n"
@@ -1071,7 +1077,7 @@ def sc_load(led: Ledger, engine: str, tag: str, url: str, store: str) -> None:
         f"  type: {engine}\n"
         f"  url_env: ORACLE_URL{tls_block}\n"
         f"exports:\n"
-        f"  - name: users\n"
+        f"  - name: {cell_export(yaml_path)}\n"
         f"    table: users\n"
         f"{mode_block}\n"
         f"    format: parquet\n"

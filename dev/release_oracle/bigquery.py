@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import gcp
+from . import gcp, scenarios
 from .core import (
     ROOT,
     Ledger,
@@ -567,7 +567,7 @@ def _bq_one_engine(
         f"  type: {engine}\n"
         f"  url_env: ORACLE_URL{tlsblk}\n"
         "exports:\n"
-        f"  - name: {exp}\n"
+        f"  - name: {scenarios.cell_export(cfgf)}\n"
         f"    table: {matrix}\n"
         "    mode: full\n"
         "    format: parquet\n"

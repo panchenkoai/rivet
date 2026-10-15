@@ -168,9 +168,7 @@ def _block(engine: str, scenario: str, table: str) -> str:
     )
 
 
-def cell_export(work: Path) -> str:
-    """A cell's export name: its scratch dir's name (engine, version, table, scenario, store, backend) and the run's."""
-    return f"{work.name}_{work.parent.name}"
+cell_export = scenarios.cell_export
 
 
 def cloud_prefix(engine: str, tag: str, table: str, scenario: str) -> str:
@@ -760,7 +758,7 @@ def sc_bq_cycle(led: Ledger, engine: str, tag: str, url: str, table: str) -> Non
     tls = "\n  tls: {accept_invalid_certs: true}" if engine == "mssql" else ""
     cfg.write_text(
         f"source:\n  type: {engine}\n  url_env: ORACLE_URL{tls}\n"
-        f"exports:\n  - name: {tbl}\n    table: {table}\n"
+        f"exports:\n  - name: {cell_export(work)}\n    table: {table}\n"
         f"    mode: full\n    format: parquet\n"
         f"    destination: {{type: gcs, bucket: {bucket}, prefix: {pfx}/}}\n"
         f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n"

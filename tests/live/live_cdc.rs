@@ -10319,7 +10319,7 @@ fn uv_python() -> std::process::Command {
     c
 }
 
-/// A MySQL TIME outside one day fails the CDC run with the batch export's own refusal, and the checkpoint stays put.
+/// A MySQL TIME outside one day fails the CDC run with the batch export's code and sentence and the stream's own remedies (no query to cast in), and the checkpoint stays put.
 #[test]
 #[ignore = "live: requires docker compose mysql-cdc (binlog ROW + REPLICATION grant)"]
 fn mysql_cdc_time_outside_one_day_is_refused_like_batch_and_never_checkpointed() {
@@ -10341,7 +10341,7 @@ fn mysql_cdc_time_outside_one_day_is_refused_like_batch_and_never_checkpointed()
     ))
     .unwrap();
 
-    // The oracle for the wording is the batch export of the same rows.
+    // The oracle for the sentence is the batch export of the same rows; its remedy is the batch's own.
     let batch = Rig::mysql_batch(&tbl)
         .source_url(MYSQL_CDC_URL)
         .run_expect_fail();
@@ -10349,7 +10349,7 @@ fn mysql_cdc_time_outside_one_day_is_refused_like_batch_and_never_checkpointed()
         .find("is outside 00:00..24:00")
         .and_then(|i| {
             batch[i..]
-                .find("CAST(col AS CHAR)")
+                .find(" Cast it in a query")
                 .map(|j| &batch[i..i + j])
         })
         .unwrap_or_else(|| panic!("the batch export must refuse the fixture: {batch}"));
@@ -10363,8 +10363,10 @@ fn mysql_cdc_time_outside_one_day_is_refused_like_batch_and_never_checkpointed()
         err.contains("RIVET_SOURCE_VALUE_UNREPRESENTABLE")
             && err.contains("column 't'")
             && err.contains("mysql: TIME 838:59:59.000000 ")
-            && err.contains(refusal),
-        "CDC must refuse with the batch's code and message, naming the column: {err}\nbatch: {batch}"
+            && err.contains(refusal)
+            && err.contains("declare the column `string` in `columns:`")
+            && !err.contains("Cast it in a query"),
+        "CDC must refuse with the batch's code and sentence, naming the column and the stream's remedies, not the batch cast: {err}\nbatch: {batch}"
     );
     assert_eq!(
         std::fs::read(&ckpt).unwrap(),

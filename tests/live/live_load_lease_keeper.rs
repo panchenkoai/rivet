@@ -494,8 +494,8 @@ fn sampled<const N: usize>(
 #[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds"]
 fn a_pooled_load_short_of_file_descriptors_never_runs_under_a_lapsed_lease() {
     const POOL: usize = 16;
-    /// Open files for sixteen workers: enough for some tables to load, too few for every connection.
-    const FEW_FILES: u64 = 150;
+    /// Open files for sixteen workers: enough for some tables to load, too few for every connection; an uncapped pooled load of this fixture peaked at 144 `lsof` entries (2026-10-15, after the storage budget of #514).
+    const FEW_FILES: u64 = 100;
     let Some(bq) = BqLive::from_env("lease_fds") else {
         return;
     };
