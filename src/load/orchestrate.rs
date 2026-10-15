@@ -18,7 +18,7 @@ use crate::load;
 use crate::load::ledger::ledger_status;
 use crate::load::ledger::{closing_status, ledger_load_id, ownership_of};
 use crate::load::partition_budget::{budgeted_uris, partition_budget_ok, partition_label};
-use crate::load::pin::{late_runs_refusal, pin_plan_to_its_run};
+use crate::load::pin::{late_runs_stop, pin_plan_to_its_run};
 use crate::load::staging::{cleanup_target_leased, ledger_writers, maybe_gc_orphans};
 use crate::state::LoadStatus;
 use crate::state::{LoadRecord, StateRef, StateStore};
@@ -74,7 +74,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         None
     };
     if let Some(why) = engine.and_then(|e| unsupported_cdc_target(e, &plans)) {
-        anyhow::bail!("{why}");
+        crate::rivet_bail!(crate::error::codes::CONFIG_SOURCE_MODE_UNSUPPORTED, "{why}");
     }
     // Route each table by its declared `mode:`; `pk:` and `allow_source_drift:`
     // come from the `load:` block, so the CLI carries no per-mode flags.
@@ -128,7 +128,8 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
             // downstream was written to notice it. The pool invents that state; this
             // is where it stops.
             if load::pool::reconnect_failure_is_fatal(parent_had_state, state.is_some()) {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::LOAD_LEDGER_UNREADABLE,
                     "`{}`: this worker could not reopen the state ledger the run started \
                      with — refusing the table rather than loading it without a lease and \
                      without recording it. Lower `--pool`, or fix the state backend.",
@@ -508,11 +509,14 @@ pub(super) fn reconnect(state_ref: Option<&StateRef>, verb: &str) -> Option<Opti
 
 /// The failure reported for a table that ended with no outcome of its own.
 pub(super) fn no_outcome_error(op: &str, table: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "{op} '{table}' did not complete — it PANICKED (a bug, please report it), or \
+    crate::error::coded(
+        crate::error::codes::INTERNAL_LOAD_INVARIANT,
+        format!(
+            "{op} '{table}' did not complete — it PANICKED (a bug, please report it), or \
          no worker was left to take it (each one panicked or could not reopen the \
          state ledger — see the warnings above). Reported as this table's failure \
          so every other table still aggregates"
+        ),
     )
 }
 
@@ -527,7 +531,11 @@ pub(super) fn take_table_lease<'a>(
     target_fqtn: &str,
 ) -> Result<Option<crate::state::LoadLease<'a>>> {
     match state.map(|s| s.try_load_lease(target_fqtn)).transpose()? {
-        Some(None) => anyhow::bail!("{}", lease_busy_message(target_fqtn)),
+        Some(None) => crate::rivet_bail!(
+            crate::error::codes::LOAD_TABLE_BUSY,
+            "{}",
+            lease_busy_message(target_fqtn)
+        ),
         held => Ok(held.flatten()),
     }
 }
@@ -592,7 +600,8 @@ pub(super) fn require_pk<'a>(plan: &'a load::plan::LoadPlan, mode: &str) -> Resu
                  declare it in the export's `load:` block (e.g. `pk: [id]`)"
             }
         };
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_PRIMARY_KEY_MISSING,
             "export `{}` {what} but has no primary key for the current-state dedup view — {why}",
             plan.export_name
         );
@@ -767,7 +776,8 @@ fn prepare_load(
         Some(s) => match s.loaded_source_run_ids(target_fqtn) {
             Ok(set) => set,
             Err(e) if load::reconcile::ledger_read_failure_is_fatal(plan.mode) => {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::LOAD_LEDGER_UNREADABLE,
                     "`{}`: cannot read which extraction runs are already loaded ({e:#}) — \
                      refusing an append load rather than re-consuming every run the target \
                      may already hold. Fix the state backend and re-run; a `full` load is \
@@ -813,9 +823,7 @@ fn prepare_load(
         }
         return Ok(None);
     }
-    if let Some(why) = late_runs_refusal(&plan.table, &new, plan.pinned_run.as_ref()) {
-        anyhow::bail!(why);
-    }
+    late_runs_stop(&plan.table, &new, plan.pinned_run.as_ref())?;
     // THE WAREHOUSE TABLE BELONGS TO ONE SOURCE.
     //
     // `ensure_single_export` above refuses two sources sharing a PREFIX. Two
@@ -847,7 +855,11 @@ fn prepare_load(
             ))
         })?;
         if let Some(other) = conflicting_source_ident(&mine, &prior) {
-            anyhow::bail!("{}", source_conflict_refusal(target_fqtn, other, &mine));
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_SOURCES_SHARED,
+                "{}",
+                source_conflict_refusal(target_fqtn, other, &mine)
+            );
         }
     }
     let manifests: Vec<_> = new.iter().map(|(_, m)| m.clone()).collect();
@@ -1690,6 +1702,22 @@ fn rebaseline_refusal(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse)
     rebaseline_refusal_text(&quoted)
 }
 
+/// The re-baseline refusal as the stop a CDC load raises before its append.
+fn rebaseline_stop(target_fqtn: &str, warehouse: crate::load::cdc::Warehouse) -> anyhow::Error {
+    load::refused(
+        crate::error::codes::LOAD_REBASELINE_OVER_CHANGES,
+        rebaseline_refusal(target_fqtn, warehouse),
+    )
+}
+
+/// The snapshot-over-a-full-table refusal as the stop a CDC load raises before its append.
+fn snapshot_over_full_table_stop(fqtn: &str, warehouse: load::cdc::Warehouse) -> anyhow::Error {
+    load::refused(
+        crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+        snapshot_over_full_table_refusal(fqtn, warehouse),
+    )
+}
+
 fn rebaseline_refusal_text(quoted_changes: &str) -> String {
     format!(
         "refusing to append a RE-baseline: this load carries snapshot parquet, but \
@@ -1749,10 +1777,10 @@ fn load_one_cdc(
             let shape = rebaseline_shape(&inputs.uris, &plan.gcs_prefix);
             let kind = load::before_write(loader.object_kind(&plan.table))?;
             if snapshot_over_full_table(shape, kind) {
-                return Err(load::refused(snapshot_over_full_table_refusal(
+                return Err(snapshot_over_full_table_stop(
                     &loader.fqtn(&plan.table),
                     loader.warehouse(),
-                )));
+                ));
             }
             if shape {
                 // The refusal stands EVEN FOR A STAMPED baseline (round-10
@@ -1778,10 +1806,10 @@ fn load_one_cdc(
                 };
                 match rebaseline_action(prior, ledger) {
                     RebaselineAction::Refuse => {
-                        return Err(load::refused(rebaseline_refusal(
+                        return Err(rebaseline_stop(
                             &loader.fqtn(&plan.table),
                             loader.warehouse(),
-                        )));
+                        ));
                     }
                     RebaselineAction::WarnStateless => eprintln!(
                         "  note: this STATELESS load re-selects the snapshot leg every \
@@ -2000,10 +2028,13 @@ fn load_one_incremental(
     config: &str,
 ) -> Result<Option<IncrementalReport>> {
     let cursor = plan.cursor_column.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "incremental load of `{}` needs the export's `cursor_column:` — the current-state \
+        crate::error::coded(
+            crate::error::codes::CONFIG_MODE_SETTING_INVALID,
+            format!(
+                "incremental load of `{}` needs the export's `cursor_column:` — the current-state \
              view's latest-per-PK ordering key",
-            plan.table
+                plan.table
+            ),
         )
     })?;
     let job = LoadJob {
@@ -2215,7 +2246,10 @@ fn load_incremental_job(
                 report = Some(IncrementalReport::Changelog(r));
             }
             let report = report.ok_or_else(|| {
-                load::refused("no loadable run among the selected manifests".to_string())
+                load::refused(
+                    crate::error::codes::LOAD_RUN_NOT_LOADABLE,
+                    "no loadable run among the selected manifests".to_string(),
+                )
             })?;
             Ok((rows, report))
         },
@@ -3872,7 +3906,8 @@ mod live_only_decisions {
     use super::*;
     use crate::destination::gcs::GcsStore;
     use crate::load::pin::{
-        respelled_refusal, runs_loaded_with_the_pin, runs_older_than, skipped_runs_note,
+        late_runs_refusal, late_runs_stop, respelled_refusal, respelled_stop,
+        runs_loaded_with_the_pin, runs_older_than, skipped_runs_note,
     };
     use crate::load::staging::{
         CleanupVerdict, cleanup_target, cleanup_verdict, ledger_says_active, prefix_has_active_run,
@@ -3884,7 +3919,10 @@ mod live_only_decisions {
     /// anything else is `failed`.
     #[test]
     fn ledger_status_tells_a_stop_before_the_write_from_a_failure() {
-        let stop = load::refused("refusing to overwrite `p.d.t`".into());
+        let stop = load::refused(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+            "refusing to overwrite `p.d.t`".into(),
+        );
         assert_eq!(ledger_status(&stop), "refused");
         let wrapped = load::before_write::<()>(Err(anyhow::anyhow!("no partition statistics")))
             .unwrap_err()
@@ -3951,7 +3989,10 @@ mod live_only_decisions {
     /// the whole defect.
     #[test]
     fn a_stop_after_a_leg_landed_is_recorded_as_a_failure_not_a_refusal() {
-        let stop = load::refused("refusing to append".into());
+        let stop = load::refused(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+            "refusing to append".into(),
+        );
 
         assert_eq!(
             closing_status(&stop, &[]),
@@ -4092,7 +4133,10 @@ mod live_only_decisions {
             active_at_fetch: Some(Default::default()),
             marker_active: Default::default(),
         };
-        let stop = load::refused("refusing to overwrite".into());
+        let stop = load::refused(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+            "refusing to overwrite".into(),
+        );
         ctx.record(&["run-1".to_string()], 0, ledger_status(&stop));
         assert_eq!(
             ownership(&state),
@@ -4280,6 +4324,68 @@ mod live_only_decisions {
             "{msg}"
         );
         assert!(msg.contains("Nothing was loaded"), "{msg}");
+    }
+
+    /// The stops the load glue raises name their codes: a respelled column, a run that
+    /// landed during the load, a re-baseline, a snapshot over a full table, a busy table,
+    /// a missing key and a table that ended with no outcome.
+    #[test]
+    fn each_load_glue_stop_carries_its_code() {
+        let code = |e: anyhow::Error| {
+            (
+                crate::error::error_code(&e),
+                crate::error::classify_exit(&e),
+            )
+        };
+        let respelled = [("r1".into(), "\u{441}ity".into(), "city".into())];
+        assert_eq!(
+            code(respelled_stop("orders", "r2", &respelled).unwrap_err()),
+            (Some("RIVET_LOAD_COLUMN_RESPELLED"), 5)
+        );
+        assert!(respelled_stop("orders", "r2", &[]).is_ok());
+        let pinned = success_manifest("r2", "p2.parquet");
+        let mut late = success_manifest("r3", "p3.parquet");
+        late.finished_at = "2026-08-21T00:01:00.250Z".into();
+        let pin = ("r2".to_string(), "2026-08-21T00:01:00Z".to_string());
+        let runs: Vec<_> = [pinned, late]
+            .into_iter()
+            .map(|m| (m.run_id.clone(), m))
+            .collect();
+        assert_eq!(
+            code(late_runs_stop("orders", &runs, Some(&pin)).unwrap_err()).0,
+            Some("RIVET_LOAD_RUN_LANDED_DURING_LOAD")
+        );
+        for (e, want) in [
+            (
+                rebaseline_stop("p.d.t", load::cdc::Warehouse::BigQuery),
+                "RIVET_LOAD_REBASELINE_OVER_CHANGES",
+            ),
+            (
+                snapshot_over_full_table_stop("p.d.t", load::cdc::Warehouse::BigQuery),
+                "RIVET_LOAD_TARGET_OBJECT_CONFLICT",
+            ),
+        ] {
+            assert!(e.is::<load::Refused>(), "{want}");
+            assert_eq!(ledger_status(&e), "refused");
+            assert_eq!(code(e), (Some(want), 5));
+        }
+        let state = crate::state::StateStore::open_in_memory().unwrap();
+        let key = format!("p.d.busy_{}", std::process::id());
+        let _held = take_table_lease(Some(&state), &key).unwrap();
+        let Err(busy) = take_table_lease(Some(&state), &key) else {
+            panic!("a held table refuses a second taker");
+        };
+        assert_eq!(code(busy), (Some("RIVET_LOAD_TABLE_BUSY"), 5));
+        let mut keyless = load::plan::test_plan(LoadMode::Cdc, "gs://b/p/");
+        keyless.pk.clear();
+        assert_eq!(
+            code(require_pk(&keyless, "cdc").unwrap_err()),
+            (Some("RIVET_LOAD_PRIMARY_KEY_MISSING"), 1)
+        );
+        assert_eq!(
+            code(no_outcome_error("load", "t")),
+            (Some("RIVET_INTERNAL_LOAD_INVARIANT"), 6)
+        );
     }
 
     #[test]

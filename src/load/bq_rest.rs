@@ -38,7 +38,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -299,7 +299,7 @@ impl BigQueryApi {
         let job_ref = parse_job_reference(&job, &self.project)?;
         match job_outcome(&job) {
             JobOutcome::Done => Ok(job_ref),
-            JobOutcome::Failed(detail) => bail!("{}", job_failed_message(&job_ref.job_id, &detail)),
+            JobOutcome::Failed(detail) => Err(job_failed(&job_ref.job_id, &detail)),
             JobOutcome::Running => self.await_job(&job_ref, JOB_POLL_DEADLINE).map(|_| job_ref),
         }
     }
@@ -344,7 +344,7 @@ impl BigQueryApi {
             "{}/bigquery/v2/projects/{}/jobs",
             self.endpoint, self.project
         );
-        let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
+        let mut last: anyhow::Error = no_attempt_made();
         for attempt in 0..=MAX_TRANSIENT_RETRIES {
             if should_back_off(attempt) {
                 std::thread::sleep(poll_interval(attempt));
@@ -355,10 +355,7 @@ impl BigQueryApi {
                     InsertOutcome::Answered => return self.read_json(resp, "jobs.insert"),
                     InsertOutcome::AlreadyExists => return self.fetch_inserted(job_id),
                     InsertOutcome::Transient => {
-                        last = anyhow::anyhow!(
-                            "BigQuery replied HTTP {} (transient)",
-                            resp.status().as_u16()
-                        );
+                        last = transient_reply(resp.status().as_u16());
                     }
                 },
                 // A timeout or reset: the job may or may not have been created; the
@@ -368,8 +365,9 @@ impl BigQueryApi {
                 }
             }
         }
-        Err(last).context(format!(
-            "BigQuery jobs.insert kept failing after {MAX_TRANSIENT_RETRIES} retries"
+        Err(last).context(crate::error::CodedError::new(
+            crate::error::codes::LOAD_WAREHOUSE_UNAVAILABLE,
+            format!("BigQuery jobs.insert kept failing after {MAX_TRANSIENT_RETRIES} retries"),
         ))
     }
 
@@ -401,9 +399,7 @@ impl BigQueryApi {
             let job = self.get_json(&url, "jobs.get")?;
             match job_outcome(&job) {
                 JobOutcome::Done => return Ok(job_ref.job_id.clone()),
-                JobOutcome::Failed(detail) => {
-                    bail!("{}", job_failed_message(&job_ref.job_id, &detail))
-                }
+                JobOutcome::Failed(detail) => return Err(job_failed(&job_ref.job_id, &detail)),
                 JobOutcome::Running if started.elapsed() > budget => {
                     return Err(crate::load::JobWaitTimeout::bigquery(
                         &job_ref.job_id,
@@ -460,7 +456,7 @@ impl BigQueryApi {
 
     /// The non-transient response of an idempotent GET, retrying transient failures.
     fn get_response(&self, url: &str, what: &str) -> Result<reqwest::blocking::Response> {
-        let mut last: anyhow::Error = anyhow::anyhow!("no attempt made");
+        let mut last: anyhow::Error = no_attempt_made();
         for attempt in 0..=MAX_TRANSIENT_RETRIES {
             if should_back_off(attempt) {
                 std::thread::sleep(poll_interval(attempt));
@@ -468,18 +464,16 @@ impl BigQueryApi {
             let sent = self.authorized(self.http.get(url))?.send();
             match sent {
                 Ok(resp) if is_transient_status(resp.status().as_u16()) => {
-                    last = anyhow::anyhow!(
-                        "BigQuery replied HTTP {} (transient)",
-                        resp.status().as_u16()
-                    );
+                    last = transient_reply(resp.status().as_u16());
                 }
                 Ok(resp) => return Ok(resp),
                 // A connection reset mid-poll is the same class as a 503.
                 Err(e) => last = anyhow::Error::new(e).context("BigQuery request failed"),
             }
         }
-        Err(last).context(format!(
-            "BigQuery {what} kept failing after {MAX_TRANSIENT_RETRIES} retries"
+        Err(last).context(crate::error::CodedError::new(
+            crate::error::codes::LOAD_WAREHOUSE_UNAVAILABLE,
+            format!("BigQuery {what} kept failing after {MAX_TRANSIENT_RETRIES} retries"),
         ))
     }
 
@@ -488,10 +482,13 @@ impl BigQueryApi {
         let status = resp.status().as_u16();
         let body = resp.text().unwrap_or_default();
         if !(200..300).contains(&status) {
-            bail!(
-                "BigQuery {what} failed: {}",
-                api_error_detail(status, &body)
-            );
+            return Err(crate::load::warehouse_http_error(
+                status,
+                format!(
+                    "BigQuery {what} failed: {}",
+                    api_error_detail(status, &body)
+                ),
+            ));
         }
         serde_json::from_str(&body)
             .with_context(|| format!("parsing the BigQuery {what} response as JSON"))
@@ -639,14 +636,18 @@ fn mint_token_via_gcloud_cli() -> Result<Zeroizing<String>> {
              RIVET_BQ_ACCESS_TOKEN",
         )?;
     if !out.status.success() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_WAREHOUSE_AUTH_FAILED,
             "`gcloud auth application-default print-access-token` failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let token = Zeroizing::new(String::from_utf8_lossy(&out.stdout).trim().to_string());
     if token.is_empty() {
-        bail!("`gcloud auth print-access-token` returned an empty token");
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_WAREHOUSE_AUTH_FAILED,
+            "`gcloud auth print-access-token` returned an empty token"
+        );
     }
     Ok(token)
 }
@@ -846,6 +847,30 @@ pub(crate) fn job_failed_message(job_id: &str, detail: &str) -> String {
     format!("BigQuery job {job_id} failed: {detail}")
 }
 
+/// A job that reached DONE with an `errorResult`: the warehouse rejected its statement.
+fn job_failed(job_id: &str, detail: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::LOAD_WAREHOUSE_REJECTED,
+        job_failed_message(job_id, detail),
+    )
+}
+
+/// One transient answer of a retried request; the last one is what the caller reports.
+fn transient_reply(status: u16) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::LOAD_WAREHOUSE_UNAVAILABLE,
+        format!("BigQuery replied HTTP {status} (transient)"),
+    )
+}
+
+/// The placeholder a retry loop starts from; every loop replaces it on its first attempt.
+fn no_attempt_made() -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::INTERNAL_LOAD_INVARIANT,
+        "no attempt made",
+    )
+}
+
 /// The reason behind a non-2xx JSON-API reply: `error.message`, plus any
 /// `error.errors[]` message that adds something. Falls back to the raw body
 /// (bounded) when the payload is not the standard error envelope — an HTML
@@ -917,7 +942,10 @@ pub(crate) fn parse_scalar_u64(results: &Value) -> Result<u64> {
         Value::Number(n) => n
             .as_u64()
             .context("BigQuery returned a count that is not a non-negative integer"),
-        other => bail!("BigQuery returned a count of an unexpected JSON type: {other}"),
+        other => crate::rivet_bail!(
+            crate::error::codes::LOAD_WAREHOUSE_ANSWER_UNREADABLE,
+            "BigQuery returned a count of an unexpected JSON type: {other}"
+        ),
     }
 }
 
@@ -1901,6 +1929,73 @@ mod tests {
             .find(|r| r.method == "PATCH")
             .unwrap();
         assert_eq!(patch.body["clustering"]["fields"][0], "a");
+    }
+
+    /// What BigQuery answers decides the code: a refused credential, a missing permission, a
+    /// missing job, a failed job, a transient reply and an answer rivet cannot read.
+    #[test]
+    fn each_bigquery_answer_carries_its_code() {
+        use stand::{Stand, json};
+        let stand = Stand::start(|seen, _| match (seen.method.as_str(), seen.path.as_str()) {
+            ("GET", "/bigquery/v2/projects/p/datasets/d/tables/expired") => json(
+                401,
+                r#"{"error":{"message":"Request had invalid authentication credentials"}}"#,
+            ),
+            ("GET", "/bigquery/v2/projects/p/datasets/d/tables/denied") => json(
+                403,
+                r#"{"error":{"message":"Access Denied: Table p:d.denied"}}"#,
+            ),
+            ("POST", "/bigquery/v2/projects/p/jobs") => {
+                let id = seen.body["jobReference"]["jobId"]
+                    .as_str()
+                    .unwrap_or("none");
+                json(
+                    200,
+                    &format!(
+                        r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"DONE","errorResult":{{"message":"Syntax error"}}}}}}"#
+                    ),
+                )
+            }
+            _ => json(404, r#"{"error":{"message":"Not found: Job p:gone"}}"#),
+        });
+        let api = stand.api();
+        let code = |e: anyhow::Error| crate::error::error_code(&e);
+        assert_eq!(
+            code(api.table_metadata("d", "expired").unwrap_err()),
+            Some("RIVET_LOAD_WAREHOUSE_AUTH_FAILED")
+        );
+        assert_eq!(
+            code(api.table_metadata("d", "denied").unwrap_err()),
+            Some("RIVET_LOAD_WAREHOUSE_ACCESS_DENIED")
+        );
+        let gone = JobRef {
+            project: "p".into(),
+            job_id: "gone".into(),
+            location: None,
+        };
+        assert_eq!(
+            code(api.await_job(&gone, Duration::from_secs(60)).unwrap_err()),
+            Some("RIVET_LOAD_WAREHOUSE_OBJECT_NOT_FOUND")
+        );
+        let failed = api
+            .run_query("SELECT BROKEN", &BTreeMap::new())
+            .unwrap_err();
+        assert_eq!(code(failed), Some("RIVET_LOAD_WAREHOUSE_REJECTED"));
+        assert_eq!(
+            code(transient_reply(503)),
+            Some("RIVET_LOAD_WAREHOUSE_UNAVAILABLE")
+        );
+        let unreadable =
+            parse_scalar_u64(&serde_json::json!({ "rows": [{ "f": [{ "v": true }] }] }));
+        let e = unreadable.unwrap_err();
+        assert_eq!(
+            (code_and_exit(&e)),
+            (Some("RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE"), 6)
+        );
+    }
+
+    fn code_and_exit(e: &anyhow::Error) -> (Option<&'static str>, i32) {
+        (crate::error::error_code(e), crate::error::classify_exit(e))
     }
 }
 

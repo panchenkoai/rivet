@@ -453,6 +453,11 @@ pub fn error_code(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
+/// The registered [`Code`] a failure carries through [`CodedError`], if any.
+pub(crate) fn code_of(err: &anyhow::Error) -> Option<Code> {
+    stop_cause(err).downcast_ref::<CodedError>().map(|c| c.code)
+}
+
 /// Map an error to its process exit code per the [`ExitClass`] taxonomy.
 ///
 /// Precedence (first match wins):
@@ -927,6 +932,181 @@ pub mod codes {
         "RIVET_LOAD_TARGET_NOT_RIVETS",
         "the warehouse object exists and this state DB has no record of rivet loading it: drop or rename it, or load into another table",
     );
+    /// A table, column or key name the loader splices into SQL is not a plain identifier.
+    pub const LOAD_IDENTIFIER_UNSAFE: Code = usage(
+        "RIVET_LOAD_IDENTIFIER_UNSAFE",
+        "rename the column or table in the source, or alias it in the export's `query:`, to a plain identifier ([A-Za-z_][A-Za-z0-9_]*)",
+    );
+    /// A `pk`, `cluster_by`, partition or cursor column the export does not deliver, or the target cannot use.
+    pub const LOAD_KEY_COLUMN_INVALID: Code = usage(
+        "RIVET_LOAD_KEY_COLUMN_INVALID",
+        "name only columns the export delivers, in a type and number the target takes, under `pk:` / `cluster_by:` / `partition:` in the export's `load:` block (or add the column to the export's SELECT), as the message names",
+    );
+    /// An append load (CDC, incremental, continued key) has no primary key for its dedup.
+    pub const LOAD_PRIMARY_KEY_MISSING: Code = usage(
+        "RIVET_LOAD_PRIMARY_KEY_MISSING",
+        "declare the key under the export's `load:` block, e.g. `pk: [id]`",
+    );
+    /// A source column carries a `__` name rivet owns in a change log or base table.
+    pub const LOAD_RESERVED_COLUMN: Code = usage(
+        "RIVET_LOAD_RESERVED_COLUMN",
+        "rename or exclude the column in the export's query, or load the table with `mode: full`",
+    );
+    /// A column name with Cyrillic look-alike letters the load cannot rename for this target.
+    pub const LOAD_LOOKALIKE_COLUMN: Code = usage(
+        "RIVET_LOAD_LOOKALIKE_COLUMN",
+        "rename the column with Cyrillic look-alike letters in the source to Latin letters, as the message names",
+    );
+    /// Two exports of one config resolve to the same warehouse object.
+    pub const LOAD_TARGET_COLLISION: Code = usage(
+        "RIVET_LOAD_TARGET_COLLISION",
+        "give each export its own `table:` or destination",
+    );
+    /// A `destination.prefix` the load cannot list the way the export wrote it.
+    pub const LOAD_STAGING_PREFIX_INVALID: Code = usage(
+        "RIVET_LOAD_STAGING_PREFIX_INVALID",
+        "set a non-empty `destination.prefix` with no `{date}` or `{run_id}` above `{partition}`, and a literal segment before `{partition}`",
+    );
+    /// An export with `load:` staged to a destination type the load target does not read.
+    pub const LOAD_DESTINATION_TYPE_UNSUPPORTED: Code = usage(
+        "RIVET_LOAD_DESTINATION_TYPE_UNSUPPORTED",
+        "stage the export to a destination the target reads (GCS; ClickHouse also S3 and Azure), or drop the `load:` block",
+    );
+    /// One Parquet file spans more partitions than one BigQuery load job may write.
+    pub const LOAD_PARTITION_BUDGET_EXCEEDED: Code = usage(
+        "RIVET_LOAD_PARTITION_BUDGET_EXCEEDED",
+        "partition by a coarser `granularity`, or export a narrower range per run, as the message names",
+    );
+    /// More files than one Snowflake COPY takes.
+    pub const LOAD_FILE_LIMIT_EXCEEDED: Code = usage(
+        "RIVET_LOAD_FILE_LIMIT_EXCEEDED",
+        "load after fewer runs, or write fewer, larger parts (lower the export's parallelism)",
+    );
+    /// A column whose type does not map to the load target.
+    pub const LOAD_COLUMN_TYPE_UNSUPPORTED: Code = usage(
+        "RIVET_LOAD_COLUMN_TYPE_UNSUPPORTED",
+        "CAST or drop the column in the export's `query:`, or add a `columns:` override to a type the target takes",
+    );
+    /// `load.ca_file` holds no certificate.
+    pub const LOAD_TLS_CA_INVALID: Code = usage(
+        "RIVET_LOAD_TLS_CA_INVALID",
+        "point `load.ca_file` at a PEM bundle holding the server's CA certificate",
+    );
+    /// The newest run exported no rows, and the target cannot be emptied to match.
+    pub const LOAD_EMPTY_RUN_UNSUPPORTED: Code = refusal(
+        "RIVET_LOAD_EMPTY_RUN_UNSUPPORTED",
+        "TRUNCATE the warehouse table by hand, or keep its previous rows knowingly; nothing was written",
+    );
+    /// The runs to load are not complete under the prefix: no Success manifest, or parts gone.
+    pub const LOAD_RUN_NOT_LOADABLE: Code = refusal(
+        "RIVET_LOAD_RUN_NOT_LOADABLE",
+        "re-run the export so a complete run (a Success manifest and every part it declares) is under the prefix the load reads, then load",
+    );
+    /// An object under the staging prefix a rivet export did not write: an unsafe name, an oversized manifest, a broken Parquet file.
+    pub const LOAD_STAGING_OBJECT_UNSAFE: Code = refusal(
+        "RIVET_LOAD_STAGING_OBJECT_UNSAFE",
+        "investigate the staging bucket: remove the object the message names, then re-run the export and the load",
+    );
+    /// A prefix or target table shared by two exports or two sources.
+    pub const LOAD_SOURCES_SHARED: Code = refusal(
+        "RIVET_LOAD_SOURCES_SHARED",
+        "give each export and each source its own destination prefix and its own target table",
+    );
+    /// A source column renamed between runs that are still unloaded.
+    pub const LOAD_COLUMN_RESPELLED: Code = refusal(
+        "RIVET_LOAD_COLUMN_RESPELLED",
+        "load the older runs by hand under the old spelling as the message describes, then delete their manifests; every run stays staged",
+    );
+    /// The warehouse object at the target name is not what this load writes.
+    pub const LOAD_TARGET_OBJECT_CONFLICT: Code = refusal(
+        "RIVET_LOAD_TARGET_OBJECT_CONFLICT",
+        "drop or rename the warehouse object the message names, or align the config with it; nothing was written",
+    );
+    /// `rivet compact` met a buffer whose base table does not exist.
+    pub const LOAD_COMPACT_BASE_MISSING: Code = refusal(
+        "RIVET_LOAD_COMPACT_BASE_MISSING",
+        "load the backfill first (the `cdc.backfill:` export builds the base), or drop the buffer to discard its changes",
+    );
+    /// A change log whose partitioning differs from the one the load declares.
+    pub const LOAD_CHANGELOG_PARTITION_CHANGED: Code = refusal(
+        "RIVET_LOAD_CHANGELOG_PARTITION_CHANGED",
+        "keep the change log's partitioning in the config, or rebuild it as the message names (`rivet load --rebuild-changelog`, or by hand where policies must be kept)",
+    );
+    /// A whole-table pass over a base whose buffer still holds older changes.
+    pub const LOAD_BUFFER_NOT_COMPACTED: Code = refusal(
+        "RIVET_LOAD_BUFFER_NOT_COMPACTED",
+        "run `rivet compact` first if the buffer belongs to the current base, or drop the buffer, then re-run the load",
+    );
+    /// A CDC re-baseline snapshot over a change log that already holds changes.
+    pub const LOAD_REBASELINE_OVER_CHANGES: Code = refusal(
+        "RIVET_LOAD_REBASELINE_OVER_CHANGES",
+        "TRUNCATE the change log the message names, then re-run the same `rivet load`",
+    );
+    /// Another `rivet load` or `rivet compact` holds the table's lease.
+    pub const LOAD_TABLE_BUSY: Code = refusal(
+        "RIVET_LOAD_TABLE_BUSY",
+        "wait for the other `rivet load` or `rivet compact` of that table to end, then run again",
+    );
+    /// A manifest whose row count disagrees with its own parts.
+    pub const LOAD_MANIFEST_INCONSISTENT: Code = integrity(
+        "RIVET_LOAD_MANIFEST_INCONSISTENT",
+        "investigate the run's manifest and parts before loading; re-run the export to replace them",
+    );
+    /// A run extracted a different number of rows than its source held.
+    pub const LOAD_SOURCE_FILE_MISMATCH: Code = integrity(
+        "RIVET_LOAD_SOURCE_FILE_MISMATCH",
+        "investigate the extract before loading; to accept the drift, set `allow_source_drift: true` in the export's `load:` block",
+    );
+    /// A warehouse copy or rename that changed the row count.
+    pub const LOAD_COPY_COUNT_MISMATCH: Code = integrity(
+        "RIVET_LOAD_COPY_COUNT_MISMATCH",
+        "compare the tables the message names before re-running; rivet left them for inspection",
+    );
+    /// The state ledger that decides ownership or what is loaded could not be read.
+    pub const LOAD_LEDGER_UNREADABLE: Code = environment(
+        "RIVET_LOAD_LEDGER_UNREADABLE",
+        "restore the state backend (lower `--pool` if workers could not reconnect), then re-run",
+    );
+    /// A run finished between typing the load and listing its runs.
+    pub const LOAD_RUN_LANDED_DURING_LOAD: Code = environment(
+        "RIVET_LOAD_RUN_LANDED_DURING_LOAD",
+        "run `rivet load` again: it types from the newest run",
+    );
+    /// The warehouse credentials could not be obtained or were not accepted.
+    pub const LOAD_WAREHOUSE_AUTH_FAILED: Code = environment(
+        "RIVET_LOAD_WAREHOUSE_AUTH_FAILED",
+        "renew the warehouse credentials (`gcloud auth application-default login`, a service-account key, or the target's connection settings)",
+    );
+    /// The warehouse refused the load's identity a permission.
+    pub const LOAD_WAREHOUSE_ACCESS_DENIED: Code = environment(
+        "RIVET_LOAD_WAREHOUSE_ACCESS_DENIED",
+        "grant the load's identity the warehouse permission the message names",
+    );
+    /// The warehouse has no object (dataset, table, job) the request names.
+    pub const LOAD_WAREHOUSE_OBJECT_NOT_FOUND: Code = environment(
+        "RIVET_LOAD_WAREHOUSE_OBJECT_NOT_FOUND",
+        "create the dataset or database the load writes into, or correct the names of the `load:` target",
+    );
+    /// The warehouse rejected a statement or job.
+    pub const LOAD_WAREHOUSE_REJECTED: Code = environment(
+        "RIVET_LOAD_WAREHOUSE_REJECTED",
+        "read the warehouse's reason in the message and fix what it names, then re-run",
+    );
+    /// The warehouse kept answering with a transient failure.
+    pub const LOAD_WAREHOUSE_UNAVAILABLE: Code = environment(
+        "RIVET_LOAD_WAREHOUSE_UNAVAILABLE",
+        "re-run the load later; the warehouse answered with a transient failure on every retry",
+    );
+    /// The warehouse answered in a shape rivet does not read.
+    pub const LOAD_WAREHOUSE_ANSWER_UNREADABLE: Code = internal(
+        "RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE",
+        "the warehouse answered in a shape rivet does not read — report it with the message",
+    );
+    /// A load invariant did not hold.
+    pub const INTERNAL_LOAD_INVARIANT: Code = internal(
+        "RIVET_INTERNAL_LOAD_INVARIANT",
+        "a load invariant did not hold — a bug; report it with the message",
+    );
     /// `run --validate` found the destination wrong after the export completed.
     pub const VALIDATE_FAILED: Code = integrity(
         "RIVET_VALIDATE_FAILED",
@@ -1025,6 +1205,41 @@ pub mod codes {
         LOAD_LEASE_LOST_DURING_WRITE,
         LOAD_ADOPTION_COLUMN_MISMATCH,
         LOAD_TARGET_NOT_RIVETS,
+        LOAD_IDENTIFIER_UNSAFE,
+        LOAD_KEY_COLUMN_INVALID,
+        LOAD_PRIMARY_KEY_MISSING,
+        LOAD_RESERVED_COLUMN,
+        LOAD_LOOKALIKE_COLUMN,
+        LOAD_TARGET_COLLISION,
+        LOAD_STAGING_PREFIX_INVALID,
+        LOAD_DESTINATION_TYPE_UNSUPPORTED,
+        LOAD_PARTITION_BUDGET_EXCEEDED,
+        LOAD_FILE_LIMIT_EXCEEDED,
+        LOAD_COLUMN_TYPE_UNSUPPORTED,
+        LOAD_TLS_CA_INVALID,
+        LOAD_EMPTY_RUN_UNSUPPORTED,
+        LOAD_RUN_NOT_LOADABLE,
+        LOAD_STAGING_OBJECT_UNSAFE,
+        LOAD_SOURCES_SHARED,
+        LOAD_COLUMN_RESPELLED,
+        LOAD_TARGET_OBJECT_CONFLICT,
+        LOAD_COMPACT_BASE_MISSING,
+        LOAD_CHANGELOG_PARTITION_CHANGED,
+        LOAD_BUFFER_NOT_COMPACTED,
+        LOAD_REBASELINE_OVER_CHANGES,
+        LOAD_TABLE_BUSY,
+        LOAD_MANIFEST_INCONSISTENT,
+        LOAD_SOURCE_FILE_MISMATCH,
+        LOAD_COPY_COUNT_MISMATCH,
+        LOAD_LEDGER_UNREADABLE,
+        LOAD_RUN_LANDED_DURING_LOAD,
+        LOAD_WAREHOUSE_AUTH_FAILED,
+        LOAD_WAREHOUSE_ACCESS_DENIED,
+        LOAD_WAREHOUSE_OBJECT_NOT_FOUND,
+        LOAD_WAREHOUSE_REJECTED,
+        LOAD_WAREHOUSE_UNAVAILABLE,
+        LOAD_WAREHOUSE_ANSWER_UNREADABLE,
+        INTERNAL_LOAD_INVARIANT,
         VALIDATE_FAILED,
         VALIDATE_UNVERIFIED,
         INTERNAL_VALUE_CONVERTER,

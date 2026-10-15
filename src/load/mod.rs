@@ -11,7 +11,7 @@
 
 use crate::destination::gcs::GcsStore;
 use crate::types::target::{TargetColumnSpec, TargetStatus};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use staging::maybe_cleanup;
 
 mod bigquery;
@@ -104,7 +104,10 @@ impl ObjectKind {
             1 => ObjectKind::Table,
             2 => ObjectKind::View,
             4 => ObjectKind::Other,
-            n => bail!("object-kind probe returned {n}, expected 0, 1, 2 or 4"),
+            n => crate::rivet_bail!(
+                crate::error::codes::LOAD_WAREHOUSE_ANSWER_UNREADABLE,
+                "object-kind probe returned {n}, expected 0, 1, 2 or 4"
+            ),
         })
     }
 }
@@ -147,7 +150,8 @@ pub trait TargetLoader {
         _pk: &[String],
         _order: cdc::CompactOrder,
     ) -> Result<CompactReport> {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_LOAD_INVARIANT,
             "`rivet compact` is BigQuery-only in this release — `{}` targets {:?}",
             self.fqtn(table),
             self.warehouse()
@@ -295,9 +299,10 @@ fn settle_changelog_shape(loader: &dyn TargetLoader, table: &str, rebuild: bool)
             bytes,
         }) => {
             if !rebuild {
-                return Err(refused(rebuild_refusal(
-                    &changes, &existing, &declared, bytes,
-                )));
+                return Err(refused(
+                    crate::error::codes::LOAD_CHANGELOG_PARTITION_CHANGED,
+                    rebuild_refusal(&changes, &existing, &declared, bytes),
+                ));
             }
             shape.rebuild_changelog(table)?;
             eprintln!("  note: `{changes}` rebuilt: partitioned by {declared}, was {existing}");
@@ -400,7 +405,8 @@ fn stale_buffer_check(loader: &dyn TargetLoader, table: &str, base_and_buffer: b
         return Ok(());
     }
     let (base, buffer) = (loader.fqtn(table), loader.fqtn(&changes));
-    bail!(
+    crate::rivet_bail!(
+        crate::error::codes::LOAD_BUFFER_NOT_COMPACTED,
         "refusing to land a whole-table pass of `{base}`: `{buffer}` still holds {rows} change \
          row(s) from BEFORE it, and the next `rivet compact` would merge those older values \
          over the new base. If they belong to the CURRENT base, run `rivet compact` first; if \
@@ -409,9 +415,21 @@ fn stale_buffer_check(loader: &dyn TargetLoader, table: &str, base_and_buffer: b
     )
 }
 
-/// A stop before any warehouse write, with its reason.
-pub(crate) fn refused(reason: String) -> anyhow::Error {
-    anyhow::Error::new(Refused(anyhow::anyhow!(reason)))
+/// A stop before any warehouse write, with its code and reason.
+pub(crate) fn refused(code: crate::error::Code, reason: String) -> anyhow::Error {
+    anyhow::Error::new(Refused(crate::error::coded(code, reason)))
+}
+
+/// A warehouse's non-2xx HTTP answer, coded by what its status says went wrong.
+pub(crate) fn warehouse_http_error(status: u16, message: String) -> anyhow::Error {
+    use crate::error::codes;
+    let code = match status {
+        401 => codes::LOAD_WAREHOUSE_AUTH_FAILED,
+        403 => codes::LOAD_WAREHOUSE_ACCESS_DENIED,
+        404 => codes::LOAD_WAREHOUSE_OBJECT_NOT_FOUND,
+        _ => codes::LOAD_WAREHOUSE_REJECTED,
+    };
+    crate::error::coded(code, message)
 }
 
 /// Whether an existing warehouse table is one rivet loaded, per the load ledger.
@@ -439,7 +457,8 @@ fn ensure_own(fqtn: &str, ownership: Ownership, verb: &str) -> Result<()> {
              record of rivet loading it — it may hold someone else's data. Drop or rename it, \
              or load into another table"
         ),
-        Ownership::Unreadable => bail!(
+        Ownership::Unreadable => crate::rivet_bail!(
+            crate::error::codes::LOAD_LEDGER_UNREADABLE,
             "refusing to {verb} `{fqtn}`: it exists, and the load ledger could not be read to \
              confirm rivet loaded it. This is NOT the stateless case — a ledger is configured \
              and the query failed, so the table may hold someone else's data and the record \
@@ -493,7 +512,8 @@ fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Owners
                 return Ok(());
             };
             if let Some(diff) = shape.table_shape_conflict(table)? {
-                bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
                     "refusing to overwrite `{fqtn}`: {diff}. A warehouse table cannot change \
                      its partitioning or clustering in place — drop or rename it, or align the \
                      config with it"
@@ -501,7 +521,8 @@ fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Owners
             }
             Ok(())
         }
-        ObjectKind::View => bail!(
+        ObjectKind::View => crate::rivet_bail!(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
             "refusing to overwrite `{fqtn}`: it is a view over `{fqtn}__changes`, the change log \
              of an earlier incremental or CDC load, and this run holds the whole table (a full \
              load, or an incremental run with no cursor to resume from) — a full pass cannot be \
@@ -509,7 +530,10 @@ fn ensure_overwritable(loader: &dyn TargetLoader, table: &str, ownership: Owners
              keep the log, resume the incremental cursor"
         ),
         ObjectKind::Other => {
-            bail!("refusing to overwrite `{fqtn}`: it exists and is neither a table nor a view")
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+                "refusing to overwrite `{fqtn}`: it exists and is neither a table nor a view"
+            )
         }
     }
 }
@@ -540,7 +564,8 @@ fn ensure_safe_load_uris(uris: &[String]) -> Result<()> {
             .chars()
             .find(|&c| c == '\'' || c == '\\' || c == '*' || c.is_control())
         {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_STAGING_OBJECT_UNSAFE,
                 "refusing to load: Parquet URI `{}` contains {:?}, which is unsafe to splice \
                  into the warehouse load statement — the loader single-quotes URIs without \
                  escaping. rivet names its own parts safely, so this URI was not produced by a \
@@ -557,13 +582,17 @@ fn ensure_safe_load_uris(uris: &[String]) -> Result<()> {
 /// (a silent-loss class — never drop it, name it), or an unsafe column identifier.
 fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     if specs.is_empty() {
-        bail!("no column specs for `{table}` — nothing to build a schema from");
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_LOAD_INVARIANT,
+            "no column specs for `{table}` — nothing to build a schema from"
+        );
     }
     // Round-6: the target table name is interpolated raw into the fqtn / DDL / dedup
     // view too (a sibling injection surface of the column names). Gate it, tolerating
     // a qualified `dataset.table` — each dot-separated component must be a plain ident.
     if table.is_empty() || !table.split('.').all(is_safe_load_ident) {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
             "cannot load: target table `{}` is not a plain (optionally dotted) SQL identifier — \
              the loader splices it into DDL/COPY.",
             table.escape_default()
@@ -575,7 +604,8 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
     // fail LOUDLY here rather than run as SQL. The one gate covers every load target.
     for s in specs {
         if !is_safe_load_ident(&s.column_name) {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
                 "cannot load `{table}`: column name `{}` is not a plain SQL identifier \
                  ([A-Za-z_][A-Za-z0-9_]*) — the warehouse loader splices it into DDL/COPY. \
                  Rename the column in the source, or alias it in the export's `query:` \
@@ -590,7 +620,8 @@ fn validate_specs(table: &str, specs: &[TargetColumnSpec]) -> Result<()> {
         .map(|s| s.column_name.as_str())
         .collect();
     if !failed.is_empty() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_COLUMN_TYPE_UNSUPPORTED,
             "cannot load `{table}`: {} column(s) do not map to the warehouse: {}",
             failed.len(),
             failed.join(", ")
@@ -657,7 +688,8 @@ fn whole_table_preflight(
     ownership: Ownership,
 ) -> Result<()> {
     if uris.is_empty() && expected_rows != Some(0) {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_RUN_NOT_LOADABLE,
             "no Parquet files to load into `{table}`, though its runs declare {} row(s) — \
              refusing rather than emptying the table. The staged parts are gone (a bucket \
              lifecycle rule or a manual cleanup?): re-run the export, then load.",
@@ -750,11 +782,15 @@ fn append_preflight(
     label: &str,
 ) -> Result<()> {
     if uris.is_empty() {
-        bail!("no Parquet URIs to append into `{table}__changes`");
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_LOAD_INVARIANT,
+            "no Parquet URIs to append into `{table}__changes`"
+        );
     }
     ensure_safe_load_uris(uris)?;
     if pk.is_empty() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_PRIMARY_KEY_MISSING,
             "{label} load of `{table}` needs a primary key for the dedup view — add \
              `pk: [<column>]` under the export's `load:` block (no --pk flag exists)"
         );
@@ -768,7 +804,8 @@ fn append_preflight(
     // here covers both, so no load driver can bypass it (the runner-bypass class).
     for c in pk {
         if !is_safe_load_ident(c) {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
                 "cannot load `{table}`: primary-key column `{}` is not a plain SQL identifier \
                  ([A-Za-z_][A-Za-z0-9_]*) — it is spliced into the dedup view's PARTITION BY. \
                  Rename or alias it in the export.",
@@ -782,7 +819,8 @@ fn append_preflight(
         None => Vec::new(),
     };
     if !leftovers.is_empty() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
             "{}",
             leftovers_refusal(&loader.fqtn(&format!("{table}__changes")), &leftovers)
         );
@@ -814,20 +852,24 @@ pub(crate) fn adopt_full_load_table(
             bytes,
         }) = before_write(shape.adoption_drift(table))?
     {
-        return Err(refused(adoption_refusal(
-            &loader.fqtn(table),
-            &loader.fqtn(&format!("{table}__changes")),
-            &existing,
-            &declared,
-            bytes,
-        )));
+        return Err(refused(
+            crate::error::codes::LOAD_CHANGELOG_PARTITION_CHANGED,
+            adoption_refusal(
+                &loader.fqtn(table),
+                &loader.fqtn(&format!("{table}__changes")),
+                &existing,
+                &declared,
+                bytes,
+            ),
+        ));
     }
     let changes = format!("{table}__changes");
     let rows = before_write(loader.row_count(table))?;
     loader.adopt_as_changelog(table)?;
     let after = loader.row_count(&changes)?;
     if after != rows {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_COPY_COUNT_MISMATCH,
             "`{}` holds {after} rows but `{}` held {rows} before the rename — investigate before \
              re-running",
             loader.fqtn(&changes),
@@ -851,7 +893,8 @@ fn adoptable(
     }
     let changes = format!("{table}__changes");
     if loader.object_kind(&changes)? != ObjectKind::Absent {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
             "cannot load `{}`: it is a table and `{}` already exists, so this is not an untouched \
              full load — refusing to guess which one holds the data. Keep one: drop the table, or \
              rename it aside and re-run.",
@@ -1005,14 +1048,16 @@ pub fn run_load_incremental(
 /// `__changes`, so the view would fail AFTER the append and the delta be re-appended.
 fn cursor_preflight(table: &str, specs: &[TargetColumnSpec], cursor_column: &str) -> Result<()> {
     if cursor_column.is_empty() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::CONFIG_MODE_SETTING_INVALID,
             "incremental load of `{table}` needs a cursor column (the export's `cursor_column:`) \
              for the dedup view's latest-per-PK ordering"
         );
     }
     if !specs.iter().any(|s| s.column_name == cursor_column) {
         let cols: Vec<&str> = specs.iter().map(|s| s.column_name.as_str()).collect();
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_KEY_COLUMN_INVALID,
             "incremental load of `{table}`: cursor_column `{cursor_column}` is not one of the \
              exported columns [{}] — add it to the export's SELECT so the dedup view can order \
              the change log by it",
@@ -1039,7 +1084,8 @@ pub(crate) fn split_object_uri(uri: &str) -> Result<(&str, &str)> {
     // legitimately targets the bucket root, so fail LOUD here rather than delete
     // everything. (Trailing/only slashes collapse to empty too.)
     if key.trim_matches('/').is_empty() {
-        anyhow::bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_STAGING_PREFIX_INVALID,
             "refusing a bucket-root staging prefix `{uri}`: a load stages into and cleans up a \
              DEDICATED prefix, so an empty prefix would list/delete the whole bucket. Set a \
              non-empty `destination.prefix`, and put any `{{partition}}` token AFTER a literal \
@@ -1335,7 +1381,7 @@ pub(crate) mod tests {
                 hook(table);
             }
             if let Some(e) = &self.kind_error {
-                bail!("{e}");
+                anyhow::bail!("{e}");
             }
             Ok(self
                 .kinds
@@ -1953,11 +1999,16 @@ pub(crate) mod tests {
             }
         }
         let f = ShortCopy(full_load_left(5));
-        let err = format!(
-            "{:#}",
-            adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own, false)
-                .unwrap_err()
+        let e = adopt_full_load_table(&f, "t", &spec(TargetStatus::Ok), Ownership::Own, false)
+            .unwrap_err();
+        assert_eq!(
+            (
+                crate::error::error_code(&e),
+                crate::error::classify_exit(&e)
+            ),
+            (Some("RIVET_LOAD_COPY_COUNT_MISMATCH"), 3)
         );
+        let err = format!("{e:#}");
         assert!(err.contains("before the rename"), "{err}");
         assert_eq!(
             calls(&f.0),
@@ -2848,5 +2899,182 @@ pub(crate) mod tests {
             f.appended.borrow().is_empty() && f.views.borrow().is_empty(),
             "must bail before appending or building the view"
         );
+    }
+
+    /// The code and exit class a failed driver call carries.
+    fn coded<T: std::fmt::Debug>(r: Result<T>) -> (Option<&'static str>, i32) {
+        let e = r.unwrap_err();
+        (
+            crate::error::error_code(&e),
+            crate::error::classify_exit(&e),
+        )
+    }
+
+    /// Every stop of the whole-table driver before its write names its code, and stays a `Refused`.
+    #[test]
+    fn each_whole_table_stop_carries_its_code() {
+        let full = |f: &FakeLoader, specs: &[TargetColumnSpec], uris: &[String]| {
+            run_load(f, "t", specs, uris, Some(3), None, Ownership::Own)
+        };
+        let mut odd = spec(TargetStatus::Ok);
+        odd[0].column_name = "a b".into();
+        let cases: [(Result<LoadReport>, &str, i32); 6] = [
+            (
+                full(&fake_loader(3), &odd, &uris()),
+                "RIVET_LOAD_IDENTIFIER_UNSAFE",
+                1,
+            ),
+            (
+                full(&fake_loader(3), &spec(TargetStatus::Fail), &uris()),
+                "RIVET_LOAD_COLUMN_TYPE_UNSUPPORTED",
+                1,
+            ),
+            (
+                full(&fake_loader(3), &[], &uris()),
+                "RIVET_INTERNAL_LOAD_INVARIANT",
+                6,
+            ),
+            (
+                full(&fake_loader(3), &spec(TargetStatus::Ok), &[]),
+                "RIVET_LOAD_RUN_NOT_LOADABLE",
+                5,
+            ),
+            (
+                full(
+                    &fake_loader(3),
+                    &spec(TargetStatus::Ok),
+                    &["gs://b/p/x'.parquet".to_string()],
+                ),
+                "RIVET_LOAD_STAGING_OBJECT_UNSAFE",
+                5,
+            ),
+            (
+                full(
+                    &fake_loader(3).with_kind("t", ObjectKind::View),
+                    &spec(TargetStatus::Ok),
+                    &uris(),
+                ),
+                "RIVET_LOAD_TARGET_OBJECT_CONFLICT",
+                5,
+            ),
+        ];
+        for (r, code, exit) in cases {
+            let e = r.unwrap_err();
+            assert!(e.is::<Refused>(), "{code}: a stop before the write: {e:#}");
+            assert_eq!(
+                (
+                    crate::error::error_code(&e),
+                    crate::error::classify_exit(&e)
+                ),
+                (Some(code), exit),
+                "{e:#}"
+            );
+        }
+    }
+
+    /// Every stop of the append drivers before their write names its code.
+    #[test]
+    fn each_append_stop_carries_its_code() {
+        let cdc = |f: &FakeLoader, pk: &[String]| {
+            run_load_cdc(
+                f,
+                "t",
+                &spec(TargetStatus::Ok),
+                &uris(),
+                pk,
+                cdc::SourceEngine::Postgres,
+                Some(3),
+                None,
+                Ownership::Own,
+                false,
+            )
+        };
+        assert_eq!(
+            coded(cdc(&fake_loader(3), &[])),
+            (Some("RIVET_LOAD_PRIMARY_KEY_MISSING"), 1)
+        );
+        assert_eq!(
+            coded(cdc(&fake_loader(3), &["a b".to_string()])),
+            (Some("RIVET_LOAD_IDENTIFIER_UNSAFE"), 1)
+        );
+        let inc = run_load_incremental(
+            &fake_loader(3),
+            "t",
+            &spec(TargetStatus::Ok),
+            &uris(),
+            &["id".to_string()],
+            "updated_at",
+            Some(3),
+            None,
+            Ownership::Own,
+            false,
+        );
+        assert_eq!(coded(inc), (Some("RIVET_LOAD_KEY_COLUMN_INVALID"), 1));
+        let drifted = changelog_with(ChangelogDrift::Partition {
+            existing: "`ts` by day".into(),
+            declared: "`ts` by month".into(),
+            bytes: None,
+        });
+        assert_eq!(
+            coded(load_incremental(&drifted)),
+            (Some("RIVET_LOAD_CHANGELOG_PARTITION_CHANGED"), 5)
+        );
+        let both = full_load_left(3).with_kind("t__changes", ObjectKind::Table);
+        assert_eq!(
+            coded(load_incremental(&both)),
+            (Some("RIVET_LOAD_TARGET_OBJECT_CONFLICT"), 5)
+        );
+    }
+
+    /// The ownership and buffer checks every load asks before its first write name their codes.
+    #[test]
+    fn the_pre_write_ownership_and_buffer_checks_carry_their_codes() {
+        let table = || fake_loader(3).with_kind("t", ObjectKind::Table);
+        assert_eq!(
+            coded(ensure_target_own(
+                &table(),
+                "t",
+                false,
+                Ownership::Unreadable
+            )),
+            (Some("RIVET_LOAD_LEDGER_UNREADABLE"), 1)
+        );
+        assert_eq!(
+            coded(ensure_target_own(&table(), "t", false, Ownership::Foreign)),
+            (Some("RIVET_LOAD_TARGET_NOT_RIVETS"), 5)
+        );
+        let buffered = fake_loader(3)
+            .with_kind("t__changes", ObjectKind::Table)
+            .with_rows("t__changes", 2);
+        let e = refuse_stale_buffer(&buffered, "t", true).unwrap_err();
+        assert!(e.is::<Refused>());
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_BUFFER_NOT_COMPACTED")
+        );
+        assert_eq!(crate::error::classify_exit(&e), 5);
+    }
+
+    /// A bucket-root staging prefix, an unreadable probe answer and a warehouse HTTP status name their codes.
+    #[test]
+    fn prefix_probe_and_http_failures_carry_their_codes() {
+        assert_eq!(
+            coded(split_object_uri("gs://b/")),
+            (Some("RIVET_LOAD_STAGING_PREFIX_INVALID"), 1)
+        );
+        assert_eq!(
+            coded(ObjectKind::from_probe(3)),
+            (Some("RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE"), 6)
+        );
+        for (status, code) in [
+            (401, "RIVET_LOAD_WAREHOUSE_AUTH_FAILED"),
+            (403, "RIVET_LOAD_WAREHOUSE_ACCESS_DENIED"),
+            (404, "RIVET_LOAD_WAREHOUSE_OBJECT_NOT_FOUND"),
+            (400, "RIVET_LOAD_WAREHOUSE_REJECTED"),
+        ] {
+            let e = warehouse_http_error(status, format!("HTTP {status}: no"));
+            assert_eq!(crate::error::error_code(&e), Some(code));
+            assert_eq!(e.to_string(), format!("HTTP {status}: no"));
+        }
     }
 }

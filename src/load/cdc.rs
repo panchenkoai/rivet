@@ -880,6 +880,13 @@ pub fn inc_dedup_view_sql(
     )
 }
 
+/// The buffer's range probe answered bounds the compaction cannot read as its key's type.
+fn unreadable_range(base: &str, col: &str, lo: &str, hi: &str) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::LOAD_WAREHOUSE_ANSWER_UNREADABLE,
+        format!("compact `{base}`: cannot read the buffer's `{col}` range ({lo:?}..{hi:?})"),
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1294,11 +1301,7 @@ pub fn plan_compact_merges(
             };
             let parse = |d: &str| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d");
             let (Ok(lo_d), Ok(hi_d)) = (parse(&probe.lo), parse(&probe.hi)) else {
-                anyhow::bail!(
-                    "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
-                    probe.lo,
-                    probe.hi
-                );
+                return Err(unreadable_range(base, col, &probe.lo, &probe.hi));
             };
             // The day AFTER `9999-12-31` (the SCD "end of time" sentinel, a legal
             // value) is past the warehouse's range: `DATE '+10000-01-01'` was a hard
@@ -1365,11 +1368,7 @@ pub fn plan_compact_merges(
             Some(col),
         ) if !probe.lo.is_empty() => {
             let (Ok(lo_i), Ok(hi_i)) = (probe.lo.parse::<i64>(), probe.hi.parse::<i64>()) else {
-                anyhow::bail!(
-                    "compact `{base}`: cannot read the buffer's `{col}` range ({:?}..{:?})",
-                    probe.lo,
-                    probe.hi
-                );
+                return Err(unreadable_range(base, col, &probe.lo, &probe.hi));
             };
             // A value outside `[start, end)` lives in the one unpartitioned bucket, which
             // no window reaches and which windowing up to it would count in the millions
@@ -2134,11 +2133,29 @@ mod compact_tests {
             Some(&day),
             &probe(1, "not-a-date", "x", 0),
         )
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE")
+        );
+        let err = err.to_string();
         assert!(
             err.contains("cannot read the buffer's `created_at` range"),
             "{err}"
+        );
+        let err = plan_compact_merges(
+            "p.d.t",
+            "p.d.t__changes",
+            &specs(),
+            &["id".to_string()],
+            SourceEngine::MySql,
+            Some(&range),
+            &probe(1, "low", "high", 0),
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE")
         );
     }
 

@@ -27,7 +27,7 @@ pub(crate) enum CompactGate {
     Go,
     /// Proceed, saying why the check could not be made.
     Note(String),
-    Refuse(String),
+    Refuse(crate::error::Code, String),
 }
 
 /// Whether the buffer may be merged into `base_fqtn`, from the two facts the
@@ -45,13 +45,16 @@ pub(crate) fn compact_gate(
     buffer_fqtn: &str,
 ) -> CompactGate {
     match (base, ownership) {
-        (ObjectKind::Absent, _) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the base table does not \
+        (ObjectKind::Absent, _) => CompactGate::Refuse(
+            crate::error::codes::LOAD_COMPACT_BASE_MISSING,
+            format!(
+                "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the base table does not \
              exist. The buffer holds changes for a table that was never loaded — load the \
              backfill first (the `cdc.backfill:` export builds the base), or drop the buffer \
              to discard EVERY change buffered since the last compaction (it accumulates \
              across loads). Nothing was merged and the buffer is untouched"
-        )),
+            ),
+        ),
         // Both layout levers are named, written one FIRST, because they have a
         // PRECEDENCE and this message used to name only the loser. `cdc_layout`
         // matches a written `load.layout:` before it consults `cdc.backfill:`
@@ -60,30 +63,42 @@ pub(crate) fn compact_gate(
         // generated config, returning this very refusal again, which left the
         // destructive branch as the only instruction that worked. The sibling
         // predicate `compact_skip_reason` has always named both.
-        (ObjectKind::View, _) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
+        (ObjectKind::View, _) => CompactGate::Refuse(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+            format!(
+                "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: that name is a VIEW — the \
              current-state view of the changelog+view layout, which has no base to merge into. \
              To move to base+buffer, drop the view and `{buffer_fqtn}`; to stay on the view, \
              set `load.layout: log_view` (or delete a written `layout:` key — a written one \
              WINS over `cdc.backfill:`, and `rivet init` writes it), and remove `cdc.backfill:` \
              from the export if it has one"
-        )),
-        (ObjectKind::Other, _) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
+            ),
+        ),
+        (ObjectKind::Other, _) => CompactGate::Refuse(
+            crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+            format!(
+                "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists and is neither a \
              table nor a view"
-        )),
-        (ObjectKind::Table, Ownership::Foreign) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
+            ),
+        ),
+        (ObjectKind::Table, Ownership::Foreign) => CompactGate::Refuse(
+            crate::error::codes::LOAD_TARGET_NOT_RIVETS,
+            format!(
+                "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: it exists, and this state \
              DB's load ledger has no record of rivet loading it — a MERGE would rewrite someone \
              else's rows. Drop or rename it, or point the export at another table"
-        )),
-        (ObjectKind::Table, Ownership::Unreadable) => CompactGate::Refuse(format!(
-            "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the load ledger could not be \
+            ),
+        ),
+        (ObjectKind::Table, Ownership::Unreadable) => CompactGate::Refuse(
+            crate::error::codes::LOAD_LEDGER_UNREADABLE,
+            format!(
+                "refusing to compact `{buffer_fqtn}` into `{base_fqtn}`: the load ledger could not be \
              read to confirm rivet loaded it. This is NOT the stateless case — a ledger is \
              configured and the query failed, so a MERGE may rewrite someone else's rows and the \
              record that would prove otherwise is unavailable. Fix the state backend and re-run; \
              nothing was merged and the buffer is untouched"
-        )),
+            ),
+        ),
         (ObjectKind::Table, Ownership::Unknown) => CompactGate::Note(format!(
             "  note: `{base_fqtn}` exists and there is no load ledger to confirm rivet loaded it \
              — compacting on its shape alone"
@@ -195,7 +210,7 @@ fn compact_gate_of(
             eprintln!("{note}");
             Ok(())
         }
-        CompactGate::Refuse(msg) => Err(load::refused(msg)),
+        CompactGate::Refuse(code, msg) => Err(load::refused(code, msg)),
     }
 }
 
@@ -253,7 +268,8 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             // and a ledger-less worker takes no lease at all rather than being
             // refused (the lease is `state.map(..)`, so `None` skips it).
             if load::pool::reconnect_failure_is_fatal(parent_had_state, state.is_some()) {
-                anyhow::bail!(
+                crate::rivet_bail!(
+                    crate::error::codes::LOAD_LEDGER_UNREADABLE,
                     "`{}`: this worker could not reopen the state ledger the run started \
                      with — refusing the table rather than compacting it without a lease. \
                      Lower `--pool`, or fix the state backend.",
@@ -378,14 +394,26 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         // test over the formatter would grade correct logic on inputs the supplier
         // never produces (the ordering INSIDE the worker is the defect surface), so
         // the honest close is a live compact whose ledger drops mid-run.
-        n => anyhow::bail!(
-            "{n} of {attempted} compacted table(s) failed: {}",
-            failures
-                .iter()
-                .map(|e| format!("{e:#}"))
-                .collect::<Vec<_>>()
-                .join(" | ")
-        ),
+        n => Err(several_failed(n, attempted, &failures)),
+    }
+}
+
+/// Several tables' compaction failed: one line naming each, carrying the code of the most stop-worthy one.
+fn several_failed(n: usize, attempted: usize, failures: &[anyhow::Error]) -> anyhow::Error {
+    let message = format!(
+        "{n} of {attempted} compacted table(s) failed: {}",
+        failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let code = crate::error::representative_failure_idx(failures)
+        .and_then(|i| crate::error::code_of(&failures[i]));
+    // An uncoded representative leaves the line uncoded too: its own site is where the code is owed.
+    match code {
+        Some(code) => crate::error::coded(code, message),
+        None => anyhow::Error::msg(message),
     }
 }
 
@@ -542,10 +570,10 @@ mod compact_gate_tests {
             "p.d.t__changes",
         );
         assert!(
-            matches!(unreadable, CompactGate::Refuse(_)),
+            matches!(unreadable, CompactGate::Refuse(..)),
             "an unreadable ledger must REFUSE, never proceed like a stateless run: {unreadable:?}"
         );
-        let CompactGate::Refuse(msg) = &unreadable else {
+        let CompactGate::Refuse(_, msg) = &unreadable else {
             unreachable!()
         };
         assert!(
@@ -577,7 +605,7 @@ mod compact_gate_tests {
             ),
         ] {
             let gate = compact_gate(kind, ownership, "p.d.t", "p.d.t__changes");
-            let CompactGate::Refuse(msg) = gate else {
+            let CompactGate::Refuse(_, msg) = gate else {
                 panic!("{kind:?}/{ownership:?} must refuse: {gate:?}")
             };
             assert!(msg.contains(wanted), "{kind:?}/{ownership:?}: {msg}");
@@ -586,6 +614,82 @@ mod compact_gate_tests {
                 "the refusal names both tables: {msg}"
             );
         }
+    }
+
+    /// Each compaction refusal carries the code of what the base is, and stays a refusal before any MERGE.
+    #[test]
+    fn each_compact_refusal_carries_its_code() {
+        for (kind, ownership, want, exit) in [
+            (
+                ObjectKind::Absent,
+                Ownership::Own,
+                "RIVET_LOAD_COMPACT_BASE_MISSING",
+                5,
+            ),
+            (
+                ObjectKind::View,
+                Ownership::Own,
+                "RIVET_LOAD_TARGET_OBJECT_CONFLICT",
+                5,
+            ),
+            (
+                ObjectKind::Other,
+                Ownership::Own,
+                "RIVET_LOAD_TARGET_OBJECT_CONFLICT",
+                5,
+            ),
+            (
+                ObjectKind::Table,
+                Ownership::Foreign,
+                "RIVET_LOAD_TARGET_NOT_RIVETS",
+                5,
+            ),
+            (
+                ObjectKind::Table,
+                Ownership::Unreadable,
+                "RIVET_LOAD_LEDGER_UNREADABLE",
+                1,
+            ),
+        ] {
+            let CompactGate::Refuse(code, msg) =
+                compact_gate(kind, ownership, "p.d.t", "p.d.t__changes")
+            else {
+                panic!("{kind:?}/{ownership:?} must refuse")
+            };
+            let e = load::refused(code, msg);
+            assert!(e.is::<load::Refused>());
+            assert_eq!(
+                (
+                    crate::error::error_code(&e),
+                    crate::error::classify_exit(&e)
+                ),
+                (Some(want), exit),
+                "{kind:?}/{ownership:?}"
+            );
+        }
+    }
+
+    /// Several failed tables are reported on one line carrying the most stop-worthy one's code.
+    #[test]
+    fn several_failed_compactions_carry_the_representative_code() {
+        let failures = vec![
+            anyhow::anyhow!("a transient blip"),
+            load::refused(
+                crate::error::codes::LOAD_COMPACT_BASE_MISSING,
+                "no base".to_string(),
+            ),
+        ];
+        let e = several_failed(2, 2, &failures);
+        assert_eq!(
+            e.to_string(),
+            "2 of 2 compacted table(s) failed: a transient blip | no base"
+        );
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_COMPACT_BASE_MISSING")
+        );
+        let uncoded = several_failed(1, 2, &failures[..1]);
+        assert_eq!(crate::error::error_code(&uncoded), None);
     }
 
     /// The VIEW refusal names the layout lever that actually DECIDES.
@@ -605,7 +709,7 @@ mod compact_gate_tests {
     #[test]
     fn the_view_refusal_names_the_written_layout_key_that_overrides_the_derived_one() {
         let gate = compact_gate(ObjectKind::View, Ownership::Own, "p.d.t", "p.d.t__changes");
-        let CompactGate::Refuse(msg) = gate else {
+        let CompactGate::Refuse(_, msg) = gate else {
             panic!("a VIEW base must refuse: {gate:?}")
         };
         assert!(

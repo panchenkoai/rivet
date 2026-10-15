@@ -7,7 +7,7 @@
 use crate::destination::gcs::GcsStore;
 use crate::load;
 use crate::load::plan::{Granularity, PartitionKey, TablePartition};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike};
 use parquet::basic::{LogicalType, TimeUnit, TimestampType, Type as PhysicalType};
 use parquet::file::FOOTER_SIZE;
@@ -138,7 +138,8 @@ fn pack_batches(key: &PartitionKey, mut files: Vec<Part>) -> Result<Vec<Vec<Stri
     {
         let alone = budgeted(key, span, rows, has_nulls);
         if alone > MAX_PARTITIONS_PER_JOB {
-            bail!(
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_PARTITION_BUDGET_EXCEEDED,
                 "{uri} alone {} — no batching splits one file",
                 over_budget_message(key, span, alone)
             );
@@ -201,7 +202,10 @@ fn read_footer_guessing(store: &GcsStore, key: &str, guess: u64) -> Result<Parqu
     let size = store.stat_size(key)?;
     let tail_len = FOOTER_SIZE as u64;
     if size < tail_len {
-        bail!("{key} is {size} bytes, too short to be a Parquet file");
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_STAGING_OBJECT_UNSAFE,
+            "{key} is {size} bytes, too short to be a Parquet file"
+        );
     }
     let guess = size.min(guess.max(tail_len));
     let end = store.read_range(key, size - guess, guess)?;
@@ -212,7 +216,10 @@ fn read_footer_guessing(store: &GcsStore, key: &str, guess: u64) -> Result<Parqu
         .context("the Parquet footer tail is not 8 bytes")?;
     let len = FooterTail::try_new(&tail)?.metadata_length() as u64;
     if size < tail_len + len {
-        bail!("{key} declares a {len}-byte footer but is {size} bytes long");
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_STAGING_OBJECT_UNSAFE,
+            "{key} declares a {len}-byte footer but is {size} bytes long"
+        );
     }
     if let Some(metadata) = metadata_in(&end, len) {
         return Ok(ParquetMetaDataReader::decode_metadata(metadata)?);
@@ -1284,5 +1291,39 @@ mod tests {
             "floors toward minus infinity"
         );
         assert_eq!(to_seconds(1_500_000_000, Unit::Nanos), 1);
+    }
+
+    /// A file over one job's partition budget and an object that is no Parquet file name their codes.
+    #[test]
+    fn an_over_budget_file_and_a_broken_part_carry_their_codes() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = at(2000, 1, 1, 0);
+        let days: Vec<i64> = (0..4100).map(|i| start + i * DAY).collect();
+        let (field, column) = ts_column(&days);
+        write_noted(dir.path(), "wide.parquet", field, column, true, None);
+        std::fs::write(dir.path().join("short.parquet"), b"PAR").unwrap();
+        let mut lying = vec![0u8; 4];
+        lying.extend_from_slice(&1000u32.to_le_bytes());
+        lying.extend_from_slice(b"PAR1");
+        std::fs::write(dir.path().join("lying.parquet"), lying).unwrap();
+        let store = GcsStore::open_fs(dir.path().to_str().unwrap()).unwrap();
+        let code = |e: anyhow::Error| crate::error::error_code(&e);
+
+        let wide = plan_load_batches(
+            &store,
+            &["gs://b/wide.parquet".to_string()],
+            &time("ts", Granularity::Day),
+        );
+        assert_eq!(
+            code(wide.unwrap_err()),
+            Some("RIVET_LOAD_PARTITION_BUDGET_EXCEEDED")
+        );
+        for broken in ["short.parquet", "lying.parquet"] {
+            assert_eq!(
+                code(read_footer(&store, broken).unwrap_err()),
+                Some("RIVET_LOAD_STAGING_OBJECT_UNSAFE"),
+                "{broken}"
+            );
+        }
     }
 }

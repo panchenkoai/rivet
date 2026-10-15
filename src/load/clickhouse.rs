@@ -7,7 +7,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use super::cdc::{self, Warehouse};
 use super::{GcsStore, ObjectKind, TargetLoader};
@@ -210,7 +210,10 @@ impl ClickhouseLoader {
             true => Ok(text.trim().to_string()),
             false => Err((
                 Failure::Status(status.as_u16(), code),
-                anyhow::anyhow!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text)),
+                super::warehouse_http_error(
+                    status.as_u16(),
+                    format!("ClickHouse (HTTP {status}): {}", trim_ch_error(&text)),
+                ),
             )),
         }
     }
@@ -362,10 +365,13 @@ impl TargetLoader for ClickhouseLoader {
 
     fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
         if let Some(c) = unsafe_column(&self.cluster_by) {
-            bail!(
-                "ClickHouse load: `cluster_by` column `{}` is not a plain SQL identifier",
-                c.escape_default()
-            );
+            return Err(super::refused(
+                crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
+                format!(
+                    "ClickHouse load: `cluster_by` column `{}` is not a plain SQL identifier",
+                    c.escape_default()
+                ),
+            ));
         }
         let part_rows = super::before_write(checked_part_rows(|| self.store(), uris))?;
         let target = self.quoted(table);
@@ -400,9 +406,17 @@ impl TargetLoader for ClickhouseLoader {
         let part_rows = super::before_write(checked_part_rows(|| self.store(), uris))?;
         let full = changelog_specs(specs);
         let changes = self.quoted(&format!("{table}__changes"));
-        let shape = changelog_shape(self.cdc, table, pk, self.partition_by.as_deref())?;
+        let shape = super::before_write(changelog_shape(
+            self.cdc,
+            table,
+            pk,
+            self.partition_by.as_deref(),
+        ))?;
         if let Some(why) = self.existing_changelog_conflict(table, &shape, pk, &full)? {
-            return Err(super::refused(why));
+            return Err(super::refused(
+                crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+                why,
+            ));
         }
         let ddl = columns_ddl(&full, shape.not_null) + &shape.version_column;
         self.query(&create_table_sql(
@@ -494,17 +508,20 @@ impl TargetLoader for ClickhouseLoader {
     fn adopt_as_changelog(&self, table: &str) -> Result<()> {
         let from = self.quoted(table);
         if self.cdc {
-            return Err(super::refused(format!(
-                "`{}` is a table from an earlier whole-table load; a ClickHouse CDC change log is \
+            return Err(super::refused(
+                crate::error::codes::LOAD_TARGET_OBJECT_CONFLICT,
+                format!(
+                    "`{}` is a table from an earlier whole-table load; a ClickHouse CDC change log is \
                  a ReplacingMergeTree, which a table cannot become in place (ADR-0035 CH11). \
                  Drop or rename `{}` and re-run — nothing was changed. The change log holds only \
                  changes from the stream's anchor on: to keep serving the table's existing rows, \
                  also set `cdc.initial: snapshot` (or a `cdc.backfill:`) and `rivet run` again \
                  before the load — the stream is already anchored, so the snapshot overlaps it \
                  and no change falls between them",
-                TargetLoader::fqtn(self, table),
-                TargetLoader::fqtn(self, table)
-            )));
+                    TargetLoader::fqtn(self, table),
+                    TargetLoader::fqtn(self, table)
+                ),
+            ));
         }
         let to = self.quoted(&format!("{table}__changes"));
         self.query_once(&format!("RENAME TABLE {from} TO {to}"))?;
@@ -605,7 +622,10 @@ fn http_client(ca_file: Option<&str>) -> Result<reqwest::blocking::Client> {
         let certs = reqwest::Certificate::from_pem_bundle(&pem)
             .with_context(|| format!("ClickHouse load: `load.ca_file` {path} is not PEM"))?;
         if certs.is_empty() {
-            bail!("ClickHouse load: `load.ca_file` {path} holds no PEM certificate");
+            crate::rivet_bail!(
+                crate::error::codes::LOAD_TLS_CA_INVALID,
+                "ClickHouse load: `load.ca_file` {path} holds no PEM certificate"
+            );
         }
         for cert in certs {
             builder = builder.add_root_certificate(cert);
@@ -665,7 +685,8 @@ fn changelog_shape<'a>(
         });
     }
     if pk.is_empty() {
-        bail!(
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_PRIMARY_KEY_MISSING,
             "ClickHouse CDC load of `{table}` needs a primary key: the change log collapses \
              versions by key (ADR-0035 CH2) — set `load.pk`"
         );
@@ -1916,6 +1937,36 @@ J10BsZgn5wxFlM4=
         );
         assert!(http_client(Some(&write("ca.pem", CA))).is_ok());
         assert!(http_client(None).is_ok());
+        assert_eq!(
+            crate::error::error_code(&http_client(Some(&junk)).unwrap_err()),
+            Some("RIVET_LOAD_TLS_CA_INVALID")
+        );
+    }
+
+    /// The ClickHouse stops before any statement name their codes and stay refusals.
+    #[test]
+    fn each_clickhouse_stop_before_a_statement_carries_its_code() {
+        let loader = ClickhouseLoader::new(
+            "http://127.0.0.1:1",
+            "d",
+            "u",
+            "RIVET_CH_UNSET_PASSWORD",
+            crate::config::DestinationConfig::default(),
+        )
+        .cluster_by(vec!["a b".into()]);
+        let e = loader.materialize("t", &[], &[]).unwrap_err();
+        assert!(e.is::<crate::load::Refused>(), "{e:#}");
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_IDENTIFIER_UNSAFE")
+        );
+        let Err(e) = changelog_shape(true, "t", &[], None) else {
+            panic!("a CDC log without a key is refused");
+        };
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_LOAD_PRIMARY_KEY_MISSING")
+        );
     }
 
     #[test]
