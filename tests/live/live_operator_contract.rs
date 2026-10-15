@@ -2500,6 +2500,92 @@ fn oracle_walk_out_of(mut s: CdcScenario, code: &'static str) {
     );
 }
 
+/// A source value the output type cannot hold is refused as `RIVET_SOURCE_VALUE_UNREPRESENTABLE` (exit 5) on every run of a batch export; emptying the destination changes nothing; each remedy the text names (map the value in the export's `query:`, exclude the column) delivers the source.
+fn an_unrepresentable_value_is_refused_by_code(e: SqlEngine) {
+    e.alive();
+    let (id, t) = (e.col("id"), e.col("t"));
+    let (col_type, plain, hostile, mapped, cast_sentence) = match e {
+        SqlEngine::Pg => (
+            "TIMESTAMP",
+            "'2024-01-01 00:00:00'",
+            "'infinity'",
+            format!("CASE WHEN {t} = 'infinity' THEN '9999-12-31' ELSE {t} END"),
+            "maps the sentinels to a real bound",
+        ),
+        SqlEngine::Mysql => (
+            "TIME(6)",
+            "'12:00:00'",
+            "'838:59:59'",
+            format!("CAST({t} AS CHAR)"),
+            "Cast it in a query",
+        ),
+        other => panic!("no unrepresentable-value fixture on {other:?}"),
+    };
+    let (table, _guard) = e.create(
+        "unrep",
+        &format!("{id} {} PRIMARY KEY, {t} {col_type}", e.int64()),
+    );
+    e.exec(&format!(
+        "INSERT INTO {table} ({id}, {t}) VALUES (1, {plain})"
+    ));
+    e.exec(&format!(
+        "INSERT INTO {table} ({id}, {t}) VALUES (2, {hostile})"
+    ));
+    let mut rig = e
+        .rig("unrep")
+        .query(&format!("SELECT {id}, {t} FROM {table} ORDER BY {id}"));
+    let same = Refused::by_code("RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+    let mut remedies = vec![
+        Remedy::wrong(
+            "empties the destination and runs again",
+            Then::Refuses(same),
+            |r| {
+                for f in std::fs::read_dir(r.out_dir())
+                    .expect("the destination")
+                    .flatten()
+                {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            },
+        ),
+        Remedy::new(cast_sentence, Then::DeliversTheSource, {
+            let (id, t, table) = (id.clone(), t.clone(), table.clone());
+            move |r| {
+                r.rebuilt(|rig| {
+                    rig.query(&format!(
+                        "SELECT {id}, {mapped} AS {t} FROM {table} ORDER BY {id}"
+                    ))
+                })
+            }
+        }),
+    ];
+    if matches!(e, SqlEngine::Pg) {
+        remedies.push(Remedy::new(
+            "exclude the column",
+            Then::DeliversTheSource,
+            {
+                let (id, table) = (id.clone(), table.clone());
+                move |r| {
+                    r.rebuilt(|rig| rig.query(&format!("SELECT {id} FROM {table} ORDER BY {id}")))
+                }
+            },
+        ));
+    }
+    rig.refuses_twice_and_walks_out(&["run"], &[], same, remedies);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn an_unrepresentable_value_is_refused_by_code_postgres() {
+    an_unrepresentable_value_is_refused_by_code(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn an_unrepresentable_value_is_refused_by_code_mysql() {
+    an_unrepresentable_value_is_refused_by_code(SqlEngine::Mysql);
+}
+
 /// A captured cell the stream cannot carry (`NaN` into a NUMERIC column) is refused as `RIVET_SOURCE_CDC_CELL_UNSUPPORTED` (exit 5) on every run; the checkpoint deleted alone meets the cell again; "leave the column out of the capture" (the column dropped at the source) and the re-baseline recipe as printed deliver the source.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
