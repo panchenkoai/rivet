@@ -95,10 +95,12 @@ soak:
 	$(LIVE) $(PY) -m dev.pytools.soak $(SOAK_ARGS)
 
 # Full live suite under nextest (per-test isolation), sweeping stale fixtures
-# FIRST so an interrupted prior run never pollutes the shared `rivet` DB.
+# FIRST so an interrupted prior run never pollutes the shared `rivet` DB, and
+# again after a green run so no orphaned replication slot keeps pinning WAL.
 # Requires `docker compose up -d` (postgres + mysql + the validator containers).
 test-live: sweep-test-db
 	$(LIVE) cargo nextest run --run-ignored all
+	@$(MAKE) --no-print-directory sweep-test-db
 
 # ── Fixture seed ────────────────────────────────────────────────────────────
 # Regenerate the shared live-test dataset (orders/users/events/page_views/
@@ -344,6 +346,8 @@ release-oracle-full: release-oracle-prev-bin sweep-test-db  ## Release gate with
 	@prev=$$(ls -t -d $(PREV_RELEASE_DIR)/rivet-v*/rivet 2>/dev/null | head -1); \
 	 echo "  previous release: $${prev:-<none — the scale legs will SKIP and the regression / differential / field-replay legs will FAIL; re-run release-oracle-prev-bin, or give the comparison up by name with ARGS=--without-prev-release-comparison>}"; \
 	 $(LIVE_ALL) env $(GATE_ENV) RIVET_PREV_RELEASE_BIN="$$prev" $(PY) -m dev.release_oracle $(ARGS)
+	@# A gate that passed leaves the stand swept too: no orphaned slot pins WAL into the next run.
+	@$(MAKE) --no-print-directory sweep-test-db
 
 release-oracle-bless: release-oracle-prev-bin  ## Re-capture the verdict + duckdb-type goldens. Deliberate: a golden must be written by rivet's own code, never edited by hand.
 	@rm -rf target/package

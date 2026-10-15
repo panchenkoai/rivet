@@ -335,6 +335,19 @@ def _report(source: str, what: str, dropped: list[str], failed: list[str]) -> No
     print(f"  {source}: {len(dropped)} orphaned {what} dropped" + (f", {len(failed)} FAILED: {failed[:3]}" if failed else ""))
 
 
+def _pg_slots(source: str, container: str, db: str | None = "rivet") -> None:
+    """Inactive replication slots of gone test processes on one PostgreSQL cluster: each pins WAL."""
+    q = lambda sql: shell.docker_exec(container, *cdc_stand.psql_argv(sql, db=db), timeout=300)  # noqa: E731
+    slots = q("SELECT slot_name FROM pg_replication_slots WHERE NOT active")
+    dropped, failed = [], []
+    for slot in _lines(slots) if slots.ok else []:
+        if registry.orphaned(slot):
+            lit = slot.replace("'", "''")
+            (dropped if q(f"SELECT pg_drop_replication_slot('{lit}')").ok else failed).append(slot)
+    if dropped or failed:
+        _report(source, "replication slots", dropped, failed)
+
+
 def _pg_cruft(source: str, container: str, db: str) -> None:
     """Orphaned tables and inactive replication slots on one PostgreSQL database."""
     q = lambda sql: shell.docker_exec(container, *cdc_stand.psql_argv(sql, db=db), timeout=300)  # noqa: E731
@@ -348,14 +361,7 @@ def _pg_cruft(source: str, container: str, db: str) -> None:
             ident = '"' + schema.replace('"', '""') + '"."' + name.replace('"', '""') + '"'
             (dropped if q(f"DROP TABLE IF EXISTS {ident} CASCADE").ok else failed).append(fq)
     _report(f"{source}/{db}", "tables", dropped, failed)
-    slots = q("SELECT slot_name FROM pg_replication_slots WHERE NOT active")
-    dropped, failed = [], []
-    for slot in _lines(slots) if slots.ok else []:
-        if registry.orphaned(slot):
-            lit = slot.replace("'", "''")
-            (dropped if q(f"SELECT pg_drop_replication_slot('{lit}')").ok else failed).append(slot)
-    if dropped or failed:
-        _report(source, "replication slots", dropped, failed)
+    _pg_slots(source, container, db)
 
 
 def _my_cruft(source: str, container: str, db: str) -> None:
@@ -482,6 +488,9 @@ def test_cruft(bigquery: bool = False) -> int:
             continue
         for db in registry.load()["databases"]:
             arms[source.split("_")[0]](source, container, db)
+    for container in registry.load().get("slot_hosts", []):
+        if _container_up(container):
+            _pg_slots(container, container)
     if bigquery:
         _bigquery_cruft()
     _sweep_live_tmp()

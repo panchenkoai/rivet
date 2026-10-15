@@ -20,6 +20,10 @@ sources:
 # 1M-row harness fixture, expensive to rebuild). Nothing else is permanent.
 databases: [rivet, rivet_bench]
 
+# PostgreSQL containers outside `sources` whose replication slots the sweep also reads: the
+# standby pair (dev/pytools/cdc_stand.py standby). An orphaned slot there pins WAL like anywhere.
+slot_hosts: [rivet-pg-cdc-primary-1, rivet-pg-cdc-standby-1]
+
 bigquery:
   project: rivet-data-tool
   location: US
