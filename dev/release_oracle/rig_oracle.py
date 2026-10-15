@@ -523,8 +523,11 @@ def _source(ora, spec: dict, renders: dict) -> tuple[str, list[str], dict]:
         cols = ", ".join(renders.get(n, "{c}").replace("{c}", f"[{c}]") + f" AS [{c}]" for c, n in native.items())
         return f"mssql_scan('ms', {_lit(f'SELECT {cols} FROM [{sch}].[{leaf}]')})", key, native
     if engine == "mongo":
+        from .value_diff import mongo_mixed_id_source
+
+        mixed = mongo_mixed_id_source(ora, spec["url"], spec["database"], leaf)
         # The scanner infers a schema (flattening nested keys); only `_id` is shared with the document blob.
-        return f'(SELECT "_id" FROM mg.{spec["database"]}.{_qi(leaf)})', ["_id"], native
+        return mixed or f'(SELECT "_id" FROM mg.{spec["database"]}.{_qi(leaf)})', ["_id"], native
     raise ValueError(f"no source reader for engine {engine!r}")
 
 
@@ -1860,7 +1863,39 @@ def _self_test() -> None:
     _layout_self_test()
     _ndjson_self_test()
     _stdout_self_test()
+    _mongo_mixed_id_self_test()
     print("rig_oracle self-test ok")
+
+
+def _mongo_mixed_id_self_test() -> None:
+    """A mixed-type Mongo `_id` is graded by value and BSON type, and rivet's `_id` column must show the document's `_id`; a homogeneous `_id` keeps its typed cast."""
+    import pyarrow as pa
+    from bson import ObjectId
+    from bson.int64 import Int64
+
+    from .value_diff import mongo_document_columns, mongo_id_json
+
+    oid = ObjectId("65f000000000000000000001")
+    source = [1, Int64(2), "zzz", oid, 3.5, "7"]
+    good = [('{"_id":1,"v":"a"}', "1"), ('{"_id":2}', "2"), ('{"_id":"zzz"}', "zzz"),
+            ('{"_id":{"$oid":"65f000000000000000000001"}}', str(oid)), ('{"_id":3.5}', "3.5"), ('{"_id":"7"}', "7")]
+
+    def diff(delivered: list[tuple[str, str]]) -> tuple[int, int]:
+        with _Mem() as ora:
+            ora.db.register("ids", pa.table({"_id": pa.array([mongo_id_json(v) for v in source], pa.string())}))
+            ora.db.sql('CREATE TABLE s AS SELECT CAST("_id" AS JSON) AS "_id" FROM ids')
+            ora.db.register("parts", pa.table({"_id": [i for _, i in delivered], "document": [d for d, _ in delivered]}))
+            f = compare(ora, "s", mongo_document_columns(ora, "s", "parts"), key=["_id"])
+            return f["only_src"], f["only_dst"]
+
+    assert diff(good) == (0, 0), diff(good)
+    assert diff(good[:-1] + [('{"_id":7}', "7")]) == (1, 1), "a string `_id` delivered as an integer is a difference"
+    assert diff(good[:4] + [('{"_id":3}', "3")] + good[5:]) == (1, 1), "a double `_id` delivered truncated is a difference"
+    assert diff(good[:2] + [('{"_id":"zzz"}', "zzy")] + good[3:]) == (1, 1), "an `_id` column that does not show the document's `_id`"
+    assert diff(good[:-1]) == (1, 0), "a document not delivered"
+    with _Mem() as ora:
+        ora.db.sql('CREATE TABLE s AS SELECT 1::BIGINT AS "_id"')
+        assert 'CAST("_id" AS BIGINT)' in mongo_document_columns(ora, "s", "parts"), "a homogeneous `_id` keeps its typed cast"
 
 
 class _Mem:

@@ -476,8 +476,7 @@ fn mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works() {
     );
 
     // Full scan (no page_size) — a single cursor crosses BSON brackets — is whole.
-    let fs = batch(&db, "t")
-        .no_oracle("heterogeneous _id types: the DuckDB mongo scanner splits or nulls a mixed _id and cannot reproduce the source _id set");
+    let fs = batch(&db, "t");
     fs.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
@@ -503,9 +502,7 @@ fn roast_resume_must_not_bypass_heterogeneous_id_guard() {
     m.seed_int_id("t", 100); // uniform int _id — run 1 passes the guard
 
     // SAME rig across runs: the keyset checkpoint persists in export_state.
-    let rig = batch(&db, "t")
-        .mongo("page_size: 40, resume: true")
-        .oracle_known_defect("a failed run left: resume-point", "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim");
+    let rig = batch(&db, "t").mongo("page_size: 40, resume: true");
     rig.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&rig.out_dir(), "_id").len(),
@@ -558,8 +555,7 @@ fn roast_null_and_object_id_must_not_slip_past_the_bracket_guard() {
     );
 
     // Full scan stays the remediation: all 4 docs, both bands.
-    let fs = batch(&db, "t")
-        .no_oracle("heterogeneous _id types: the DuckDB mongo scanner splits or nulls a mixed _id and cannot reproduce the source _id set");
+    let fs = batch(&db, "t");
     fs.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),
@@ -617,8 +613,7 @@ fn roast_nan_id_refused_for_keyset_and_parallel_full_scan_complete() {
     );
 
     // Remediation path: the full scan (single cursor, no seek) reads all 4.
-    let fs = batch(&db, "t")
-        .no_oracle("heterogeneous _id types: the DuckDB mongo scanner splits or nulls a mixed _id and cannot reproduce the source _id set");
+    let fs = batch(&db, "t");
     fs.run_ok();
     assert_eq!(
         duckdb_dir_parquet_distinct_strings(&fs.out_dir(), "_id").len(),

@@ -1374,7 +1374,7 @@ pub mod codes {
     /// A MongoDB `_id` set a type-bracketed `$gt` seek cannot page over (NaN, or more than one BSON type).
     pub const SOURCE_KEYSET_KEY_UNORDERED: Code = refusal(
         "RIVET_SOURCE_KEYSET_KEY_UNORDERED",
-        "remove `page_size` and `parallel` so the collection is read in one ordered scan, or fix the `_id` values the message names",
+        "remove `page_size`, `resume` and `parallel` so the collection is read in one ordered scan, or fix the `_id` values the message names",
     );
 
     /// An option given a value in a form it does not take (`--format`, `--mode`, `--date`, `--param`).

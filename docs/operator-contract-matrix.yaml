@@ -269,7 +269,7 @@ scenarios:
     postgres: { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
     mysql:    { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
     mssql:    { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
-    mongo:    { test: open_defect_removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo }
+    mongo:    { test: removing_page_size_runs_after_the_heterogeneous_id_refusal_mongo }
     oracle:   { na: "`page_size` and the heterogeneous-`_id` guard are MongoDB's" }
 
   - id: run_missing_bucket_s3

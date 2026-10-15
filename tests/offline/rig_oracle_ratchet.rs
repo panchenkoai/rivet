@@ -29,7 +29,8 @@ use std::path::{Path, PathBuf};
 // 21 -> 22 (2026-10-03): the PG truncate refusal's resumed run keeps the pre-truncate rows the refusal says only a re-snapshot removes.
 // 22 -> 23 (2026-10-03): pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split merges by a declared `load.pk: [code]`; the oracle dedups by the source primary key `id`.
 // Raised 23 -> 24 (2026-10-08): the MongoDB oplog-gone cells run on a replica set container they start themselves, which the reader inside rivet-duckdb cannot reach.
-const NO_ORACLE_CEILING: usize = 24; // ratchet-pin: no-oracle-opt-outs
+// 24 -> 21 (2026-10-15): the oracle reads a mixed-type MongoDB `_id` (pymongo, canonical extended JSON), so the three heterogeneous-`_id` full scans are graded.
+const NO_ORACLE_CEILING: usize = 21; // ratchet-pin: no-oracle-opt-outs
 
 /// Typed declarations in tests/live of what a run that does not exit 0 may leave: `.a_failed_run_may_leave(` and a raw run's `FAILED_RUN_LEAVES_ENV`.
 // 0 -> 19 (2026-10-07): the refusal grade's first pass; every site is a gate that fails a run after its parts are written (quality, schema drift, a manifest that did not land).
@@ -174,7 +175,8 @@ fn failed_run_leftover_declarations_never_grow() {
 // 5 -> 4 (2026-10-08): the corrupt CDC checkpoint is refused by code (#497).
 // 4 -> 3 (2026-10-08): the bounded-drain refusal on a PostgreSQL standby carries RIVET_SOURCE_CDC_PREREQUISITE.
 // 3 -> 2 (2026-10-15): a run beside a held run lease is refused as RIVET_STATE_RUN_IN_PROGRESS (#538).
-const UNCODED_REFUSAL_CEILING: usize = 2; // ratchet-pin: uncoded-refusals
+// 2 -> 1 (2026-10-15): the mixed-type MongoDB `_id` refusal of a resumed keyset run is asserted as RIVET_SOURCE_KEYSET_KEY_UNORDERED.
+const UNCODED_REFUSAL_CEILING: usize = 1; // ratchet-pin: uncoded-refusals
 
 #[test]
 fn uncoded_refusals_the_cells_accept_never_grow() {
@@ -268,16 +270,6 @@ const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
         "chunked_checkpoint_refuses_to_clobber_a_cdc_manifest",
         "a failed run left: chunk-checkpoint",
         "known defect: the refusal to overwrite a CDC manifest comes after the chunk plan is stored",
-    ),
-    (
-        "roast_resume_must_not_bypass_heterogeneous_id_guard",
-        "a failed run left: resume-point",
-        "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
-    ),
-    (
-        "mongo_heterogeneous_resume_remedy",
-        "a failed run left: resume-point",
-        "known defect: a resumed keyset run the heterogeneous-_id guard refuses has already written its claim (resume_run_id, resume_owner) on the cursor row; the guard must come before the claim",
     ),
     (
         "a_change_older_than_an_alter_is_refused_by_code_oracle",
