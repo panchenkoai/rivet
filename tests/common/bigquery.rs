@@ -201,6 +201,7 @@ pub fn recreate_dataset(project: &str, dataset: &str) {
         Some(serde_json::json!({
             "datasetReference": {"projectId": project, "datasetId": dataset},
             "location": super::registry::stand_bq_location(),
+            "defaultTableExpirationMs": super::registry::stand_cloud_ttl_ms().to_string(),
         })),
     );
     assert!(
@@ -282,6 +283,7 @@ impl BqLive {
                     Some(serde_json::json!({
                         "datasetReference": {"projectId": project, "datasetId": dataset},
                         "location": super::registry::stand_bq_location(),
+                        "defaultTableExpirationMs": super::registry::stand_cloud_ttl_ms().to_string(),
                     })),
                 );
                 assert!(

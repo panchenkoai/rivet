@@ -19,9 +19,11 @@ Two ports that share a name and nothing else:
 * `dev/sweep-test-cruft.sh` → `test_cruft()`
   Drops test objects left behind by INTERRUPTED live runs, on every source in
   `dev/stand/registry.yaml` (tables, PG slots, Mongo databases and collections;
-  BigQuery with `--bigquery`). Live tests name objects `<prefix>_<pid>_<counter>`
+  the cloud with `--cloud`). Live tests name objects `<prefix>_<pid>_<counter>`
   (`tests/common::unique_name`); an object is dropped only when that pid is no
-  longer running, so a concurrent live run is never swept.
+  longer running, so a concurrent live run is never swept. Cloud objects (BigQuery
+  `rivet_tmp_*` datasets, `rivet_e2e` tables, the GCS test bucket) are dropped by
+  AGE past `cloud_ttl_hours`, since several machines share them.
 
 Usage:
 
@@ -82,7 +84,7 @@ ROOT = shell.ROOT
 
 USAGE = (
     "usage: dev/pytools/sweep.py source-parity [rivet-binary]\n"
-    "       dev/pytools/sweep.py test-cruft [--bigquery]"
+    "       dev/pytools/sweep.py test-cruft [--cloud]"
 )
 
 # The comparison core is the CDC sibling's, on purpose — one `norm`, one `chk`,
@@ -335,6 +337,19 @@ def _report(source: str, what: str, dropped: list[str], failed: list[str]) -> No
     print(f"  {source}: {len(dropped)} orphaned {what} dropped" + (f", {len(failed)} FAILED: {failed[:3]}" if failed else ""))
 
 
+def _pg_slots(source: str, container: str, db: str | None = "rivet") -> None:
+    """Inactive replication slots of gone test processes on one PostgreSQL cluster: each pins WAL."""
+    q = lambda sql: shell.docker_exec(container, *cdc_stand.psql_argv(sql, db=db), timeout=300)  # noqa: E731
+    slots = q("SELECT slot_name FROM pg_replication_slots WHERE NOT active")
+    dropped, failed = [], []
+    for slot in _lines(slots) if slots.ok else []:
+        if registry.orphaned(slot):
+            lit = slot.replace("'", "''")
+            (dropped if q(f"SELECT pg_drop_replication_slot('{lit}')").ok else failed).append(slot)
+    if dropped or failed:
+        _report(source, "replication slots", dropped, failed)
+
+
 def _pg_cruft(source: str, container: str, db: str) -> None:
     """Orphaned tables and inactive replication slots on one PostgreSQL database."""
     q = lambda sql: shell.docker_exec(container, *cdc_stand.psql_argv(sql, db=db), timeout=300)  # noqa: E731
@@ -348,14 +363,7 @@ def _pg_cruft(source: str, container: str, db: str) -> None:
             ident = '"' + schema.replace('"', '""') + '"."' + name.replace('"', '""') + '"'
             (dropped if q(f"DROP TABLE IF EXISTS {ident} CASCADE").ok else failed).append(fq)
     _report(f"{source}/{db}", "tables", dropped, failed)
-    slots = q("SELECT slot_name FROM pg_replication_slots WHERE NOT active")
-    dropped, failed = [], []
-    for slot in _lines(slots) if slots.ok else []:
-        if registry.orphaned(slot):
-            lit = slot.replace("'", "''")
-            (dropped if q(f"SELECT pg_drop_replication_slot('{lit}')").ok else failed).append(slot)
-    if dropped or failed:
-        _report(source, "replication slots", dropped, failed)
+    _pg_slots(source, container, db)
 
 
 def _my_cruft(source: str, container: str, db: str) -> None:
@@ -427,31 +435,88 @@ def _mongo_cruft(source: str, container: str) -> None:
     print(f"  {source}: {dbs} orphaned databases, {colls} orphaned collections dropped")
 
 
-def _bigquery_cruft() -> None:
-    """Every disposable (`tmp_prefix`) dataset, and orphaned tables in the permanent one — opt-in, never during a run."""
-    bq = registry.load()["bigquery"]
-    proj, tmp, e2e = bq["project"], bq["tmp_prefix"], bq["e2e"]
-    ls = shell.run(["bq", "ls", "--format=json", "--max_results=10000", f"{proj}:"], timeout=300)
-    if not ls.ok:
-        shell.warn(f"  bigquery: listing FAILED: {ls.stderr.strip()[-200:]}")
-        return
+def _cloud_ttl() -> tuple[int, str]:
+    """`(seconds, BigQuery cutoff expression)` of the registry's `cloud_ttl_hours`."""
+    hours = int(registry.load()["cloud_ttl_hours"])
+    return hours * 3600, f"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {hours} HOUR)"
+
+
+def _bq_rows(proj: str, sql: str) -> list[dict] | None:
+    """Rows of one standard-SQL query as dicts, or None when it failed (reported)."""
     import json
 
-    names = [d["datasetReference"]["datasetId"] for d in json.loads(ls.stdout or "[]")]
+    r = shell.run(["bq", "query", f"--project_id={proj}", "--nouse_legacy_sql", "--format=json",
+                   "--max_rows=100000", sql], timeout=600)
+    if not r.ok:
+        shell.warn(f"  bigquery: query FAILED: {(r.stderr or r.stdout).strip()[-200:]}")
+        return None
+    return json.loads(r.stdout or "[]")
+
+
+def _bigquery_cruft() -> None:
+    """Disposable (`tmp_prefix`) datasets and `e2e` tables older than the cloud TTL, and the
+    TTL itself as every one of those datasets' default table expiration."""
+    bq = registry.load()["bigquery"]
+    proj, tmp, e2e, loc = bq["project"], bq["tmp_prefix"], bq["e2e"], bq["location"].lower()
+    ttl_s, cutoff = _cloud_ttl()
+    old = _bq_rows(proj, f"SELECT schema_name FROM `{proj}`.`region-{loc}`.INFORMATION_SCHEMA.SCHEMATA "
+                         f"WHERE STARTS_WITH(schema_name, '{tmp}') AND creation_time < {cutoff}")
     dropped, failed = [], []
-    for name in names:
-        if name.startswith(tmp):
-            ok = shell.run(["bq", "rm", "-r", "-f", "-d", f"{proj}:{name}"], timeout=300).ok
-            (dropped if ok else failed).append(name)
-    _report("bigquery", f"datasets ({tmp}*)", dropped, failed)
-    tl = shell.run(["bq", "ls", "--format=json", "--max_results=100000", f"{proj}:{e2e}"], timeout=300)
+    for row in old or []:
+        name = row["schema_name"]
+        ok = shell.run(["bq", "rm", "-r", "-f", "-d", f"{proj}:{name}"], timeout=300).ok
+        (dropped if ok else failed).append(name)
+    _report("bigquery", f"datasets ({tmp}*) older than the TTL", dropped, failed)
+    stale = _bq_rows(proj, f"SELECT table_id FROM `{proj}.{e2e}.__TABLES__` "
+                           f"WHERE TIMESTAMP_MILLIS(last_modified_time) < {cutoff}")
     dropped, failed = [], []
-    for t in json.loads(tl.stdout or "[]") if tl.ok else []:
-        name = t["tableReference"]["tableId"]
-        if registry.orphaned(name):
-            ok = shell.run(["bq", "rm", "-f", "-t", f"{proj}:{e2e}.{name}"], timeout=300).ok
-            (dropped if ok else failed).append(name)
-    _report(f"bigquery/{e2e}", "tables", dropped, failed)
+    for row in stale or []:
+        name = row["table_id"]
+        ok = shell.run(["bq", "rm", "-f", "-t", f"{proj}:{e2e}.{name}"], timeout=300).ok
+        (dropped if ok else failed).append(name)
+    _report(f"bigquery/{e2e}", "tables older than the TTL", dropped, failed)
+    if not shell.run(["bq", "update", f"--default_table_expiration={ttl_s}", f"{proj}:{e2e}"], timeout=300).ok:
+        shell.warn(f"  bigquery/{e2e}: could not set the default table expiration to {ttl_s} s")
+
+
+def _gcs_lifecycle(days: int) -> str:
+    """The bucket lifecycle JSON that deletes every object `days` after it was written."""
+    import json
+
+    return json.dumps({"rule": [{"action": {"type": "Delete"}, "condition": {"age": days}}]})
+
+
+def _gcs_cruft() -> None:
+    """Objects of the test bucket older than the cloud TTL, and the bucket's lifecycle rule that
+    deletes them on its own; a bucket holds only test output (registry `gcs.bucket`)."""
+    import datetime
+    import tempfile
+
+    bucket = registry.load()["gcs"]["bucket"]
+    ttl_s, _ = _cloud_ttl()
+    days = max(1, -(-ttl_s // 86400))
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write(_gcs_lifecycle(days))
+    if not shell.run(["gcloud", "storage", "buckets", "update", f"gs://{bucket}",
+                      f"--lifecycle-file={f.name}"], timeout=300).ok:
+        shell.warn(f"  gcs/{bucket}: could not set the {days}-day delete rule")
+    Path(f.name).unlink(missing_ok=True)
+    ls = shell.run(["gcloud", "storage", "ls", "-l", "-r", f"gs://{bucket}/**"], timeout=900)
+    if not ls.ok:
+        if "matched no objects" not in (ls.stderr or ""):
+            shell.warn(f"  gcs/{bucket}: listing FAILED: {(ls.stderr or ls.stdout).strip()[-200:]}")
+        return
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=ttl_s)
+    old = []
+    for line in _lines(ls):
+        parts = line.split()
+        if len(parts) == 3 and parts[2].startswith("gs://"):
+            written = datetime.datetime.fromisoformat(parts[1].replace("Z", "+00:00"))
+            if written < cutoff:
+                old.append(parts[2])
+    if old:
+        rm = shell.run(["gcloud", "storage", "rm", "-I"], stdin="\n".join(old) + "\n", timeout=1800)
+        _report(f"gcs/{bucket}", "objects older than the TTL", old if rm.ok else [], [] if rm.ok else old)
 
 
 def _my_quote(name: str) -> str:
@@ -464,7 +529,7 @@ def _container_up(name: str) -> bool:
     return shell.docker_exec(name, "true", timeout=30).ok
 
 
-def test_cruft(bigquery: bool = False) -> int:
+def test_cruft(cloud: bool = False) -> int:
     """Drop test objects whose creating process is gone, on every source in the stand registry.
 
     Best-effort: a down container is skipped, a failed drop is reported, the exit code stays 0.
@@ -482,8 +547,12 @@ def test_cruft(bigquery: bool = False) -> int:
             continue
         for db in registry.load()["databases"]:
             arms[source.split("_")[0]](source, container, db)
-    if bigquery:
+    for container in registry.load().get("slot_hosts", []):
+        if _container_up(container):
+            _pg_slots(container, container)
+    if cloud:
         _bigquery_cruft()
+        _gcs_cruft()
     _sweep_live_tmp()
     print("sweep-test-cruft: done")
     return 0
@@ -533,7 +602,7 @@ def main_cli(argv: Sequence[str] | None = None) -> int:
     if cmd in ("source-parity", "source_parity", "parity"):
         return source_parity(rest[0] if rest else None)
     if cmd in ("test-cruft", "test_cruft", "cruft"):
-        return test_cruft(bigquery="--bigquery" in rest)
+        return test_cruft(cloud="--cloud" in rest or "--bigquery" in rest)
 
     print(USAGE)
     return 1
