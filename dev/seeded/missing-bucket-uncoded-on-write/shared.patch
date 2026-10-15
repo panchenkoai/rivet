@@ -1,0 +1,15 @@
+--- a/src/destination/cloud.rs
++++ b/src/destination/cloud.rs
+@@ -386,10 +386,8 @@
+                 || c.downcast_ref::<std::io::Error>()
+                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+         });
+-        match not_found.then(|| self.require_container()) {
+-            Some(Err(absent)) => absent,
+-            _ => err,
+-        }
++        let _ = not_found;
++        err
+     }
+ 
+     /// Upload one local part to `remote_key` under the prefix.

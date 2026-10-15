@@ -377,8 +377,23 @@ impl<B: CloudBackend> CloudDestination<B> {
     }
 }
 
-impl<B: CloudBackend> super::Destination for CloudDestination<B> {
-    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
+impl<B: CloudBackend> CloudDestination<B> {
+    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the store answered "not found" to a write and the bucket itself is absent; any other error unchanged.
+    fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
+        let not_found = err.chain().any(|c| {
+            c.downcast_ref::<opendal::Error>()
+                .is_some_and(|e| e.kind() == opendal::ErrorKind::NotFound)
+                || c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        });
+        match not_found.then(|| self.require_container()) {
+            Some(Err(absent)) => absent,
+            _ => err,
+        }
+    }
+
+    /// Upload one local part to `remote_key` under the prefix.
+    fn write_part(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
         let key = format!("{}{}", self.prefix, remote_key);
         let size = std::fs::metadata(local_path)?.len();
         // One-shot upload when the part fits this destination's memory budget: one
@@ -422,6 +437,13 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         };
         log::info!("uploaded {}://{} ({size} bytes)", B::SCHEME, key);
         Ok(outcome)
+    }
+}
+
+impl<B: CloudBackend> super::Destination for CloudDestination<B> {
+    fn write(&self, local_path: &Path, remote_key: &str) -> Result<super::WriteOutcome> {
+        self.write_part(local_path, remote_key)
+            .map_err(|e| self.absent_container_or(e))
     }
 
     fn capabilities(&self) -> super::DestinationCapabilities {
@@ -810,7 +832,7 @@ mod tests {
                 let n = stream.read(&mut head).unwrap_or(0);
                 let request = String::from_utf8_lossy(&head[..n]).into_owned();
                 let target = request.split_whitespace().nth(1).unwrap_or("");
-                let is_listing = target.contains("/o?");
+                let is_listing = target.contains("/o?") && !target.starts_with("/upload/");
                 let (status, body) = if is_listing {
                     seen.lock().unwrap().push(target.to_string());
                     (list_status, "{}")
@@ -840,6 +862,44 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    /// A write the store answers 404 is the missing bucket's coded error when the bucket is absent, and the store's own error otherwise.
+    #[test]
+    fn a_write_into_a_missing_container_is_refused_by_code() {
+        use crate::destination::Destination;
+        let part = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(part.path(), b"bytes").unwrap();
+        let (endpoint, _) = stub_store(404, 404);
+        let err = stub_destination(&endpoint)
+            .write(part.path(), "part.parquet")
+            .expect_err("the bucket is absent");
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_DEST_CONTAINER_NOT_FOUND")
+        );
+        assert!(err.to_string().starts_with("gs://exports:"), "{err:#}");
+
+        let (endpoint, listings) = stub_store(404, 200);
+        let err = stub_destination(&endpoint)
+            .write(part.path(), "part.parquet")
+            .expect_err("the store refused the write");
+        assert_eq!(crate::error::error_code(&err), None, "{err:#}");
+        assert_eq!(
+            listings.lock().unwrap().len(),
+            1,
+            "the 404 asked about the bucket"
+        );
+
+        let (endpoint, listings) = stub_store(500, 404);
+        let err = stub_destination(&endpoint)
+            .write(part.path(), "part.parquet")
+            .expect_err("the store failed the write");
+        assert_eq!(crate::error::error_code(&err), None, "{err:#}");
+        assert!(
+            listings.lock().unwrap().is_empty(),
+            "only a 404 asks about the bucket"
+        );
     }
 
     /// `head` answers "absent" only for a key: a bucket that does not exist is an error with its own code.

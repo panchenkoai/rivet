@@ -377,6 +377,17 @@ fn two_full_runs(rig: Rig, N: i64, after_ms: u64) {
     );
 }
 
+/// 2026-10-14 sweep P6: a run into a bucket that does not exist is refused RIVET_DEST_CONTAINER_NOT_FOUND, naming the bucket.
+fn run_into_a_missing_bucket(rig: Rig, bucket: &str, envs: &[(&str, &str)]) {
+    let out = rig.cli_env(&["run"], envs);
+    assert_refused(&out, Refused::by_code("RIVET_DEST_CONTAINER_NOT_FOUND", 1));
+    assert!(
+        text(&out).contains(bucket),
+        "the refusal names the missing bucket `{bucket}`\n{}",
+        text(&out)
+    );
+}
+
 /// RESULTS 5: `validate` on a bucket that does not exist cannot verify (exit 1) and names the missing bucket.
 fn validate_on_a_missing_bucket(rig: Rig, envs: &[(&str, &str)]) {
     let out = rig.cli_env(&["validate"], envs);
@@ -2204,6 +2215,36 @@ fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn a_resume_that_never_connected_leaves_the_unfinished_run_as_it_was_oracle() {
     resume_never_connected(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose minio"]
+fn a_run_into_a_missing_bucket_is_refused_by_code_s3() {
+    require_alive(LiveService::Minio);
+    let bucket = unique_name("oc-runnobucket").replace('_', "-");
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_runnobucket", 3);
+    let rig = Rig::pg_batch(&table).dest_s3(&bucket, "p", MINIO_ENDPOINT);
+    run_into_a_missing_bucket(rig, &bucket, MINIO_ENV);
+}
+
+#[test]
+#[ignore = "live: requires docker compose fake-gcs"]
+fn a_run_into_a_missing_bucket_is_refused_by_code_gcs() {
+    require_alive(LiveService::FakeGcs);
+    let bucket = unique_name("oc_runnobucket");
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_runnobucket", 3);
+    let rig = Rig::pg_batch(&table).dest_gcs(&bucket, "p", FAKE_GCS_ENDPOINT);
+    run_into_a_missing_bucket(rig, &bucket, &[]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose azurite"]
+fn a_run_into_a_missing_bucket_is_refused_by_code_azure() {
+    require_alive(LiveService::Azurite);
+    let bucket = unique_name("oc-runnobucket").replace('_', "-");
+    let (table, _guard) = id_v_table(SqlEngine::Pg, "oc_runnobucket", 3);
+    let rig = Rig::pg_batch(&table).dest_azure(&bucket, "p");
+    run_into_a_missing_bucket(rig, &bucket, &[("RIVET_TEST_AZURITE_KEY", AZURITE_KEY)]);
 }
 
 #[test]
