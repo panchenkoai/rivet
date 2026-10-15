@@ -160,6 +160,14 @@ scenarios:
     mongo:    { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo }
     oracle:   { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle }
 
+  - id: cdc_time_past_a_day_remedies
+    what: "a `TIME` past 24 hours captured by a stream is refused as RIVET_SOURCE_VALUE_UNREPRESENTABLE (exit 5) on every run, and each remedy the text names (the column declared `string` in `columns:`; the column left out of the capture, then the re-baseline recipe) delivers"
+    postgres: { na: "a PostgreSQL `time` is a time of day (00:00..24:00), never a duration past it" }
+    mysql:    { test: a_time_past_a_day_in_a_stream_is_refused_by_code_and_both_remedies_deliver_mysql }
+    mssql:    { na: "a SQL Server `time` is a time of day (00:00..24:00), never a duration past it" }
+    mongo:    { na: "a MongoDB change row is two text cells (`_id`, `document`), with no TIME column" }
+    oracle:   { na: "Oracle has no TIME type; a DATE or TIMESTAMP carries a time of day inside a day" }
+
   - id: plan_unreadable_source
     what: "RESULTS 10: `plan` over a table that does not exist fails as RIVET_PLAN_SOURCE_UNREADABLE (exit 1) and seals no artifact"
     postgres: { test: plan_refuses_a_table_that_does_not_exist_postgres }

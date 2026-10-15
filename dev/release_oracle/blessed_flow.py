@@ -480,7 +480,7 @@ def _config(cell: Cell, work: Path, src_block: str, dest_block: str,
     cfg = work / "rivet.yaml"
     if cell.pipeline == "cdc":
         body = (
-            f"  - name: flow\n"
+            f"  - name: {scenarios.cell_export(work)}\n"
             f"    table: {cell.table}\n"
             f"    mode: cdc\n"
             f"    format: parquet\n"
@@ -489,7 +489,7 @@ def _config(cell: Cell, work: Path, src_block: str, dest_block: str,
         )
     else:
         body = (
-            f"  - name: flow\n"
+            f"  - name: {scenarios.cell_export(work)}\n"
             f"    table: {cell.table}\n"
             f"    mode: full\n"
             f"    format: parquet\n"
@@ -885,7 +885,7 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
         # file parses AND names the export; `apply`, next stage, is the real
         # reader.
         art = json.loads(plan.read_text()) if plan.is_file() else {}
-        ok = p.ok and bool(art) and "flow" in json.dumps(art)
+        ok = p.ok and bool(art) and scenarios.cell_export(work) in json.dumps(art)
         if not _stage(led, cell, tag, "plan", ok,
                       f"exit={p.returncode} plan.json={plan.is_file()} keys={sorted(art)[:6]}"):
             _unreached(led, cell, tag, "plan")
@@ -1144,7 +1144,7 @@ def _load_leg(led: Ledger, cell: Cell, tag: str, work: Path, env: dict, url: str
     lcfg.write_text(
         f"source:\n  type: {cell.engine}\n  url_env: ORACLE_URL{tls}\n"
         # The warehouse table is derived from `table:`, not from the export name.
-        f"exports:\n  - name: {tbl}\n    table: {cell.table}\n"
+        f"exports:\n  - name: {scenarios.cell_export(lcfg)}\n    table: {cell.table}\n"
         f"    mode: full\n    format: parquet\n"
         f"    destination: {{type: gcs, bucket: {bucket}, prefix: {pfx}/}}\n"
         f"load:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n"
