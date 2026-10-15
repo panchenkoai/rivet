@@ -1169,7 +1169,8 @@ fn empty_run_delivery(eng: Eng, table: &str, lines: &[&str]) -> EmptyRun {
         })
         .collect();
     files.sort();
-    let metrics = String::from_utf8_lossy(&rig.cli(&["metrics"]).stdout).into_owned();
+    let metrics =
+        String::from_utf8_lossy(&rig.cli(&["metrics", "--last", "1"]).stdout).into_owned();
     let journal: Vec<String> = metrics
         .lines()
         .filter(|l| l.starts_with(rig.export_name()))
