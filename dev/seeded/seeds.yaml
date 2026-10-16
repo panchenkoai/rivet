@@ -2571,6 +2571,24 @@ seeds:
         cells: ["lib:a_mixed_split_generation_is_journaled_refused_and_refuses_again", "lib:a_missing_spec_and_an_unreadable_spec_store_are_two_codes"]
       postgres-state:
         cells: ["lib:pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"]
+  - name: missing-container-retried-as-timeout
+    class: "a store's final answer is classified by the words in its text, so a header such as `keep-alive: timeout=5` on a 404 reads as a timeout and the chunk is retried for minutes"
+    history: "2026-10-08 - the gate's Azure removed-container cell (live_sabotage) ran past its 180 s ceiling: each chunk's upload into the removed container was retried 16 times, 9 min 21 s to exit 1 by hand (Azurite answers its 404 with `keep-alive: timeout=5`, and the classifier's text scan matched `timeout`), through 0.31.0; fixed by classifying an opendal error by its own verdict before any text scan"
+    scope: source
+    patch: missing-container-retried-as-timeout/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"
+          - a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres
+      mysql:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      mssql:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      mongo:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      oracle:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
   - name: child-entry-by-name-on-shared-state
     class: "the parent of `--parallel-export-processes` takes a child's run-aggregate entry as the newest `export_metrics` row of the export's name, so on a state shared by two holders of the name a failed child is reported as the other holder's success"
     history: "2026-10-16 - found by the verifier of #604: two holders of one export name on one PostgreSQL state, the PostgreSQL one failed its snapshot leg and exited 1 while its entry read `status: success` with the MySQL holder's run id, on main through 0.31.0; fixed by matching the run id each child reports in its `Finished` event (`collect_child_entries`, `StateStore::get_metric_by_run_id`)"

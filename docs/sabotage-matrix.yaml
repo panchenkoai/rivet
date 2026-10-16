@@ -631,7 +631,7 @@ scenarios:
 
   - id: takeaway_bucket_removed_azure
     what: "the azure bucket of a live range-checkpoint run removed with everything in it once it holds an object, then created again empty: the run delivers or fails loudly, so does every run while it is away, and with it back a run delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres }
+    postgres: { test: a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres }
     mysql:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
     mssql:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
     mongo:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }

@@ -1,0 +1,11 @@
+--- a/src/error/retry.rs
++++ b/src/error/retry.rs
+@@ -161,7 +161,7 @@
+     // The store's answer is final by TYPE: a 404 whose response headers happen to
+     // carry `keep-alive: timeout=5` (Azurite) must not read as a timeout.
+     if let Some(class) = err.chain().find_map(opendal_error).map(classify_opendal) {
+-        return class;
++        let _ = class;
+     }
+ 
+     // --- Fallback: string-based classification ---

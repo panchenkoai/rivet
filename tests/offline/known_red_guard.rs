@@ -12,7 +12,8 @@ const LEDGER: &str = "dev/release_oracle/known_red.py";
 // A new entry is a new acknowledged red: raise this in the same diff, with the entry's reason;
 // a fixed one lowers it.
 // 12 -> 9 (2026-10-15): a stored cursor past the destination's success manifest is refused by code (-3).
-const ENTRY_CEILING: usize = 9; // ratchet-pin: known-red-entries
+// 9 -> 8 (2026-10-16): the Azure removed-container cell is a plain cell again (fix/azure-missing-container-is-persistent).
+const ENTRY_CEILING: usize = 8; // ratchet-pin: known-red-entries
 
 /// The horizon every `_open` entry expires at; moves only here and in the ledger together.
 const EXPIRES: &str = "2026-10-31"; // pinned: the ledger's `_EXPIRES`, moved only together with it

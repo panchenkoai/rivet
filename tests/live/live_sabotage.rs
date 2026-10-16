@@ -3353,8 +3353,8 @@ fn a_run_whose_gcs_bucket_is_removed_delivers_or_fails_loudly_postgres() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres + azurite; open defect (a removed Azure container is retried for minutes), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres() {
+#[ignore = "live: requires docker compose postgres + azurite"]
+fn a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres() {
     bucket_removed(Store::Azure);
 }
 
