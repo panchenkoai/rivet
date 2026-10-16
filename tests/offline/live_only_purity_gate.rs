@@ -755,7 +755,12 @@ fn graded_sites() -> BTreeMap<String, Decisions> {
     let mut sites: BTreeMap<String, Decisions> = BTreeMap::new();
     for (name, ret, owner) in live_only_functions() {
         let mut hits = 0usize;
+        let needle = format!("fn {name}");
         for (rel, code) in &blanked {
+            // The prebuilt std's search first: the char scans below are unoptimised in a test build.
+            if !code.contains(&needle) {
+                continue;
+            }
             // A qualified exclusion (`<impl Drop for LoadLease>::drop`) names ONE impl's
             // function; matching the bare name graded every `fn drop` in the tree.
             let scope = owner.as_deref().map(|t| impl_ranges(code, t));

@@ -529,17 +529,10 @@ impl Case {
         if self.cli.is_some() {
             return None;
         }
-        Some(
-            envs.iter()
-                .find(|(n, _)| *n == "RIVET_STATE_URL")
-                .map(|(_, v)| v.to_string())
-                .or_else(super::state::state_url_under_test)
-                .filter(|u| u.starts_with("postgres"))
-                .map_or_else(
-                    || refusal::StateAt::Sqlite(self.config_dir.join(".rivet_state.db")),
-                    refusal::StateAt::Postgres,
-                ),
-        )
+        Some(super::state::state_url_for(envs).map_or_else(
+            || refusal::StateAt::Sqlite(self.config_dir.join(".rivet_state.db")),
+            refusal::StateAt::Postgres,
+        ))
     }
 
     /// What the refusal grade fingerprints: each export's destination tree (a cloud prefix only around a `run` the oracle can pull), the checkpoint files, the state.

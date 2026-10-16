@@ -1,0 +1,14 @@
+--- a/src/pipeline/chunked/mod.rs
++++ b/src/pipeline/chunked/mod.rs
+@@ -567,9 +567,8 @@
+             )
+         })
+         .collect();
+-    let err = met
+-        .err()
+-        .unwrap_or_else(|| chunk_failures(export, runner, &stored));
++    drop(met);
++    let err = chunk_failures(export, runner, &stored);
+     Err(err.context(format!(
+         "{pending} chunk task(s) of export '{export}' not completed; fix the cause, then \
+          `rivet run {config_hint} --export {export} --resume`, or inspect \

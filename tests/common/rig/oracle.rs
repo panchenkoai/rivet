@@ -259,7 +259,8 @@ impl Rig {
         // The state backend under test: a Postgres URL when the run used one
         // (the gate's Postgres pass), otherwise the `.rivet_state.db` beside
         // the CONFIG, one level above the destination.
-        let state = super::super::state::state_url_under_test()
+        let state = self
+            .state_url(&[])
             .unwrap_or_else(|| format!("{}/.rivet_state.db", container.trim_end_matches("/out")));
         super::super::duckdb::duckdb_row_census(
             engine,

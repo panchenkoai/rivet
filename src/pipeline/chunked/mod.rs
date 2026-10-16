@@ -405,7 +405,7 @@ pub(crate) fn live_run_refusal(export: &str, run_id: Option<&str>, resumable: bo
 }
 
 /// The key of an export's run lease on one source: held by every run of the export that reads `source`, taken by every command that rewrites its stored progress or its destination. The source enters as a hash, so a lease file name stays short and names no host.
-fn run_lease_key(export: &str, source: &str) -> String {
+pub fn run_lease_key(export: &str, source: &str) -> String {
     format!(
         "chunk-run:{export}@{:016x}",
         xxhash_rust::xxh3::xxh3_64(source.as_bytes())
@@ -534,6 +534,47 @@ pub(super) fn config_hint(config_path: &str) -> String {
     } else {
         format!("--config {}", config_path)
     }
+}
+
+/// `RIVET_RUN_UNITS_FAILED` over every failed unit's `chunk N: cause` line of `runner`, the shape the summary compacts.
+pub(super) fn chunk_failures(export: &str, runner: &str, lines: &[String]) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::RUN_UNITS_FAILED,
+        format!("export '{export}': {runner} errors:\n{}", lines.join("\n")),
+    )
+}
+
+/// The end of a checkpointed run once no chunk is claimable: `met` (this run's unit failures, raised through `fan_in::unit_failures`) when every chunk completed, else `met` or the stored causes when it met none, under the resume remedy.
+pub(super) fn incomplete_run_check(
+    export: &str,
+    runner: &str,
+    pending: i64,
+    tasks: &[crate::state::ChunkTaskInfo],
+    config_hint: &str,
+    met: Result<()>,
+) -> Result<()> {
+    if pending == 0 {
+        return met;
+    }
+    let stored: Vec<String> = tasks
+        .iter()
+        .filter(|t| t.status == "failed")
+        .map(|t| {
+            format!(
+                "chunk {}: {}",
+                t.chunk_index,
+                t.last_error.as_deref().unwrap_or("(no error recorded)")
+            )
+        })
+        .collect();
+    let err = met
+        .err()
+        .unwrap_or_else(|| chunk_failures(export, runner, &stored));
+    Err(err.context(format!(
+        "{pending} chunk task(s) of export '{export}' not completed; fix the cause, then \
+         `rivet run {config_hint} --export {export} --resume`, or inspect \
+         `rivet state chunks {config_hint} --export {export}`"
+    )))
 }
 
 pub(super) fn ensure_chunk_checkpoint_plan(
@@ -1653,5 +1694,137 @@ mod tests {
         assert!(!plain.contains("won the race"));
         let raced = format!("{}", chunk_run_unfinished("orders", "r1", "c.yaml", true));
         assert!(raced.contains("(a concurrent run won the race)"), "{raced}");
+    }
+}
+
+#[cfg(test)]
+mod incomplete_run_tests {
+    use super::{chunk_failures, incomplete_run_check};
+    use crate::error::{assert_coded, coded, codes};
+    use crate::state::ChunkTaskInfo;
+
+    const REMEDY: &str = "2 chunk task(s) of export 'orders' not completed; fix the cause, then \
+         `rivet run --config c.yaml --export orders --resume`, or inspect \
+         `rivet state chunks --config c.yaml --export orders`";
+
+    fn task(idx: i64, status: &str, err: Option<&str>) -> ChunkTaskInfo {
+        ChunkTaskInfo {
+            chunk_index: idx,
+            start_key: String::new(),
+            end_key: String::new(),
+            status: status.into(),
+            attempts: 4,
+            last_error: err.map(Into::into),
+            rows_written: None,
+            file_name: None,
+        }
+    }
+
+    /// What the sequential runner hands in: its chunk failures raised through the FanIn seam.
+    fn met(failures: Vec<(&str, anyhow::Error)>) -> crate::error::Result<()> {
+        Err(crate::pipeline::fan_in::unit_failures(
+            failures
+                .into_iter()
+                .map(|(l, e)| (l.to_string(), e))
+                .collect(),
+            |lines| chunk_failures("orders", "chunk checkpoint", lines),
+        ))
+    }
+
+    /// A refusal met by one chunk beside an untyped failure in another: the run exits by the refusal's code and class, under the resume remedy, every cause listed.
+    #[test]
+    fn a_coded_chunk_failure_decides_the_runs_exit_under_the_resume_remedy() {
+        let err = incomplete_run_check(
+            "orders",
+            "chunk checkpoint",
+            2,
+            &[],
+            "--config c.yaml",
+            met(vec![
+                ("chunk 1", anyhow::anyhow!("connection refused")),
+                (
+                    "chunk 3",
+                    coded(
+                        codes::SOURCE_VALUE_UNREPRESENTABLE,
+                        "pg: timestamp infinity has no reading",
+                    ),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert_coded(&err, "RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "{REMEDY}: export 'orders': chunk checkpoint errors:\n\
+                 chunk 1: connection refused\n\
+                 chunk 3: pg: timestamp infinity has no reading"
+            )
+        );
+    }
+
+    /// Chunk failures that carry no code end as the incomplete run always did.
+    #[test]
+    fn untyped_chunk_failures_end_as_an_incomplete_run() {
+        let err = incomplete_run_check(
+            "orders",
+            "chunk checkpoint",
+            2,
+            &[],
+            "--config c.yaml",
+            met(vec![
+                ("chunk 1", anyhow::anyhow!("boom")),
+                ("chunk 3", anyhow::anyhow!("bang")),
+            ]),
+        )
+        .unwrap_err();
+        assert_coded(&err, "RIVET_RUN_UNITS_FAILED", 1);
+        assert!(format!("{err:#}").starts_with(REMEDY), "{err:#}");
+    }
+
+    /// A run that met no failure of its own but left chunks not completed names each stored cause.
+    #[test]
+    fn stored_causes_name_each_failed_chunk_when_this_run_met_none() {
+        let tasks = [
+            task(0, "completed", None),
+            task(3, "failed", Some("permission denied for table orders")),
+            task(5, "failed", None),
+        ];
+        let err = incomplete_run_check(
+            "orders",
+            "parallel checkpoint worker",
+            2,
+            &tasks,
+            "--config c.yaml",
+            Ok(()),
+        )
+        .unwrap_err();
+        assert_coded(&err, "RIVET_RUN_UNITS_FAILED", 1);
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "{REMEDY}: export 'orders': parallel checkpoint worker errors:\n\
+                 chunk 3: permission denied for table orders\n\
+                 chunk 5: (no error recorded)"
+            )
+        );
+    }
+
+    /// Every chunk completed: the run ends as its drain did, remedy-free.
+    #[test]
+    fn a_complete_run_ends_as_its_drain_did() {
+        assert!(
+            incomplete_run_check("orders", "chunk checkpoint", 0, &[], "-c c.yaml", Ok(())).is_ok()
+        );
+        let err = incomplete_run_check(
+            "orders",
+            "parallel checkpoint worker",
+            0,
+            &[],
+            "-c c.yaml",
+            Err(anyhow::anyhow!("state open: database is locked")),
+        )
+        .unwrap_err();
+        assert_eq!(format!("{err:#}"), "state open: database is locked");
     }
 }

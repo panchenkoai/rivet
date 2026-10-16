@@ -320,6 +320,16 @@ pub fn state_url_under_test() -> Option<String> {
         .filter(|u| u.starts_with("postgres"))
 }
 
+/// The Postgres state a rivet child spawned with `envs` uses (the last `RIVET_STATE_URL` wins, as in the child's environment), else the backend under test; `None` is SQLite.
+pub fn state_url_for(envs: &[(&str, &str)]) -> Option<String> {
+    envs.iter()
+        .rev()
+        .find(|(k, _)| *k == "RIVET_STATE_URL")
+        .map(|(_, v)| v.to_string())
+        .or_else(state_url_under_test)
+        .filter(|u| u.starts_with("postgres"))
+}
+
 /// Every metrics row `(name, status, duration_ms, total_rows)`, oldest first, of the exports named in `names` and of their `<name>#<n>` split units, from the backend the run used.
 pub fn recorded_export_runs(
     cfg: &std::path::Path,
