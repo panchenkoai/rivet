@@ -704,7 +704,7 @@ rivet state reset --config <PATH> --export <NAME>
 
 The reset clears the progress the export holds on the source this config names (its cursor and any interrupted keyset run), so the config's source URL must resolve. An export of the same name that reads another source through the same state database keeps its cursor.
 
-While a checkpointed run of that export (`chunk_checkpoint: true`) is alive in another rivet process, the reset is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5) and removes nothing: wait for the run, or stop its process, and repeat the command. A run that was killed does not hold the reset back.
+While a checkpointed run of that export (`chunk_checkpoint: true`) is alive in another rivet process, the reset is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 2, retryable) and removes nothing: wait for the run, or stop its process, and repeat the command. A run that was killed does not hold the reset back.
 
 ### `rivet state accept`
 
@@ -720,7 +720,7 @@ A run refuses stored progress that was written reading another table, another sc
 - It reads the config as `rivet run` does, so pass the same `--param` values.
 - A cursor written for another `cursor_column` or keyset key is not accepted: the command stops with `RIVET_STATE_CURSOR_OWNER_MISMATCH` (exit 5) and changes nothing.
 - When no run would be refused (no stored progress, or it already belongs to what the export reads) the command says so and changes nothing. The same holds for a `cdc` export, which stores a log position and no cursor.
-- While a run of that export is alive in another rivet process the command is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
+- While a run of that export is alive in another rivet process the command is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 2, retryable).
 - Each acceptance that changed the row is recorded in the run journal: `rivet journal --config <PATH> --export <NAME>` lists it with status `accepted` and a line naming what the progress was written reading and what it is kept for.
 
 ### `rivet state files`
@@ -768,7 +768,7 @@ rivet state reset-chunks --config <PATH> --failed
 
 Then run `rivet run --config <PATH> --resume` (or a normal run without `--resume`) as needed.
 
-A run that is still alive is not stuck. `--export <NAME>` against one is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 5), naming the run; `--stuck-checkpoints` leaves that export alone, prints why, and clears the others. A run that was killed does not hold either form back.
+A run that is still alive is not stuck. `--export <NAME>` against one is refused with `RIVET_STATE_RUN_IN_PROGRESS` (exit 2, retryable), naming the run; `--stuck-checkpoints` leaves that export alone, prints why, and clears the others. A run that was killed does not hold either form back.
 
 ### `rivet state vacuum`
 
@@ -899,7 +899,7 @@ RUST_LOG=info rivet run -c my_export.yaml
 |------|---------|
 | 0 | All exports succeeded |
 | 1 | Usage / config error — config parsing/validation, a bad command, or an export error no other class claims. Fix the input; retrying won't help |
-| 2 | Retryable transient failure (connection loss, timeout, throttling) — safe to retry. Clap argument-parse errors also exit 2 (distinguishable by the usage text and absence of an `Error:` line) |
+| 2 | Retryable transient failure (connection loss, timeout, throttling), or busy: another live rivet process holds the lease or lock the command needs (`RIVET_STATE_RUN_IN_PROGRESS`, `RIVET_LOAD_TABLE_BUSY`, `RIVET_STATE_LEASE_LOST`) — safe to retry; the retry succeeds once that process ends. Clap argument-parse errors also exit 2 (distinguishable by the usage text and absence of an `Error:` line) |
 | 3 | Data-integrity failure (quality gate / reconcile / validate / duplicate-guard) — stop and investigate |
 | 4 | Schema drift (`on_schema_drift: fail` tripped) |
 | 5 | Protective refusal — rivet stopped on purpose so as not to lose, duplicate or overwrite data (a foreign checkpoint, a newer state DB, a cursor-owner mismatch, ...). Retrying unchanged refuses again; a human decides |

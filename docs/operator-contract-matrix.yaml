@@ -49,7 +49,7 @@ scenarios:
     oracle:   { test: a_cursor_column_in_another_case_is_refused_by_code_oracle }
 
   - id: run_lease_per_source
-    what: "2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name; a run on the same source is refused RIVET_STATE_RUN_IN_PROGRESS (exit 5); the live run delivers"
+    what: "2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name; a run on the same source is refused RIVET_STATE_RUN_IN_PROGRESS (exit 2, retryable); the live run delivers, then the refused command run again delivers"
     postgres: { test: one_export_name_runs_beside_itself_on_another_source_and_is_refused_on_the_same }
     mysql:    { na: "one cell holds the pair: the live run reads PostgreSQL and the run beside it MySQL; the lease key is one function for every engine (run_lease_key)" }
     mssql:    { na: "the lease key is one function for every engine (run_lease_key); the postgres cell pairs two engines" }
@@ -145,7 +145,7 @@ scenarios:
     oracle:   { test: resume_force_runs_over_a_complete_prefix_oracle }
 
   - id: run_in_progress_code
-    what: "RESULTS 11: a second run beside a live checkpointed run is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 5)"
+    what: "RESULTS 11: a second run beside a live checkpointed run is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 2, retryable), and the refused command run again delivers"
     postgres: { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres }
     mysql:    { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql }
     mssql:    { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql }
@@ -153,7 +153,7 @@ scenarios:
     oracle:   { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle }
 
   - id: cdc_run_in_progress_code
-    what: "a second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 5), and the first delivers"
+    what: "a second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as RIVET_STATE_RUN_IN_PROGRESS (exit 2, retryable), the first delivers, and the refused command run again delivers"
     postgres: { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres }
     mysql:    { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql }
     mssql:    { test: a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql }
