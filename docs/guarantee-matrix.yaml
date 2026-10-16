@@ -229,6 +229,14 @@ guarantees:
       mssql: { test: a_replayed_applied_full_plan_answers_with_its_run_mssql, asserts: "nothing written under the prefix" }
       oracle: { test: a_replayed_applied_full_plan_answers_with_its_run_oracle, asserts: "nothing written under the prefix" }
 
+  - id: an_unpinned_incremental_plan_reads_what_arrived_since_on_every_apply
+    stated:
+      - file: docs/concepts.md
+        sentence: "unless the plan continues a stored cursor it does not pin, whose every apply reads what arrived since"
+    held_by:
+      postgres: { test: a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_postgres, asserts: "an unpinned plan reads what arrived since" }
+      mysql: { test: a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_mysql, asserts: "an unpinned plan reads what arrived since" }
+
   - id: run_resume_is_not_refused_over_a_marker_a_failed_run_left_alone
     stated:
       - file: docs/cloud-destinations.md

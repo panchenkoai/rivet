@@ -319,6 +319,12 @@ impl PlanArtifact {
         }
     }
 
+    /// Whether a second apply of this plan reads the rows the first one read: it continues no stored cursor, or pins the cursor it starts from.
+    pub fn replay_reads_the_same_rows(&self) -> bool {
+        !self.resolved_plan.strategy.continues_stored_cursor()
+            || self.computed.cursor_snapshot.is_some()
+    }
+
     /// One compact row for the multi-export plan table — `wave  rec  export
     /// strategy  rows  verdict`: `apply_wave` is the `wave:` apply reads ("—" when
     /// unset), `rec` the cost model's recommendation.

@@ -17,8 +17,32 @@
 
 seeds:
 
+  - name: unpinned-plan-replay-answered
+    class: "`rivet apply` of a sealed plan that continues a stored cursor it does not pin (an incremental plan made before any cursor was stored, a `keyset_incremental` plan) answers \"already applied\" after its first exit-0 apply, so every row that arrived since is never delivered, exit 0"
+    history: "found 2026-10-16 on PR #616 CI (run 38911927276): the F3 replay answer keyed on plan_id alone; `incremental_keyset_apply_rotates_run_id_across_repeated_applies` read COUNT(*) source 150, delivered 100"
+    scope: source
+    patch: unpinned-plan-replay-answered/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_postgres
+          - a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres
+          - incremental_keyset_apply_rotates_run_id_across_repeated_applies
+          - "lib:a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay"
+      mysql:
+        cells:
+          - a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_mysql
+          - a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql
+          - "lib:a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay"
+      mssql:
+        cells: ["lib:a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay"]
+      oracle:
+        cells: ["lib:a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay"]
+      mongo:
+        cells: ["lib:a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay"]
+
   - name: applied-plan-replayed
-    class: "`rivet apply` of a sealed plan whose apply already exited 0 runs it again: a full, chunked or keyset plan extracts the table a second time, an incremental plan with no snapshot writes an empty second run, and one with a snapshot is refused RIVET_PLAN_ARTIFACT_STALE by its own cursor commit"
+    class: "`rivet apply` of a sealed plan whose apply already exited 0 runs it again: a full, chunked or keyset plan extracts the table a second time, and an incremental plan that pins its cursor snapshot is refused RIVET_PLAN_ARTIFACT_STALE by its own cursor commit"
     history: "retry matrix F3, 2026-10-16: a scheduler retry after the task process died right after a successful apply replayed the same artifact; measured on main 04c4a712 (PostgreSQL, GCS): cycle 1 rc 0 with a second run, cycle 2 exit 5 \"cursor has drifted\""
     scope: source
     patch: applied-plan-replayed/shared.patch

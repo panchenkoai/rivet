@@ -127,8 +127,13 @@ pub fn run_apply_command(
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
     // 3. A replay of a plan that already applied to exit 0 (a retry whose first
-    //    try died after rivet finished) answers with that run and extracts nothing.
-    if let Some(run_id) = state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)? {
+    //    try died after rivet finished) answers with that run and extracts nothing,
+    //    unless the plan continues a stored cursor it does not pin: then the replay
+    //    reads only what arrived since, the next increment.
+    if artifact.replay_reads_the_same_rows()
+        && let Some(run_id) =
+            state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)?
+    {
         if !force {
             eprintln!("{}", already_applied_report(&state, &artifact, &run_id));
             return Ok(());
@@ -653,11 +658,36 @@ mod tests {
         )
     }
 
-    /// Replayed after its own apply exited 0, a plan answers with that run on every cycle and touches nothing — even when its snapshot cursor was moved by its own commit.
+    /// An incremental cursor plan over `updated_at`.
+    fn incremental() -> ExtractionStrategy {
+        ExtractionStrategy::Incremental(crate::plan::IncrementalCursorPlan {
+            primary_column: "updated_at".into(),
+            fallback_column: None,
+            mode: crate::config::IncrementalCursorMode::SingleColumn,
+            settle: None,
+        })
+    }
+
+    /// A keyset plan over `id`, continuing its stored key on a clean run when `incremental`.
+    fn keyset(incremental: bool) -> ExtractionStrategy {
+        ExtractionStrategy::Keyset(crate::plan::KeysetPlan {
+            key_column: "id".into(),
+            chunk_size: 1000,
+            checkpoint: true,
+            incremental,
+            parallel: 1,
+        })
+    }
+
+    /// Replayed after its own apply exited 0, a plan that reads the same rows again answers with that run on every cycle and touches nothing — even when its snapshot cursor was moved by its own commit.
     #[test]
     fn a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing() {
-        for snapshot in [None, Some("1000")] {
-            let mut artifact = validation_refused_artifact();
+        for (strategy, snapshot) in [
+            (ExtractionStrategy::Snapshot, None),
+            (keyset(false), None),
+            (incremental(), Some("1000")),
+        ] {
+            let mut artifact = validation_refused_artifact_of(strategy);
             artifact.computed.cursor_snapshot = snapshot.map(String::from);
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_artifact(&dir, &artifact);
@@ -672,9 +702,34 @@ mod tests {
         }
     }
 
+    /// Replayed after its own apply exited 0, a plan that continues a stored cursor it does not pin runs again on every cycle: it reads only what arrived since.
+    #[test]
+    fn a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay() {
+        for strategy in [incremental(), keyset(true)] {
+            let artifact = validation_refused_artifact_of(strategy.clone());
+            assert!(!artifact.replay_reads_the_same_rows(), "{strategy:?}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_artifact(&dir, &artifact);
+            applied_state(&dir, &artifact, "success", true);
+            for cycle in 1..=2 {
+                let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+                assert!(
+                    format!("{err:#}").contains("max_file_size cannot be used with stdout"),
+                    "{strategy:?}, replay {cycle}: the replay must run the plan, got {err:#}"
+                );
+            }
+        }
+    }
+
     /// A plan whose run is refused by plan validation, before it connects: proof that the replay ran it.
     fn validation_refused_artifact() -> PlanArtifact {
+        validation_refused_artifact_of(ExtractionStrategy::Snapshot)
+    }
+
+    /// [`validation_refused_artifact`] with `strategy`.
+    fn validation_refused_artifact_of(strategy: ExtractionStrategy) -> PlanArtifact {
         let mut plan = unreachable_plan();
+        plan.strategy = strategy;
         plan.destination = DestinationConfig {
             destination_type: DestinationType::Stdout,
             ..Default::default()

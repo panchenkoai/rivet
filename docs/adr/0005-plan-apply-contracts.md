@@ -162,11 +162,13 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 ### PA11 — An Applied Plan Answers Its Replay (APR)
 
-> The run that applies a plan to exit 0 records the plan's `plan_id` on its `run_status` row (state schema v37). `rivet apply` of an artifact whose `plan_id` a finished run of the export recorded exits 0 WITHOUT extracting and prints `apply: plan <plan_id> of export '<export>' was already applied by run <run_id> (<status>, <rows> rows, <files> files, <bytes> bytes, finished <time>); nothing was extracted again. To extract new data, make a new plan with `rivet plan`.` on stderr. It writes no run, no manifest and no metrics row, so `rivet metrics --last 1` still names the run that applied the plan. `--force` extracts again (`already_applied` in the run report's `force_bypassed`).
+> The run that applies a plan to exit 0 records the plan's `plan_id` on its `run_status` row (state schema v37). `rivet apply` of an artifact that reads the same rows on every apply — it continues no stored cursor (`mode: full`, chunked ranges, keyset, time window), or it pins the cursor it starts from (`cursor_snapshot`, an incremental plan made after a cursor was stored) — and whose `plan_id` a finished run of the export recorded exits 0 WITHOUT extracting and prints `apply: plan <plan_id> of export '<export>' was already applied by run <run_id> (<status>, <rows> rows, <files> files, <bytes> bytes, finished <time>); nothing was extracted again. To extract new data, make a new plan with `rivet plan`.` on stderr. It writes no run, no manifest and no metrics row, so `rivet metrics --last 1` still names the run that applied the plan. `--force` extracts again (`already_applied` in the run report's `force_bypassed`).
 
-**Rationale**: a scheduler retries a task whose process died after `rivet apply` exited 0, with the same sealed artifact. Before PA11 that retry extracted the whole table again (`mode: full`, chunked, keyset; an incremental plan with no snapshot delivered an empty run) or was refused `RIVET_PLAN_ARTIFACT_STALE` because PA4 read the plan's own cursor commit as drift. A plan whose run failed, was interrupted, or died before exit 0 recorded nothing and replays as before; a cursor another run moved is still refused by PA4.
+An artifact that continues a stored cursor it does not pin (an incremental plan made before any cursor was stored, `keyset_incremental`) is not answered: the work of each apply is the plan AND the stored cursor it starts from, which the previous apply moved, so every apply reads what arrived since — the next increment, never a duplicate — and answering it would leave those rows undelivered with exit 0.
 
-**Current implementation**: `StateStore::record_applied_plan` (after an exit-0 run) and `StateStore::run_that_applied_plan` (before staleness and PA4), both called from `apply_cmd::run_apply_command`.
+**Rationale**: a scheduler retries a task whose process died after `rivet apply` exited 0, with the same sealed artifact. Before PA11 that retry extracted the whole table again (`mode: full`, chunked, keyset) or was refused `RIVET_PLAN_ARTIFACT_STALE` because PA4 read the plan's own cursor commit as drift. A plan whose run failed, was interrupted, or died before exit 0 recorded nothing and replays as before; a cursor another run moved is still refused by PA4.
+
+**Current implementation**: `StateStore::record_applied_plan` (after an exit-0 run) and `StateStore::run_that_applied_plan` (before staleness and PA4, asked only when `PlanArtifact::replay_reads_the_same_rows`), both called from `apply_cmd::run_apply_command`.
 
 ---
 
@@ -208,6 +210,7 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 | Plan generated, applied 25h later | Error | not checked | bail (unless --force) |
 | Plan generated, applied with --force after 25h | Warn override | Checked | Proceeds; operator takes responsibility |
 | Plan applied to exit 0, then the same artifact applied again (a retry) | not checked | not checked | PA11: exit 0, names the run that applied it; nothing written |
+| Unpinned incremental / `keyset_incremental` plan applied again | Checked | not checked (no snapshot) | A new run reads what arrived since the previous apply |
 | Plan's apply died (kill, panic) or failed, artifact applied again | Checked | Checked | Replays: a new run extracts |
 
 ---

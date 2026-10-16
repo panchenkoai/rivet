@@ -1047,7 +1047,7 @@ fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
 
 // ─── PA-L10: a replay of a plan that already applied (retry matrix F3) ────────
 
-/// The export shape of a replay cell; `IncrementalAfterRun` plans after a `rivet run` stored a cursor, so the plan holds a snapshot its own apply moves.
+/// The export shape of a replay cell; `IncrementalAfterRun` plans after a `rivet run` stored a cursor, so the plan pins a snapshot its own apply moves; `IncrementalFirst` and `KeysetIncremental` continue a stored cursor they do not pin.
 #[derive(Clone, Copy, Debug)]
 enum ReplayShape {
     Full,
@@ -1055,6 +1055,7 @@ enum ReplayShape {
     IncrementalAfterRun,
     Chunked,
     Keyset,
+    KeysetIncremental,
 }
 
 impl ReplayShape {
@@ -1071,6 +1072,16 @@ impl ReplayShape {
             ReplayShape::Keyset => {
                 engine.staged(rig, "chunked", &["chunk_by_key: id", "chunk_size: 5"])
             }
+            ReplayShape::KeysetIncremental => engine.staged(
+                rig,
+                "chunked",
+                &[
+                    "chunk_by_key: id",
+                    "chunk_checkpoint: true",
+                    "keyset_incremental: true",
+                    "chunk_size: 5",
+                ],
+            ),
         }
     }
 }
@@ -1214,6 +1225,37 @@ fn a_replayed_applied_plan_names_the_run_that_applied_it(engine: SqlEngine, shap
     }
 }
 
+/// A plan that continues a stored cursor it does not pin is the next increment on every replay: each writes its own run, none answers "already applied", and the rig oracle finds every row the source holds after each.
+fn a_replayed_unpinned_plan_delivers_what_arrived_since(engine: SqlEngine, shape: ReplayShape) {
+    let Some(stand) = ReplayStand::new(engine, shape) else {
+        return;
+    };
+    let plan = stand.plan();
+    let mut seen = manifest_run_ids(&stand.objects());
+    let mut next = 21;
+    for (cycle, arrived) in [(0, 20), (1, 10), (2, 5)] {
+        if cycle > 0 {
+            engine.insert(&stand.table, next..=next + arrived - 1, 60, None);
+            next += arrived;
+        }
+        let out = stand.apply(&plan, &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{shape:?}, apply {cycle}: {stderr}");
+        assert!(
+            !stderr.contains("already applied"),
+            "{shape:?}, apply {cycle}: an unpinned plan reads what arrived since: {stderr}"
+        );
+        let now = manifest_run_ids(&stand.objects());
+        let new: Vec<&String> = now.difference(&seen).collect();
+        assert_eq!(
+            new.len(),
+            1,
+            "{shape:?}, apply {cycle}: one new run for the {arrived} row(s) that arrived: {new:?}"
+        );
+        seen = now;
+    }
+}
+
 /// A plan whose apply died mid-run is replayed for real: a new run writes its manifest and nothing answers "already applied".
 fn a_replayed_plan_whose_apply_died_extracts(engine: SqlEngine) {
     let Some(stand) = ReplayStand::new(engine, ReplayShape::Full) else {
@@ -1272,10 +1314,19 @@ fn a_replayed_applied_full_plan_answers_with_its_run_postgres() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
-fn a_replayed_applied_first_incremental_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_names_the_run_that_applied_it(
+fn a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_postgres() {
+    a_replayed_unpinned_plan_delivers_what_arrived_since(
         SqlEngine::Pg,
         ReplayShape::IncrementalFirst,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres() {
+    a_replayed_unpinned_plan_delivers_what_arrived_since(
+        SqlEngine::Pg,
+        ReplayShape::KeysetIncremental,
     );
 }
 
@@ -1320,10 +1371,19 @@ fn a_replayed_applied_full_plan_answers_with_its_run_mysql() {
 
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
-fn a_replayed_applied_first_incremental_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_names_the_run_that_applied_it(
+fn a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_mysql() {
+    a_replayed_unpinned_plan_delivers_what_arrived_since(
         SqlEngine::Mysql,
         ReplayShape::IncrementalFirst,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql() {
+    a_replayed_unpinned_plan_delivers_what_arrived_since(
+        SqlEngine::Mysql,
+        ReplayShape::KeysetIncremental,
     );
 }
 
