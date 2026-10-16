@@ -1,11 +1,12 @@
 --- a/src/pipeline/apply_cmd.rs
 +++ b/src/pipeline/apply_cmd.rs
-@@ -128,7 +128,7 @@
- 
-     // 3. A replay of a plan that already applied to exit 0 (a retry whose first
-     //    try died after rivet finished) answers with that run and extracts nothing.
--    if let Some(run_id) = state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)? {
-+    if let Some(run_id) = None::<String> {
+@@ -131,7 +131,6 @@
+     //    unless the plan continues a stored cursor it does not pin: then the replay
+     //    reads only what arrived since, the next increment.
+-    if artifact.replay_reads_the_same_rows()
+-        && let Some(run_id) =
+-            state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)?
++    if artifact.replay_reads_the_same_rows()
++        && let Some(run_id) = None::<String>
+     {
          if !force {
-             eprintln!("{}", already_applied_report(&state, &artifact, &run_id));
-             return Ok(());
