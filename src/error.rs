@@ -2082,7 +2082,11 @@ mod tests {
             .filter(|c| c.kind == ErrorKind::Refusal && c.action.starts_with("wait for"))
             .map(|c| c.id)
             .collect();
-        assert_eq!(waits_refused, Vec::<&str>::new(), "a refusal whose remedy is to wait");
+        assert_eq!(
+            waits_refused,
+            Vec::<&str>::new(),
+            "a refusal whose remedy is to wait"
+        );
         for code in busy {
             let bare = || anyhow::Error::new(CodedError::new(code, "held"));
             assert_coded(&bare().context("export 'orders'"), code.id, 2);
