@@ -1,0 +1,14 @@
+--- a/src/connect/postgres.rs
++++ b/src/connect/postgres.rs
+@@ -154,11 +154,6 @@
+ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
+     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
+     super::require_tls_or_loopback(url, tls)?;
+-    require_a_runtime(
+-        tokio::runtime::Builder::new_current_thread()
+-            .enable_all()
+-            .build(),
+-    )?;
+     match tls {
+         Some(cfg) if cfg.mode.is_enforced() => {
+             let connector = build_native_tls(cfg)?;

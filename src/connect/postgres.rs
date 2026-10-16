@@ -154,6 +154,11 @@ fn read_under<T>(
 pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     super::require_tls_or_loopback(url, tls)?;
+    require_a_runtime(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build(),
+    )?;
     match tls {
         Some(cfg) if cfg.mode.is_enforced() => {
             let connector = build_native_tls(cfg)?;
@@ -166,6 +171,38 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
                 .map_err(|e| super::describe_connect_error(url, e.into()))
         }
         _ => Client::connect(url, NoTls).map_err(|e| super::describe_connect_error(url, e.into())),
+    }
+}
+
+/// The environment stop for a process that cannot start a runtime, read off a probe build: `postgres::Config::connect` unwraps its own runtime build (postgres 0.19 `src/config.rs`), so an `EMFILE` there would abort the process instead of failing with a code.
+// ponytail: the probe's runtime is dropped before the driver builds its own, so another thread can still take the last descriptor in between; a driver API that accepts a runtime would close that.
+fn require_a_runtime(built: std::io::Result<tokio::runtime::Runtime>) -> Result<()> {
+    super::driver_runtime("postgres", built).map(drop)
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    /// A process out of descriptors is refused by the source-runtime code before the driver can unwrap its own runtime build; a runtime that builds lets the dial go on.
+    #[test]
+    fn a_dial_refuses_by_code_when_the_process_cannot_start_a_runtime() {
+        let emfile = std::io::Error::from_raw_os_error(24);
+        let err = super::require_a_runtime(Err(emfile)).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_SOURCE_RUNTIME_UNAVAILABLE")
+        );
+        assert!(
+            err.to_string()
+                .contains("postgres: tokio runtime build failed"),
+            "{err:#}"
+        );
+        assert!(
+            matches!(crate::error::classify_exit(&err), 1 | 2),
+            "exit {}: the environment, not a bug",
+            crate::error::classify_exit(&err)
+        );
+        let rt = tokio::runtime::Builder::new_current_thread().build();
+        assert!(super::require_a_runtime(rt).is_ok());
     }
 }
 
