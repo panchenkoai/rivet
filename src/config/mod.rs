@@ -131,19 +131,23 @@ impl Config {
         let mut config =
             Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))?;
         config.record_queries_as_written(&contents);
-        config.anchor_paths(path)?;
+        config.anchor_paths(path, std::env::current_dir().ok())?;
         Ok(config)
     }
 
     /// Anchor every relative local destination path to the config file's directory: the one place a path in the file is resolved, so every command reads and writes one location whatever directory rivet is started from; refuses while the directory under the working directory (where a release before 0.32 wrote) alone holds the export's files.
-    fn anchor_paths(&mut self, config_path: &str) -> crate::error::Result<()> {
+    fn anchor_paths(
+        &mut self,
+        config_path: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> crate::error::Result<()> {
         let Some(dir) = std::path::absolute(config_path)
             .ok()
             .and_then(|p| p.parent().map(destination::normalized))
         else {
             return Ok(());
         };
-        let cwd = std::env::current_dir().ok().filter(|c| *c != dir);
+        let cwd = cwd.filter(|c| *c != dir);
         for export in &mut self.exports {
             let Some(written) = export.destination.anchor(&dir) else {
                 continue;

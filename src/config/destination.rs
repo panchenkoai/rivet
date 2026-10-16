@@ -247,6 +247,48 @@ mod tests {
             normalized(Path::new("/home/op/../etc/rivet/./out/..")),
             Path::new("/home/etc/rivet")
         );
+        assert_eq!(
+            normalized(Path::new("../out/./x")),
+            Path::new("../out/x"),
+            "a leading `..` has nothing to fold into and stays"
+        );
+    }
+
+    /// The one resolver refuses only from ANOTHER working directory whose place holds the export: from the config's own directory the same files are the destination itself.
+    #[test]
+    fn a_config_loaded_from_another_directory_is_refused_while_that_directory_holds_the_export() {
+        let root = tempfile::tempdir().unwrap();
+        let (cwd, cfg_dir) = (root.path().join("cwd"), root.path().join("cfg"));
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cwd.join("out/manifest.json"),
+            r#"{"export_name":"orders","run_id":"r"}"#,
+        )
+        .unwrap();
+        let config_path = cfg_dir.join("rivet.yaml");
+        let load = || {
+            crate::config::Config::from_yaml(
+                "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+                 exports:\n  - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+                 \x20   destination: { type: local, path: ./out }\n",
+            )
+            .unwrap()
+        };
+        let err = load()
+            .anchor_paths(config_path.to_str().unwrap(), Some(cwd.clone()))
+            .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_DEST_RELATIVE_PATH_MOVED", 5);
+        let said = format!("{err:#}");
+        for dir in [&cwd.join("out"), &cfg_dir.join("out")] {
+            assert!(said.contains(dir.to_str().unwrap()), "{said}");
+        }
+        load()
+            .anchor_paths(config_path.to_str().unwrap(), Some(cfg_dir.clone()))
+            .expect("from the config's own directory nothing is checked");
+        load()
+            .anchor_paths(config_path.to_str().unwrap(), None)
+            .expect("no working directory, nothing to compare");
     }
 
     /// The one resolver: a relative local path lands under the CONFIG's directory, not the working directory the test runs in.
