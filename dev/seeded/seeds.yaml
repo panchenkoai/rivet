@@ -2698,3 +2698,25 @@ seeds:
           - "lib:a_dead_holder_on_this_host_is_recognised_and_nothing_else_is"
       sqlite-state:
         na: the SQLite lease is an flock on a sidecar file that the kernel drops with its holder; there is no holder row naming a host to misjudge
+  - name: repair-under-a-changed-chunk-plan
+    class: "`reconcile` and `repair` read the stored chunk run without comparing the chunk plan it was planned under with the config, so after a `chunk_column` edit they re-read the stored windows on the new column and a repair supersedes parts: the manifest lists fewer rows than the source has"
+    history: "2026-10-16 - P-21 (live_reconcile_repair): a repair --execute after chunk_column was edited from id to other_id left the manifest listing 39 rows over 39 distinct ids for 40 source ids, exit 0, on main through 0.31.0; fixed by routing reconcile and repair through the check `run --resume` already runs (`chunked::refuse_changed_chunk_plan`, via `reconcile_cmd::latest_chunk_run_under_this_plan`)"
+    scope: source
+    patch: repair-under-a-changed-chunk-plan/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"
+          - repair_after_a_chunk_column_edit_is_refused_by_code_postgres
+      mysql:
+        cells:
+          - "lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"
+          - repair_after_a_chunk_column_edit_is_refused_by_code_mysql
+      mssql:
+        cells:
+          - "lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"
+          - repair_after_a_chunk_column_edit_is_refused_by_code_mssql
+      mongo:
+        na: "`rivet reconcile` and `rivet repair` take a `mode: chunked` export; MongoDB exports have none"
+      oracle:
+        cells: ["lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"]
