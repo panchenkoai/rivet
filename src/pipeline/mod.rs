@@ -15,6 +15,8 @@ mod apply_cmd;
 pub(crate) mod cdc;
 pub(crate) mod cdc_job;
 pub(crate) mod chunked;
+#[doc(hidden)]
+pub use chunked::run_lease_key;
 mod cli;
 pub(crate) mod commit;
 mod finalize;

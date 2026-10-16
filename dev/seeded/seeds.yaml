@@ -2615,3 +2615,15 @@ seeds:
         cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
       sqlite-state:
         cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]
+  - name: foreign-lease-taken-before-expiry
+    class: "a run lease whose holder names another host is judged by a local pid probe, so a run on a live host loses its lease to a run here before the lease expires"
+    history: "2026-10-16 - harness: the dead-owner cells damaged `chunk-run:<export>` after the run lease became `chunk-run:<export>@<source hash>`, so on a PostgreSQL state they failed on `changed 0 row(s)` and on SQLite they were skipped; no cell could catch a takeover rule that ignored the host (fixed by deriving the key through `run_lease_key` and keeping a Postgres state in the cell)"
+    scope: state
+    patch: foreign-lease-taken-before-expiry/shared.patch
+    engines:
+      postgres-state:
+        cells:
+          - a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_postgres
+          - "lib:a_dead_holder_on_this_host_is_recognised_and_nothing_else_is"
+      sqlite-state:
+        na: the SQLite lease is an flock on a sidecar file that the kernel drops with its holder; there is no holder row naming a host to misjudge

@@ -100,6 +100,8 @@ pub struct Rig {
     bin: Option<PathBuf>,
     /// The most files an invocation of this rig may hold open (`RLIMIT_NOFILE`).
     open_files: Option<u64>,
+    /// The Postgres state this rig's invocations use instead of the backend under test (see `Rig::on_postgres_state`).
+    state: Option<String>,
     oracle_off: Option<String>,
     /// A product defect the oracle must keep catching (see `Rig::oracle_known_defect`).
     oracle_xfail: Option<(String, String)>,
@@ -177,6 +179,7 @@ impl Rig {
             census_key: None,
             bin: None,
             open_files: None,
+            state: None,
             oracle_off: None,
             oracle_xfail: None,
             oracle_xfailed: std::cell::Cell::new(false),
@@ -457,6 +460,35 @@ impl Rig {
     pub fn open_files(mut self, most: u64) -> Self {
         self.open_files = Some(most);
         self
+    }
+
+    /// Keep this rig's state in the Postgres database at `url` whatever backend the gate grades: for a cell whose subject exists only on a Postgres state.
+    pub fn on_postgres_state(mut self, url: String) -> Self {
+        self.state = Some(url);
+        self
+    }
+
+    /// `envs` behind this rig's own state URL, so the child, its grade and the rig's state reads name one backend.
+    pub(crate) fn with_state<'a>(&'a self, envs: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut all: Vec<(&str, &str)> = self
+            .state
+            .iter()
+            .map(|u| ("RIVET_STATE_URL", u.as_str()))
+            .collect();
+        all.extend_from_slice(envs);
+        all
+    }
+
+    /// The Postgres state an invocation of this rig with `envs` uses, or `None` for SQLite beside the config.
+    pub fn state_url(&self, envs: &[(&str, &str)]) -> Option<String> {
+        crate::common::state_url_for(&self.with_state(envs))
+    }
+
+    /// The key of this rig's export's run lease, from rivet's own function over the source its config names.
+    pub fn lease_key(&self) -> String {
+        let cfg = rivet::config::Config::load(&self.config_path().display().to_string())
+            .expect("fixture: the rig's config loads");
+        rivet::pipeline::run_lease_key(&self.name, &cfg.source.state_key())
     }
 
     /// Keep the config, and so the SQLite state beside it, in `dir` instead of the rig's tempdir.

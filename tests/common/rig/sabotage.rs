@@ -254,9 +254,9 @@ impl Rig {
     /// Run one statement on the state database this rig's runs use (`{export}` is the export's name); panics unless it changed exactly `rows` rows.
     pub fn edit_state(&self, sql: &str, rows: u64) {
         let sql = sql.replace("{export}", &self.name);
-        let changed = match crate::common::state_url_under_test() {
+        let changed = match self.state_url(&[]) {
             Some(url) => postgres::Client::connect(&url, postgres::NoTls)
-                .expect("connect to the Postgres state (RIVET_GATE_STATE_URL)")
+                .expect("connect to the rig's Postgres state")
                 .execute(sql.as_str(), &[])
                 .unwrap_or_else(|e| panic!("sabotage: `{sql}`: {e}")),
             None => {
@@ -274,9 +274,9 @@ impl Rig {
     /// One count read from the state database this rig's runs use (`{export}` is the export's name).
     pub fn state_count(&self, sql: &str) -> i64 {
         let sql = sql.replace("{export}", &self.name);
-        match crate::common::state_url_under_test() {
+        match self.state_url(&[]) {
             Some(url) => postgres::Client::connect(&url, postgres::NoTls)
-                .expect("connect to the Postgres state (RIVET_GATE_STATE_URL)")
+                .expect("connect to the rig's Postgres state")
                 .query_one(sql.as_str(), &[])
                 .unwrap_or_else(|e| panic!("state read: `{sql}`: {e}"))
                 .get(0),
