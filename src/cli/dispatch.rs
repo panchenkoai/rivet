@@ -148,6 +148,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             clickhouse_url,
             clickhouse_database,
             clickhouse_user,
+            snowflake_connection,
+            snowflake_warehouse,
+            snowflake_database,
+            snowflake_schema,
+            snowflake_storage_integration,
             tls,
             tls_ca,
         } => dispatch_init(
@@ -170,6 +175,13 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             clickhouse_url,
             clickhouse_database,
             clickhouse_user,
+            InitSnowflakeFlags {
+                connection: snowflake_connection,
+                warehouse: snowflake_warehouse,
+                database: snowflake_database,
+                schema: snowflake_schema,
+                storage_integration: snowflake_storage_integration,
+            },
             tls,
             tls_ca,
         ),
@@ -579,6 +591,59 @@ fn report_plan_compatibility(plans: Vec<BatchPlan>, json_output: bool) -> Result
     Ok(())
 }
 
+/// The `rivet init --snowflake-*` flags as clap parsed them.
+struct InitSnowflakeFlags {
+    connection: Option<String>,
+    warehouse: Option<String>,
+    database: Option<String>,
+    schema: Option<String>,
+    storage_integration: Option<String>,
+}
+
+impl InitSnowflakeFlags {
+    /// The Snowflake target to scaffold: all five values, or none. Clap already
+    /// ties the flags together; a blank value is refused here, since the loader
+    /// needs every one of them to name a real object.
+    fn target(self) -> Result<Option<init::InitSnowflakeTarget>> {
+        let flags = [
+            ("--snowflake-connection", self.connection),
+            ("--snowflake-warehouse", self.warehouse),
+            ("--snowflake-database", self.database),
+            ("--snowflake-schema", self.schema),
+            ("--snowflake-storage-integration", self.storage_integration),
+        ];
+        if flags.iter().all(|(_, v)| v.is_none()) {
+            return Ok(None);
+        }
+        let mut values = Vec::with_capacity(flags.len());
+        for (flag, v) in flags {
+            match v {
+                Some(v) if !v.trim().is_empty() => values.push(v),
+                Some(_) => crate::rivet_bail!(
+                    crate::error::codes::CLI_VALUE_INVALID,
+                    "{flag} is empty: a Snowflake `load:` block needs a value for every \
+                     --snowflake-* flag"
+                ),
+                None => crate::rivet_bail!(
+                    crate::error::codes::CLI_OPTION_UNSUPPORTED,
+                    "{flag} is missing: a Snowflake `load:` block needs all of \
+                     --snowflake-connection, --snowflake-warehouse, --snowflake-database, \
+                     --snowflake-schema and --snowflake-storage-integration"
+                ),
+            }
+        }
+        let [connection, warehouse, database, schema, storage_integration]: [String; 5] =
+            values.try_into().expect("five flags, five values");
+        Ok(Some(init::InitSnowflakeTarget {
+            connection,
+            warehouse,
+            database,
+            schema,
+            storage_integration,
+        }))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_init(
     source: Option<String>,
@@ -600,6 +665,7 @@ fn dispatch_init(
     clickhouse_url: Option<String>,
     clickhouse_database: Option<String>,
     clickhouse_user: String,
+    snowflake: InitSnowflakeFlags,
     tls: Option<crate::config::TlsMode>,
     tls_ca: Option<String>,
 ) -> Result<()> {
@@ -630,6 +696,7 @@ fn dispatch_init(
         clickhouse_url,
         clickhouse_database,
         clickhouse_user: Some(clickhouse_user),
+        snowflake: snowflake.target()?,
     };
     let filter = init::TableFilter { include, exclude };
     let tls_config = resolve_init_tls(tls, tls_ca)?;
@@ -1170,6 +1237,13 @@ mod init_tls_tests {
             None,
             None,
             "default".into(),
+            super::InitSnowflakeFlags {
+                connection: None,
+                warehouse: None,
+                database: None,
+                schema: None,
+                storage_integration: None,
+            },
             None,
             None,
         )
@@ -1292,5 +1366,67 @@ mod error_code_tests {
         crate::error::assert_coded(&err, "RIVET_CLI_RUN_ID_UNKNOWN", 1);
         let err = super::parse_cli_target("nope").unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CONFIG_TARGET_UNKNOWN", 1);
+    }
+}
+
+#[cfg(test)]
+mod init_snowflake_flags_tests {
+    use super::InitSnowflakeFlags;
+
+    fn flags(v: [Option<&str>; 5]) -> InitSnowflakeFlags {
+        let [connection, warehouse, database, schema, storage_integration] =
+            v.map(|s| s.map(str::to_string));
+        InitSnowflakeFlags {
+            connection,
+            warehouse,
+            database,
+            schema,
+            storage_integration,
+        }
+    }
+
+    /// No flag, no target; all five, the target with those values; a blank or a
+    /// missing value is a coded usage refusal naming the flag.
+    #[test]
+    fn the_snowflake_flags_become_a_target_only_when_every_value_is_given() {
+        assert_eq!(flags([None; 5]).target().unwrap(), None);
+        let t = flags([Some("c"), Some("w"), Some("d"), Some("s"), Some("i")])
+            .target()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                t.connection.as_str(),
+                t.warehouse.as_str(),
+                t.database.as_str(),
+                t.schema.as_str(),
+                t.storage_integration.as_str()
+            ),
+            ("c", "w", "d", "s", "i")
+        );
+        let blank = flags([Some("c"), Some("w"), Some(" "), Some("s"), Some("i")])
+            .target()
+            .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&blank),
+            Some("RIVET_CLI_VALUE_INVALID")
+        );
+        assert!(
+            blank.to_string().contains("--snowflake-database"),
+            "{blank}"
+        );
+        let missing = flags([Some("c"), Some("w"), Some("d"), Some("s"), None])
+            .target()
+            .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_CLI_OPTION_UNSUPPORTED")
+        );
+        assert!(
+            missing
+                .to_string()
+                .contains("--snowflake-storage-integration"),
+            "{missing}"
+        );
     }
 }
