@@ -133,7 +133,7 @@ impl FanIn {
 }
 
 /// `on_err` over every unit's `label: cause`; under it the worst coded unit failure, whose line is its label alone and last, so the run exits and is coded as that unit.
-fn unit_failures(
+pub(crate) fn unit_failures(
     errors: Vec<(String, anyhow::Error)>,
     on_err: impl FnOnce(&[String]) -> anyhow::Error,
 ) -> anyhow::Error {

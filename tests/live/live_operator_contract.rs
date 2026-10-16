@@ -2957,6 +2957,79 @@ fn a_refusal_in_one_worker_exits_as_with_one_worker_oracle() {
     a_refusal_in_one_worker_exits_as_with_one_worker(SqlEngine::Oracle);
 }
 
+/// A coded refusal met by one chunk of a CHECKPOINTED export (`chunk_checkpoint: true`) exits by its code and class with one worker and with four, and so does the `--resume` that re-meets it: never the incomplete run's `RIVET_RUN_UNITS_FAILED` and exit 1, which a scheduler would resume forever. The run names its runner's failure line and the resume remedy.
+fn a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume(e: SqlEngine) {
+    const N: i64 = 2000;
+    let (table, _guard) = range_table(e, "oc_ckref", N);
+    let (col_type, plain, hostile, line) = worker_refusal_fixture(e);
+    let (id, t) = (e.col("id"), e.col("t"));
+    e.exec(&format!("ALTER TABLE {table} ADD {t} {col_type}"));
+    e.exec(&format!("UPDATE {table} SET {t} = {plain}"));
+    e.exec(&format!(
+        "UPDATE {table} SET {t} = {hostile} WHERE {id} = {}",
+        N - 50
+    ));
+    let refused = Refused::by_code("RIVET_SOURCE_VALUE_UNREPRESENTABLE", 5);
+    for (parallel, runner) in [
+        (1, "chunk checkpoint errors:"),
+        (4, "parallel checkpoint worker errors:"),
+    ] {
+        let mut rig = e
+            .rig(&table)
+            .mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 200")
+            .export_line("chunk_checkpoint: true")
+            .export_line(&format!("parallel: {parallel}"))
+            .a_failed_run_may_leave(
+                &[
+                    Leftover::OrphanPart,
+                    Leftover::FileLog,
+                    Leftover::ObservedSchema,
+                    Leftover::ChunkCheckpoint,
+                ],
+                "the value is met near the end of the key range: the chunks read before it were written and checkpointed, and their parts, file_log rows, chunk tasks and observed schema stay as the record of what the run wrote",
+            );
+        if !line.is_empty() {
+            rig = rig.export_line(line);
+        }
+        for (cycle, args) in [("the run", &[][..]), ("its --resume", &["--resume"][..])] {
+            let out = rig.run_args(args);
+            assert_refused(&out, refused);
+            let said = text(&out);
+            assert!(
+                said.contains(runner) && said.contains("--resume"),
+                "parallel {parallel}, {cycle}: the runner that met the value and the remedy are named: {said}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_postgres() {
+    a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_mysql() {
+    a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_mssql() {
+    a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_oracle() {
+    a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume(SqlEngine::Oracle);
+}
+
 /// MongoDB: a coded failure in one `_id`-range worker (the test hook's `RIVET_CLI_TEST_FAULT_INJECTED`) is the run's code and exit, not the aggregate's `RIVET_RUN_UNITS_FAILED`; the run still names its runner's failure line.
 #[test]
 #[ignore = "live: requires docker compose mongo"]
