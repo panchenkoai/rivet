@@ -397,3 +397,16 @@ mod tls_gate_tests {
         }
     }
 }
+
+/// The async runtime a driver runs on, or an environment stop naming `engine` when the process cannot start one.
+pub(crate) fn driver_runtime(
+    engine: &str,
+    built: std::io::Result<tokio::runtime::Runtime>,
+) -> crate::error::Result<tokio::runtime::Runtime> {
+    built.map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::SOURCE_RUNTIME_UNAVAILABLE,
+            format!("{engine}: tokio runtime build failed: {e}"),
+        )
+    })
+}

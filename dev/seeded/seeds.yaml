@@ -2508,3 +2508,19 @@ seeds:
         cells: ["lib:a_mixed_split_generation_is_journaled_refused_and_refuses_again", "lib:a_missing_spec_and_an_unreadable_spec_store_are_two_codes"]
       postgres-state:
         cells: ["lib:pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"]
+  - name: postgres-dial-runtime-unwrapped
+    class: "a driver builds its own async runtime inside its connect call and unwraps the build, so a process out of file descriptors aborts with a panic instead of the environment stop the other drivers raise"
+    history: "2026-10-08 - the gate's PostgreSQL out-of-descriptors cell (live_sabotage): `rivet run` capped at 8 open files panicked at postgres-0.19 src/config.rs:463 (`Too many open files`), exit 101 with no `Error:` line, while MySQL, SQL Server, Oracle and MongoDB failed loudly through `driver_runtime`, through 0.31.0; fixed by proving a runtime build at the shared PostgreSQL dial (`connect_client`) before the driver builds its own"
+    scope: source
+    patch: postgres-dial-runtime-unwrapped/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres]
+      mysql:
+        na: "the MySQL driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      mssql:
+        na: "the SQL Server driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      mongo:
+        na: "the MongoDB driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      oracle:
+        na: "the Oracle driver is synchronous and builds no runtime; the unwrapped build is the PostgreSQL crate's connect call only"
