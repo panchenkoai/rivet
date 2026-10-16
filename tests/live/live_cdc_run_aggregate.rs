@@ -229,9 +229,15 @@ fn a_cdc_child_killed_after_its_leg_counts_the_leg_postgres() {
         .unwrap_or_else(|| panic!("no entry for the CDC export in {doc}"))
         .clone();
     let (rows, files, bytes) = parquet_on_disk(&scn.rig.out_dir());
+    let at_source: i64 = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+        .expect("postgres-cdc")
+        .query_one(&format!("SELECT count(*) FROM {}", scn.table), &[])
+        .expect("count the source")
+        .get(0);
     assert_eq!(
-        rows, ROWS,
-        "fixture: the leg wrote the seeded rows before the kill"
+        (rows, at_source),
+        (ROWS, ROWS),
+        "fixture: the leg wrote every source row before the kill"
     );
     assert_eq!(
         (
