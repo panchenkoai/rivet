@@ -534,10 +534,24 @@ pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
 /// exits the process on the scariest reason rather than whichever export happened
 /// to fail first. Returns `None` for an empty slice.
 pub(crate) fn representative_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
-    (0..failures.len()).max_by_key(|&i| {
-        crate::error::ExitClass::from_code(crate::error::classify_exit(&failures[i]))
-            .map_or(0, crate::error::ExitClass::stop_rank)
-    })
+    (0..failures.len()).max_by_key(|&i| failure_rank(&failures[i]))
+}
+
+/// The [`ExitClass::stop_rank`] of the class `err` exits by.
+fn failure_rank(err: &anyhow::Error) -> u8 {
+    ExitClass::from_code(classify_exit(err)).map_or(0, ExitClass::stop_rank)
+}
+
+/// Index of the most stop-worthy failure that carries a code or a typed class (the last of equals), `None` when none does.
+pub(crate) fn worst_typed_failure_idx(failures: &[anyhow::Error]) -> Option<usize> {
+    (0..failures.len())
+        .filter(|&i| {
+            let e = &failures[i];
+            error_code(e).is_some()
+                || stop_class(e).is_some()
+                || e.downcast_ref::<PreclassifiedExit>().is_some()
+        })
+        .max_by_key(|&i| failure_rank(&failures[i]))
 }
 
 /// Stable, greppable error codes carried by [`CodedError`]. A scheduler / CI step
@@ -1300,7 +1314,7 @@ pub mod codes {
         "RIVET_DEST_PART_ROWS_MISMATCH",
         "stop and report it: a writer bug or a damaged disk; the part was not committed",
     );
-    /// One or more units (chunks, keyset ranges, child exports) of the run failed; the message lists each cause.
+    /// One or more units (chunks, keyset ranges, child exports) of the run failed and none carries its own code or class; the message lists each cause.
     pub const RUN_UNITS_FAILED: Code = environment(
         "RIVET_RUN_UNITS_FAILED",
         "fix the first cause the message names and run again; a checkpointed run resumes from where it stopped",
@@ -2151,6 +2165,33 @@ mod representative_failure_tests {
         let failures = vec![refused(), anyhow::anyhow!("generic")];
         let idx = representative_failure_idx(&failures).unwrap();
         assert_eq!(classify_exit(&failures[idx]), ExitClass::Refusal.code());
+    }
+
+    /// Only a failure with a code, a typed class or a decided exit is a candidate, however its text classifies; of equals the last.
+    #[test]
+    fn the_worst_typed_failure_is_picked_by_code_class_or_decided_exit() {
+        use super::{PreclassifiedExit, worst_typed_failure_idx};
+        let transient = || anyhow::anyhow!("connection reset by peer");
+        assert_eq!(worst_typed_failure_idx(&[transient(), transient()]), None);
+        let typed: [fn() -> anyhow::Error; 3] = [
+            || crate::error::coded(crate::error::codes::RUN_UNITS_FAILED, "permanent"),
+            || SchemaDriftError::new("drift").into(),
+            || PreclassifiedExit(5).into(),
+        ];
+        for t in typed {
+            assert_eq!(worst_typed_failure_idx(&[transient(), t()]), Some(1));
+            assert_eq!(worst_typed_failure_idx(&[t(), transient()]), Some(0));
+        }
+        let refused = || crate::error::coded(crate::error::codes::STATE_CURSOR_OWNER_MISMATCH, "r");
+        assert_eq!(
+            worst_typed_failure_idx(&[refused(), refused(), transient()]),
+            Some(1)
+        );
+        let integrity: anyhow::Error = DataIntegrityError::new("mismatch").into();
+        assert_eq!(
+            worst_typed_failure_idx(&[integrity, refused(), transient()]),
+            Some(0)
+        );
     }
 }
 

@@ -17,6 +17,27 @@
 
 seeds:
 
+  - name: worker-error-loses-its-class
+    class: a coded failure in one parallel worker reaches the run as text only (FanIn kept strings), so the run prints RIVET_RUN_UNITS_FAILED and exits 1 or 2 instead of the worker's own code and class
+    history: found 2026-10-15 reading FanIn::fail against the owner's "exit follows code class" rule; a PostgreSQL `infinity` met by a parallel keyset worker exited [RIVET_RUN_UNITS_FAILED] 1 where one worker exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0
+    scope: source
+    patch: worker-error-loses-its-class/shared.patch
+    engines:
+      postgres:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_postgres]
+      mysql:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_mysql]
+      mssql:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_mssql]
+      oracle:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_oracle]
+      mongo:
+        cells: [a_coded_failure_in_one_worker_keeps_its_code_mongo]
+      lib:
+        cells:
+          - "lib:a_coded_refusal_in_one_worker_decides_the_runs_exit_and_code"
+          - "lib:the_most_stop_worthy_coded_unit_failure_decides"
+
   - name: keyset-anchor-kept-without-a-part
     class: a keyset run that stops before its first part keeps its resume anchor, so the run of another mode the refusal names as the remedy is refused as continuing an interrupted run
     history: "Sweep 14, 2026-10-12: a resumed MongoDB keyset run refused for a mixed-type `_id` left its claim on the cursor row; removing `page_size` (the remedy it names) was refused RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH, exit 5 (v0.31.0)"
