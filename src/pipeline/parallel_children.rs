@@ -31,10 +31,15 @@ use super::parent_ui::{ChildWaitStatus, UiMessage, sanitize_terminal};
 /// (bughunt 2026-08-14, finding #4). Keeping the fold here makes the
 /// invariant structural — a counter is folded only after arriving over a
 /// pipe from another process.
-fn adopt_child_event(line: &str) -> serde_json::Result<ChildEvent> {
+///
+/// `dest_retries` is the child's CUMULATIVE process counter and one child may
+/// send several `Finished` lines (a CDC export's snapshot legs, then its own),
+/// so only the growth since `retries_seen`, that child's previous value, is added.
+fn adopt_child_event(line: &str, retries_seen: &mut u64) -> serde_json::Result<ChildEvent> {
     let ev: ChildEvent = serde_json::from_str(line)?;
     if let ChildEvent::Finished { dest_retries, .. } = &ev {
-        crate::destination::add_transient_retries(*dest_retries);
+        crate::destination::add_transient_retries(dest_retries.saturating_sub(*retries_seen));
+        *retries_seen = (*retries_seen).max(*dest_retries);
     }
     Ok(ev)
 }
@@ -208,6 +213,7 @@ pub(super) fn run_exports_as_child_processes(
                         .name(format!("rivet-ipc-rx-{}", export.name))
                         .spawn(move || {
                             let reader = BufReader::new(stdout);
+                            let mut retries_seen = 0u64;
                             for line in reader.lines() {
                                 let line = match line {
                                     Ok(l) => l,
@@ -224,7 +230,7 @@ pub(super) fn run_exports_as_child_processes(
                                 if trimmed.is_empty() {
                                     continue;
                                 }
-                                match adopt_child_event(trimmed) {
+                                match adopt_child_event(trimmed, &mut retries_seen) {
                                     Ok(ev) => {
                                         sink.lock()
                                             .unwrap_or_else(|p| p.into_inner())
@@ -677,7 +683,8 @@ mod foreign_counter_tests {
 
         let before = crate::destination::transient_retries_total();
         for (name, n) in [("orders", 3u64), ("events", 4u64)] {
-            let ev = adopt_child_event(&line(name, n)).expect("child wire format must parse");
+            let ev =
+                adopt_child_event(&line(name, n), &mut 0).expect("child wire format must parse");
             assert!(matches!(ev, ChildEvent::Finished { .. }));
         }
         let grew_by = crate::destination::transient_retries_total() - before;
@@ -690,6 +697,48 @@ mod foreign_counter_tests {
         );
     }
 
+    /// One child's `Finished` lines each carry its CUMULATIVE process counter, so the
+    /// parent adds only the growth since that child's previous line: a CDC child
+    /// sends its snapshot leg's line (1000 so far) and then its export's (1500).
+    #[test]
+    fn one_childs_cumulative_counter_is_folded_once_across_its_finished_lines() {
+        let _serial = super::super::parent_ui::retry_counter_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = crate::destination::transient_retries_total();
+        let mut seen = 0;
+        // The third line is out of order: a value below one already seen adds nothing.
+        for (name, cumulative) in [
+            ("pg_cdc__snapshot_items", 1_000u64),
+            ("pg_cdc", 1_500),
+            ("pg_cdc", 1_200),
+        ] {
+            let line = serde_json::to_string(&ChildEvent::Finished {
+                export_name: name.into(),
+                run_id: format!("{name}_run"),
+                status: "success".into(),
+                total_rows: 10,
+                files_produced: 1,
+                bytes_written: 100,
+                duration_ms: 5,
+                peak_rss_mb: 7,
+                error_message: None,
+                dest_retries: cumulative,
+                bytes_read: 0,
+                mode: "full".into(),
+            })
+            .unwrap();
+            adopt_child_event(&line, &mut seen).expect("child wire format must parse");
+        }
+        assert_eq!(seen, 1_500, "the child's record is its highest value");
+        let grew_by = crate::destination::transient_retries_total() - before;
+        // `destination::cloud`'s interceptor test adds 2 outside this lock.
+        assert!(
+            (1_500..1_550).contains(&grew_by),
+            "the child's retries are its highest cumulative value, 1500 (grew by {grew_by})"
+        );
+    }
+
     /// A line the child could not have written is rejected BEFORE the fold
     /// (the `?` in `adopt_child_event`), so the reader keeps going and the
     /// counter is untouched. Asserted on the return value rather than the
@@ -697,8 +746,10 @@ mod foreign_counter_tests {
     /// this lock, so an equality on a process-wide counter would flake.
     #[test]
     fn an_unparsable_line_is_rejected_before_the_fold() {
-        assert!(adopt_child_event("{not json").is_err());
-        assert!(adopt_child_event(r#"{"type":"nope"}"#).is_err());
+        let mut seen = 0;
+        assert!(adopt_child_event("{not json", &mut seen).is_err());
+        assert!(adopt_child_event(r#"{"type":"nope"}"#, &mut seen).is_err());
+        assert_eq!(seen, 0, "a rejected line moves no child's record");
     }
 }
 
