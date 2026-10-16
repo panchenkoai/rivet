@@ -716,7 +716,7 @@ mod tests {
         let said = format!("{err:#}");
         for want in [
             "chunk_column",
-            "cannot reconcile the stored chunk run",
+            "cannot reconcile it",
             "`rivet state reset-chunks -c rivet.yaml -e orders`",
         ] {
             assert!(said.contains(want), "{want} in {said}");

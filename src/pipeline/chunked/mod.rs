@@ -599,8 +599,8 @@ pub(crate) fn refuse_changed_chunk_plan(
     if stored_hash != chunk_plan_hash(plan, cp) {
         crate::rivet_bail!(
             crate::error::codes::STATE_CHUNK_PLAN_CHANGED,
-            "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot {action} the stored chunk run. \
-             To continue it: restore the query and the chunk settings that run had. \
+            "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot {action} it. \
+             To finish it: restore the query and the chunk settings the interrupted run had and run once to finish it. \
              To abandon it: `rivet state reset-chunks -c {config_path} -e {}` abandons it and the next run starts over",
             plan.export_name,
             plan.export_name
