@@ -581,7 +581,7 @@ exports:
     compression: gzip
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: /tmp
 """
 
 MISPLACED_FIELD_YAML = """source:
