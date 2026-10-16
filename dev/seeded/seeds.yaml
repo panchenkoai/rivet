@@ -648,6 +648,26 @@ seeds:
       mongo:
         na: "a Mongo export has no range chunking"
 
+  - name: snowflake-full-load-empties-before-copy
+    class: a whole-table Snowflake load replaces the target before its COPY succeeds, so a failed or lost COPY leaves the table empty until a retry succeeds
+    history: "2026-10-16 retry matrix F6: `CREATE OR REPLACE TABLE` then `COPY` in one script; a COPY of an unreadable part left the target with 0 rows (read through DuckDB's snowflake extension), exit 1, on main through 0.31.0"
+    scope: source
+    patch: snowflake-full-load-empties-before-copy/shared.patch
+    engines:
+      postgres:
+        cells: [snowflake_full_load_that_fails_keeps_the_last_table_postgres]
+      mysql:
+        cells: [snowflake_full_load_that_fails_keeps_the_last_table_mysql]
+      mssql:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cell and the postgres/mysql cells"
+      mongo:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cell and the postgres/mysql cells"
+      oracle:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cell and the postgres/mysql cells"
+      lib:
+        cells:
+          - "lib:a_full_load_swaps_in_only_a_counted_copy_and_drops_its_staging_table"
+
   - name: load-append-writes-before-asking
     class: a load writes a warehouse name before asking whether the ledger has a record of it, or journals a stop before the write in a way the next load reads as ownership
     history: "2026-10-06 triage P-03, P-08, P-10 - an incremental or CDC load replaced a foreign view and appended to a foreign `__changes`, exit 0; the stale-buffer stop was journaled `failed` and the `writing` row preceded the ownership check, so the next load overwrote a table it had refused"
