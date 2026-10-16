@@ -388,6 +388,20 @@ impl StateStore {
             ),
         }
     }
+
+    /// The newest `export_metrics` row of one run, by its run id.
+    pub fn get_metric_by_run_id(&self, run_id: &str) -> Result<Option<ExportMetric>> {
+        Ok(self
+            .query(
+                &format!(
+                    "SELECT {METRIC_COLUMNS} FROM export_metrics WHERE run_id = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+                &[run_id.into()],
+                metric_from_row,
+            )?
+            .into_iter()
+            .next())
+    }
 }
 
 /// Shared row→struct projection for every `export_metrics` query, written once

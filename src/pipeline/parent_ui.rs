@@ -424,6 +424,8 @@ impl Renderer {
                 // shared by an in-process transport, where this number IS
                 // this process's own counter.
                 dest_retries: _,
+                bytes_read: _,
+                mode: _,
             } => {
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.finalize(
@@ -862,6 +864,39 @@ mod tests {
             "rendering the process's OWN events must not fold their counter back \
              into it (grew by {grew_by}; the mutant folds >= {} per event)",
             SEED
+        );
+    }
+
+    /// A child's `Started` opens its card and its `Finished` closes it with the child's counts.
+    #[test]
+    fn a_childs_started_and_finished_events_open_and_close_its_card() {
+        let mut r = Renderer::new(80, 8);
+        r.process_message(UiMessage::Event(ChildEvent::Started {
+            export_name: "orders".into(),
+            run_id: "orders_run".into(),
+            mode: "full".into(),
+            tuning_profile: "balanced".into(),
+            batch_size: 10,
+        }));
+        assert!(!r.cards["orders"].finished, "Started opens a running card");
+        r.process_message(UiMessage::Event(ChildEvent::Finished {
+            export_name: "orders".into(),
+            run_id: "orders_run".into(),
+            status: "success".into(),
+            total_rows: 42,
+            files_produced: 1,
+            bytes_written: 100,
+            duration_ms: 5,
+            peak_rss_mb: 1,
+            error_message: None,
+            dest_retries: 0,
+            bytes_read: 200,
+            mode: "full".into(),
+        }));
+        let card = &r.cards["orders"];
+        assert_eq!(
+            (card.finished, card.status.as_str(), card.rows),
+            (true, "success", 42)
         );
     }
 
