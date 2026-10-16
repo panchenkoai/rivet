@@ -58,10 +58,13 @@ fn mongo_db(tag: &str, n: i64) -> (String, MongoTest, MongoDbGuard) {
 fn insert_ids(engine: SqlEngine, table: &str, ids: std::ops::RangeInclusive<i64>) {
     let (id, v) = (engine.col("id"), engine.col("v"));
     let rows: Vec<String> = ids.map(|g| format!("({g}, {g})")).collect();
-    engine.exec(&format!(
-        "INSERT INTO {table} ({id}, {v}) VALUES {}",
-        rows.join(", ")
-    ));
+    // SQL Server takes at most 1000 row values per INSERT.
+    for batch in rows.chunks(1000) {
+        engine.exec(&format!(
+            "INSERT INTO {table} ({id}, {v}) VALUES {}",
+            batch.join(", ")
+        ));
+    }
 }
 
 /// Everything an invocation printed, whitespace collapsed.
