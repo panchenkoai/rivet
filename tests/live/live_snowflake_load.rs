@@ -45,7 +45,7 @@ fn a_full_load_lands_and_the_next_cycle_follows_the_source(e: SqlEngine) {
     load_ok(&rig);
 }
 
-/// A full load onto a free name lands the source; a later full load whose COPY fails keeps the table the last load landed and leaves no other table behind; the next cycle lands the source again.
+/// A full load onto a free name lands the source; a later full load whose COPY fails keeps the table the last load landed and leaves no other table behind; the next cycle lands the source again and keeps the table's grants.
 fn a_full_load_that_fails_keeps_the_last_table(e: SqlEngine) {
     let Some(sf) = SfLive::from_env("sf_keep") else {
         return;
@@ -123,10 +123,10 @@ fn a_full_load_that_fails_keeps_the_last_table(e: SqlEngine) {
         "the next cycle lands the source"
     );
     assert_eq!(sf.names_from(&table), [table.to_uppercase()]);
+    let grants = sf.grants(&table);
     assert!(
-        !sf.grants(&table).iter().any(|g| g.ends_with(" PUBLIC")),
-        "a full load lands a new table, so a grant on the old one does not carry over: {:?}",
-        sf.grants(&table)
+        grants.iter().any(|g| g == "SELECT PUBLIC"),
+        "a grant on the table survives a full load: {grants:?}"
     );
 }
 
