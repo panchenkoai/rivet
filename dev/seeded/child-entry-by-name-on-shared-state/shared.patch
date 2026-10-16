@@ -1,0 +1,15 @@
+--- a/src/pipeline/aggregate.rs
++++ b/src/pipeline/aggregate.rs
+@@ -688,7 +688,11 @@
+     for export in exports {
+         let own = reports.get(&export.name).and_then(|r| r.run.as_ref());
+         let mut entry: Option<RunAggregateEntry> = None;
+-        match own.map(|(run_id, _)| state.get_metric_by_run_id(run_id)) {
++        match Some(
++            state
++                .get_metrics(Some(&export.name), 1)
++                .map(|rows| rows.into_iter().next()),
++        ) {
+             Some(Ok(row)) => {
+                 // A `running` row is an IN-FLIGHT marker, not an outcome: a
+                 // hard-crashed child (OOM-kill, panic — there is no catch_unwind)

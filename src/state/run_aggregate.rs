@@ -52,6 +52,9 @@ pub struct RunAggregateEntry {
     pub duration_ms: i64,
     pub mode: String,
     pub error_message: Option<String>,
+    /// Rows of the `initial: snapshot` legs folded into `rows`; never serialized, kept out of the throughput self-check.
+    #[serde(skip)]
+    pub snapshot_rows: i64,
 }
 
 impl StateStore {
@@ -151,6 +154,7 @@ mod tests {
             total_bytes: 750 * 1024 * 1024,
             per_export: vec![
                 RunAggregateEntry {
+                    snapshot_rows: 0,
                     bytes_read: 0,
                     export_name: "orders".into(),
                     status: "success".into(),
@@ -163,6 +167,7 @@ mod tests {
                     error_message: None,
                 },
                 RunAggregateEntry {
+                    snapshot_rows: 0,
                     bytes_read: 0,
                     export_name: "users".into(),
                     status: "failed".into(),

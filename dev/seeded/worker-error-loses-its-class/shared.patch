@@ -1,0 +1,11 @@
+--- a/src/pipeline/fan_in.rs
++++ b/src/pipeline/fan_in.rs
+@@ -138,7 +138,7 @@
+     on_err: impl FnOnce(&[String]) -> anyhow::Error,
+ ) -> anyhow::Error {
+     let (labels, mut causes): (Vec<String>, Vec<anyhow::Error>) = errors.into_iter().unzip();
+-    let worst = crate::error::worst_typed_failure_idx(&causes);
++    let worst: Option<usize> = None;
+     let mut lines: Vec<String> = labels
+         .iter()
+         .zip(&causes)

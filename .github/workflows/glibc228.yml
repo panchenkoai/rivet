@@ -19,6 +19,7 @@ on:
       - .github/workflows/glibc228.yml
       - .github/workflows/release.yml
       - dev/pytools/glibc_floor.py
+      - dev/pytools/pypi_wheels.py
 
 permissions:
   contents: read
@@ -127,4 +128,21 @@ jobs:
           for image in rockylinux:8 rockylinux:9 amazonlinux:2023 debian:bookworm apache/airflow:2.10.5 apache/airflow:3.3.2; do
             echo "== ${image}"
             docker run --rm --entrypoint /usr/local/bin/rivet -v "${bin}:/usr/local/bin/rivet:ro" "${image}" --version
+          done
+
+      # The `rivet-cli` wheel the release publishes to PyPI is packed from this very tarball:
+      # it must install with pip and run from the path `rivet_cli.path()` gives, in both Airflows.
+      - name: The rivet-cli wheel installs and runs in the Airflow images
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            x86_64-*)  platform=manylinux_2_28_x86_64 ;;
+            aarch64-*) platform=manylinux_2_28_aarch64 ;;
+          esac
+          python3 -m dev.pytools.pypi_wheels one --tarball dist/*.tar.gz --platform "${platform}" \
+            --tag "${RELEASE_TAG}" --out wheels
+          for image in apache/airflow:2.10.5 apache/airflow:3.3.2; do
+            echo "== ${image}"
+            docker run --rm -v "$PWD/wheels:/w:ro" --entrypoint bash "${image}" -c \
+              'pip install -q --no-deps /w/*.whl && b="$(python -c "import rivet_cli; print(rivet_cli.path())")" && echo "$b" && "$b" --version && "$(dirname "$b")/rivet-mcp" --version'
           done

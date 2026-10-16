@@ -935,6 +935,27 @@ pub(crate) fn destination_has_success(dest: &crate::config::DestinationConfig) -
     matches!(d.head(SUCCESS_FILENAME), Ok(Some(_)))
 }
 
+/// The `cursor_high` of the success manifest `export` left at `dest`; `None` when there is none, or it cannot be read.
+pub(super) fn last_success_cursor_high(
+    dest: &crate::config::DestinationConfig,
+    export: &str,
+) -> Option<String> {
+    use crate::manifest::{MANIFEST_FILENAME, ManifestStatus, RunManifest};
+    let d = crate::destination::create_destination(dest).ok()?;
+    if !d.capabilities().commit_protocol.leaves_objects_at_rest() {
+        return None;
+    }
+    let bytes = super::validate_manifest::read_capped(
+        &*d,
+        MANIFEST_FILENAME,
+        super::validate_manifest::MANIFEST_MAX_BYTES,
+    )
+    .ok()?;
+    let m: RunManifest = serde_json::from_slice(&bytes).ok()?;
+    (m.status == ManifestStatus::Success && m.export_name == export)
+        .then_some(m.source.extraction?.cursor_high?)
+}
+
 /// Whether a prior `manifest.json` names a completed run with parts; unparseable counts as yes.
 fn manifest_describes_completed_parts(bytes: &[u8]) -> bool {
     // A failed run's parts are durable too, and a re-run beside them double-counts.

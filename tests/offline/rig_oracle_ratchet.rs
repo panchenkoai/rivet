@@ -42,7 +42,8 @@ const NO_ORACLE_CEILING: usize = 21; // ratchet-pin: no-oracle-opt-outs
 // 40 -> 41 (2026-10-08): the sabotage cells that take a resource away from a live run (one shared declaration, `stopped_mid_run`): the parts, file_log rows and checkpoint rows written before the stop stay for the next run.
 // 41 -> 42 (2026-10-09): a load whose lease is lost after the warehouse write exits 3 and keeps its `failed` ledger row, which is what makes the table rivet's own.
 // 42 -> 43 (2026-10-14): the Mongo mid-stream outage cell's refuse-then-rerun path (nightly, Mongo 4.4: parts commit before the proxy drops, the retry is refused with exit 3): the committed parts, their file_log rows and the observed schema stay for the clean re-run that completes the export.
-const FAILED_RUN_LEFTOVER_CEILING: usize = 43; // ratchet-pin: failed-run-leftover-declarations
+// 43 -> 44 (2026-10-15): a refusal met by one parallel worker near the end of the key range (a_refusal_in_one_worker_exits_as_with_one_worker_*): the other workers' pages and chunks were written first, and their parts, file_log rows and observed schema stay.
+const FAILED_RUN_LEFTOVER_CEILING: usize = 44; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
 // 2 -> 1 (2026-10-08): a run that fails before its first write leaves the prefix alone, so a failed manifest before a write is a failure, no longer an excuse.

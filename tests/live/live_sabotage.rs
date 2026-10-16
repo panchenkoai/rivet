@@ -133,6 +133,28 @@ fn cursor_incomparable(engine: SqlEngine) {
     );
 }
 
+/// RIVET_STATE_CURSOR_PAST_MANIFEST: a stored cursor moved past the `cursor_high` of the destination's success manifest.
+fn cursor_past_manifest(engine: SqlEngine) {
+    let (table, mut rig, _guard) = cursor_edited(engine, &(N + 2).to_string());
+    rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_STATE_CURSOR_PAST_MANIFEST", 5),
+        vec![
+            Remedy::new(
+                &format!("`rivet state reset -c <config> --export {table}` starts"),
+                Then::DeliversTheSource,
+                |r| state(r, "reset", &table),
+            ),
+            Remedy::wrong(
+                "runs `rivet state reset-chunks`, the sibling of the command the text names",
+                Then::Refuses(Refused::by_code("RIVET_STATE_CURSOR_PAST_MANIFEST", 5)),
+                |r| state(r, "reset-chunks", &table),
+            ),
+        ],
+    );
+}
+
 /// RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table with no reset.
 fn cursor_stream_mismatch(engine: SqlEngine) {
     engine.alive();
@@ -673,10 +695,16 @@ fn cursor_edited(engine: SqlEngine, value: &str) -> (String, Rig, Box<dyn std::a
     (table, rig, guard)
 }
 
-/// The cursor moved back, or forward past rows the export never delivered: the run delivers the source or refuses.
+/// The cursor moved back: the run delivers the source or refuses.
 fn cursor_moved(engine: SqlEngine, value: i64) {
     let (_table, rig, _guard) = cursor_edited(engine, &value.to_string());
     rig.delivers_or_refuses(&["run"], &[]);
+}
+
+/// The cursor moved forward past rows the export never delivered: the run delivers the source, or is refused by code naming `rivet state reset`, which leads out.
+fn cursor_moved_forward(engine: SqlEngine) {
+    let (table, rig, _guard) = cursor_edited(engine, &(N + 2).to_string());
+    delivers_or_is_led_out(&rig, "rivet state reset", |r| state(r, "reset", &table));
 }
 
 /// A cursor value that is not of the cursor column's type: the run delivers the source, or is refused by code naming `rivet state reset`, which leads out.
@@ -2230,6 +2258,31 @@ fn a_stored_cursor_of_another_type_is_refused_and_walked_out_oracle() {
 }
 
 #[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_cursor_past_the_manifest_is_refused_and_walked_out_postgres() {
+    cursor_past_manifest(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_cursor_past_the_manifest_is_refused_and_walked_out_mysql() {
+    cursor_past_manifest(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_past_the_manifest_is_refused_and_walked_out_mssql() {
+    cursor_past_manifest(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_past_the_manifest_is_refused_and_walked_out_oracle() {
+    cursor_past_manifest(SqlEngine::Oracle);
+}
+
+#[test]
 #[ignore = "live: requires docker compose mysql"]
 fn a_changed_cursor_column_is_refused_and_walked_out_mysql() {
     cursor_owner_mismatch(SqlEngine::Mysql);
@@ -3024,21 +3077,28 @@ fn a_cursor_moved_back_delivers_or_refuses_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a cursor moved forward skips rows), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_moved_forward_delivers_or_refuses_postgres() {
-    cursor_moved(SqlEngine::Pg, N + 2);
+#[ignore = "live: requires docker compose postgres"]
+fn a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_postgres() {
+    cursor_moved_forward(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mysql; open defect (a cursor moved forward skips rows), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_moved_forward_delivers_or_refuses_mysql() {
-    cursor_moved(SqlEngine::Mysql, N + 2);
+#[ignore = "live: requires docker compose mysql"]
+fn a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mysql() {
+    cursor_moved_forward(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose mssql; open defect (a cursor moved forward skips rows), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_cursor_moved_forward_delivers_or_refuses_mssql() {
-    cursor_moved(SqlEngine::Mssql, N + 2);
+#[ignore = "live: requires docker compose mssql"]
+fn a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mssql() {
+    cursor_moved_forward(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_oracle() {
+    cursor_moved_forward(SqlEngine::Oracle);
 }
 
 #[test]
