@@ -3,11 +3,12 @@
 //! Responsibilities:
 //!
 //! 1. Deserialize `PlanArtifact` from the plan JSON file.
-//! 2. Check staleness (warn > 1 h, error > 24 h unless `--force`).
-//! 3. For `Incremental`: validate cursor has not drifted since plan time.
-//! 4. Execute using `ChunkSource::Precomputed` so chunk boundaries from the
+//! 2. Answer a replay of a plan that already applied to exit 0 with that run (unless `--force`).
+//! 3. Check staleness (warn > 1 h, error > 24 h unless `--force`).
+//! 4. For `Incremental`: validate cursor has not drifted since plan time.
+//! 5. Execute using `ChunkSource::Precomputed` so chunk boundaries from the
 //!    artifact are replayed without re-running `SELECT min/max` queries.
-//! 5. Persist outcomes (manifest, cursor, metrics) via `StateStore` as usual.
+//! 6. Persist outcomes (manifest, cursor, metrics) via `StateStore` as usual, and the plan id on the run that applied it.
 
 use chrono::Duration;
 use std::path::Path;
@@ -80,50 +81,7 @@ pub fn run_apply_command(
     // auditable record of bypassed gates (finding F5 of the 0.7.5 audit).
     let mut force_bypassed: Vec<String> = Vec::new();
 
-    // 2. Staleness check
-    let warn_threshold = Duration::hours(1);
-    let error_threshold = Duration::hours(24);
-    match artifact.staleness(warn_threshold, error_threshold) {
-        StalenessCheck::Fresh => {}
-        StalenessCheck::StaleWarn(age) => {
-            log::warn!(
-                "plan '{}' is {} minutes old — consider regenerating with `rivet plan`",
-                artifact.export_name,
-                age.num_minutes()
-            );
-        }
-        StalenessCheck::StaleError(age) => {
-            // F6 (0.7.5 audit): "56035 hours old" is mathematically
-            // correct but unreadable.  For ages above 48 h switch to
-            // days + the actual `created_at` date; below that keep
-            // hours so the boundary right above 24 h reads cleanly.
-            let age_phrase = if age.num_hours() >= 48 {
-                format!(
-                    "{} days old (created {})",
-                    age.num_days(),
-                    artifact.created_at.format("%Y-%m-%d")
-                )
-            } else {
-                format!("{} hours old", age.num_hours())
-            };
-            if !force {
-                crate::rivet_bail!(
-                    crate::error::codes::PLAN_ARTIFACT_STALE,
-                    "plan '{}' is {} (limit: 24 h). Regenerate with `rivet plan` or pass --force to override.",
-                    artifact.export_name,
-                    age_phrase,
-                );
-            }
-            force_bypassed.push("staleness".into());
-            log::warn!(
-                "plan '{}': ignoring staleness ({}) because --force was passed",
-                artifact.export_name,
-                age_phrase,
-            );
-        }
-    }
-
-    // 3. Open StateStore — F13 (0.7.5 audit) resolution policy:
+    // 2. Open StateStore — F13 (0.7.5 audit) resolution policy:
     //    a) If the artifact recorded the original config path AND that
     //       directory exists, open state next to it.  This is the only
     //       path that keeps `apply` consistent with `rivet run`'s state
@@ -168,7 +126,66 @@ pub fn run_apply_command(
     let state_path = state_dir.join(".rivet_state.db");
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
-    // 4. Cursor drift check for Incremental exports
+    // 3. A replay of a plan that already applied to exit 0 (a retry whose first
+    //    try died after rivet finished) answers with that run and extracts nothing.
+    if let Some(run_id) = state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)? {
+        if !force {
+            eprintln!("{}", already_applied_report(&state, &artifact, &run_id));
+            return Ok(());
+        }
+        force_bypassed.push("already_applied".into());
+        log::warn!(
+            "plan '{}': plan {} already applied by run {run_id} — extracting again because \
+             --force was passed",
+            artifact.export_name,
+            artifact.plan_id,
+        );
+    }
+
+    // 4. Staleness check
+    let warn_threshold = Duration::hours(1);
+    let error_threshold = Duration::hours(24);
+    match artifact.staleness(warn_threshold, error_threshold) {
+        StalenessCheck::Fresh => {}
+        StalenessCheck::StaleWarn(age) => {
+            log::warn!(
+                "plan '{}' is {} minutes old — consider regenerating with `rivet plan`",
+                artifact.export_name,
+                age.num_minutes()
+            );
+        }
+        StalenessCheck::StaleError(age) => {
+            // F6 (0.7.5 audit): "56035 hours old" is mathematically
+            // correct but unreadable.  For ages above 48 h switch to
+            // days + the actual `created_at` date; below that keep
+            // hours so the boundary right above 24 h reads cleanly.
+            let age_phrase = if age.num_hours() >= 48 {
+                format!(
+                    "{} days old (created {})",
+                    age.num_days(),
+                    artifact.created_at.format("%Y-%m-%d")
+                )
+            } else {
+                format!("{} hours old", age.num_hours())
+            };
+            if !force {
+                crate::rivet_bail!(
+                    crate::error::codes::PLAN_ARTIFACT_STALE,
+                    "plan '{}' is {} (limit: 24 h). Regenerate with `rivet plan` or pass --force to override.",
+                    artifact.export_name,
+                    age_phrase,
+                );
+            }
+            force_bypassed.push("staleness".into());
+            log::warn!(
+                "plan '{}': ignoring staleness ({}) because --force was passed",
+                artifact.export_name,
+                age_phrase,
+            );
+        }
+    }
+
+    // 5. Cursor drift check for Incremental exports
     //
     // Finding F1 of the 0.7.5 audit: the error message has always told the
     // user "pass --force to skip this check", but until 0.7.5 the code did
@@ -205,14 +222,14 @@ pub fn run_apply_command(
         }
     }
 
-    // 5. Build ChunkSource from the pre-computed ranges in the artifact
+    // 6. Build ChunkSource from the pre-computed ranges in the artifact
     let chunk_source = if artifact.computed.chunk_ranges.is_empty() {
         ChunkSource::Detect
     } else {
         ChunkSource::Precomputed(artifact.computed.chunk_ranges.clone())
     };
 
-    // 6. Execute using the plan from the artifact, carrying the apply audit
+    // 7. Execute using the plan from the artifact, carrying the apply audit
     // context into the run report (F5).
     let apply_context = ApplyContext {
         plan_id: artifact.plan_id.clone(),
@@ -238,6 +255,11 @@ pub fn run_apply_command(
         record_load_spec,
     );
     if result.is_ok()
+        && let Some(warning) = record_applied_plan(&state, &artifact, &summary.run_id)
+    {
+        log::warn!("{warning}");
+    }
+    if result.is_ok()
         && let Some(cfg_path) = artifact.config_path.as_deref()
         && let Some(config) = config.as_ref()
         && let Some(export) = config
@@ -251,7 +273,7 @@ pub fn run_apply_command(
         super::load_spec::record_after_run(config, export, &state, cfg_dir, None, &summary);
     }
 
-    // 7. The run's tail. This arm is a FULL orchestrator — it opens the state
+    // 8. The run's tail. This arm is a FULL orchestrator — it opens the state
     // store, drives one export to completion and writes its `export_metrics`
     // row — so it owes the same run-over-run self-check every other tail emits,
     // through the same seam (`run::self_check_throughput`: it holds the
@@ -280,6 +302,40 @@ pub fn run_apply_command(
         &super::run::RunModes::uniform(super::run::run_mode_label(1, false)),
     );
     result
+}
+
+/// Record that `run_id` applied this plan, so a replay answers with it; returns the warning of a miss (the replay then extracts again).
+fn record_applied_plan(
+    state: &StateStore,
+    artifact: &PlanArtifact,
+    run_id: &str,
+) -> Option<String> {
+    let why = match state.record_applied_plan(run_id, &artifact.plan_id) {
+        Ok(true) => return None,
+        Ok(false) => "no run-status row".to_string(),
+        Err(e) => format!("{e:#}"),
+    };
+    Some(format!(
+        "plan '{}': could not record that run {run_id} applied plan {} ({why}); a replay of this \
+         plan will extract again",
+        artifact.export_name, artifact.plan_id,
+    ))
+}
+
+/// The line `rivet apply` prints for a plan that run `run_id` already applied, with that run's outcome.
+fn already_applied_report(state: &StateStore, artifact: &PlanArtifact, run_id: &str) -> String {
+    let outcome = match state.get_metric_by_run_id(run_id) {
+        Ok(Some(m)) => format!(
+            "{}, {} rows, {} files, {} bytes, finished {}",
+            m.status, m.total_rows, m.files_produced, m.bytes_written, m.run_at
+        ),
+        _ => "its metrics row is not readable".into(),
+    };
+    format!(
+        "apply: plan {} of export '{}' was already applied by run {run_id} ({outcome}); nothing \
+         was extracted again. To extract new data, make a new plan with `rivet plan`.",
+        artifact.plan_id, artifact.export_name,
+    )
 }
 
 /// Finding #17: reject — with an actionable remedy — a plan whose source
@@ -540,6 +596,180 @@ mod tests {
             "expected cursor drift error: {msg}"
         );
         crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
+    }
+
+    // ── replay of an applied plan (retry matrix F3) ──────────────────────────
+
+    /// The state the plan's own apply left: run `r1` finished `status`, and recorded as the plan's run when it exited 0.
+    fn applied_state(dir: &tempfile::TempDir, artifact: &PlanArtifact, status: &str, exit0: bool) {
+        let state = StateStore::open(dir.path().join(".rivet_state.db").to_str().unwrap()).unwrap();
+        state
+            .begin_run("r1", "orders", "file:///out", "2026-01-01T00:00:00Z")
+            .unwrap();
+        state
+            .finish_run("r1", status, "2026-01-01T00:01:00Z")
+            .unwrap();
+        state
+            .record_metric_full(&crate::state::MetricRow {
+                export_name: "orders".into(),
+                run_id: "r1".into(),
+                total_rows: 1000,
+                status: status.into(),
+                files_produced: 2,
+                bytes_written: 4096,
+                ..Default::default()
+            })
+            .unwrap();
+        if exit0 {
+            assert!(state.record_applied_plan("r1", &artifact.plan_id).unwrap());
+        }
+        state.update_legacy("orders", "1010").unwrap();
+    }
+
+    /// `(run_status rows, export_metrics rows)` in the state next to the plan.
+    fn state_rows(dir: &tempfile::TempDir) -> (usize, usize) {
+        let state = StateStore::open(dir.path().join(".rivet_state.db").to_str().unwrap()).unwrap();
+        (
+            state.recent_run_status(100, false).unwrap().len(),
+            state.get_metrics(None, 100).unwrap().len(),
+        )
+    }
+
+    /// Replayed after its own apply exited 0, a plan answers with that run on every cycle and touches nothing — even when its snapshot cursor was moved by its own commit.
+    #[test]
+    fn a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing() {
+        for snapshot in [None, Some("1000")] {
+            let mut artifact = validation_refused_artifact();
+            artifact.computed.cursor_snapshot = snapshot.map(String::from);
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_artifact(&dir, &artifact);
+            applied_state(&dir, &artifact, "success", true);
+            let before = state_rows(&dir);
+            for cycle in 1..=2 {
+                run_apply_command(&path, false, false, false, None, false).unwrap_or_else(|e| {
+                    panic!("snapshot {snapshot:?}, replay {cycle}: already applied, got {e:#}")
+                });
+                assert_eq!(state_rows(&dir), before, "replay {cycle} wrote no run");
+            }
+        }
+    }
+
+    /// A plan whose run is refused by plan validation, before it connects: proof that the replay ran it.
+    fn validation_refused_artifact() -> PlanArtifact {
+        let mut plan = unreachable_plan();
+        plan.destination = DestinationConfig {
+            destination_type: DestinationType::Stdout,
+            ..Default::default()
+        };
+        plan.max_file_size_bytes = Some(1);
+        let a = fresh_artifact();
+        PlanArtifact::new(
+            a.export_name,
+            a.strategy,
+            a.plan_fingerprint,
+            plan,
+            a.computed,
+            a.diagnostics,
+        )
+    }
+
+    /// A plan whose run did not exit 0, another plan's run, and `--force` still run the plan.
+    #[test]
+    fn only_an_exit_zero_apply_of_the_same_plan_answers_a_replay() {
+        let artifact = validation_refused_artifact();
+        let ran = |err: anyhow::Error, what: &str| {
+            assert!(
+                format!("{err:#}").contains("max_file_size cannot be used with stdout"),
+                "{what}: the replay must run the plan, got {err:#}"
+            );
+        };
+        for (status, exit0, force) in [
+            ("failed", false, false),
+            ("interrupted", false, false),
+            ("running", true, false),
+            ("success", true, true),
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_artifact(&dir, &artifact);
+            applied_state(&dir, &artifact, status, exit0);
+            let err = run_apply_command(&path, force, false, false, None, false).unwrap_err();
+            ran(err, &format!("{status}, exit0 {exit0}, force {force}"));
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_artifact(&dir, &artifact);
+        applied_state(&dir, &validation_refused_artifact(), "success", true);
+        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+        ran(err, "another plan's run");
+    }
+
+    /// A drifted cursor with no applied run of this plan is still refused STALE.
+    #[test]
+    fn a_cursor_another_run_moved_is_still_refused_stale() {
+        let mut artifact = fresh_artifact();
+        artifact.computed.cursor_snapshot = Some("1000".into());
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_artifact(&dir, &artifact);
+        applied_state(&dir, &artifact, "success", false);
+        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
+        assert!(format!("{err:#}").contains("cursor has drifted"), "{err:#}");
+    }
+
+    /// The answer names the plan, the run and that run's outcome as its metrics row holds it, and the remedy.
+    #[test]
+    fn the_already_applied_report_names_the_plan_the_run_its_rows_and_the_remedy() {
+        let artifact = validation_refused_artifact();
+        let dir = tempfile::TempDir::new().unwrap();
+        applied_state(&dir, &artifact, "success", true);
+        let state = StateStore::open(dir.path().join(".rivet_state.db").to_str().unwrap()).unwrap();
+        let line = already_applied_report(&state, &artifact, "r1");
+        let (head, tail) = line.split_once(", finished ").expect(&line);
+        assert_eq!(
+            head,
+            format!(
+                "apply: plan {} of export 'orders' was already applied by run r1 (success, 1000 \
+                 rows, 2 files, 4096 bytes",
+                artifact.plan_id
+            )
+        );
+        assert!(
+            tail.ends_with(
+                "); nothing was extracted again. To extract new data, make a new plan with `rivet plan`."
+            ),
+            "{line}"
+        );
+        assert!(
+            already_applied_report(&state, &artifact, "r9")
+                .contains("(its metrics row is not readable)")
+        );
+    }
+
+    /// The run that applied a plan is found by it afterwards; a run id with no row is a warning, never a silent miss.
+    #[test]
+    fn an_exit_zero_apply_records_its_plan_and_a_missing_run_row_warns() {
+        let artifact = validation_refused_artifact();
+        let dir = tempfile::TempDir::new().unwrap();
+        applied_state(&dir, &artifact, "success", false);
+        let state = StateStore::open(dir.path().join(".rivet_state.db").to_str().unwrap()).unwrap();
+        assert_eq!(
+            state
+                .run_that_applied_plan("orders", &artifact.plan_id)
+                .unwrap(),
+            None
+        );
+        assert_eq!(record_applied_plan(&state, &artifact, "r1"), None);
+        assert_eq!(
+            state
+                .run_that_applied_plan("orders", &artifact.plan_id)
+                .unwrap()
+                .as_deref(),
+            Some("r1")
+        );
+        let warning = record_applied_plan(&state, &artifact, "r9").expect("no row for r9");
+        assert!(
+            warning.contains("(no run-status row); a replay of this plan will extract again"),
+            "{warning}"
+        );
     }
 
     // ── file I/O errors ──────────────────────────────────────────────────────

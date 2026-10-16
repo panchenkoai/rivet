@@ -219,6 +219,16 @@ guarantees:
       mongo: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_mongo, asserts: "`apply --resume` skipped the export whose last run never connected" }
       oracle: { test: a_wave_retry_reruns_the_export_whose_last_run_never_connected_oracle, asserts: "`apply --resume` skipped the export whose last run never connected" }
 
+  - id: a_replay_of_an_applied_plan_is_not_run_again
+    stated:
+      - file: docs/concepts.md
+        sentence: "A plan that already applied to exit 0 is not run again: a replay of the same artifact (a scheduler retry) exits 0 and names the run that applied it"
+    held_by:
+      postgres: { test: a_replayed_applied_full_plan_answers_with_its_run_postgres, asserts: "nothing written under the prefix" }
+      mysql: { test: a_replayed_applied_full_plan_answers_with_its_run_mysql, asserts: "nothing written under the prefix" }
+      mssql: { test: a_replayed_applied_full_plan_answers_with_its_run_mssql, asserts: "nothing written under the prefix" }
+      oracle: { test: a_replayed_applied_full_plan_answers_with_its_run_oracle, asserts: "nothing written under the prefix" }
+
   - id: run_resume_is_not_refused_over_a_marker_a_failed_run_left_alone
     stated:
       - file: docs/cloud-destinations.md

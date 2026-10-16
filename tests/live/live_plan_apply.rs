@@ -14,6 +14,7 @@
 //! | PA-L7 | Missing plan file → non-zero exit | PA1 |
 //! | PA-L8 | `plan --param` substitutes query parameter | PA1 — artifact embeds params |
 //! | PA-L9 | A degraded re-apply WARNs run-over-run | not ADR-0005 — the orchestrator-tail throughput self-check, which `apply` bypassed until round 7 |
+//! | PA-L10 | A replay of a plan that applied to exit 0 answers with its run, writes nothing; a died apply replays; another run's cursor move stays STALE | PA2, PA4 — retry matrix F3 |
 
 use crate::common::*;
 
@@ -1042,4 +1043,355 @@ fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
         "P-26: the sealed plan holds no `{{date}}` placeholder: its destination is frozen at the planning date, {:?}",
         dated[0].file_name().unwrap()
     );
+}
+
+// ─── PA-L10: a replay of a plan that already applied (retry matrix F3) ────────
+
+/// The export shape of a replay cell; `IncrementalAfterRun` plans after a `rivet run` stored a cursor, so the plan holds a snapshot its own apply moves.
+#[derive(Clone, Copy, Debug)]
+enum ReplayShape {
+    Full,
+    IncrementalFirst,
+    IncrementalAfterRun,
+    Chunked,
+    Keyset,
+}
+
+impl ReplayShape {
+    /// `rig` staged to this shape over the `id` key.
+    fn staged(self, engine: SqlEngine, rig: Rig) -> Rig {
+        match self {
+            ReplayShape::Full => engine.staged(rig, "full", &[]),
+            ReplayShape::IncrementalFirst | ReplayShape::IncrementalAfterRun => {
+                engine.staged(rig, "incremental", &["cursor_column: id"])
+            }
+            ReplayShape::Chunked => {
+                engine.staged(rig, "chunked", &["chunk_column: id", "chunk_size: 5"])
+            }
+            ReplayShape::Keyset => {
+                engine.staged(rig, "chunked", &["chunk_by_key: id", "chunk_size: 5"])
+            }
+        }
+    }
+}
+
+/// The run ids the `manifest-<run_id>.json` copies among `objects` name.
+fn manifest_run_ids(objects: &[String]) -> std::collections::BTreeSet<String> {
+    objects
+        .iter()
+        .filter_map(|o| {
+            let leaf = o.rsplit('/').next()?;
+            Some(
+                leaf.strip_prefix("manifest-")?
+                    .strip_suffix(".json")?
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A replay cell's stand: a 20-row range table, a rig on a unique GCS prefix, and the `url_env` the artifact resolves.
+struct ReplayStand {
+    gcs: BqLive,
+    rig: Rig,
+    table: String,
+    url: &'static str,
+    _table_guard: Box<dyn std::any::Any>,
+    plan_dir: tempfile::TempDir,
+}
+
+impl ReplayStand {
+    /// The stand, or `None` (recorded as a skip) without a Google credential.
+    fn new(engine: SqlEngine, shape: ReplayShape) -> Option<Self> {
+        engine.alive();
+        let gcs = BqLive::from_env("apply_replay")?;
+        let (table, guard) = engine.range_table("apr");
+        engine.insert(&table, 1..=20, 60, None);
+        let rig = shape.staged(
+            engine,
+            engine
+                .rig(&table)
+                .source_url_env("DATABASE_URL")
+                .dest_gcs_live(&gcs.bucket, &gcs.prefix),
+        );
+        Some(Self {
+            gcs,
+            rig,
+            table,
+            url: engine.url(),
+            _table_guard: guard,
+            plan_dir: tempfile::tempdir().unwrap(),
+        })
+    }
+
+    fn envs(&self) -> [(&str, &str); 1] {
+        [("DATABASE_URL", self.url)]
+    }
+
+    /// `rivet plan` into this stand's plan file.
+    fn plan(&self) -> std::path::PathBuf {
+        let plan = self.plan_dir.path().join("plan.json");
+        let out = self.rig.plan_json_env(&plan, &[], &self.envs());
+        assert!(
+            out.status.success(),
+            "rivet plan: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        plan
+    }
+
+    /// `rivet apply <plan>` with `envs` added.
+    fn apply(&self, plan: &std::path::Path, envs: &[(&str, &str)]) -> std::process::Output {
+        let mut all = self.envs().to_vec();
+        all.extend_from_slice(envs);
+        self.rig.apply_env(plan, &[], &all)
+    }
+
+    /// Every object under the stand's prefix, sorted.
+    fn objects(&self) -> Vec<String> {
+        let mut o = self.gcs.gcs_objects();
+        o.sort();
+        o
+    }
+}
+
+/// F3: a sealed plan replayed after its own apply exited 0 (a scheduler retry whose first try died after rivet finished)
+/// extracts nothing, writes nothing under the prefix, exits 0 and names the run that applied it with that run's rows, on every replay.
+fn a_replayed_applied_plan_answers_with_its_run(engine: SqlEngine, shape: ReplayShape) {
+    let Some(stand) = ReplayStand::new(engine, shape) else {
+        return;
+    };
+    let mut planned_rows = 20;
+    if let ReplayShape::IncrementalAfterRun = shape {
+        let out = stand.rig.run_args_env(&[], &stand.envs());
+        assert!(
+            out.status.success(),
+            "rivet run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        engine.insert(&stand.table, 21..=30, 60, None);
+        planned_rows = 10;
+    }
+    let plan = stand.plan();
+    let before = manifest_run_ids(&stand.objects());
+    let out = stand.apply(&plan, &[]);
+    assert!(
+        out.status.success(),
+        "{shape:?}: the apply: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let applied = stand.objects();
+    let runs: Vec<String> = manifest_run_ids(&applied)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert_eq!(
+        runs.len(),
+        1,
+        "{shape:?}: one run applied the plan: {runs:?}"
+    );
+    let named = format!(
+        "was already applied by run {} (success, {planned_rows} rows,",
+        runs[0]
+    );
+    for cycle in 1..=2 {
+        let replay = stand.apply(&plan, &[]);
+        let stderr = String::from_utf8_lossy(&replay.stderr);
+        assert!(
+            replay.status.success(),
+            "{shape:?}, replay {cycle}: an applied plan exits 0, got {:?}: {stderr}",
+            replay.status.code()
+        );
+        assert_eq!(
+            stand.objects(),
+            applied,
+            "{shape:?}, replay {cycle}: nothing written under the prefix"
+        );
+        assert!(
+            stderr.contains(&named),
+            "{shape:?}, replay {cycle}: names `{named}`: {stderr}"
+        );
+    }
+}
+
+/// A plan whose apply died mid-run is replayed for real: a new run writes its manifest and nothing answers "already applied".
+fn a_replayed_plan_whose_apply_died_extracts(engine: SqlEngine) {
+    let Some(stand) = ReplayStand::new(engine, ReplayShape::Full) else {
+        return;
+    };
+    let plan = stand.plan();
+    let died = stand.apply(&plan, &[("RIVET_TEST_PANIC_AT", "after_file_write")]);
+    assert_eq!(
+        died.status.code(),
+        Some(101),
+        "the apply dies at the hook: {}",
+        String::from_utf8_lossy(&died.stderr)
+    );
+    let before = manifest_run_ids(&stand.objects());
+    let replay = stand.apply(&plan, &[]);
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(replay.status.success(), "the replay runs: {stderr}");
+    assert!(!stderr.contains("already applied"), "{stderr}");
+    let new = manifest_run_ids(&stand.objects())
+        .difference(&before)
+        .count();
+    assert_eq!(new, 1, "the replay is a new run with its own manifest");
+}
+
+/// A plan whose snapshot cursor ANOTHER run moved is still refused `RIVET_PLAN_ARTIFACT_STALE`.
+fn a_plan_whose_cursor_another_run_moved_is_refused_stale(engine: SqlEngine) {
+    let Some(stand) = ReplayStand::new(engine, ReplayShape::IncrementalAfterRun) else {
+        return;
+    };
+    let run = || {
+        let out = stand.rig.run_args_env(&[], &stand.envs());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run();
+    let plan = stand.plan();
+    engine.insert(&stand.table, 21..=30, 60, None);
+    run();
+    let out = stand.apply(&plan, &[]);
+    assert_refused(&out, Refused::by_code("RIVET_PLAN_ARTIFACT_STALE", 5));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cursor has drifted"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_applied_full_plan_answers_with_its_run_postgres() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::Full);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_applied_first_incremental_plan_answers_with_its_run_postgres() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::IncrementalFirst);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_applied_incremental_plan_answers_with_its_run_postgres() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::IncrementalAfterRun);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_applied_chunked_plan_answers_with_its_run_postgres() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::Chunked);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_applied_keyset_plan_answers_with_its_run_postgres() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::Keyset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_plan_whose_apply_died_extracts_postgres() {
+    a_replayed_plan_whose_apply_died_extracts(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
+fn a_plan_whose_cursor_another_run_moved_is_refused_stale_postgres() {
+    a_plan_whose_cursor_another_run_moved_is_refused_stale(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_applied_full_plan_answers_with_its_run_mysql() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::Full);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_applied_first_incremental_plan_answers_with_its_run_mysql() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::IncrementalFirst);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_applied_incremental_plan_answers_with_its_run_mysql() {
+    a_replayed_applied_plan_answers_with_its_run(
+        SqlEngine::Mysql,
+        ReplayShape::IncrementalAfterRun,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_applied_chunked_plan_answers_with_its_run_mysql() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::Chunked);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_applied_keyset_plan_answers_with_its_run_mysql() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::Keyset);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_plan_whose_apply_died_extracts_mysql() {
+    a_replayed_plan_whose_apply_died_extracts(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_plan_whose_cursor_another_run_moved_is_refused_stale_mysql() {
+    a_plan_whose_cursor_another_run_moved_is_refused_stale(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql + GCS"]
+fn a_replayed_applied_full_plan_answers_with_its_run_mssql() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mssql, ReplayShape::Full);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql + GCS"]
+fn a_replayed_applied_incremental_plan_answers_with_its_run_mssql() {
+    a_replayed_applied_plan_answers_with_its_run(
+        SqlEngine::Mssql,
+        ReplayShape::IncrementalAfterRun,
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql + GCS"]
+fn a_replayed_applied_keyset_plan_answers_with_its_run_mssql() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mssql, ReplayShape::Keyset);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle + GCS"]
+fn a_replayed_applied_full_plan_answers_with_its_run_oracle() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Oracle, ReplayShape::Full);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle + GCS"]
+fn a_replayed_applied_incremental_plan_answers_with_its_run_oracle() {
+    a_replayed_applied_plan_answers_with_its_run(
+        SqlEngine::Oracle,
+        ReplayShape::IncrementalAfterRun,
+    );
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle + GCS"]
+fn a_replayed_applied_keyset_plan_answers_with_its_run_oracle() {
+    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Oracle, ReplayShape::Keyset);
 }

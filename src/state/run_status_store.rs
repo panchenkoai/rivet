@@ -197,6 +197,29 @@ impl StateStore {
         })
     }
 
+    /// Record that `run_id` applied the sealed plan `plan_id` to exit 0; returns whether a run row took it.
+    pub fn record_applied_plan(&self, run_id: &str, plan_id: &str) -> Result<bool> {
+        let n = self.execute(
+            "UPDATE run_status SET plan_id = ?2 WHERE run_id = ?1",
+            &[run_id.into(), plan_id.into()],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The newest finished run of `export_name` that applied the sealed plan `plan_id` to exit 0.
+    pub fn run_that_applied_plan(
+        &self,
+        export_name: &str,
+        plan_id: &str,
+    ) -> Result<Option<String>> {
+        self.query_opt(
+            "SELECT run_id FROM run_status WHERE export_name = ?1 AND plan_id = ?2 \
+             AND status IN ('success', 'skipped') ORDER BY started_at DESC LIMIT 1",
+            &[export_name.into(), plan_id.into()],
+            |r| r.text(0),
+        )
+    }
+
     /// Record the source `run_id` reads, which scopes the run lease that closes its row if it dies.
     pub fn record_run_source(&self, run_id: &str, source: &str) -> Result<()> {
         self.execute(
