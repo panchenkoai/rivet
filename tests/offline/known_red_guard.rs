@@ -14,7 +14,8 @@ const LEDGER: &str = "dev/release_oracle/known_red.py";
 // 12 -> 9 (2026-10-15): a stored cursor past the destination's success manifest is refused by code (-3).
 // 9 -> 8 (2026-10-16): the Azure removed-container cell is a plain cell again (fix/azure-missing-container-is-persistent).
 // 8 -> 7 (2026-10-16): the PostgreSQL out-of-descriptors cell is a plain cell again (fix/postgres-client-runtime-is-coded).
-const ENTRY_CEILING: usize = 6; // ratchet-pin: known-red-entries
+// 6 -> 10 (2026-10-16): the dropped-source-table cells on four SQL engines (fix/dropped-source-table-is-coded).
+const ENTRY_CEILING: usize = 10; // ratchet-pin: known-red-entries
 
 /// The horizon every `_open` entry expires at; moves only here and in the ledger together.
 const EXPIRES: &str = "2026-10-31"; // pinned: the ledger's `_EXPIRES`, moved only together with it
