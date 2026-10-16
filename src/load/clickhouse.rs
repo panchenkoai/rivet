@@ -363,7 +363,13 @@ impl TargetLoader for ClickhouseLoader {
         format!("{}.{}", self.database, table)
     }
 
-    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
+    fn materialize(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        uris: &[String],
+        _expected_rows: Option<u64>,
+    ) -> Result<u64> {
         if let Some(c) = unsafe_column(&self.cluster_by) {
             return Err(super::refused(
                 crate::error::codes::LOAD_IDENTIFIER_UNSAFE,
@@ -1954,7 +1960,7 @@ J10BsZgn5wxFlM4=
             crate::config::DestinationConfig::default(),
         )
         .cluster_by(vec!["a b".into()]);
-        let e = loader.materialize("t", &[], &[]).unwrap_err();
+        let e = loader.materialize("t", &[], &[], None).unwrap_err();
         assert!(e.is::<crate::load::Refused>(), "{e:#}");
         assert_eq!(
             crate::error::error_code(&e),

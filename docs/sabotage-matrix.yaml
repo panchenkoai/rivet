@@ -853,6 +853,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no range-chunk checkpoint" }
     oracle:   { test: run_resume_over_a_replaced_committed_part_delivers_or_refuses_oracle }
 
+  - id: corrupt_staged_part_snowflake_full_load
+    what: "a Snowflake full load over a run whose staged part is unreadable: the COPY fails, the table keeps the rows the last load landed (read through DuckDB's snowflake extension) and no staging table is left; the next export and load land the source"
+    postgres: { test: snowflake_full_load_that_fails_keeps_the_last_table_postgres }
+    mysql:    { test: snowflake_full_load_that_fails_keeps_the_last_table_mysql }
+    mssql:    { na: "the load never reads the source engine: one code path, carried by the postgres and mysql cells" }
+    mongo:    { na: "the load never reads the source engine: one code path, carried by the postgres and mysql cells" }
+    oracle:   { na: "the load never reads the source engine: one code path, carried by the postgres and mysql cells" }
+
   - id: kill_full
     what: "the process killed at each named point of a run (`mode: full`; points: after_source_read, after_file_write, after_manifest_update): between the crash and the recovery `state show`, `state chunks` and `state runs` answer and `validate` passes or fails loudly, then a plain run delivers the source and `validate` passes"
     postgres: { test: a_full_run_killed_at_each_point_recovers_postgres }

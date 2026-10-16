@@ -910,7 +910,7 @@ fn materialize_refuses_too_many_cluster_columns() {
         "e".into(),
     ]);
     let err = l
-        .materialize("t", &[spec("id", None, TargetStatus::Ok)], &uris())
+        .materialize("t", &[spec("id", None, TargetStatus::Ok)], &uris(), None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("clustering"), "{err}");
@@ -924,7 +924,7 @@ fn materialize_refuses_a_non_identifier_cluster_column() {
     // gate for the BigQuery shape clause.
     let l = BigQueryLoader::new("p", "d").clustered_on(vec!["id) FROM secrets; --".into()]);
     let err = l
-        .materialize("t", &[spec("id", None, TargetStatus::Ok)], &uris())
+        .materialize("t", &[spec("id", None, TargetStatus::Ok)], &uris(), None)
         .unwrap_err()
         .to_string();
     assert!(

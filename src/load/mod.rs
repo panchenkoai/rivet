@@ -126,8 +126,15 @@ pub trait TargetLoader {
     fn fqtn(&self, table: &str) -> String;
 
     /// Overwrite `table` with the Parquet at `uris`, materializing the native
-    /// column types in `specs`. Returns the rows the load landed.
-    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64>;
+    /// column types in `specs`. Returns the rows the load landed; an adapter that
+    /// lands beside the table refuses `expected_rows` mismatches before it swaps in.
+    fn materialize(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        uris: &[String],
+        expected_rows: Option<u64>,
+    ) -> Result<u64>;
 
     /// Append the CDC change Parquet into `<table>__changes` (created if absent),
     /// prepending the `__op` / `__pos` / `__seq` meta columns to `specs`. Returns
@@ -657,18 +664,8 @@ pub fn run_load(
         ownership,
     ))?;
 
-    let rows_loaded = loader.materialize(table, specs, uris)?;
-
-    if let Some(expected) = expected_rows
-        && rows_loaded != expected
-    {
-        crate::rivet_bail!(
-            crate::error::codes::LOAD_COUNT_MISMATCH,
-            "count validation failed for `{}`: loaded {rows_loaded} rows, expected {expected} — \
-             NOT cleaning up source; investigate before re-running",
-            loader.fqtn(table)
-        );
-    }
+    let rows_loaded = loader.materialize(table, specs, uris, expected_rows)?;
+    check_loaded_rows(&loader.fqtn(table), rows_loaded, expected_rows)?;
 
     let source_cleaned = maybe_cleanup(cleanup);
     Ok(LoadReport {
@@ -676,6 +673,20 @@ pub fn run_load(
         target_table: loader.fqtn(table),
         source_cleaned,
     })
+}
+
+/// Refuse a whole-table load that landed another row count than its runs declare.
+pub(crate) fn check_loaded_rows(fqtn: &str, rows_loaded: u64, expected: Option<u64>) -> Result<()> {
+    if let Some(expected) = expected
+        && rows_loaded != expected
+    {
+        crate::rivet_bail!(
+            crate::error::codes::LOAD_COUNT_MISMATCH,
+            "count validation failed for `{fqtn}`: loaded {rows_loaded} rows, expected {expected} — \
+             NOT cleaning up source; investigate before re-running"
+        );
+    }
+    Ok(())
 }
 
 /// Everything a whole-table load checks before it writes.
@@ -1410,7 +1421,13 @@ pub(crate) mod tests {
             self.counts.borrow_mut().insert(changes, rows);
             Ok(())
         }
-        fn materialize(&self, table: &str, _: &[TargetColumnSpec], _: &[String]) -> Result<u64> {
+        fn materialize(
+            &self,
+            table: &str,
+            _: &[TargetColumnSpec],
+            _: &[String],
+            _: Option<u64>,
+        ) -> Result<u64> {
             self.wrote(format!("materialize {table}"));
             self.kinds
                 .borrow_mut()
@@ -1979,8 +1996,14 @@ pub(crate) mod tests {
             fn adopt_as_changelog(&self, t: &str) -> Result<()> {
                 self.0.adopt_as_changelog(t)
             }
-            fn materialize(&self, t: &str, s: &[TargetColumnSpec], u: &[String]) -> Result<u64> {
-                self.0.materialize(t, s, u)
+            fn materialize(
+                &self,
+                t: &str,
+                s: &[TargetColumnSpec],
+                u: &[String],
+                n: Option<u64>,
+            ) -> Result<u64> {
+                self.0.materialize(t, s, u, n)
             }
             fn append_changelog(
                 &self,

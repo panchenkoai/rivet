@@ -45,6 +45,91 @@ fn a_full_load_lands_and_the_next_cycle_follows_the_source(e: SqlEngine) {
     load_ok(&rig);
 }
 
+/// A full load onto a free name lands the source; a later full load whose COPY fails keeps the table the last load landed and leaves no other table behind; the next cycle lands the source again and keeps the table's grants.
+fn a_full_load_that_fails_keeps_the_last_table(e: SqlEngine) {
+    let Some(sf) = SfLive::from_env("sf_keep") else {
+        return;
+    };
+    e.alive();
+    let (table, _guard) = e.create(
+        "sf_keep",
+        &format!("id {0} NOT NULL PRIMARY KEY, v {0} NOT NULL", e.int64()),
+    );
+    for id in 1..=20 {
+        e.exec(&format!(
+            "INSERT INTO {table} (id, v) VALUES ({id}, {})",
+            id * 10
+        ));
+    }
+    let _cleanup = sf.cleanup(&[&table]);
+    let rig = e
+        .rig(&table)
+        .dest_gcs_live(&sf.bucket, &sf.prefix)
+        .top_line(&sf.load_line(""))
+        .a_failed_run_may_leave(
+            &[Leftover::LoadAttempt],
+            "the COPY of the corrupted parts fails after the load began writing",
+        );
+    rig.run_ok();
+    load_ok(&rig);
+    let first = e.id_v_pairs(&table);
+    assert_eq!(
+        sf.id_v_pairs(&table),
+        first,
+        "the first load lands the source"
+    );
+    assert_eq!(sf.names_from(&table), [table.to_uppercase()]);
+    sf.exec(&format!(
+        "GRANT SELECT ON TABLE {} TO ROLE PUBLIC",
+        sf.fq(&table)
+    ));
+
+    e.exec(&format!("DELETE FROM {table} WHERE id = 3"));
+    e.exec(&format!("UPDATE {table} SET v = 41 WHERE id = 4"));
+    e.exec(&format!("INSERT INTO {table} (id, v) VALUES (21, 210)"));
+    let before = sf.gcs_objects();
+    rig.run_ok();
+    let parts: Vec<String> = sf
+        .gcs_objects()
+        .into_iter()
+        .filter(|o| o.ends_with(".parquet") && !before.contains(o))
+        .collect();
+    assert!(!parts.is_empty(), "the second run wrote parts");
+    for part in &parts {
+        sf.corrupt(part);
+    }
+    let out = rig.cli(&["load"]);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "a load of unreadable parts fails: {said}"
+    );
+    assert_eq!(
+        sf.id_v_pairs(&table),
+        first,
+        "the failed load keeps the rows the last load landed: {said}"
+    );
+    assert_eq!(
+        sf.names_from(&table),
+        [table.to_uppercase()],
+        "the failed load leaves no other table behind"
+    );
+
+    rig.run_ok();
+    load_ok(&rig);
+    assert_eq!(
+        sf.id_v_pairs(&table),
+        e.id_v_pairs(&table),
+        "the next cycle lands the source"
+    );
+    assert_eq!(sf.names_from(&table), [table.to_uppercase()]);
+    let grants = sf.grants(&table);
+    assert!(
+        grants.iter().any(|g| g == "SELECT PUBLIC"),
+        "a grant on the table survives a full load: {grants:?}"
+    );
+}
+
 /// An incremental export first lands as a table; its first delta turns the name into a view over `<table>__changes`, and a whole pass after `state reset` joins the log.
 fn an_incremental_load_starts_a_table_then_a_change_log(e: SqlEngine) {
     let Some(sf) = SfLive::from_env("sf_inc") else {
@@ -184,6 +269,18 @@ fn snowflake_full_load_lands_and_the_next_cycle_follows_the_source_postgres() {
 #[ignore = "live: requires docker compose up -d mysql + Snowflake creds"]
 fn snowflake_full_load_lands_and_the_next_cycle_follows_the_source_mysql() {
     a_full_load_lands_and_the_next_cycle_follows_the_source(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d postgres + Snowflake creds"]
+fn snowflake_full_load_that_fails_keeps_the_last_table_postgres() {
+    a_full_load_that_fails_keeps_the_last_table(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose up -d mysql + Snowflake creds"]
+fn snowflake_full_load_that_fails_keeps_the_last_table_mysql() {
+    a_full_load_that_fails_keeps_the_last_table(SqlEngine::Mysql);
 }
 
 #[test]

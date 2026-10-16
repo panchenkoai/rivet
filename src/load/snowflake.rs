@@ -187,7 +187,13 @@ impl TargetLoader for SnowflakeLoader {
         format!("{}.{}.{}", self.database, self.schema, table)
     }
 
-    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
+    fn materialize(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        uris: &[String],
+        expected_rows: Option<u64>,
+    ) -> Result<u64> {
         if uris.is_empty() {
             return Err(super::refused(
                 crate::error::codes::LOAD_EMPTY_RUN_UNSUPPORTED,
@@ -198,12 +204,19 @@ impl TargetLoader for SnowflakeLoader {
                 ),
             ));
         }
-        let sql = super::before_write(self.build_materialize_sql(table, specs, uris))?;
-        let result = self.run_snow(&sql)?;
-        // ponytail: rows via COUNT(*); can become the COPY's `rows_loaded`
-        // (metadata) behind this seam, no driver change.
-        extract_count(&result)
-            .context("COPY ran but the row count could not be read from snow output")
+        let staging = staging_table(table);
+        let sql = super::before_write(self.build_materialize_sql(table, &staging, specs, uris))?;
+        let landed = self.run_snow(&sql).and_then(|result| {
+            let rows = extract_count(&result)
+                .context("COPY ran but the row count could not be read from snow output")?;
+            super::check_loaded_rows(&self.fqtn(table), rows, expected_rows)?;
+            self.run_snow(&self.build_clone_in_sql(table, &staging))?;
+            Ok(rows)
+        });
+        if landed.is_err() {
+            self.drop_staging(&staging);
+        }
+        landed
     }
 
     fn append_changelog(
@@ -295,25 +308,15 @@ impl TargetLoader for SnowflakeLoader {
 }
 
 impl SnowflakeLoader {
-    /// Probe whose `KIND_` is `1·table + 2·view + 4·other` for `table`.
-    /// The overwrite script, as ONE `snow` invocation.
-    ///
-    /// Behind a `build_*` seam like every other statement this adapter sends, so the
-    /// ORDER of the statements is gradeable offline — there is no Snowflake in the
-    /// stand and no live test anywhere, so the string is the only thing a test can
-    /// hold. The order it pins today is deliberate to RECORD, not to bless:
-    /// `CREATE OR REPLACE TABLE` runs BEFORE the `COPY`, so a COPY that fails leaves
-    /// the target replaced and EMPTY — the rows a previous successful load put there
-    /// are gone. BigQuery's sibling never does this (`LOAD DATA OVERWRITE` replaces
-    /// only on success). Changing it means loading into a staging table and swapping,
-    /// which is a behaviour change to a warehouse nothing here can exercise.
+    /// The landing script: COPY the parts into the fresh `staging` table and count it; `table` is not touched.
     fn build_materialize_sql(
         &self,
         table: &str,
+        staging: &str,
         specs: &[TargetColumnSpec],
         uris: &[String],
     ) -> Result<String> {
-        let fqtn = self.fqtn(table);
+        let staging = self.fqtn(staging);
         let ddl = Self::build_schema_ddl(specs);
         let select = Self::build_copy_select(specs);
         let columns = Self::build_column_list(specs);
@@ -325,8 +328,7 @@ impl SnowflakeLoader {
         let files = copy_files_clause(&self.gcs_url, uris)?;
         let cluster = Self::cluster_clause(&self.cluster_keys());
 
-        // `CREATE OR REPLACE` (overwrite): storage is the source of truth. Pin
-        // the session to UTC before the COPY — Snowflake otherwise stamps a
+        // Pin the session to UTC before the COPY — Snowflake otherwise stamps a
         // Parquet timestamp with the session offset, shifting a `timestamptz`.
         let sql = format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
@@ -334,11 +336,11 @@ impl SnowflakeLoader {
              USE WAREHOUSE {wh};\n\
              USE SCHEMA {db}.{sc};\n\
              CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT={PARQUET_FORMAT};\n\
-             CREATE OR REPLACE TABLE {fqtn} (\n{ddl}\n){cluster};\n\
-             COPY INTO {fqtn} ({columns})\n\
+             CREATE TABLE {staging} (\n{ddl}\n){cluster};\n\
+             COPY INTO {staging} ({columns})\n\
              \x20 FROM (SELECT {select} FROM @{stage})\n\
              \x20 FILE_FORMAT={PARQUET_FORMAT} {files};\n\
-             SELECT COUNT(*) AS ROWS_ FROM {fqtn};",
+             SELECT COUNT(*) AS ROWS_ FROM {staging};",
             tag = self.query_tag(table),
             wh = self.warehouse,
             db = self.database,
@@ -348,6 +350,26 @@ impl SnowflakeLoader {
         );
 
         Ok(sql)
+    }
+
+    /// The publish script: `table` becomes a zero-copy clone of the loaded `staging` in one statement, keeping the grants made on it; then `staging` is dropped.
+    fn build_clone_in_sql(&self, table: &str, staging: &str) -> String {
+        format!(
+            "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
+             CREATE OR REPLACE TABLE {fqtn} CLONE {staging} COPY GRANTS;\n\
+             DROP TABLE {staging};",
+            tag = self.query_tag(table),
+            fqtn = self.fqtn(table),
+            staging = self.fqtn(staging),
+        )
+    }
+
+    /// Drop a load's staging table after a failure; one that cannot be dropped is named for the operator.
+    fn drop_staging(&self, staging: &str) {
+        let fq = self.fqtn(staging);
+        if let Err(e) = self.run_snow(&format!("DROP TABLE IF EXISTS {fq};")) {
+            eprintln!("  note: could not drop the staging table `{fq}` ({e:#}); drop it by hand");
+        }
     }
 
     /// The re-baseline probe, as one `snow` invocation.
@@ -589,6 +611,12 @@ fn needs_parse_json(spec: &TargetColumnSpec) -> bool {
     spec.target_type == TargetType::Snowflake(SfType::Variant)
 }
 
+/// A staging table name of `table` no earlier load used: `<table>__rivet_load_<16 hex>`.
+fn staging_table(table: &str) -> String {
+    use rand::RngExt;
+    format!("{table}__rivet_load_{:016x}", rand::rng().random::<u64>())
+}
+
 /// Keep a table name safe for a stage name / query tag (alnum + underscore).
 fn sanitize_tag(s: &str) -> String {
     s.chars()
@@ -732,12 +760,14 @@ mod tests {
         let many: Vec<String> = (0..1001)
             .map(|i| format!("gs://b/p/f{i}.parquet"))
             .collect();
-        let l = adoption_loader();
+        let stand = Stand::scripted(&[]);
+        let l = stand.loader();
         for (uris, code, exit) in [
             (Vec::new(), "RIVET_LOAD_EMPTY_RUN_UNSUPPORTED", 5),
             (many, "RIVET_LOAD_FILE_LIMIT_EXCEEDED", 1),
         ] {
-            let e = l.materialize("t", &specs, &uris).unwrap_err();
+            let e = l.materialize("t", &specs, &uris, None).unwrap_err();
+            assert!(stand.sent().is_empty(), "{code}: {:?}", stand.sent());
             assert!(e.is::<crate::load::Refused>(), "{code}: {e:#}");
             assert_eq!(
                 (
@@ -961,7 +991,8 @@ mod tests {
             l.gcs_url = url.into();
             l.storage_integration = "RIVET_GCS".into();
             let scripts = [
-                l.build_materialize_sql("orders", &specs, &uris).unwrap(),
+                l.build_materialize_sql("orders", "orders__rivet_load_0", &specs, &uris)
+                    .unwrap(),
                 l.build_append_changelog_sql("orders", &specs, &uris)
                     .unwrap(),
             ];
@@ -1018,41 +1049,6 @@ mod tests {
         assert!(
             sql.contains("orders__changes"),
             "and it must probe the change log, not the base: {sql}"
-        );
-    }
-
-    /// The overwrite script REPLACES the table before the COPY — recorded, not blessed.
-    ///
-    /// This pins today's statement order so the hazard is a fact a reader inherits
-    /// rather than rediscovers: `CREATE OR REPLACE TABLE` runs first, so a COPY that
-    /// fails leaves the target EMPTY and the rows a previous successful load put
-    /// there are gone. BigQuery's sibling cannot do this — `LOAD DATA OVERWRITE`
-    /// replaces only on success. Making Snowflake match means loading into a staging
-    /// table and swapping, which is a behaviour change to a warehouse that has no
-    /// stand service and no live test anywhere in this repo; this string is the only
-    /// oracle available, which is exactly why the SQL was put behind a `build_*` seam.
-    #[test]
-    fn the_overwrite_script_replaces_the_table_before_the_copy() {
-        let mut l = adoption_loader();
-        l.gcs_url = "gcs://bkt/exports/orders/".into();
-        l.storage_integration = "RIVET_GCS".into();
-        let sql = l
-            .build_materialize_sql(
-                "orders",
-                &[col("id", SfType::NumberPs(38, 0))],
-                &["gs://bkt/exports/orders/part-0.parquet".to_string()],
-            )
-            .expect("the overwrite script builds");
-
-        let replace = sql
-            .find("CREATE OR REPLACE TABLE")
-            .expect("the script creates the target");
-        let copy = sql.find("COPY INTO").expect("the script copies into it");
-        assert!(
-            replace < copy,
-            "today the table is replaced BEFORE the copy, so a failed COPY empties a \
-             previously loaded table. If this assertion is what broke, the order was \
-             fixed and the doc above should go with it: {sql}"
         );
     }
 
@@ -1135,6 +1131,134 @@ mod tests {
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect()
         }
+    }
+
+    /// The staging table a script names after `prefix`, up to the next `;`, space or `(`.
+    fn staging_in(sql: &str, prefix: &str) -> String {
+        let at = sql
+            .find(prefix)
+            .unwrap_or_else(|| panic!("{prefix} in {sql}"));
+        sql[at..]
+            .split([';', ' ', '('])
+            .next()
+            .expect("a name")
+            .to_string()
+    }
+
+    /// A full load lands in a fresh staging table and clones it over the table only after the COPY and the count; any failure before leaves the table alone and drops the staging table.
+    #[test]
+    fn a_full_load_swaps_in_only_a_counted_copy_and_drops_its_staging_table() {
+        let specs = [col("id", SfType::NumberPs(38, 0))];
+        let uris = ["gs://bkt/exports/orders/part-0.parquet".to_string()];
+        let rows = |n: u64| format!(r#"[[{{"status":"ok"}}],[{{"ROWS_":{n}}}]]"#);
+        let (two, three) = (rows(2), rows(3));
+        // (what the COPY answers, what the clone answers, expected rows, the code, sent the clone)
+        type Case<'a> = (&'a str, i32, i32, Option<u64>, Option<&'a str>, bool);
+        let cases: [Case; 5] = [
+            (&two, 0, 0, Some(2), None, true),
+            (&two, 0, 0, None, None, true),
+            (
+                &two,
+                0,
+                0,
+                Some(3),
+                Some("RIVET_LOAD_COUNT_MISMATCH"),
+                false,
+            ),
+            (
+                "",
+                1,
+                0,
+                Some(2),
+                Some("RIVET_LOAD_WAREHOUSE_REJECTED"),
+                false,
+            ),
+            (
+                &three,
+                0,
+                1,
+                Some(3),
+                Some("RIVET_LOAD_WAREHOUSE_REJECTED"),
+                true,
+            ),
+        ];
+        for (copy_out, copy_exit, clone_exit, expected, code, cloned) in cases {
+            let stand = Stand::scripted(&[
+                ("CLONE", clone_exit, "[]", "clone refused"),
+                ("DROP TABLE IF EXISTS", 0, "[]", ""),
+                (
+                    "COPY INTO",
+                    copy_exit,
+                    copy_out,
+                    "Error parsing the parquet file",
+                ),
+            ]);
+            let mut l = stand.loader();
+            l.gcs_url = "gcs://bkt/exports/orders/".into();
+            l.storage_integration = "RIVET_GCS".into();
+            let got = l.materialize("orders", &specs, &uris, expected);
+            let sent = stand.sent();
+            let case = format!("{copy_exit}/{clone_exit}/{expected:?}: {sent:#?}");
+            let staging = staging_in(&sent[0], "DB.SC.orders__rivet_load_");
+            assert_eq!(
+                staging.len(),
+                "DB.SC.orders__rivet_load_".len() + 16,
+                "{case}"
+            );
+            assert!(
+                sent[0].contains(&format!("CREATE TABLE {staging} (\n"))
+                    && sent[0].contains(&format!("COPY INTO {staging} (id)"))
+                    && sent[0].contains(&format!("SELECT COUNT(*) AS ROWS_ FROM {staging};")),
+                "{case}"
+            );
+            assert!(
+                sent.iter().filter(|q| !q.contains(" CLONE ")).all(|q| !q
+                    .contains("OR REPLACE TABLE")
+                    && !q.contains("TRUNCATE")
+                    && !q.contains("DROP TABLE DB.SC.orders;")
+                    && !q.contains("COPY INTO DB.SC.orders ")),
+                "no statement but the clone writes the table: {case}"
+            );
+            assert_eq!(sent.iter().any(|q| q.contains(" CLONE ")), cloned, "{case}");
+            if cloned {
+                assert_eq!(
+                    sent[1],
+                    format!(
+                        "ALTER SESSION SET QUERY_TAG = '{}';\n\
+                         CREATE OR REPLACE TABLE DB.SC.orders CLONE {staging} COPY GRANTS;\n\
+                         DROP TABLE {staging};",
+                        l.query_tag("orders")
+                    ),
+                    "{case}"
+                );
+            }
+            match code {
+                None => {
+                    assert_eq!(got.unwrap(), 2, "{case}");
+                    assert_eq!(sent.len(), 2, "{case}");
+                }
+                Some(code) => {
+                    let e = got.unwrap_err();
+                    assert_eq!(crate::error::error_code(&e), Some(code), "{case}: {e:#}");
+                    assert_eq!(
+                        sent.last().unwrap(),
+                        &format!("DROP TABLE IF EXISTS {staging};"),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every full load lands in a staging table no earlier load named.
+    #[test]
+    fn each_full_load_names_its_own_staging_table() {
+        let names: std::collections::HashSet<String> =
+            (0..64).map(|_| staging_table("orders")).collect();
+        assert_eq!(names.len(), 64);
+        assert!(names.iter().all(|n| n.starts_with("orders__rivet_load_")
+            && n.len() == "orders__rivet_load_".len() + 16
+            && crate::load::is_safe_load_ident(n)));
     }
 
     /// What Snowflake's catalog answers for a name: `[[status], [status], [row]]`, as `snow sql --format json` prints three statements.
