@@ -100,6 +100,8 @@ mod live_cdc_oracledb;
 mod live_cdc_property;
 #[path = "live/live_cdc_replica.rs"]
 mod live_cdc_replica;
+#[path = "live/live_cdc_run_aggregate.rs"]
+mod live_cdc_run_aggregate;
 #[path = "live/live_cdc_schema_drift.rs"]
 mod live_cdc_schema_drift;
 #[path = "live/live_cdc_source_connections.rs"]

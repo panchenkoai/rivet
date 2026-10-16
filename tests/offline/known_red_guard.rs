@@ -11,8 +11,10 @@ const LEDGER: &str = "dev/release_oracle/known_red.py";
 // 25 (2026-10-14): 21 open-defect cells, 4 gate rows (Oracle cdc-load x2, Oracle TIMESTAMP(9) sentinels x2).
 // A new entry is a new acknowledged red: raise this in the same diff, with the entry's reason;
 // a fixed one lowers it.
-// 11 (2026-10-16): the PostgreSQL out-of-descriptors cell is a plain cell again (fix/postgres-client-runtime-is-coded).
-const ENTRY_CEILING: usize = 11; // ratchet-pin: known-red-entries
+// 12 -> 9 (2026-10-15): a stored cursor past the destination's success manifest is refused by code (-3).
+// 9 -> 8 (2026-10-16): the Azure removed-container cell is a plain cell again (fix/azure-missing-container-is-persistent).
+// 8 -> 7 (2026-10-16): the PostgreSQL out-of-descriptors cell is a plain cell again (fix/postgres-client-runtime-is-coded).
+const ENTRY_CEILING: usize = 7; // ratchet-pin: known-red-entries
 
 /// The horizon every `_open` entry expires at; moves only here and in the ledger together.
 const EXPIRES: &str = "2026-10-31"; // pinned: the ledger's `_EXPIRES`, moved only together with it
@@ -61,7 +63,8 @@ fn known_red_entries_never_grow_unseen() {
     let (open, rows) = entries(&ledger());
     super::nonvacuity::require_enumerated(
         open.len() + rows.len(),
-        10,
+        // The four gate rows stay until ADR-0037 lands; fewer means the ledger was not read.
+        4,
         "known-red entries",
         "the ledger moved or changed shape",
     );

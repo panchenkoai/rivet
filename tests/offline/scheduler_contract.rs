@@ -160,6 +160,7 @@ const SHAPES: &[(&str, Rule)] = &[
     }),
     ("run_entry.json", check_run_entry),
     ("run_entry_caught_up.json", check_run_entry),
+    ("run_entry_snapshot.json", check_run_entry),
     ("run_entry_skipped.json", check_run_entry),
     ("run_entry_failed.json", check_run_entry),
     ("run_entry_crashed.json", check_run_entry),
@@ -315,6 +316,15 @@ fn check_run_entry(v: &Value, at: &str) -> Check {
             ("files", Int, false),
         ];
         shape(t, &format!("{at}.tables[{i}]"), &fields)?;
+    }
+    for key in ["rows", "files"] {
+        let Some(tables) = v["tables"].as_array() else {
+            break;
+        };
+        let sum: i64 = tables.iter().filter_map(|t| t[key].as_i64()).sum();
+        require(v[key].as_i64() == Some(sum), || {
+            format!("{at}: {key} is the sum of tables[].{key}, snapshot legs included")
+        })?;
     }
     Ok(())
 }
@@ -638,6 +648,8 @@ fn a_wrong_type_an_unknown_word_or_a_moved_key_is_refused() {
             json!("export 'events' exited with status signal"),
         ),
         ("run_entry.json", "/tables/0/rows", json!("1200")),
+        ("run_entry_snapshot.json", "/rows", json!(0)),
+        ("run_entry_snapshot.json", "/files", json!(0)),
         ("run_entry.json", "/tables", Value::Null),
         ("run_entry_failed.json", "/error", Value::Null),
         ("run_entry_failed.json", "/error/retryable", json!("no")),
@@ -937,6 +949,7 @@ fn today_the_exit_of_an_untyped_fold_follows_its_text_documents_two_requirements
 #[test]
 fn the_run_entry_is_what_the_product_serializes_plus_the_pending_keys() {
     let entry = rivet::state::RunAggregateEntry {
+        snapshot_rows: 0,
         export_name: "orders_cdc".into(),
         status: "failed".into(),
         run_id: "r".into(),

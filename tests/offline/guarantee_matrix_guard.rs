@@ -20,7 +20,8 @@ const GATE_DIR: &str = "dev/release_oracle";
 // 20 -> 19 (2026-10-14, main): schema_drift_surfaces_as_an_error cites its existing cells; 19 -> 17: at_least_once_at_the_destination
 // and a_rerun_never_overwrites_the_previous_parts are held on Oracle too.
 // 17 -> 16 (2026-10-14): decimals_never_become_floats is held on every engine by one SqlEngine body.
-const ROWS_NOT_HELD: usize = 16; // ratchet-pin: guarantee-rows-not-held
+// 16 -> 15 (2026-10-15): no_row_silently_skipped is no longer contradicted; a cursor past the manifest is refused.
+const ROWS_NOT_HELD: usize = 15; // ratchet-pin: guarantee-rows-not-held
 /// `gap` cells over all rows. Shrink-only; LOWER it when a cell is written.
 // 29 -> 26 (2026-10-14): the `on_schema_drift: fail` cells already existed on MySQL, SQL Server and Oracle
 // (one body, live_schema_drift.rs); the row now cites them. 26 -> 19: the Oracle crash-after-write cell holds

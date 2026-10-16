@@ -86,6 +86,14 @@ scenarios:
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
     oracle:   { test: a_stored_cursor_of_another_type_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_cursor_past_manifest
+    what: "RIVET_STATE_CURSOR_PAST_MANIFEST: a stored cursor past the `cursor_high` of the destination's success manifest; `rivet state reset` delivers, `state reset-chunks` (the sibling command) leaves the refusal"
+    postgres: { test: a_cursor_past_the_manifest_is_refused_and_walked_out_postgres }
+    mysql:    { test: a_cursor_past_the_manifest_is_refused_and_walked_out_mysql }
+    mssql:    { test: a_cursor_past_the_manifest_is_refused_and_walked_out_mssql }
+    mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
+    oracle:   { test: a_cursor_past_the_manifest_is_refused_and_walked_out_oracle }
+
   - id: refusal_state_cursor_stream_mismatch
     what: "RIVET_STATE_CURSOR_STREAM_MISMATCH: an incremental export repointed at another table; own names and `state reset` deliver, `state reset-chunks` leaves the refusal (`state accept`, the third named remedy, is walked by incremental_query_filter_edited and incremental_query_cosmetic_edit_accepted in docs/mode-transition-matrix.yaml)"
     postgres: { test: a_repointed_incremental_export_is_refused_and_walked_out_postgres }
@@ -294,12 +302,12 @@ scenarios:
     oracle:   { test: a_cursor_moved_back_delivers_or_refuses_oracle }
 
   - id: corrupt_cursor_moved_forward
-    what: "the stored incremental cursor moved forward past rows the export never delivered: the run delivers the source or refuses"
-    postgres: { test: open_defect_a_cursor_moved_forward_delivers_or_refuses_postgres }
-    mysql:    { test: open_defect_a_cursor_moved_forward_delivers_or_refuses_mysql }
-    mssql:    { test: open_defect_a_cursor_moved_forward_delivers_or_refuses_mssql }
+    what: "the stored incremental cursor moved forward past rows the export never delivered: the run delivers the source, or is refused by code naming `rivet state reset`, which then delivers it"
+    postgres: { test: a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_postgres }
+    mysql:    { test: a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mysql }
+    mssql:    { test: a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes, RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED), so it has no incremental cursor" }
-    oracle:   { gap: "an open defect on PostgreSQL, MySQL and SQL Server; the Oracle cell is not written, because no stand that runs `open_defect_` cells has Oracle within reach of the machine this row was built on (CI skips them), so its first failing line could not be read" }
+    oracle:   { test: a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_oracle }
 
   - id: corrupt_cursor_wrong_type
     what: "the stored incremental cursor replaced by a value of another type: the run delivers the source, or is refused by code naming `rivet state reset`, which then delivers it"
@@ -623,7 +631,7 @@ scenarios:
 
   - id: takeaway_bucket_removed_azure
     what: "the azure bucket of a live range-checkpoint run removed with everything in it once it holds an object, then created again empty: the run delivers or fails loudly, so does every run while it is away, and with it back a run delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres }
+    postgres: { test: a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres }
     mysql:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
     mssql:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
     mongo:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }

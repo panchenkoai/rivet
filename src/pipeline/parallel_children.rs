@@ -10,6 +10,7 @@ use crate::config::ExportConfig;
 use crate::error::Result;
 use crate::state::StateStore;
 
+use super::aggregate::ChildReports;
 use super::ipc::{ChildEvent, ENV_IPC_EVENTS};
 use super::parent_ui::{ChildWaitStatus, UiMessage, sanitize_terminal};
 
@@ -68,11 +69,16 @@ pub(super) fn run_exports_as_child_processes(
     // Wave-wide max export-name width so the card table aligns across the
     // cost-gate's separate safe/lone batches, not just within one batch.
     name_floor: usize,
-) -> (Result<()>, HashMap<String, String>, String) {
+) -> (Result<()>, HashMap<String, String>, String, ChildReports) {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
-            return (Err(executable_unresolved(e)), HashMap::new(), String::new());
+            return (
+                Err(executable_unresolved(e)),
+                HashMap::new(),
+                String::new(),
+                ChildReports::new(),
+            );
         }
     };
 
@@ -86,6 +92,7 @@ pub(super) fn run_exports_as_child_processes(
             Err(e.context("failed to open / migrate state DB before spawning children")),
             HashMap::new(),
             String::new(),
+            ChildReports::new(),
         );
     }
 
@@ -130,6 +137,8 @@ pub(super) fn run_exports_as_child_processes(
             })
             .collect(),
     );
+
+    let child_reports: std::sync::Arc<std::sync::Mutex<ChildReports>> = Default::default();
 
     let mut children: Vec<(String, std::process::Child)> = Vec::with_capacity(exports.len());
     let mut reader_handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(exports.len());
@@ -193,6 +202,8 @@ pub(super) fn run_exports_as_child_processes(
                 if let Some(stdout) = child.stdout.take() {
                     let tx = tx.clone();
                     let export_name = export.name.clone();
+                    let legs = super::aggregate::snapshot_leg_names(export);
+                    let sink = std::sync::Arc::clone(&child_reports);
                     let h = std::thread::Builder::new()
                         .name(format!("rivet-ipc-rx-{}", export.name))
                         .spawn(move || {
@@ -215,6 +226,11 @@ pub(super) fn run_exports_as_child_processes(
                                 }
                                 match adopt_child_event(trimmed) {
                                     Ok(ev) => {
+                                        sink.lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .entry(export_name.clone())
+                                            .or_default()
+                                            .take(&export_name, &legs, &ev);
                                         let _ = tx.send(UiMessage::Event(ev));
                                     }
                                     Err(e) => {
@@ -400,7 +416,8 @@ pub(super) fn run_exports_as_child_processes(
     }
 
     let result = aggregate_child_result(&failures, &child_exit_codes);
-    (result, all_failures, stderr_dump)
+    let reports = std::mem::take(&mut *child_reports.lock().unwrap_or_else(|p| p.into_inner()));
+    (result, all_failures, stderr_dump, reports)
 }
 
 /// #153: when K+ children fail with the SAME error class before any success,
@@ -652,6 +669,8 @@ mod foreign_counter_tests {
                 peak_rss_mb: 7,
                 error_message: None,
                 dest_retries,
+                bytes_read: 0,
+                mode: "full".into(),
             })
             .unwrap()
         };
