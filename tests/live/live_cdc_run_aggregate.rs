@@ -165,6 +165,118 @@ fn cdc_entry_counts_the_snapshot_legs_oracle() {
     );
 }
 
+/// A CDC child SIGKILLed in its drain after its snapshot leg finished: the parent's failed entry counts
+/// the leg the child reported, which is what the disk holds (ADR-0039 D3, a killed child's entry).
+#[cfg(unix)]
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_cdc_child_killed_after_its_leg_counts_the_leg_postgres() {
+    let mut scn = CdcScenario::pg_with("agg_kill_pp", "id BIGINT PRIMARY KEY, v BIGINT", |r, _| {
+        r.cdc_line("initial: snapshot")
+            .also_export("agg_kill_side", "SELECT 1 AS x")
+    });
+    for id in 1..=ROWS {
+        scn.insert(id);
+    }
+    scn.settle();
+    let docs = tempfile::tempdir().unwrap();
+    let doc = docs.path().join("summary.json");
+    let mut live = scn.rig.spawn_args_env(
+        &[
+            "--parallel-export-processes",
+            "--summary-output",
+            doc.to_str().unwrap(),
+        ],
+        &[("RIVET_TEST_PAUSE_AT", "cdc_after_open:90000")],
+    );
+    // The drain's run row opens only after the leg's run ended and reported.
+    until_ready(&mut live, "the drain started after its leg", || {
+        drain_running(&scn.rig)
+    });
+    let export_flag = format!("--export {}", scn.rig.export_name());
+    let cdc_child = String::from_utf8_lossy(
+        &std::process::Command::new("pgrep")
+            .args(["-P", &live.id().to_string()])
+            .output()
+            .expect("pgrep")
+            .stdout,
+    )
+    .lines()
+    .filter_map(|l| l.trim().parse::<u32>().ok())
+    .find(|pid| {
+        let cmd = std::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&cmd.stdout).contains(&export_flag)
+    })
+    .expect("fixture: the CDC export's child process is alive");
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &cdc_child.to_string()])
+        .status()
+        .expect("kill");
+    assert!(killed.success(), "fixture: SIGKILL the CDC child");
+    // The leg delivered beside the killed drain; the disk is compared with the source below.
+    let status = std::process::Child::wait(&mut live).expect("reap the parent");
+    let said = live.reaped_beside_a_delivery(status);
+    assert!(!said.status.success(), "a killed child fails the run");
+    let doc = read_doc(&doc);
+    let entry = doc["per_export"]
+        .as_array()
+        .expect("per_export[]")
+        .iter()
+        .find(|e| e["export_name"] == scn.rig.export_name())
+        .unwrap_or_else(|| panic!("no entry for the CDC export in {doc}"))
+        .clone();
+    let (rows, files, bytes) = parquet_on_disk(&scn.rig.out_dir());
+    assert_eq!(
+        rows, ROWS,
+        "fixture: the leg wrote the seeded rows before the kill"
+    );
+    assert_eq!(
+        (
+            entry["status"].as_str(),
+            entry["run_id"].as_str(),
+            entry["duration_ms"].as_i64()
+        ),
+        (Some("failed"), Some(""), Some(0)),
+        "{entry}"
+    );
+    assert_eq!(
+        (
+            entry["rows"].as_i64(),
+            entry["files"].as_i64(),
+            entry["bytes"].as_u64()
+        ),
+        (Some(rows), Some(files), Some(bytes)),
+        "the killed child's entry counts the finished leg it reported: {entry}"
+    );
+    assert!(
+        entry["error_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("signal")),
+        "{entry}"
+    );
+}
+
+/// Whether the rig's CDC export has a `running` run row; false while the state does not exist yet.
+fn drain_running(rig: &Rig) -> bool {
+    let sql = "SELECT count(*) FROM run_status WHERE export_name = $1 AND status = 'running'";
+    match state_url_under_test() {
+        Some(url) => state_count(&url, sql, rig.export_name()) > 0,
+        None => rusqlite::Connection::open_with_flags(
+            rig.config_path().with_file_name(".rivet_state.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|c| {
+            c.query_row(&sql.replace("$1", "?1"), [rig.export_name()], |r| {
+                r.get::<_, i64>(0)
+            })
+        })
+        .is_ok_and(|n| n > 0),
+    }
+}
+
 /// Two holders of one export name and one table name on one PostgreSQL state, differing only in source, each under child processes: each entry counts the legs its own child ran.
 #[test]
 #[ignore = "live: requires postgres-cdc, mysql-cdc and RIVET_TEST_STATE_URL (postgres)"]
