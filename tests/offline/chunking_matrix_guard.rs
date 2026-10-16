@@ -1837,7 +1837,7 @@ const REFUSAL_ROW: &str = "refusal_";
 /// The one entry point of a `refusal_*` cell: refuse, again, each named remedy, one wrong remedy.
 const REFUSAL_WALK: &str = "refuses_twice_and_walks_out(";
 
-/// The `refusal` codes of the generated registry (docs/reference/errors.md, written by `rivet schema errors`).
+/// The `refusal` and `busy` codes of the generated registry (docs/reference/errors.md, written by `rivet schema errors`): each is a stop with a walk out.
 fn registry_refusal_codes() -> std::collections::BTreeSet<String> {
     let text = std::fs::read_to_string(repo_root().join("docs/reference/errors.md"))
         .expect("docs/reference/errors.md");
@@ -1845,7 +1845,7 @@ fn registry_refusal_codes() -> std::collections::BTreeSet<String> {
         .filter_map(|l| {
             let cols: Vec<&str> = l.split('|').map(str::trim).collect();
             let code = cols.get(1)?.strip_prefix("`RIVET_")?.strip_suffix('`')?;
-            (cols.get(2) == Some(&"refusal")).then(|| format!("RIVET_{code}"))
+            matches!(cols.get(2), Some(&("refusal" | "busy"))).then(|| format!("RIVET_{code}"))
         })
         .collect()
 }
