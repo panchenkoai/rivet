@@ -2533,6 +2533,6 @@ seeds:
     patch: child-entry-by-name-on-shared-state/shared.patch
     engines:
       postgres-state:
-        cells: [a_failed_holder_of_a_shared_name_is_reported_by_its_own_run]
+        cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
       sqlite-state:
         cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]

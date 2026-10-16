@@ -178,11 +178,11 @@ fn cdc_entries_of_one_name_on_two_sources_count_their_own_legs() {
 /// Of two holders of one export name on one PostgreSQL state, the one that fails is reported failed under its own run, never as the other's success.
 #[test]
 #[ignore = "live: requires postgres-cdc, mysql-cdc and RIVET_TEST_STATE_URL (postgres)"]
-fn a_failed_holder_of_a_shared_name_is_reported_by_its_own_run() {
+fn a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id() {
     let Some(state) = pg_state_url() else {
         return;
     };
-    a_failed_holder_is_reported_by_its_own_run(&state);
+    the_failed_holder_is_reported_failed_by_its_own_run_id(&state);
 }
 
 /// Rows in the PostgreSQL and the MySQL table of [`TwoHolders`].
@@ -348,7 +348,7 @@ fn two_holders_count_their_own_legs(state: &str) {
 /// The PostgreSQL holder pauses in its snapshot leg (`pg_after_snapshot_open`) and then fails its first
 /// part write; the MySQL holder runs to success meanwhile, so the newest row of the export's name on the
 /// shared `state` is the other holder's success when the failed parent builds its entry.
-fn a_failed_holder_is_reported_by_its_own_run(state: &str) {
+fn the_failed_holder_is_reported_failed_by_its_own_run_id(state: &str) {
     let two = TwoHolders::new("agg_fail");
     let docs = tempfile::tempdir().unwrap();
     let (failed_doc, ok_doc) = (docs.path().join("failed.json"), docs.path().join("ok.json"));
