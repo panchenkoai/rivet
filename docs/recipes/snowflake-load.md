@@ -30,6 +30,12 @@ $ rivet load -c cfg.yaml     # COPY → ANALYTICS.PUBLIC.orders
   integrity ✓ source ? → files 3 → warehouse 3 rows in ANALYTICS.PUBLIC.orders (source cleaned)
 ```
 
+`rivet init` writes this block for you — `--gcs-bucket my-bucket --snowflake-connection
+my_conn --snowflake-warehouse COMPUTE_WH --snowflake-database ANALYTICS
+--snowflake-schema PUBLIC --snowflake-storage-integration MY_GCS_INT` (all five plus
+the GCS bucket; see [`rivet init`](../reference/init.md)),
+so the whole extract → load config comes from one command.
+
 **What it handles for you** — every autoload quirk the by-hand appendix below
 recovers manually, `rivet load` does automatically. Each row below is held by a live cell
 that reads the table back through a second client (`tests/live/live_snowflake_load.rs`,

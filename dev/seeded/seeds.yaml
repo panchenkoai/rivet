@@ -2591,6 +2591,40 @@ seeds:
         cells: ["lib:a_mixed_split_generation_is_journaled_refused_and_refuses_again", "lib:a_missing_spec_and_an_unreadable_spec_store_are_two_codes"]
       postgres-state:
         cells: ["lib:pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"]
+  - name: postgres-dial-runtime-unwrapped
+    class: "a driver builds its own async runtime inside its connect call and unwraps the build, so a process out of file descriptors aborts with a panic instead of the environment stop the other drivers raise"
+    history: "2026-10-08 - the gate's PostgreSQL out-of-descriptors cell (live_sabotage): `rivet run` capped at 8 open files panicked at postgres-0.19 src/config.rs:463 (`Too many open files`), exit 101 with no `Error:` line, while MySQL, SQL Server, Oracle and MongoDB failed loudly through `driver_runtime`, through 0.31.0; fixed by proving a runtime build at the shared PostgreSQL dial (`connect_client`) before the driver builds its own"
+    scope: source
+    patch: postgres-dial-runtime-unwrapped/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres]
+      mysql:
+        na: "the MySQL driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      mssql:
+        na: "the SQL Server driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      mongo:
+        na: "the MongoDB driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      oracle:
+        na: "the Oracle driver is synchronous and builds no runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+  - name: missing-container-retried-as-timeout
+    class: "a store's final answer is classified by the words in its text, so a header such as `keep-alive: timeout=5` on a 404 reads as a timeout and the chunk is retried for minutes"
+    history: "2026-10-08 - the gate's Azure removed-container cell (live_sabotage) ran past its 180 s ceiling: each chunk's upload into the removed container was retried 16 times, 9 min 21 s to exit 1 by hand (Azurite answers its 404 with `keep-alive: timeout=5`, and the classifier's text scan matched `timeout`), through 0.31.0; fixed by classifying an opendal error by its own verdict before any text scan"
+    scope: source
+    patch: missing-container-retried-as-timeout/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"
+          - a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres
+      mysql:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      mssql:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      mongo:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      oracle:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
   - name: child-entry-by-name-on-shared-state
     class: "the parent of `--parallel-export-processes` takes a child's run-aggregate entry as the newest `export_metrics` row of the export's name, so on a state shared by two holders of the name a failed child is reported as the other holder's success"
     history: "2026-10-16 - found by the verifier of #604: two holders of one export name on one PostgreSQL state, the PostgreSQL one failed its snapshot leg and exited 1 while its entry read `status: success` with the MySQL holder's run id, on main through 0.31.0; fixed by matching the run id each child reports in its `Finished` event (`collect_child_entries`, `StateStore::get_metric_by_run_id`)"

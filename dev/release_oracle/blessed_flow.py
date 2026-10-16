@@ -1523,6 +1523,18 @@ FLAG_EXCUSED = {
                         "every refusal between them.",
     "--clickhouse-database": "the other half of the ClickHouse `load:` scaffold — see --clickhouse-url.",
     "--clickhouse-user": "the ClickHouse `load:` scaffold's user — see --clickhouse-url.",
+    "--snowflake-connection": "scaffolds a Snowflake `load:` section, which the blessed chain never "
+                              "loads and the local stand cannot (Snowflake is cloud-only). The "
+                              "scaffold is pinned offline: yaml_scaffold::load_block_tests::"
+                              "a_snowflake_load_block_carries_its_connection_and_parses_into_the_"
+                              "target parses the generated file into the Snowflake target, and "
+                              "args::tests::init_clap_ties_the_snowflake_flags_together_and_to_a_"
+                              "gcs_bucket checks every refusal between the flags.",
+    "--snowflake-warehouse": "part of the Snowflake `load:` scaffold — see --snowflake-connection.",
+    "--snowflake-database": "part of the Snowflake `load:` scaffold — see --snowflake-connection.",
+    "--snowflake-schema": "part of the Snowflake `load:` scaffold — see --snowflake-connection.",
+    "--snowflake-storage-integration": "part of the Snowflake `load:` scaffold — see "
+                                       "--snowflake-connection.",
     "--strict": "needs a column whose mapping is lossy, which the blessed postgres chain has none of. "
                 "Carried INSIDE the gate by blessed_flow.verify_run_strict: an Oracle TIMESTAMP(9) "
                 "export is refused by `run --strict` with RIVET_TYPE_UNSAFE_MAPPING and no part, "

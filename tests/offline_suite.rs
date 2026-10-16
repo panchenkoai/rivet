@@ -34,6 +34,8 @@ mod field_state_guard;
 mod fix_cells_guard;
 #[path = "offline/form_a_checksum_guard.rs"]
 mod form_a_checksum_guard;
+#[path = "offline/init_snowflake_flags.rs"]
+mod init_snowflake_flags;
 #[path = "offline/memory_throttle_wiring.rs"]
 mod memory_throttle_wiring;
 #[path = "offline/one_sanitizer_guard.rs"]
