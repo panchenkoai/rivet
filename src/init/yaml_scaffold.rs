@@ -754,6 +754,38 @@ fn load_block_lines(
             "  cleanup_source: true".into(),
         ];
     }
+    if let Some(sf) = &dest.snowflake {
+        if let Some(lines) = refused("snowflake") {
+            d.load_refused = true;
+            return lines;
+        }
+        d.has_load = true;
+        return vec![
+            String::new(),
+            "# The warehouse half of the cycle: `rivet load` COPYs into Snowflake from a GCS"
+                .into(),
+            "# external stage. There is no `rivet compact` on Snowflake: an incremental or CDC"
+                .into(),
+            "# table is a change log read through the deduplicated `<table>` view.".into(),
+            "# Review every value below — they are guesses, not decisions.".into(),
+            "load:".into(),
+            "  target: snowflake".into(),
+            format!(
+                "  connection: {}  # a `snow` CLI connection (key-pair / JWT auth)",
+                yaml_quote_if_needed(&sf.connection)
+            ),
+            format!("  warehouse: {}", yaml_quote_if_needed(&sf.warehouse)),
+            format!("  database: {}", yaml_quote_if_needed(&sf.database)),
+            format!("  schema: {}", yaml_quote_if_needed(&sf.schema)),
+            format!(
+                "  storage_integration: {}  # pre-created; must grant Snowflake read on the bucket",
+                yaml_quote_if_needed(&sf.storage_integration)
+            ),
+            "  pk: auto  # the source primary key `rivet run` recorded".into(),
+            "  cluster_by: auto".into(),
+            "  cleanup_source: true".into(),
+        ];
+    }
     let (Some(project), Some(dataset)) = (
         dest.bigquery_project.as_deref(),
         dest.bigquery_dataset.as_deref(),
@@ -1813,6 +1845,17 @@ mod tests {
             clickhouse_database: Some("d".into()),
             ..Default::default()
         };
+        let sf = InitYamlDestination {
+            gcs_bucket: Some("b".into()),
+            snowflake: Some(crate::init::InitSnowflakeTarget {
+                connection: "c".into(),
+                warehouse: "w".into(),
+                database: "d".into(),
+                schema: "s".into(),
+                storage_integration: "i".into(),
+            }),
+            ..Default::default()
+        };
         let engines = [
             ("postgresql://u:p@localhost/db", "sales"),
             ("mysql://u:p@localhost/db", "db"),
@@ -1822,7 +1865,7 @@ mod tests {
         ];
         for (url, schema) in engines {
             let st = crate::init::source_type_of(url).unwrap();
-            for (warehouse, dest) in [("bigquery", &bq), ("clickhouse", &ch)] {
+            for (warehouse, dest) in [("bigquery", &bq), ("clickhouse", &ch), ("snowflake", &sf)] {
                 let infos: Vec<TableInfo> = ["a", "b"]
                     .iter()
                     .map(|n| TableInfo {
@@ -1955,6 +1998,17 @@ mod tests {
             clickhouse_database: Some("d".into()),
             ..Default::default()
         };
+        let sf = InitYamlDestination {
+            gcs_bucket: Some("b".into()),
+            snowflake: Some(crate::init::InitSnowflakeTarget {
+                connection: "c".into(),
+                warehouse: "w".into(),
+                database: "d".into(),
+                schema: "s".into(),
+                storage_integration: "i".into(),
+            }),
+            ..Default::default()
+        };
         let none = InitYamlDestination::default();
         let named = |n: &str, cols: Vec<ColumnInfo>| TableInfo {
             cdc_capture_instance: None,
@@ -1978,6 +2032,8 @@ mod tests {
             table(&keyed("orders"), pg, &bq, Some("full")),
             table(&keyed("orders"), pg, &bq, Some("incremental")),
             table(&keyed("orders"), pg, &ch, Some("incremental")),
+            table(&keyed("orders"), pg, &sf, Some("incremental")),
+            table(&keyed("orders"), pg, &sf, Some("cdc")),
             table(&by_id("orders"), pg, &none, Some("incremental")),
             table(&keyless("orders"), pg, &none, Some("incremental")),
             table(&keyless("orders"), pg, &none, Some("time_window")),
@@ -2119,7 +2175,7 @@ mod tests {
         assert!(pg.contains("    mode: cdc"), "{pg}");
     }
 
-    fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
+    pub(super) fn make_table(cols: Vec<ColumnInfo>) -> TableInfo {
         TableInfo {
             cdc_capture_instance: None,
             density: None,
@@ -2131,7 +2187,7 @@ mod tests {
         }
     }
 
-    fn col(name: &str, ty: &str) -> ColumnInfo {
+    pub(super) fn col(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo {
             name: name.into(),
             data_type: ty.into(),
@@ -2154,7 +2210,7 @@ mod tests {
     // the only honest subject. Asserted through the real loader, never a grep of
     // init's own rendering (same rule as the TLS scaffold test above).
 
-    fn pk(name: &str, ty: &str) -> ColumnInfo {
+    pub(super) fn pk(name: &str, ty: &str) -> ColumnInfo {
         ColumnInfo {
             is_primary_key: true,
             is_nullable: false,
@@ -2826,7 +2882,7 @@ mod tests {
         assert_eq!(cfg.exports.len(), 3, "two recipes + the stream");
     }
 
-    /// With BigQuery (day) or ClickHouse (month), the whole-DB scaffold's partition guesses sit where
+    /// With BigQuery (day), ClickHouse (month) or Snowflake (day), the whole-DB scaffold's partition guesses sit where
     /// the LOAD reads them for a stream — `load.tables.<name>` on the stream — not on
     /// the recipes, which the load never reads (the bases came out unpartitioned under
     /// a config that visibly said `partition:`). The oracle is the resolver the load
@@ -2861,9 +2917,21 @@ mod tests {
             gcs_bucket: Some("b".into()),
             ..Default::default()
         };
+        let snowflake = InitYamlDestination {
+            snowflake: Some(crate::init::InitSnowflakeTarget {
+                connection: "c".into(),
+                warehouse: "w".into(),
+                database: "d".into(),
+                schema: "s".into(),
+                storage_integration: "i".into(),
+            }),
+            gcs_bucket: Some("b".into()),
+            ..Default::default()
+        };
         for (dest, want) in [
             (bigquery, Granularity::Day),
             (clickhouse, Granularity::Month),
+            (snowflake, Granularity::Day),
         ] {
             for mode in [Some("cdc"), Some("incremental")] {
                 let yaml = generate_schema_config(
@@ -3524,6 +3592,7 @@ mod load_block_tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            snowflake: None,
         };
         assert!(
             load_block_lines(&bare, true, None, &mut ScaffoldDecisions::default()).is_empty(),
@@ -3592,6 +3661,111 @@ mod load_block_tests {
         assert!(
             !block.contains("layout:") && !block.contains("partition"),
             "{block}"
+        );
+    }
+
+    /// A Snowflake scaffold carries the five values the loader requires, promises no
+    /// compaction, and the generated file parses into a Snowflake target with exactly
+    /// those values; its per-table partition guess is a date column the loader turns
+    /// into a leading `DATE_TRUNC` clustering key.
+    #[test]
+    fn a_snowflake_load_block_carries_its_connection_and_parses_into_the_target() {
+        let dest = InitYamlDestination {
+            gcs_bucket: Some("my-bucket".into()),
+            snowflake: Some(crate::init::InitSnowflakeTarget {
+                connection: "my_conn".into(),
+                warehouse: "COMPUTE_WH".into(),
+                database: "ANALYTICS".into(),
+                schema: "PUBLIC".into(),
+                storage_integration: "MY_GCS_INT".into(),
+            }),
+            ..Default::default()
+        };
+        let info = TableInfo {
+            cdc_capture_instance: None,
+            table: "orders".into(),
+            ..super::tests::make_table(vec![
+                super::tests::pk("id", "bigint"),
+                super::tests::col("created_at", "timestamp"),
+                super::tests::col("updated_at", "timestamp"),
+            ])
+        };
+        for mode in ["full", "incremental", "cdc"] {
+            let s = scaffold_table(
+                &info,
+                "postgresql://u:p@localhost/db",
+                &crate::init::SourceProvenance::Inline,
+                &dest,
+                Some(mode),
+                None,
+            )
+            .unwrap();
+            let yaml = &s.text;
+            assert!(
+                s.decisions.has_load && !s.decisions.compacts,
+                "{mode}:\n{yaml}"
+            );
+            assert!(yaml.contains("Review every value"), "{mode}:\n{yaml}");
+            assert!(
+                !yaml.contains("layout:"),
+                "{mode}: no compaction on Snowflake:\n{yaml}"
+            );
+            let cfg = crate::config::Config::from_yaml(yaml)
+                .unwrap_or_else(|e| panic!("{mode}: the scaffold must load: {e:#}\n{yaml}"));
+            let load = cfg.load.as_ref().expect("a load: block");
+            assert_eq!(
+                load.target,
+                crate::config::load::LoadTarget::Snowflake {
+                    connection: "my_conn".into(),
+                    warehouse: "COMPUTE_WH".into(),
+                    database: "ANALYTICS".into(),
+                    schema: "PUBLIC".into(),
+                    storage_integration: "MY_GCS_INT".into(),
+                },
+                "{mode}:\n{yaml}"
+            );
+            assert!(load.cleanup_source, "{mode}");
+            assert!(!load.target.compacts(), "{mode}");
+            let export = &cfg.exports[0];
+            assert_eq!(
+                export.destination.destination_type,
+                crate::config::DestinationType::Gcs,
+                "{mode}"
+            );
+            assert!(load.target.reads_from(export.destination.destination_type));
+            // A single-table CDC export carries no partition guess on any warehouse.
+            if mode == "cdc" {
+                continue;
+            }
+            let spec = crate::load::plan::resolved_partition(&cfg, export, None)
+                .unwrap_or_else(|| panic!("{mode}: a partition guess:\n{yaml}"));
+            assert!(
+                matches!(
+                    spec.form,
+                    crate::config::load::PartitionForm::Column { ref column, granularity }
+                        if column == "created_at"
+                            && granularity == crate::config::load::Granularity::Day
+                ),
+                "{mode}: {spec:?}"
+            );
+        }
+    }
+
+    /// An Oracle CDC stream cannot load into any warehouse: the Snowflake scaffold
+    /// leaves the block out and says why, like the others.
+    #[test]
+    fn a_snowflake_scaffold_of_an_oracle_cdc_stream_has_no_load_block() {
+        let dest = InitYamlDestination {
+            gcs_bucket: Some("b".into()),
+            snowflake: Some(crate::init::InitSnowflakeTarget::default()),
+            ..Default::default()
+        };
+        let mut d = ScaffoldDecisions::default();
+        let lines = load_block_lines(&dest, true, Some(crate::config::SourceType::Oracle), &mut d);
+        assert!(d.load_refused && !d.has_load, "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l.starts_with(NO_LOAD_BLOCK)),
+            "{lines:?}"
         );
     }
 }

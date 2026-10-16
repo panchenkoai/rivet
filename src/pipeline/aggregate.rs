@@ -947,6 +947,44 @@ mod tests {
         );
     }
 
+    /// A CDC child killed after its snapshot leg finished: a failed entry with no run of its own, counting the leg it reported.
+    #[test]
+    fn a_cdc_child_killed_after_its_leg_counts_the_leg_it_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::StateStore::open_at_path(&dir.path().join("state.db")).unwrap();
+        // The leg's own row is on the state; the drain never finished, so the export has none.
+        finished_metric(&state, "pg_cdc__snapshot_items", 30, 1);
+        let export = cdc_export("cdc: { initial: snapshot }\n");
+        let failures = HashMap::from([(
+            "pg_cdc".to_string(),
+            "exited with status signal".to_string(),
+        )]);
+        let reports = report_of(&[finished("pg_cdc__snapshot_items", 30)]);
+        let entries = collect_child_entries(&state, &[&export], &failures, &reports);
+        let e = &entries[0];
+        assert_eq!(
+            (e.status.as_str(), e.run_id.as_str(), e.mode.as_str()),
+            ("failed", "", ""),
+            "the child reported no run of its own"
+        );
+        assert_eq!(
+            (
+                e.rows,
+                e.files,
+                e.bytes,
+                e.bytes_read,
+                e.snapshot_rows,
+                e.duration_ms
+            ),
+            (30, 1, 300, 600, 30, 0),
+            "the finished leg's rows were written and are counted; duration stays the drain's, none"
+        );
+        assert_eq!(
+            e.error_message.as_deref(),
+            Some("exited with status signal")
+        );
+    }
+
     /// A leg row another holder of the export name wrote on the shared state is not this child's.
     #[test]
     fn another_holders_leg_row_is_not_folded_into_this_childs_entry() {

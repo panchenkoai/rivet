@@ -54,12 +54,6 @@ KNOWN_RED: tuple[KnownRed, ...] = (
     KnownRed('sentinels[rivet_sent_ts9/keyset]: SUCCEEDED WITH A CHANGED VALUE: `V` differs',
              "Oracle TIMESTAMP(9) is delivered at microseconds today: docs/type-capability-matrix.yaml's oracle TIMESTAMP(9) row is a known_defect (exact native is Timestamp(ns), ADR-0038 CP1, Oracle engine step), so the 1 ns sentinel lands truncated",
              "2026-10-31"),
-    _open("live_sabotage::open_defect_a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres",
-          "the live run did not end within 180s of the action beside it",
-          "other, a failure that takes minutes: with its Azure container removed mid-run the export retried a persistent 404 (`ContainerNotFound`, which its own summary calls persistent) 108 times and ended after 9 min 21 s with exit 1 and `chunk checkpoint incomplete` (by hand, Azurite); the s3 and gcs cells of the same row family end in seconds; no work item yet: a missing container is not retryable"),
-    _open("live_sabotage::open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres",
-          "`rivet run` neither a delivery nor a loud failure: ended with exit 101",
-          "other, a crash: a PostgreSQL export capped at 8 open files panics (`called Result::unwrap() on an Err value: Os { code: 24, .. \"Too many open files\" }` at postgres-0.19 src/config.rs:463, the client building its runtime) instead of failing with an `Error:` line; MySQL, SQL Server, Oracle and MongoDB fail loudly under the same cap on either state, and on a PostgreSQL state this export fails loudly too, at the state's connect, so the crash is the source client's and shows on a SQLite state; no work item yet"),
 )
 
 

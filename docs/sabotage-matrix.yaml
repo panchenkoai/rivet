@@ -631,7 +631,7 @@ scenarios:
 
   - id: takeaway_bucket_removed_azure
     what: "the azure bucket of a live range-checkpoint run removed with everything in it once it holds an object, then created again empty: the run delivers or fails loudly, so does every run while it is away, and with it back a run delivers the source and `validate` passes"
-    postgres: { test: open_defect_a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres }
+    postgres: { test: a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres }
     mysql:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
     mssql:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
     mongo:    { na: "the cloud destination seam (src/destination) does not depend on the source engine: pinned once on PostgreSQL" }
@@ -1248,7 +1248,7 @@ scenarios:
 
   - id: exhaust_open_files
     what: "every run capped at 8 open files (`RLIMIT_NOFILE`, `Rig::open_files`) fails loudly, never by a crash, and a run without the cap then delivers the source and `validate` passes; the cells of the other engines run on the SQLite state, since a Postgres state puts the PostgreSQL client, the open defect of the postgres cell, into every run"
-    postgres: { test: open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres }
+    postgres: { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres }
     mysql:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql }
     mssql:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql }
     mongo:    { test: a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo }

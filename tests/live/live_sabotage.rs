@@ -3353,8 +3353,8 @@ fn a_run_whose_gcs_bucket_is_removed_delivers_or_fails_loudly_postgres() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres + azurite; open defect (a removed Azure container is retried for minutes), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres() {
+#[ignore = "live: requires docker compose postgres + azurite"]
+fn a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres() {
     bucket_removed(Store::Azure);
 }
 
@@ -5150,8 +5150,8 @@ fn a_run_whose_state_volume_fills_up_delivers_or_fails_loudly_mongo() {
 }
 
 #[test]
-#[ignore = "live+gate-only: docker compose postgres; open defect (a PostgreSQL run out of file descriptors panics), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres() {
     {
         let (_table, rig, _guard) = shaped(SqlEngine::Pg, "sab_fds", Shape::RangeCheckpoint);
         out_of_file_descriptors(rig);
