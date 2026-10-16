@@ -257,13 +257,7 @@ fn listing_says_container_absent<B: CloudBackend>(
 
 /// The opendal kind of one error in a chain: an opendal error itself, or the one an `io::Error` from opendal's std writer wraps.
 fn opendal_kind(e: &(dyn std::error::Error + 'static)) -> Option<opendal::ErrorKind> {
-    e.downcast_ref::<opendal::Error>()
-        .or_else(|| {
-            e.downcast_ref::<std::io::Error>()?
-                .get_ref()?
-                .downcast_ref::<opendal::Error>()
-        })
-        .map(opendal::Error::kind)
+    crate::error::retry::opendal_error(e).map(opendal::Error::kind)
 }
 
 /// Whether a failed write may have hit an absent container: some error in its chain has a kind the backend's listing answers an absent container with.
@@ -364,11 +358,18 @@ impl<B: CloudBackend> CloudDestination<B> {
         })
     }
 
-    /// Fail when the bucket or container itself is absent, which a 404 on a key cannot tell from an absent key.
+    /// Fail when the bucket or container itself is absent, which a 404 on a key cannot tell from an absent key; asked once per destination.
     fn require_container(&self) -> Result<()> {
         if self.container_answered.get().is_some() {
             return Ok(());
         }
+        self.refuse_an_absent_container()?;
+        let _ = self.container_answered.set(());
+        Ok(())
+    }
+
+    /// Ask the store now whether the bucket or container exists, whatever it answered before.
+    fn refuse_an_absent_container(&self) -> Result<()> {
         let first_page = self
             .op
             .lister_options(
@@ -389,7 +390,6 @@ impl<B: CloudBackend> CloudDestination<B> {
                 container_absent_message(B::SCHEME, &self.container)
             );
         }
-        let _ = self.container_answered.set(());
         Ok(())
     }
 
@@ -403,9 +403,11 @@ impl<B: CloudBackend> CloudDestination<B> {
 }
 
 impl<B: CloudBackend> CloudDestination<B> {
-    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the write failed with a kind the backend reports an absent container by and the bucket itself is absent; any other error unchanged.
+    /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the operation failed with a kind the backend reports an absent container by and the bucket itself is absent now (it may have gone since it last answered); any other error unchanged.
     fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
-        match write_error_may_mean_absent_container::<B>(&err).then(|| self.require_container()) {
+        match write_error_may_mean_absent_container::<B>(&err)
+            .then(|| self.refuse_an_absent_container())
+        {
             Some(Err(absent)) => absent,
             _ => err,
         }
@@ -489,21 +491,25 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         // bucket/container root the empty string is fine; for any non-empty
         // prefix we add `/` if the caller didn't.
         let listed = if full.is_empty() || full.ends_with('/') {
-            self.op.list_options(
-                &full,
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
+            self.op
+                .list_options(
+                    &full,
+                    opendal::options::ListOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| self.absent_container_or(e.into()))?
         } else {
-            self.op.list_options(
-                &format!("{}/", full),
-                opendal::options::ListOptions {
-                    recursive: true,
-                    ..Default::default()
-                },
-            )?
+            self.op
+                .list_options(
+                    &format!("{}/", full),
+                    opendal::options::ListOptions {
+                        recursive: true,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| self.absent_container_or(e.into()))?
         };
         let mut out = Vec::with_capacity(listed.len());
         for entry in listed {
@@ -537,27 +543,11 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
 
     fn read(&self, key: &str) -> Result<Vec<u8>> {
         let full = format!("{}{}", self.prefix, key);
-        let buf = self.op.read(&full)?;
+        let buf = self
+            .op
+            .read(&full)
+            .map_err(|e| self.absent_container_or(e.into()))?;
         Ok(buf.to_vec())
-    }
-
-    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
-        let full = format!("{}{}", self.prefix, key);
-        // `stat` returns NotFound for absent keys; opendal exposes the
-        // discriminator on the returned error so we can keep our contract
-        // "Ok(None) is unambiguous absence".
-        match self.op.stat(&full) {
-            Ok(meta) => Ok(Some(super::ObjectMeta {
-                key: key.to_string(),
-                size_bytes: meta.content_length(),
-                content_md5: meta.content_md5().map(str::to_string),
-            })),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                self.require_container()?;
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        }
     }
 
     fn remove(&self, key: &str) -> Result<()> {
@@ -577,6 +567,25 @@ impl<B: CloudBackend> super::Destination for CloudDestination<B> {
         self.op.copy(&from_full, &to_full)?;
         self.op.delete(&from_full)?;
         Ok(())
+    }
+
+    fn head(&self, key: &str) -> Result<Option<super::ObjectMeta>> {
+        let full = format!("{}{}", self.prefix, key);
+        // `stat` returns NotFound for absent keys; opendal exposes the
+        // discriminator on the returned error so we can keep our contract
+        // "Ok(None) is unambiguous absence".
+        match self.op.stat(&full) {
+            Ok(meta) => Ok(Some(super::ObjectMeta {
+                key: key.to_string(),
+                size_bytes: meta.content_length(),
+                content_md5: meta.content_md5().map(str::to_string),
+            })),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                self.require_container()?;
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -839,7 +848,17 @@ mod tests {
         stat_status: u16,
         list_status: u16,
     ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        stub_store_answering(stat_status, &[list_status])
+    }
+
+    /// A store answering `stat_status` to every key and `list_statuses` to listings in order, the last one from then on.
+    fn stub_store_answering(
+        stat_status: u16,
+        list_statuses: &[u16],
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
+        let mut list_statuses: std::collections::VecDeque<u16> =
+            list_statuses.iter().copied().collect();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let listings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -854,7 +873,14 @@ mod tests {
                 let is_listing = target.contains("/o?") && !target.starts_with("/upload/");
                 let (status, body) = if is_listing {
                     seen.lock().unwrap().push(target.to_string());
-                    (list_status, "{}")
+                    let status = list_statuses.front().copied().unwrap_or(stat_status);
+                    if list_statuses.len() > 1 {
+                        list_statuses.pop_front();
+                    }
+                    (
+                        status,
+                        r#"{"items":[{"name":"p/part.parquet","size":"5","md5Hash":"bWQ1","etag":"e","updated":"2026-10-16T00:00:00.000Z","contentType":"application/octet-stream"}],"prefixes":["p/dir/"]}"#,
+                    )
                 } else {
                     (stat_status, "{}")
                 };
@@ -919,6 +945,83 @@ mod tests {
             listings.lock().unwrap().is_empty(),
             "only a 404 asks about the bucket"
         );
+    }
+
+    /// A container that answered once may be gone by the next failed operation: the write, listing, read and delete ask again and refuse by code.
+    #[test]
+    fn an_operation_that_fails_after_the_container_once_answered_asks_the_store_again() {
+        use crate::destination::Destination;
+        let part = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(part.path(), b"bytes").unwrap();
+        let (endpoint, listings) = stub_store_answering(404, &[200, 404]);
+        let dest = stub_destination(&endpoint);
+        assert_eq!(
+            dest.head("manifest.json").unwrap(),
+            None,
+            "the container answered"
+        );
+        assert_eq!(listings.lock().unwrap().len(), 1);
+        for (what, err) in [
+            (
+                "write",
+                dest.write(part.path(), "part.parquet")
+                    .map(|_| ())
+                    .unwrap_err(),
+            ),
+            ("list", dest.list_prefix("").map(|_| ()).unwrap_err()),
+            ("read", dest.read("part.parquet").map(|_| ()).unwrap_err()),
+        ] {
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_DEST_CONTAINER_NOT_FOUND"),
+                "{what}: {err:#}"
+            );
+            assert_eq!(
+                crate::error::retry::classify_error(&err),
+                crate::error::retry::RetryClass::Permanent,
+                "{what}"
+            );
+        }
+        assert_eq!(
+            listings.lock().unwrap().len(),
+            1 + 1 + 2 + 1,
+            "the write and the read each asked again; the listing failed and asked again"
+        );
+        assert!(
+            dest.remove("part.parquet").is_ok(),
+            "a delete the store answers 404 is complete by opendal's contract: nothing to classify"
+        );
+    }
+
+    /// A listing walks the prefix recursively (no delimiter), under the configured prefix as it is, and hands back files only, keys relative to that prefix.
+    #[test]
+    fn a_listing_is_recursive_under_the_prefix_and_hands_back_relative_file_keys() {
+        use crate::destination::Destination;
+        let (endpoint, listings) = stub_store(404, 200);
+        let dest = stub_destination(&endpoint);
+        let listed = dest.list_prefix("").unwrap();
+        let asked = listings.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert!(
+            asked[0].contains("prefix=p%2F&") || asked[0].ends_with("prefix=p%2F"),
+            "the configured prefix as it is, one slash: {asked:?}"
+        );
+        assert!(!asked[0].contains("delimiter"), "recursive: {asked:?}");
+        assert_eq!(
+            listed.len(),
+            1,
+            "the directory entry is not an object: {listed:?}"
+        );
+        assert_eq!(listed[0].key, "part.parquet");
+        assert_eq!(listed[0].size_bytes, 5);
+        assert_eq!(listed[0].content_md5.as_deref(), Some("bWQ1"));
+        let under = dest.list_prefix("dir").unwrap();
+        let asked = listings.lock().unwrap().clone();
+        assert!(
+            asked[1].contains("prefix=p%2Fdir%2F") && !asked[1].contains("delimiter"),
+            "a sub-prefix gets its slash and is walked recursively too: {asked:?}"
+        );
+        assert_eq!(under.len(), 1);
     }
 
     /// `head` answers "absent" only for a key: a bucket that does not exist is an error with its own code.

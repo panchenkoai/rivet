@@ -392,18 +392,7 @@ pub(crate) fn unsafe_mapping_refusal(message: String) -> anyhow::Error {
     crate::error::coded(crate::error::codes::TYPE_UNSAFE_MAPPING, message)
 }
 
-/// The async runtime a driver runs on, or an environment stop naming `engine` when the process cannot start one.
-pub(crate) fn driver_runtime(
-    engine: &str,
-    built: std::io::Result<tokio::runtime::Runtime>,
-) -> Result<tokio::runtime::Runtime> {
-    built.map_err(|e| {
-        crate::error::coded(
-            crate::error::codes::SOURCE_RUNTIME_UNAVAILABLE,
-            format!("{engine}: tokio runtime build failed: {e}"),
-        )
-    })
-}
+pub(crate) use crate::connect::driver_runtime;
 
 /// A key column list, or `None` when the table has no key.
 pub(crate) fn non_empty_keys(cols: Vec<String>) -> Option<Vec<String>> {

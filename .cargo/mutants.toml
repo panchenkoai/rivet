@@ -56,6 +56,15 @@ exclude_re = [
     # of_every_sized_type` kills `<` and `==`).
     "replace > with >= in ExportSink::track_shape$",
 
+    # Equivalent on the wire: `list_prefix` adds a `/` only when `full` lacks one, and
+    # the `&&` form adds it to a slashed or empty `full` too (`p//`, `/`), which opendal's
+    # path normalization collapses back to `p/` and the root before the request is
+    # built. Witness search: every `full` (empty, `p/`, `p/dir`) lists the same prefix
+    # under both forms, measured through the stub store of
+    # `a_listing_is_recursive_under_the_prefix_and_hands_back_relative_file_keys`
+    # (which kills the two `recursive` mutants beside it).
+    "replace \\|\\| with && in <impl super::Destination for CloudDestination<B>>::list_prefix$",
+
     # Display-only arithmetic and output, each the only operator of its kind in its
     # function (checked with `cargo mutants --list -F`): the chunk progress bar's
     # position (`pb.inc(done + this_chunk)`), the rehydration info line's `n > 0`
