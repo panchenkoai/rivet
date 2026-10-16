@@ -1,0 +1,8 @@
+--- a/src/plan/artifact.rs
++++ b/src/plan/artifact.rs
+@@ -331,4 +331,4 @@
+     /// Whether this plan is a reusable description whose every apply continues the stored cursor (incremental, `keyset_incremental`), not a point-in-time snapshot (full, chunked, keyset, time window).
+     pub fn is_reusable(&self) -> bool {
+-        self.resolved_plan.strategy.continues_stored_cursor()
++        false
+     }

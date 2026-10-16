@@ -222,20 +222,22 @@ guarantees:
   - id: a_replay_of_an_applied_plan_is_not_run_again
     stated:
       - file: docs/concepts.md
-        sentence: "A plan that already applied to exit 0 is not run again: a replay of the same artifact (a scheduler retry) exits 0 and names the run that applied it"
+        sentence: "a full, chunked or keyset plan that already applied to exit 0 is not run again: a replay of the same artifact (a scheduler retry) exits 0 and names the run that applied it"
     held_by:
       postgres: { test: a_replayed_applied_full_plan_answers_with_its_run_postgres, asserts: "nothing written under the prefix" }
       mysql: { test: a_replayed_applied_full_plan_answers_with_its_run_mysql, asserts: "nothing written under the prefix" }
       mssql: { test: a_replayed_applied_full_plan_answers_with_its_run_mssql, asserts: "nothing written under the prefix" }
       oracle: { test: a_replayed_applied_full_plan_answers_with_its_run_oracle, asserts: "nothing written under the prefix" }
 
-  - id: an_unpinned_incremental_plan_reads_what_arrived_since_on_every_apply
+  - id: an_incremental_plan_reads_what_arrived_since_on_every_apply
     stated:
       - file: docs/concepts.md
-        sentence: "unless the plan continues a stored cursor it does not pin, whose every apply reads what arrived since"
+        sentence: "An incremental plan is a reusable description: every apply of it reads the cursor from state and delivers what arrived since"
     held_by:
-      postgres: { test: a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_postgres, asserts: "an unpinned plan reads what arrived since" }
-      mysql: { test: a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_mysql, asserts: "an unpinned plan reads what arrived since" }
+      postgres: { test: a_replayed_incremental_plan_delivers_what_arrived_since_postgres, asserts: "an incremental plan reads what arrived since" }
+      mysql: { test: a_replayed_incremental_plan_delivers_what_arrived_since_mysql, asserts: "an incremental plan reads what arrived since" }
+      mssql: { test: a_replayed_incremental_plan_delivers_what_arrived_since_mssql, asserts: "an incremental plan reads what arrived since" }
+      oracle: { test: a_replayed_incremental_plan_delivers_what_arrived_since_oracle, asserts: "an incremental plan reads what arrived since" }
 
   - id: run_resume_is_not_refused_over_a_marker_a_failed_run_left_alone
     stated:

@@ -1,0 +1,13 @@
+--- a/src/pipeline/apply_cmd.rs
++++ b/src/pipeline/apply_cmd.rs
+@@ -209,9 +209,3 @@
+         let current = state.get(&artifact.export_name, &source)?.last_cursor_value;
+-        if !artifact.cursor_matches(current.as_deref())
+-            && !state.cursor_last_moved_by_plan(
+-                &artifact.export_name,
+-                &source,
+-                &artifact.plan_id,
+-            )?
+-        {
++        if !artifact.cursor_matches(current.as_deref()) {
+             if !force {

@@ -220,6 +220,23 @@ impl StateStore {
         )
     }
 
+    /// Whether the newest successful run of `export_name` from `source` applied the sealed plan `plan_id`: the stored cursor was last moved by that plan.
+    pub fn cursor_last_moved_by_plan(
+        &self,
+        export_name: &str,
+        source: &str,
+        plan_id: &str,
+    ) -> Result<bool> {
+        let newest = self.query_opt(
+            "SELECT COALESCE(plan_id, '') FROM run_status WHERE export_name = ?1 \
+             AND (source = ?2 OR source IS NULL) AND status = 'success' \
+             ORDER BY started_at DESC LIMIT 1",
+            &[export_name.into(), source.into()],
+            |r| r.text(0),
+        )?;
+        Ok(newest.as_deref() == Some(plan_id))
+    }
+
     /// Record the source `run_id` reads, which scopes the run lease that closes its row if it dies.
     pub fn record_run_source(&self, run_id: &str, source: &str) -> Result<()> {
         self.execute(

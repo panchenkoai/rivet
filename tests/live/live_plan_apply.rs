@@ -14,7 +14,7 @@
 //! | PA-L7 | Missing plan file → non-zero exit | PA1 |
 //! | PA-L8 | `plan --param` substitutes query parameter | PA1 — artifact embeds params |
 //! | PA-L9 | A degraded re-apply WARNs run-over-run | not ADR-0005 — the orchestrator-tail throughput self-check, which `apply` bypassed until round 7 |
-//! | PA-L10 | A replay of a plan that applied to exit 0 answers with its run, writes nothing; a died apply replays; another run's cursor move stays STALE | PA2, PA4 — retry matrix F3 |
+//! | PA-L10 | A replay of a full, chunked or keyset plan that applied to exit 0 answers with its run and writes nothing; every apply of an incremental plan delivers what arrived since; a died apply replays; another run's cursor move stays STALE | PA2, PA3, PA4, PA11 — retry matrix F3 |
 
 use crate::common::*;
 
@@ -1047,7 +1047,7 @@ fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
 
 // ─── PA-L10: a replay of a plan that already applied (retry matrix F3) ────────
 
-/// The export shape of a replay cell; `IncrementalAfterRun` plans after a `rivet run` stored a cursor, so the plan pins a snapshot its own apply moves; `IncrementalFirst` and `KeysetIncremental` continue a stored cursor they do not pin.
+/// The export shape of a replay cell; `IncrementalAfterRun` plans after a `rivet run` stored a cursor, so the plan holds a snapshot its own apply moves; `IncrementalFirst` plans before any cursor is stored.
 #[derive(Clone, Copy, Debug)]
 enum ReplayShape {
     Full,
@@ -1172,17 +1172,6 @@ fn a_replayed_applied_plan_names_the_run_that_applied_it(engine: SqlEngine, shap
     let Some(stand) = ReplayStand::new(engine, shape) else {
         return;
     };
-    let mut planned_rows = 20;
-    if let ReplayShape::IncrementalAfterRun = shape {
-        let out = stand.rig.run_args_env(&[], &stand.envs());
-        assert!(
-            out.status.success(),
-            "rivet run: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        engine.insert(&stand.table, 21..=30, 60, None);
-        planned_rows = 10;
-    }
     let plan = stand.plan();
     let before = manifest_run_ids(&stand.objects());
     let out = stand.apply(&plan, &[]);
@@ -1201,10 +1190,7 @@ fn a_replayed_applied_plan_names_the_run_that_applied_it(engine: SqlEngine, shap
         1,
         "{shape:?}: one run applied the plan: {runs:?}"
     );
-    let named = format!(
-        "was already applied by run {} (success, {planned_rows} rows,",
-        runs[0]
-    );
+    let named = format!("was already applied by run {} (success, 20 rows,", runs[0]);
     for cycle in 1..=2 {
         let replay = stand.apply(&plan, &[]);
         let stderr = String::from_utf8_lossy(&replay.stderr);
@@ -1225,16 +1211,25 @@ fn a_replayed_applied_plan_names_the_run_that_applied_it(engine: SqlEngine, shap
     }
 }
 
-/// A plan that continues a stored cursor it does not pin is the next increment on every replay: each writes its own run, none answers "already applied", and the rig oracle finds every row the source holds after each.
-fn a_replayed_unpinned_plan_delivers_what_arrived_since(engine: SqlEngine, shape: ReplayShape) {
+/// An incremental plan is reusable: every apply of it continues the stored cursor, writes its own run, never answers "already applied" nor is refused by its own cursor moves, and the rig oracle finds every row the source holds after each.
+fn a_replayed_incremental_plan_delivers_what_arrived_since(engine: SqlEngine, shape: ReplayShape) {
     let Some(stand) = ReplayStand::new(engine, shape) else {
         return;
     };
+    let after_run = matches!(shape, ReplayShape::IncrementalAfterRun);
+    if after_run {
+        let out = stand.rig.run_args_env(&[], &stand.envs());
+        assert!(
+            out.status.success(),
+            "rivet run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let plan = stand.plan();
     let mut seen = manifest_run_ids(&stand.objects());
     let mut next = 21;
-    for (cycle, arrived) in [(0, 20), (1, 10), (2, 5)] {
-        if cycle > 0 {
+    for (cycle, arrived) in [(0, if after_run { 10 } else { 20 }), (1, 10), (2, 5)] {
+        if cycle > 0 || after_run {
             engine.insert(&stand.table, next..=next + arrived - 1, 60, None);
             next += arrived;
         }
@@ -1243,7 +1238,7 @@ fn a_replayed_unpinned_plan_delivers_what_arrived_since(engine: SqlEngine, shape
         assert!(out.status.success(), "{shape:?}, apply {cycle}: {stderr}");
         assert!(
             !stderr.contains("already applied"),
-            "{shape:?}, apply {cycle}: an unpinned plan reads what arrived since: {stderr}"
+            "{shape:?}, apply {cycle}: an incremental plan reads what arrived since: {stderr}"
         );
         let now = manifest_run_ids(&stand.objects());
         let new: Vec<&String> = now.difference(&seen).collect();
@@ -1314,8 +1309,8 @@ fn a_replayed_applied_full_plan_answers_with_its_run_postgres() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
-fn a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_postgres() {
-    a_replayed_unpinned_plan_delivers_what_arrived_since(
+fn a_replayed_first_incremental_plan_delivers_what_arrived_since_postgres() {
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Pg,
         ReplayShape::IncrementalFirst,
     );
@@ -1324,7 +1319,7 @@ fn a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_postgres() {
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres() {
-    a_replayed_unpinned_plan_delivers_what_arrived_since(
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Pg,
         ReplayShape::KeysetIncremental,
     );
@@ -1332,8 +1327,8 @@ fn a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
-fn a_replayed_applied_incremental_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_names_the_run_that_applied_it(
+fn a_replayed_incremental_plan_delivers_what_arrived_since_postgres() {
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Pg,
         ReplayShape::IncrementalAfterRun,
     );
@@ -1371,8 +1366,8 @@ fn a_replayed_applied_full_plan_answers_with_its_run_mysql() {
 
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
-fn a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_mysql() {
-    a_replayed_unpinned_plan_delivers_what_arrived_since(
+fn a_replayed_first_incremental_plan_delivers_what_arrived_since_mysql() {
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Mysql,
         ReplayShape::IncrementalFirst,
     );
@@ -1381,7 +1376,7 @@ fn a_replayed_unpinned_incremental_plan_delivers_what_arrived_since_mysql() {
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql() {
-    a_replayed_unpinned_plan_delivers_what_arrived_since(
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Mysql,
         ReplayShape::KeysetIncremental,
     );
@@ -1389,8 +1384,8 @@ fn a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql() {
 
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
-fn a_replayed_applied_incremental_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_names_the_run_that_applied_it(
+fn a_replayed_incremental_plan_delivers_what_arrived_since_mysql() {
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Mysql,
         ReplayShape::IncrementalAfterRun,
     );
@@ -1428,8 +1423,8 @@ fn a_replayed_applied_full_plan_answers_with_its_run_mssql() {
 
 #[test]
 #[ignore = "live: requires docker compose mssql + GCS"]
-fn a_replayed_applied_incremental_plan_answers_with_its_run_mssql() {
-    a_replayed_applied_plan_names_the_run_that_applied_it(
+fn a_replayed_incremental_plan_delivers_what_arrived_since_mssql() {
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Mssql,
         ReplayShape::IncrementalAfterRun,
     );
@@ -1451,8 +1446,8 @@ fn a_replayed_applied_full_plan_answers_with_its_run_oracle() {
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle + GCS"]
-fn a_replayed_applied_incremental_plan_answers_with_its_run_oracle() {
-    a_replayed_applied_plan_names_the_run_that_applied_it(
+fn a_replayed_incremental_plan_delivers_what_arrived_since_oracle() {
+    a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Oracle,
         ReplayShape::IncrementalAfterRun,
     );

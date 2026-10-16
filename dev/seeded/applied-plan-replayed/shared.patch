@@ -1,12 +1,9 @@
 --- a/src/pipeline/apply_cmd.rs
 +++ b/src/pipeline/apply_cmd.rs
-@@ -131,7 +131,6 @@
-     //    unless the plan continues a stored cursor it does not pin: then the replay
-     //    reads only what arrived since, the next increment.
--    if artifact.replay_reads_the_same_rows()
+@@ -132,5 +132,4 @@
+     let reusable = artifact.is_reusable();
+     if !reusable
 -        && let Some(run_id) =
 -            state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)?
-+    if artifact.replay_reads_the_same_rows()
 +        && let Some(run_id) = None::<String>
      {
-         if !force {

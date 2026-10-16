@@ -126,11 +126,11 @@ pub fn run_apply_command(
     let state_path = state_dir.join(".rivet_state.db");
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
-    // 3. A replay of a plan that already applied to exit 0 (a retry whose first
-    //    try died after rivet finished) answers with that run and extracts nothing,
-    //    unless the plan continues a stored cursor it does not pin: then the replay
-    //    reads only what arrived since, the next increment.
-    if artifact.replay_reads_the_same_rows()
+    // 3. A replay of a point-in-time plan that already applied to exit 0 (a retry
+    //    whose first try died after rivet finished) answers with that run and
+    //    extracts nothing. A reusable plan continues the stored cursor instead.
+    let reusable = artifact.is_reusable();
+    if !reusable
         && let Some(run_id) =
             state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)?
     {
@@ -147,10 +147,15 @@ pub fn run_apply_command(
         );
     }
 
-    // 4. Staleness check
+    // 4. Staleness check, for a point-in-time plan only: a reusable plan has no age.
     let warn_threshold = Duration::hours(1);
     let error_threshold = Duration::hours(24);
-    match artifact.staleness(warn_threshold, error_threshold) {
+    let staleness = if reusable {
+        StalenessCheck::Fresh
+    } else {
+        artifact.staleness(warn_threshold, error_threshold)
+    };
+    match staleness {
         StalenessCheck::Fresh => {}
         StalenessCheck::StaleWarn(age) => {
             log::warn!(
@@ -197,14 +202,18 @@ pub fn run_apply_command(
     // not actually honour `--force` here.  The flag now bypasses the bail
     // with a WARN log, matching the documented contract and the analogous
     // staleness path above.
+    // A cursor the last successful run moved by applying this same plan is the
+    // plan's own progress, not drift.
     if artifact.computed.cursor_snapshot.is_some() {
-        let current = state
-            .get(
+        let source = artifact.resolved_plan.source.state_key();
+        let current = state.get(&artifact.export_name, &source)?.last_cursor_value;
+        if !artifact.cursor_matches(current.as_deref())
+            && !state.cursor_last_moved_by_plan(
                 &artifact.export_name,
-                &artifact.resolved_plan.source.state_key(),
+                &source,
+                &artifact.plan_id,
             )?
-            .last_cursor_value;
-        if !artifact.cursor_matches(current.as_deref()) {
+        {
             if !force {
                 crate::rivet_bail!(
                     crate::error::codes::PLAN_ARTIFACT_STALE,
@@ -679,35 +688,36 @@ mod tests {
         })
     }
 
-    /// Replayed after its own apply exited 0, a plan that reads the same rows again answers with that run on every cycle and touches nothing — even when its snapshot cursor was moved by its own commit.
+    /// Replayed after its own apply exited 0, a point-in-time plan answers with that run on every cycle and touches nothing.
     #[test]
     fn a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing() {
-        for (strategy, snapshot) in [
-            (ExtractionStrategy::Snapshot, None),
-            (keyset(false), None),
-            (incremental(), Some("1000")),
-        ] {
-            let mut artifact = validation_refused_artifact_of(strategy);
-            artifact.computed.cursor_snapshot = snapshot.map(String::from);
+        for strategy in [ExtractionStrategy::Snapshot, keyset(false)] {
+            let artifact = validation_refused_artifact_of(strategy.clone());
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_artifact(&dir, &artifact);
             applied_state(&dir, &artifact, "success", true);
             let before = state_rows(&dir);
             for cycle in 1..=2 {
                 run_apply_command(&path, false, false, false, None, false).unwrap_or_else(|e| {
-                    panic!("snapshot {snapshot:?}, replay {cycle}: already applied, got {e:#}")
+                    panic!("{strategy:?}, replay {cycle}: already applied, got {e:#}")
                 });
                 assert_eq!(state_rows(&dir), before, "replay {cycle} wrote no run");
             }
         }
     }
 
-    /// Replayed after its own apply exited 0, a plan that continues a stored cursor it does not pin runs again on every cycle: it reads only what arrived since.
+    /// Replayed after its own apply exited 0, a reusable plan runs again on every cycle from the stored cursor, even when that apply moved the cursor its snapshot pinned and the plan is days old.
     #[test]
-    fn a_plan_that_continues_an_unpinned_stored_cursor_extracts_on_every_replay() {
-        for strategy in [incremental(), keyset(true)] {
-            let artifact = validation_refused_artifact_of(strategy.clone());
-            assert!(!artifact.replay_reads_the_same_rows(), "{strategy:?}");
+    fn a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor() {
+        for (strategy, snapshot) in [
+            (incremental(), None),
+            (incremental(), Some("1000")),
+            (keyset(true), None),
+        ] {
+            let mut artifact = validation_refused_artifact_of(strategy.clone());
+            artifact.computed.cursor_snapshot = snapshot.map(String::from);
+            artifact.created_at = Utc::now() - Duration::hours(73);
+            assert!(artifact.is_reusable(), "{strategy:?}");
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_artifact(&dir, &artifact);
             applied_state(&dir, &artifact, "success", true);
@@ -715,9 +725,39 @@ mod tests {
                 let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
                 assert!(
                     format!("{err:#}").contains("max_file_size cannot be used with stdout"),
-                    "{strategy:?}, replay {cycle}: the replay must run the plan, got {err:#}"
+                    "{strategy:?}, snapshot {snapshot:?}, replay {cycle}: the replay must run the \
+                     plan, got {err:#}"
                 );
             }
+        }
+    }
+
+    /// A reusable plan's snapshot cursor moved by a run that did not apply it, after or without an apply of it, is refused STALE.
+    #[test]
+    fn a_reusable_plan_whose_cursor_another_run_moved_is_refused_stale() {
+        let mut artifact = validation_refused_artifact_of(incremental());
+        artifact.computed.cursor_snapshot = Some("1000".into());
+        for applied_first in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_artifact(&dir, &artifact);
+            applied_state(&dir, &artifact, "success", applied_first);
+            if applied_first {
+                let state =
+                    StateStore::open(dir.path().join(".rivet_state.db").to_str().unwrap()).unwrap();
+                state
+                    .begin_run("r2", "orders", "file:///out", "2026-01-02T00:00:00Z")
+                    .unwrap();
+                state
+                    .finish_run("r2", "success", "2026-01-02T00:01:00Z")
+                    .unwrap();
+                state.update_legacy("orders", "1020").unwrap();
+            }
+            let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
+            assert!(
+                format!("{err:#}").contains("cursor has drifted"),
+                "applied first {applied_first}: {err:#}"
+            );
         }
     }
 
@@ -773,19 +813,6 @@ mod tests {
         applied_state(&dir, &validation_refused_artifact(), "success", true);
         let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
         ran(err, "another plan's run");
-    }
-
-    /// A drifted cursor with no applied run of this plan is still refused STALE.
-    #[test]
-    fn a_cursor_another_run_moved_is_still_refused_stale() {
-        let mut artifact = fresh_artifact();
-        artifact.computed.cursor_snapshot = Some("1000".into());
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = write_artifact(&dir, &artifact);
-        applied_state(&dir, &artifact, "success", false);
-        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
-        crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
-        assert!(format!("{err:#}").contains("cursor has drifted"), "{err:#}");
     }
 
     /// The answer names the plan, the run and that run's outcome as its metrics row holds it, and the remedy.
