@@ -46,7 +46,7 @@ fn scalar_i64(conn: &mut OracleSource, sql: &str, what: &str) -> Option<i64> {
 fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    if let Some(fail) = schema_fail_oracle(conn, base_query) {
+    if let Some(fail) = schema_fail_oracle(conn, base_query, export) {
         return Err(fail);
     }
 
@@ -132,24 +132,35 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
     ))
 }
 
-/// Validate the query's relations by parsing it; a missing table/column
-/// (ORA-00942 / ORA-00904) is a loud preflight error, anything else fail-soft.
-fn schema_fail_oracle(conn: &mut OracleSource, base_query: &str) -> Option<anyhow::Error> {
+/// Validate the query's relations by parsing it: a missing table (ORA-00942) is the shared
+/// `RIVET_SOURCE_TABLE_NOT_FOUND`, a missing column (ORA-00904) the loud preflight error,
+/// anything else fail-soft.
+fn schema_fail_oracle(
+    conn: &mut OracleSource,
+    base_query: &str,
+    export: &ExportConfig,
+) -> Option<anyhow::Error> {
     let Err(e) = conn.parses(base_query) else {
         return None;
     };
-    let m = format!("{e:#}");
-    let (detail, code) = if m.contains("ORA-00942") {
-        (
-            "a table/view in the export's query does not exist",
-            "ORA-00942",
-        )
-    } else if m.contains("ORA-00904") {
-        ("a column in the export's query does not exist", "ORA-00904")
-    } else {
+    if crate::source::names_a_missing_relation(&e) {
+        return Some(crate::source::code_a_missing_relation(
+            e,
+            &export.name,
+            export.table.as_deref(),
+            export.query.as_deref(),
+        ));
+    }
+    if !format!("{e:#}").contains("ORA-00904") {
         return None;
-    };
-    Some(PreflightSchemaError::new(detail, code.to_string()).into_error())
+    }
+    Some(
+        PreflightSchemaError::new(
+            "a column in the export's query does not exist",
+            "ORA-00904".to_string(),
+        )
+        .into_error(),
+    )
 }
 
 /// Refuse a `columns:` key spelled in another case than the result column it means, as the run does.

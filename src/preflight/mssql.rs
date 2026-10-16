@@ -78,7 +78,7 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     // at run time. The catalog-based row-estimate below never touches the table,
     // so this zero-row probe is the only check that validates the query's actual
     // relations. Operational errors stay fail-soft (`None`).
-    if let Some(fail) = schema_fail_mssql(conn, base_query) {
+    if let Some(fail) = schema_fail_mssql(conn, base_query, export) {
         return Err(fail);
     }
 
@@ -171,19 +171,29 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
 /// clustered index (`index_id IN (0,1)`), no `COUNT(*)` scan. `None` when the
 /// stats row is absent (view, no stats) or the probe fails; preflight is
 /// non-fatal, so a failure is logged at debug, never aborted.
-/// Validate the query's relations with a zero-row wrap; map an author-fixable
-/// failure (Invalid object name = 208, Invalid column name = 207) to a loud
-/// preflight error. `None` (fail-soft) for success and operational errors.
-fn schema_fail_mssql(conn: &mut MssqlSource, base_query: &str) -> Option<anyhow::Error> {
+/// Validate the query's relations with a zero-row wrap: a missing relation (208) is the shared
+/// `RIVET_SOURCE_TABLE_NOT_FOUND`, a missing column (207) the loud preflight error. `None`
+/// (fail-soft) for success and operational errors.
+fn schema_fail_mssql(
+    conn: &mut MssqlSource,
+    base_query: &str,
+    export: &ExportConfig,
+) -> Option<anyhow::Error> {
     // `TOP 0` over a derived table executes the relations without scanning rows.
     let probe = format!("SELECT TOP 0 1 AS _ok FROM ({base_query}) AS _rivet_probe");
     let Err(e) = conn.query_scalar(&probe) else {
         return None;
     };
+    if crate::source::names_a_missing_relation(&e) {
+        return Some(crate::source::code_a_missing_relation(
+            e,
+            &export.name,
+            export.table.as_deref(),
+            export.query.as_deref(),
+        ));
+    }
     let m = format!("{e:#}");
-    let detail = if m.contains("Invalid object name") {
-        "a table/view in the export's query does not exist"
-    } else if m.contains("Invalid column name") {
+    let detail = if m.contains("Invalid column name") {
         "a column in the export's query does not exist"
     } else {
         return None; // operational → fail-soft

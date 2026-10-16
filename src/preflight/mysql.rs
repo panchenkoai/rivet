@@ -43,20 +43,34 @@ fn fetch_max_connections_mysql(conn: &mut mysql::PooledConn) -> Option<u32> {
 /// `EXPLAIN` the export's query purely to validate the schema; map an
 /// author-fixable failure to a loud preflight error. `None` (fail-soft) for
 /// success and for operational/transient errors.
-fn schema_fail_mysql(conn: &mut mysql::PooledConn, query: &str) -> Option<anyhow::Error> {
+fn schema_fail_mysql(
+    conn: &mut mysql::PooledConn,
+    query: &str,
+    export: &ExportConfig,
+) -> Option<anyhow::Error> {
     use mysql::prelude::Queryable;
     match conn.query_drop(format!("EXPLAIN {query}")) {
         Ok(()) => None,
-        Err(e) => mysql_schema_error(&e),
+        Err(e) => mysql_schema_error(e, export),
     }
 }
 
-/// MySQL author-fixable schema errors: ER_NO_SUCH_TABLE (1146),
-/// ER_BAD_FIELD_ERROR (1054), ER_TABLEACCESS_DENIED_ERROR (1142), parse error
-/// (1064). Every other code/variant is operational → `None` (fail-soft).
-fn mysql_schema_error(e: &mysql::Error) -> Option<anyhow::Error> {
-    if let mysql::Error::MySqlError(me) = e
-        && matches!(me.code, 1146 | 1054 | 1142 | 1064)
+/// A missing table (ER_NO_SUCH_TABLE, 1146) as the shared `RIVET_SOURCE_TABLE_NOT_FOUND`; the
+/// other author-fixable schema errors, ER_BAD_FIELD_ERROR (1054), ER_TABLEACCESS_DENIED_ERROR
+/// (1142) and a parse error (1064), as the loud preflight schema error. Every other
+/// code/variant is operational → `None` (fail-soft).
+fn mysql_schema_error(e: mysql::Error, export: &ExportConfig) -> Option<anyhow::Error> {
+    let cause = anyhow::Error::new(e);
+    if crate::source::names_a_missing_relation(&cause) {
+        return Some(crate::source::code_a_missing_relation(
+            cause,
+            &export.name,
+            export.table.as_deref(),
+            export.query.as_deref(),
+        ));
+    }
+    if let Some(mysql::Error::MySqlError(me)) = cause.downcast_ref::<mysql::Error>()
+        && matches!(me.code, 1054 | 1142 | 1064)
     {
         return Some(
             PreflightSchemaError::new(me.message.as_str(), format!("MySQL error {}", me.code))
@@ -98,7 +112,7 @@ fn diagnose_mysql(
     // permanent and author-fixable — fail preflight loudly instead of letting it
     // sail through to run time. Operational errors stay fail-soft in the probes
     // below (which `unwrap_or_default` / log at debug and continue).
-    if let Some(fail) = schema_fail_mysql(conn, &effective_query) {
+    if let Some(fail) = schema_fail_mysql(conn, &effective_query, export) {
         return Err(fail);
     }
 

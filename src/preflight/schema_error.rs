@@ -2,6 +2,10 @@
 //! failure (missing table/column, no SELECT grant, query syntax) that must make
 //! `rivet check` FAIL loudly instead of sailing through to run time.
 //!
+//! A MISSING RELATION is not mapped here: every engine's probe asks
+//! `crate::source::names_a_missing_relation` first and raises the one
+//! `RIVET_SOURCE_TABLE_NOT_FOUND` the run raises (`code_a_missing_relation`).
+//!
 //! ADR-0015 pattern: the seam lives at this **named data shape**, not a trait.
 //! Each engine detects its own native error taxonomy and maps it here —
 //!

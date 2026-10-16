@@ -122,7 +122,18 @@ impl FanIn {
             kind,
             inner(self.committed),
         );
-        let mut errors = inner(self.errors);
+        let mut errors: Vec<(String, anyhow::Error)> = inner(self.errors)
+            .into_iter()
+            .map(|(label, e)| {
+                let e = crate::source::code_a_missing_relation(
+                    e,
+                    &plan.export_name,
+                    plan.source_table.as_deref(),
+                    Some(&plan.base_query),
+                );
+                (label, e)
+            })
+            .collect();
         if errors.is_empty() {
             mark_validated(plan, summary);
             return Ok(());

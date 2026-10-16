@@ -392,6 +392,54 @@ pub(crate) fn unsafe_mapping_refusal(message: String) -> anyhow::Error {
     crate::error::coded(crate::error::codes::TYPE_UNSAFE_MAPPING, message)
 }
 
+/// Whether `err` is an engine's typed verdict that a relation the export reads does not exist: PostgreSQL SQLSTATE 42P01, MySQL 1146, SQL Server 208, Oracle ORA-00942.
+pub(crate) fn names_a_missing_relation(err: &anyhow::Error) -> bool {
+    if let Some(db) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<::postgres::Error>())
+        .and_then(::postgres::Error::as_db_error)
+    {
+        return *db.code() == ::postgres::error::SqlState::UNDEFINED_TABLE;
+    }
+    if let Some(e) = err.chain().find_map(|e| e.downcast_ref::<::mysql::Error>()) {
+        return matches!(e, ::mysql::Error::MySqlError(me) if me.code == 1146);
+    }
+    // SQL Server and Oracle errors arrive as the driver's own rendering of the server number (src/source/mssql, src/source/oracle); MySQL's rendering covers a wrapper that re-rendered the typed error.
+    let text = format!("{err:#}");
+    text.contains("(code: 208,") || text.contains("ORA-00942") || text.contains("ERROR 1146 (")
+}
+
+/// `err` as `RIVET_SOURCE_TABLE_NOT_FOUND` when [`names_a_missing_relation`], naming what `export` reads (its `table:`, or the one relation of a simple `query:`); any other error, or one already so coded, as it came.
+pub(crate) fn code_a_missing_relation(
+    err: anyhow::Error,
+    export: &str,
+    table: Option<&str>,
+    query: Option<&str>,
+) -> anyhow::Error {
+    let code = crate::error::codes::SOURCE_TABLE_NOT_FOUND;
+    if crate::error::code_of(&err) == Some(code) || !names_a_missing_relation(&err) {
+        return err;
+    }
+    let from_query = || {
+        let parts = crate::sql::first_relation(query?)?;
+        let names: Vec<&str> = parts.iter().map(|p| p.name.as_str()).collect();
+        Some(names.join("."))
+    };
+    let reads = match (table, from_query()) {
+        (Some(t), _) => format!("`table: {t}`"),
+        (None, Some(t)) => format!("`{t}`, read by its `query:`"),
+        (None, None) => "a relation in its `query:`".to_string(),
+    };
+    err.context(crate::error::CodedError::new(
+        code,
+        format!(
+            "export '{export}': the table it reads does not exist ({reads}). Correct the export's \
+             `table:` or `query:`, or remove the export from `exports:` if the table was dropped \
+             on purpose"
+        ),
+    ))
+}
+
 pub(crate) use crate::connect::driver_runtime;
 
 /// A key column list, or `None` when the table has no key.
@@ -723,5 +771,146 @@ mod error_code_tests {
         crate::error::assert_coded(&err, "RIVET_SOURCE_VALUE_TOO_LARGE", 1);
         let err = verify_wire_columns(&["a"], &["b"]).unwrap_err();
         crate::error::assert_coded(&err, "RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ", 1);
+    }
+}
+
+#[cfg(test)]
+mod missing_relation_tests {
+    use super::{code_a_missing_relation, names_a_missing_relation};
+
+    /// A real `postgres::Error` carrying `sqlstate`, from a server that answers every statement with it.
+    fn pg_error(sqlstate: &'static str) -> anyhow::Error {
+        use crate::connect::postgres::wire_recorder::{Answer, answering_server};
+        let (url, queries) = answering_server(Answer::Error(sqlstate));
+        let mut client = crate::connect::postgres::connect_client(&url, None).unwrap();
+        let err = client
+            .query("SELECT 1", &[])
+            .expect_err("the server refuses every statement");
+        drop(client);
+        drop(queries);
+        anyhow::Error::new(err)
+    }
+
+    fn mysql_error(code: u16, message: &str) -> anyhow::Error {
+        anyhow::Error::new(::mysql::Error::MySqlError(::mysql::MySqlError {
+            state: "42S02".to_string(),
+            message: message.to_string(),
+            code,
+        }))
+    }
+
+    /// The driver's rendering as the SQL Server and Oracle sources lift it: a coded string.
+    fn rendered(text: &str) -> anyhow::Error {
+        crate::error::coded(crate::error::codes::SOURCE_QUERY_FAILED, text.to_string())
+    }
+
+    #[test]
+    fn each_engines_verdict_for_a_missing_relation_is_coded_and_no_other_is() {
+        let cases: Vec<(&str, anyhow::Error, bool)> = vec![
+            ("postgres 42P01", pg_error("42P01"), true),
+            ("postgres 42703", pg_error("42703"), false),
+            (
+                "mysql 1146",
+                mysql_error(1146, "Table 'rivet.drop_probe_b' doesn't exist"),
+                true,
+            ),
+            (
+                "mysql 1054",
+                mysql_error(1054, "Unknown column 'totl' in 'field list'"),
+                false,
+            ),
+            (
+                "mssql 208",
+                rendered(
+                    "mssql: query failed: Token error: 'Invalid object name 'drop_probe_b'.' on \
+                     server x executing  on line 1 (code: 208, state: 1, class: 16)",
+                ),
+                true,
+            ),
+            (
+                "mssql 207",
+                rendered(
+                    "mssql: query failed: Token error: 'Invalid column name 'totl'.' on server \
+                     x executing  on line 1 (code: 207, state: 1, class: 16)",
+                ),
+                false,
+            ),
+            (
+                "oracle ORA-00942",
+                rendered(
+                    "oracle: OracleError { code: 942, message: \"ORA-00942: table or view does \
+                     not exist\" }",
+                ),
+                true,
+            ),
+            (
+                "oracle ORA-00904",
+                rendered(
+                    "oracle: OracleError { code: 904, message: \"ORA-00904: \\\"TOTL\\\": \
+                     invalid identifier\" }",
+                ),
+                false,
+            ),
+            (
+                "a wrapper that re-rendered the MySQL error",
+                rendered(
+                    "page 3: MySqlError { ERROR 1146 (42S02): Table 'rivet.t' doesn't exist }",
+                ),
+                true,
+            ),
+            (
+                "a network error",
+                anyhow::anyhow!("connection reset by peer"),
+                false,
+            ),
+        ];
+        for (what, err, missing) in cases {
+            assert_eq!(names_a_missing_relation(&err), missing, "{what}: {err:#}");
+            let coded = code_a_missing_relation(err, "orders", Some("drop_probe_b"), None);
+            let code = crate::error::error_code(&coded);
+            if missing {
+                assert_eq!(code, Some("RIVET_SOURCE_TABLE_NOT_FOUND"), "{what}");
+                assert_eq!(crate::error::classify_exit(&coded), 1, "{what}: {coded:#}");
+                let text = format!("{coded:#}");
+                assert!(
+                    text.starts_with(
+                        "export 'orders': the table it reads does not exist (`table: drop_probe_b`)"
+                    ) && text.contains("remove the export from `exports:`"),
+                    "{what}: {text}"
+                );
+            } else {
+                assert_ne!(
+                    code,
+                    Some("RIVET_SOURCE_TABLE_NOT_FOUND"),
+                    "{what}: {coded:#}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_query_export_is_named_by_the_relation_its_query_reads_and_is_not_coded_twice() {
+        let gone = || mysql_error(1146, "Table 'rivet.drop_probe_b' doesn't exist");
+        let init_shape = "SELECT `id`, `v`\nFROM `drop_probe_b`";
+        let once = code_a_missing_relation(gone(), "o", None, Some(init_shape));
+        let twice = code_a_missing_relation(once, "o", None, Some(init_shape));
+        let text = format!("{twice:#}");
+        assert_eq!(
+            text.matches("the table it reads does not exist").count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            text.starts_with(
+                "export 'o': the table it reads does not exist (`drop_probe_b`, read by its `query:`)"
+            ),
+            "{text}"
+        );
+        let joined =
+            code_a_missing_relation(gone(), "o", None, Some("SELECT 1 FROM a JOIN b ON 1 = 1"));
+        assert!(
+            format!("{joined:#}").contains("(a relation in its `query:`)"),
+            "a query with no single relation names none: {joined:#}"
+        );
     }
 }

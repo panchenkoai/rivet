@@ -1951,6 +1951,22 @@ seeds:
         cells: [check_refuses_a_collection_that_does_not_exist_as_run_does_mongo]
       oracle:
         na: "a missing SQL table fails the query, read by the engine; the absent-collection guard is MongoDB's"
+  - name: dropped-source-table-uncoded
+    class: "a verdict every engine types (the relation the export reads does not exist) is recognised by no path, so each path ends with the raw driver error or a generic query-failed code instead of the one refusal"
+    history: "2026-10-16 - found by hand on the pilot client's shape (MySQL -> GCS -> BigQuery, cron): an export whose source table was dropped failed as `MySqlError { ERROR 1146 (42S02): Table 'rivet.drop_probe_b' doesn't exist }` with no RIVET_* code (PostgreSQL too), RIVET_SOURCE_QUERY_FAILED on SQL Server and Oracle, through 0.31.0; fixed by one `names_a_missing_relation` / `code_a_missing_relation` on every path that reads the table"
+    scope: source
+    patch: dropped-source-table-uncoded/shared.patch
+    engines:
+      postgres:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_postgres]
+      mysql:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mysql]
+      mssql:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mssql]
+      mongo:
+        na: "a missing collection is MongoDB's own RIVET_SOURCE_COLLECTION_NOT_FOUND (collection-refusal-uncoded-on-run); no SQL verdict exists to recognise"
+      oracle:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_oracle]
   - name: cursor-case-uncoded
     class: "a refusal the product raises from the result set is never reached on an engine where the same config fails the query first, so that engine exits with the raw database error instead of the code"
     history: "2026-10-14 - found by the by-hand CLI sweep (P6): `cursor_column` in another case was RIVET_CONFIG_CURSOR_COLUMN_CASE on MySQL and SQL Server but a raw 42703 / ORA-00904 on PostgreSQL and Oracle, through 0.31.0; fixed by `refuse_a_cursor_case_miss`"

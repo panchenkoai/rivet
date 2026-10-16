@@ -618,15 +618,18 @@ fn resolve_chunked_strategy(
             ));
         }
         Err(e) => {
-            return Err(crate::error::recoded(
-                &e,
-                crate::error::codes::PLAN_SOURCE_UNREADABLE,
+            // The cause stays in the chain (its typed verdict is what the pipeline recodes a
+            // dropped table by); its own code, when it has one, stays the code.
+            let code =
+                crate::error::code_of(&e).unwrap_or(crate::error::codes::PLAN_SOURCE_UNREADABLE);
+            return Err(e.context(crate::error::CodedError::new(
+                code,
                 format!(
-                    "export '{}': chunked-mode introspection probe failed: {e}. \
-                     Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
+                    "export '{}': chunked-mode introspection probe failed; set `chunk_column:` \
+                     (and `chunk_size:`) explicitly or check connectivity",
                     export.name
                 ),
-            ));
+            )));
         }
     };
 

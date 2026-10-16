@@ -1932,27 +1932,27 @@ fn a_cursor_column_in_another_case_is_refused_by_code_oracle() {
 }
 
 #[test]
-#[ignore = "live+gate-only: postgres; open defect (a dropped source table is uncoded), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_postgres() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_postgres() {
     dropped_source_table(SqlEngine::Pg);
 }
 
 #[test]
-#[ignore = "live+gate-only: mysql; open defect (a dropped source table is uncoded), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mysql() {
+#[ignore = "live: requires docker compose mysql"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mysql() {
     dropped_source_table(SqlEngine::Mysql);
 }
 
 #[test]
-#[ignore = "live+gate-only: mssql; open defect (a dropped source table is uncoded), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mssql() {
+#[ignore = "live: requires docker compose mssql"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mssql() {
     dropped_source_table(SqlEngine::Mssql);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
-#[ignore = "live+gate-only: oracle; open defect (a dropped source table is uncoded), acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_oracle() {
+#[ignore = "live: requires docker compose oracle"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_oracle() {
     dropped_source_table(SqlEngine::Oracle);
 }
 
