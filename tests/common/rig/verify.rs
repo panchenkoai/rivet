@@ -102,7 +102,7 @@ impl Rig {
             }
             return None;
         }
-        crate::common::verify::begin(argv, envs, cwd)
+        crate::common::verify::begin(argv, &self.with_state(envs), cwd)
     }
 
     /// Grade a finished invocation by how it exited; records an expected known-defect disagreement.
@@ -126,7 +126,14 @@ impl Rig {
             key: self.census_key.as_deref(),
             leaves: &self.failed_run_leaves,
         };
-        if crate::common::verify::settle(case, status, stdout, stderr, envs, &opts) {
+        if crate::common::verify::settle(
+            case,
+            status,
+            stdout,
+            stderr,
+            &self.with_state(envs),
+            &opts,
+        ) {
             self.oracle_xfailed.set(true);
         }
     }

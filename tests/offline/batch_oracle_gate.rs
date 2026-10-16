@@ -21,6 +21,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
+use super::capture_markers::calls;
+
 fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -60,36 +62,10 @@ fn batch_files() -> Vec<PathBuf> {
     out
 }
 
-/// Capture spellings, DERIVED from the rig and runner exactly as the CDC gate
-/// derives them — one source, so a new runner is born graded on both sides.
+/// Capture spellings: the rig's and the runner's, derived once for both oracle gates, and a direct spawn.
 fn capture_markers() -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let mut files: Vec<PathBuf> = fs::read_dir(root().join("tests/common/rig"))
-        .expect("read tests/common/rig")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
-    files.push(root().join("tests/common/runner.rs"));
-    for f in files {
-        for line in fs::read_to_string(&f).unwrap_or_default().lines() {
-            let t = line.trim_start();
-            if let Some(rest) = t.strip_prefix("pub fn ")
-                && let Some(name) = rest.split('(').next()
-                && ["run", "cli", "spawn", "drain", "apply"]
-                    .iter()
-                    .any(|p| name.starts_with(p))
-            {
-                out.insert(format!("{name}("));
-            }
-        }
-    }
+    let mut out = super::capture_markers::capture_markers();
     out.insert("Command::new(RIVET_BIN)".into());
-    assert!(
-        out.len() >= 12,
-        "capture-marker derivation collapsed to {} — every check below would \
-         skip rather than fail: {out:?}",
-        out.len()
-    );
     out
 }
 
@@ -123,6 +99,7 @@ fn outcome_markers() -> BTreeSet<String> {
                         "declared_",
                         "files_with_extension",
                         "parquet_",
+                        "total_parquet_",
                         "dir_",
                         "mc_",
                         "fake_gcs_",
@@ -192,7 +169,7 @@ fn helper_bodies(src: &str, test_body: &str) -> Vec<String> {
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        if !name.is_empty() && test_body.contains(&format!("{name}(")) {
+        if !name.is_empty() && calls(test_body, &format!("{name}(")) {
             // The WHOLE body, by brace counting — a fixed character window is a
             // magic number that silently truncates: at 6000 it cut
             // `pool_split_cloud` (185 lines) before its oracle and reported a
@@ -220,8 +197,8 @@ fn helper_bodies(src: &str, test_body: &str) -> Vec<String> {
 }
 
 /// Readers a live file defines for ITSELF: any `fn` in this file whose body
-/// reads the delivered artifacts. Returned as call spellings (`name(`).
-fn local_readers(src: &str) -> BTreeSet<String> {
+/// reads the delivered artifacts, directly or through a shared reader in `outcome`. Returned as call spellings (`name(`).
+fn local_readers(src: &str, outcome: &BTreeSet<String>) -> BTreeSet<String> {
     let reads = [
         "read_parquet",
         "ParquetRecordBatchReaderBuilder",
@@ -248,7 +225,10 @@ fn local_readers(src: &str) -> BTreeSet<String> {
             .last()
             .unwrap_or(0);
         let window = &after[..end];
-        if !name.is_empty() && reads.iter().any(|r| window.contains(r)) {
+        if !name.is_empty()
+            && (reads.iter().any(|r| window.contains(r))
+                || outcome.iter().any(|m| calls(window, m)))
+        {
             out.insert(format!("{name}("));
         }
         rest = after;
@@ -298,6 +278,27 @@ fn test_chunks(src: &str) -> Vec<(String, String)> {
     out
 }
 
+/// A capture marker counts only where it starts a name: a helper whose name ends in a runner's (`…_with_its_run(`) runs nothing itself.
+#[test]
+fn a_marker_inside_a_longer_name_is_not_a_call() {
+    assert!(!calls(
+        "fn t() { a_lease_answers_with_its_run(SqlEngine::Pg) }",
+        "run("
+    ));
+    assert!(!calls("x_run(&rig)", "run("));
+    assert!(calls("rig.run(&[])", "run("));
+    assert!(calls("{\n    run(&rig);", "run("));
+    assert!(calls("x_run(&a); rig.run(&b)", "run("));
+    assert!(calls(
+        "assert!(!out.status.success())",
+        "!out.status.success()"
+    ));
+    assert!(calls(
+        "let c = Command::new(RIVET_BIN);",
+        "Command::new(RIVET_BIN)"
+    ));
+}
+
 /// TIER 1 for batch: a test that RUNS a capture must read something back —
 /// files, rows, the ledger, or a named refusal. "The process exited 0" is not
 /// an outcome; a zero-row export exits 0 too.
@@ -315,14 +316,14 @@ fn every_batch_capture_test_asserts_an_outcome() {
         // called 43% of batch tests oracle-less and hand checking put the true
         // number at ZERO, entirely because of these. Derived per file, so a new
         // local reader is recognised the day it is written.
-        let local = local_readers(&src);
+        let local = local_readers(&src, &outcome);
         for (name, body) in test_chunks(&src) {
-            if !cap.iter().any(|m| body.contains(m.as_str())) {
+            if !cap.iter().any(|m| calls(&body, m)) {
                 continue;
             }
-            let reads_back = outcome.iter().any(|m| body.contains(m.as_str()))
-                || local.iter().any(|m| body.contains(m.as_str()));
-            let refuses = REFUSAL.iter().any(|m| body.contains(m))
+            let reads_back =
+                outcome.iter().any(|m| calls(&body, m)) || local.iter().any(|m| calls(&body, m));
+            let refuses = REFUSAL.iter().any(|m| calls(&body, m))
                 || body.contains(".code()")
                 || body.contains("stderr");
             if !reads_back && !refuses {

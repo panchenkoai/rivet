@@ -1,0 +1,15 @@
+diff --git a/src/state/load_lease.rs b/src/state/load_lease.rs
+index 0ff68e50..9c595f14 100644
+--- a/src/state/load_lease.rs
++++ b/src/state/load_lease.rs
+@@ -314,8 +314,8 @@ fn holder_is_dead_here(holder: &str, host: &str) -> bool {
+     ) else {
+         return false;
+     };
+-    h == host
+-        && pid > 0
++    let _ = (h, host);
++    pid > 0
+         && unsafe { libc::kill(pid, 0) } != 0
+         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+ }
