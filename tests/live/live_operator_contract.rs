@@ -969,7 +969,7 @@ fn one_export_name_on_two_sources() {
         .beside_a_live_run(
             &[
                 ("RIVET_STATE_URL", state.as_str()),
-                ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:6000"),
+                ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:20000"),
             ],
             opened,
             |_| {
