@@ -1,0 +1,30 @@
+diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
+index a2694f27..100a0f60 100644
+--- a/src/load/snowflake.rs
++++ b/src/load/snowflake.rs
+@@ -210,7 +210,6 @@ impl TargetLoader for SnowflakeLoader {
+             let rows = extract_count(&result)
+                 .context("COPY ran but the row count could not be read from snow output")?;
+             super::check_loaded_rows(&self.fqtn(table), rows, expected_rows)?;
+-            self.run_snow(&self.build_swap_sql(table, &staging, specs))?;
+             Ok(rows)
+         });
+         if landed.is_err() {
+@@ -316,7 +315,7 @@ impl SnowflakeLoader {
+         specs: &[TargetColumnSpec],
+         uris: &[String],
+     ) -> Result<String> {
+-        let staging = self.fqtn(staging);
++        let staging = self.fqtn(table);
+         let ddl = Self::build_schema_ddl(specs);
+         let select = Self::build_copy_select(specs);
+         let columns = Self::build_column_list(specs);
+@@ -336,7 +335,7 @@ impl SnowflakeLoader {
+              USE WAREHOUSE {wh};\n\
+              USE SCHEMA {db}.{sc};\n\
+              CREATE OR REPLACE STAGE {stage} URL='{url}' STORAGE_INTEGRATION={si} FILE_FORMAT={PARQUET_FORMAT};\n\
+-             CREATE TABLE {staging} (\n{ddl}\n){cluster};\n\
++             CREATE OR REPLACE TABLE {staging} (\n{ddl}\n){cluster};\n\
+              COPY INTO {staging} ({columns})\n\
+              \x20 FROM (SELECT {select} FROM @{stage})\n\
+              \x20 FILE_FORMAT={PARQUET_FORMAT} {files};\n\

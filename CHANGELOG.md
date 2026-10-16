@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Behaviour change: a Snowflake full load emptied its table before the COPY.** The load ran
+  `CREATE OR REPLACE TABLE` and then `COPY` as one script, so a COPY that failed (an unreadable
+  part, a lost client, a killed `snow`) left the table with 0 rows until a later load succeeded
+  (0.31.0 and earlier; measured: 20 rows before, 0 after a COPY of a corrupted part). **Now** the
+  parts land in a new table `<table>__rivet_load_<16 hex>`, the landed row count is checked against
+  the runs, and `ALTER TABLE … SWAP WITH` puts it in place in one statement; any failure before
+  the swap leaves the table as it was and drops the staging table. A table that existed before the
+  upgrade is swapped like any other: its rows are replaced as before. Grants and ownership behave
+  as before (the table rivet lands carries no grant made on the old one, as with `CREATE OR
+  REPLACE`). **What to do:** nothing; a load killed between the COPY and the swap can leave a
+  `<table>__rivet_load_*` table, which holds no rows anyone reads: drop it.
+
 - **The end-of-run summary of a failed export re-read its error text from every `; `.** The step
   that strips the inline `rivet …` recovery hint was quadratic in the message: a 512 KiB message
   made of `; ` took 21 s (×4 per doubling) before the summary printed (0.31.0 and earlier).
