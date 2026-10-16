@@ -563,20 +563,38 @@ mod tests {
 
     // ── staleness enforcement ────────────────────────────────────────────────
 
+    /// A plan past 24 h is refused STALE before it runs, its age in hours below 48 h and in days with its date from 48 h.
     #[test]
     fn stale_error_without_force_is_rejected() {
-        let mut artifact = fresh_artifact();
-        artifact.created_at = Utc::now() - Duration::hours(25);
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = write_artifact(&dir, &artifact);
-
-        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("hours old") || msg.contains("24 h"),
-            "expected staleness error: {msg}"
-        );
-        crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
+        for (hours, phrase) in [
+            (25, "25 hours old".to_string()),
+            (47, "47 hours old".to_string()),
+            (
+                48,
+                format!(
+                    "2 days old (created {})",
+                    (Utc::now() - Duration::hours(48)).format("%Y-%m-%d")
+                ),
+            ),
+            (
+                73,
+                format!(
+                    "3 days old (created {})",
+                    (Utc::now() - Duration::hours(73)).format("%Y-%m-%d")
+                ),
+            ),
+        ] {
+            let mut artifact = validation_refused_artifact();
+            artifact.created_at = Utc::now() - Duration::hours(hours);
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_artifact(&dir, &artifact);
+            let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
+            let want = format!(
+                "plan 'orders' is {phrase} (limit: 24 h). Regenerate with `rivet plan` or pass --force to override."
+            );
+            assert!(format!("{err:#}").contains(&want), "{hours} h: {err:#}");
+        }
     }
 
     // ── cursor drift ─────────────────────────────────────────────────────────

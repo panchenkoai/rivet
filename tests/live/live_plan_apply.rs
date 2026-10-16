@@ -1157,7 +1157,7 @@ impl ReplayStand {
 
 /// F3: a sealed plan replayed after its own apply exited 0 (a scheduler retry whose first try died after rivet finished)
 /// extracts nothing, writes nothing under the prefix, exits 0 and names the run that applied it with that run's rows, on every replay.
-fn a_replayed_applied_plan_answers_with_its_run(engine: SqlEngine, shape: ReplayShape) {
+fn a_replayed_applied_plan_names_the_run_that_applied_it(engine: SqlEngine, shape: ReplayShape) {
     let Some(stand) = ReplayStand::new(engine, shape) else {
         return;
     };
@@ -1267,31 +1267,37 @@ fn a_plan_whose_cursor_another_run_moved_is_refused_stale(engine: SqlEngine) {
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_applied_full_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::Full);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Pg, ReplayShape::Full);
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_applied_first_incremental_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::IncrementalFirst);
+    a_replayed_applied_plan_names_the_run_that_applied_it(
+        SqlEngine::Pg,
+        ReplayShape::IncrementalFirst,
+    );
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_applied_incremental_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::IncrementalAfterRun);
+    a_replayed_applied_plan_names_the_run_that_applied_it(
+        SqlEngine::Pg,
+        ReplayShape::IncrementalAfterRun,
+    );
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_applied_chunked_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::Chunked);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Pg, ReplayShape::Chunked);
 }
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_applied_keyset_plan_answers_with_its_run_postgres() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Pg, ReplayShape::Keyset);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Pg, ReplayShape::Keyset);
 }
 
 #[test]
@@ -1309,19 +1315,22 @@ fn a_plan_whose_cursor_another_run_moved_is_refused_stale_postgres() {
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_applied_full_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::Full);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Mysql, ReplayShape::Full);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_applied_first_incremental_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::IncrementalFirst);
+    a_replayed_applied_plan_names_the_run_that_applied_it(
+        SqlEngine::Mysql,
+        ReplayShape::IncrementalFirst,
+    );
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_applied_incremental_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_answers_with_its_run(
+    a_replayed_applied_plan_names_the_run_that_applied_it(
         SqlEngine::Mysql,
         ReplayShape::IncrementalAfterRun,
     );
@@ -1330,13 +1339,13 @@ fn a_replayed_applied_incremental_plan_answers_with_its_run_mysql() {
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_applied_chunked_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::Chunked);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Mysql, ReplayShape::Chunked);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_applied_keyset_plan_answers_with_its_run_mysql() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mysql, ReplayShape::Keyset);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Mysql, ReplayShape::Keyset);
 }
 
 #[test]
@@ -1354,13 +1363,13 @@ fn a_plan_whose_cursor_another_run_moved_is_refused_stale_mysql() {
 #[test]
 #[ignore = "live: requires docker compose mssql + GCS"]
 fn a_replayed_applied_full_plan_answers_with_its_run_mssql() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mssql, ReplayShape::Full);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Mssql, ReplayShape::Full);
 }
 
 #[test]
 #[ignore = "live: requires docker compose mssql + GCS"]
 fn a_replayed_applied_incremental_plan_answers_with_its_run_mssql() {
-    a_replayed_applied_plan_answers_with_its_run(
+    a_replayed_applied_plan_names_the_run_that_applied_it(
         SqlEngine::Mssql,
         ReplayShape::IncrementalAfterRun,
     );
@@ -1369,21 +1378,21 @@ fn a_replayed_applied_incremental_plan_answers_with_its_run_mssql() {
 #[test]
 #[ignore = "live: requires docker compose mssql + GCS"]
 fn a_replayed_applied_keyset_plan_answers_with_its_run_mssql() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Mssql, ReplayShape::Keyset);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Mssql, ReplayShape::Keyset);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle + GCS"]
 fn a_replayed_applied_full_plan_answers_with_its_run_oracle() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Oracle, ReplayShape::Full);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Oracle, ReplayShape::Full);
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle + GCS"]
 fn a_replayed_applied_incremental_plan_answers_with_its_run_oracle() {
-    a_replayed_applied_plan_answers_with_its_run(
+    a_replayed_applied_plan_names_the_run_that_applied_it(
         SqlEngine::Oracle,
         ReplayShape::IncrementalAfterRun,
     );
@@ -1393,5 +1402,5 @@ fn a_replayed_applied_incremental_plan_answers_with_its_run_oracle() {
 #[test]
 #[ignore = "live: requires docker compose oracle + GCS"]
 fn a_replayed_applied_keyset_plan_answers_with_its_run_oracle() {
-    a_replayed_applied_plan_answers_with_its_run(SqlEngine::Oracle, ReplayShape::Keyset);
+    a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Oracle, ReplayShape::Keyset);
 }
