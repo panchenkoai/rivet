@@ -17,6 +17,26 @@
 
 seeds:
 
+  - name: checkpointed-chunk-loses-its-class
+    class: a coded failure met by one chunk of a checkpointed export (chunk_checkpoint true, one worker or several) ends the run as the incomplete run RIVET_RUN_UNITS_FAILED with exit 1 and a --resume hint instead of the chunk's own code and class, and the --resume meets it again and ends the same way
+    history: the second half of worker-error-loses-its-class, found 2026-10-15 fixing it; both checkpoint runners recorded a failed chunk's cause as text in chunk_task and stopped on the not-completed count; a PostgreSQL `infinity` met by a checkpointed chunk exited [RIVET_RUN_UNITS_FAILED] 1 where the same export without chunk_checkpoint exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0
+    scope: source
+    patch: checkpointed-chunk-loses-its-class/shared.patch
+    engines:
+      postgres:
+        cells: [a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_postgres]
+      mysql:
+        cells: [a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_mysql]
+      mssql:
+        cells: [a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_mssql]
+      oracle:
+        cells: [a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_oracle]
+      mongo:
+        na: the range-chunk checkpoint runners (chunk_column + chunk_checkpoint) read SQL ranges; MongoDB fans out through mongo_parallel, which drains through FanIn (worker-error-loses-its-class)
+      lib:
+        cells:
+          - "lib:a_coded_chunk_failure_decides_the_runs_exit_under_the_resume_remedy"
+
   - name: worker-error-loses-its-class
     class: a coded failure in one parallel worker reaches the run as text only (FanIn kept strings), so the run prints RIVET_RUN_UNITS_FAILED and exits 1 or 2 instead of the worker's own code and class
     history: found 2026-10-15 reading FanIn::fail against the owner's "exit follows code class" rule; a PostgreSQL `infinity` met by a parallel keyset worker exited [RIVET_RUN_UNITS_FAILED] 1 where one worker exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0
@@ -2664,3 +2684,15 @@ seeds:
         cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
       oracle:
         cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+  - name: foreign-lease-taken-before-expiry
+    class: "a run lease whose holder names another host is judged by a local pid probe, so a run on a live host loses its lease to a run here before the lease expires"
+    history: "2026-10-16 - harness: the dead-owner cells damaged `chunk-run:<export>` after the run lease became `chunk-run:<export>@<source hash>`, so on a PostgreSQL state they failed on `changed 0 row(s)` and on SQLite they were skipped; no cell could catch a takeover rule that ignored the host (fixed by deriving the key through `run_lease_key` and keeping a Postgres state in the cell)"
+    scope: state
+    patch: foreign-lease-taken-before-expiry/shared.patch
+    engines:
+      postgres-state:
+        cells:
+          - a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_postgres
+          - "lib:a_dead_holder_on_this_host_is_recognised_and_nothing_else_is"
+      sqlite-state:
+        na: the SQLite lease is an flock on a sidecar file that the kernel drops with its holder; there is no holder row naming a host to misjudge

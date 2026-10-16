@@ -90,20 +90,24 @@ fn graceful_mongo() {
 }
 
 /// The run lease of a killed range run, rewritten to the holder `holder_sql` yields and kept for a few seconds: the run is refused twice, and waiting it out delivers.
+///
+/// A lease is a row only on a Postgres state (SQLite holds it by `flock`, which dies with its process), so under an SQLite gate the cell keeps its own Postgres state.
 fn a_lease_nobody_can_see_dead(engine: SqlEngine, holder_sql: &str) {
     const KEPT_S: u64 = 20;
-    if state_url_under_test().is_none() {
-        skip_live(
-            "a lease is a row only on a Postgres state: set RIVET_GATE_STATE_URL (SQLite holds it by flock, which dies with its process)",
-        );
-        return;
-    }
-    let (mut rig, _guard) = rig_of(engine, "stop_owner", RANGE);
+    let own_state = state_url_under_test()
+        .is_none()
+        .then(|| ScratchStateDb::new("stop_owner"));
+    let (rig, _guard) = rig_of(engine, "stop_owner", RANGE);
+    let mut rig = match &own_state {
+        Some(db) => rig.on_postgres_state(db.url()),
+        None => rig,
+    };
     rig.stopped(Parked::APartCommitted, Stop::Kill, &[]);
     rig.edit_state(
         &format!(
             "UPDATE state_lease SET holder = {holder_sql}, expires_at = now() + interval '{KEPT_S} seconds' \
-             WHERE lease_key = 'chunk-run:{{export}}'"
+             WHERE lease_key = '{}'",
+            rig.lease_key()
         ),
         1,
     );
@@ -126,9 +130,14 @@ fn a_lease_nobody_can_see_dead(engine: SqlEngine, holder_sql: &str) {
     );
 }
 
-/// [`a_lease_nobody_can_see_dead`] with an owner on a host that is gone.
+/// [`a_lease_nobody_can_see_dead`] with an owner on a host that is gone, under a pid that is dead here: only the host keeps the lease.
 fn owner_on_another_host(engine: SqlEngine) {
-    a_lease_nobody_can_see_dead(engine, "'a-host-that-is-gone:4242:0'");
+    let mut gone = std::process::Command::new("true")
+        .spawn()
+        .expect("fixture: spawn `true`");
+    let pid = gone.id();
+    gone.wait().expect("fixture: reap `true`");
+    a_lease_nobody_can_see_dead(engine, &format!("'a-host-that-is-gone:{pid}:0'"));
 }
 
 /// [`a_lease_nobody_can_see_dead`] with the dead owner's pid alive again as an unrelated process (this test).

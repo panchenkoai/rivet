@@ -811,8 +811,8 @@ mod tests {
         );
         let drain = src.find("Some(governor),").expect("drain call site");
         let bail = src
-            .find("parallel checkpoint worker errors")
-            .expect("worker-error bail");
+            .find("super::incomplete_run_check(")
+            .expect("the incomplete-run bail");
         assert!(
             drain < bail,
             "drain BEFORE the error bail, or a failed run journals none of its governor \
