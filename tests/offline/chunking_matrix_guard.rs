@@ -303,7 +303,9 @@ const MATRICES: &[(&str, usize)] = &[
     // Raised 0 -> 1 (2026-10-15): worker_failure_keeps_its_class on chunked_checkpoint; the
     // checkpointed runners turn a chunk's coded stop into the incomplete-run refusal, a
     // separate defect from FanIn's (one defect, one PR).
-    ("docs/runner-coverage-matrix.yaml", 1),
+    // Lowered 1 -> 0 (2026-10-16): both checkpoint runners keep each chunk's failure typed and end through
+    // incomplete_run_check; a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_* on four engines.
+    ("docs/runner-coverage-matrix.yaml", 0),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Raised 14 -> 17 (2026-10-07): three Oracle cells of the range-chunk rows. Range chunking refuses

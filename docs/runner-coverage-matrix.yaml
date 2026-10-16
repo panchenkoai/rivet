@@ -323,7 +323,8 @@ scenarios:
     single:         { na: "one unit and no worker: the stop is the run's error as raised" }
     # The test runs both shapes on each engine: chunk_by_key (keyset) and chunk_column (range), each with parallel 1 and 4.
     chunked:        { test: a_refusal_in_one_worker_exits_as_with_one_worker_postgres }
-    chunked_checkpoint: { gap: "its workers record a failed chunk in chunk_task, not in FanIn, and the run stops with the checkpoint's incomplete-run RIVET_RUN_UNITS_FAILED; the sequential checkpoint runner does the same, so a coded refusal in a checkpointed chunk exits 1 on both (a separate defect, reported 2026-10-15)" }
+    # Both checkpoint runners (parallel 1 and 4) and the --resume that re-meets the value, on each engine.
+    chunked_checkpoint: { test: a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_postgres }
     keyset:         { test: a_refusal_in_one_worker_exits_as_with_one_worker_postgres }
     mongo_parallel: { test: a_coded_failure_in_one_worker_keeps_its_code_mongo }
     cdc:            { na: "one capture loop per export; no worker fan-out through FanIn" }
