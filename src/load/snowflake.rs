@@ -763,12 +763,14 @@ mod tests {
         let many: Vec<String> = (0..1001)
             .map(|i| format!("gs://b/p/f{i}.parquet"))
             .collect();
-        let l = adoption_loader();
+        let stand = Stand::scripted(&[]);
+        let l = stand.loader();
         for (uris, code, exit) in [
             (Vec::new(), "RIVET_LOAD_EMPTY_RUN_UNSUPPORTED", 5),
             (many, "RIVET_LOAD_FILE_LIMIT_EXCEEDED", 1),
         ] {
             let e = l.materialize("t", &specs, &uris, None).unwrap_err();
+            assert!(stand.sent().is_empty(), "{code}: {:?}", stand.sent());
             assert!(e.is::<crate::load::Refused>(), "{code}: {e:#}");
             assert_eq!(
                 (
