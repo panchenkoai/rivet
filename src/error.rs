@@ -847,7 +847,7 @@ pub mod codes {
         "RIVET_STATE_RUN_IN_PROGRESS",
         "wait for the run to finish, or stop its process, then repeat the command",
     );
-    /// A resume met an unfinished chunk run opened under another query or other chunk settings.
+    /// A resume, reconcile or repair met a stored chunk run planned under another query or other chunk settings.
     pub const STATE_CHUNK_PLAN_CHANGED: Code = refusal(
         "RIVET_STATE_CHUNK_PLAN_CHANGED",
         "restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over",

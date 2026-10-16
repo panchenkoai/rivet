@@ -107,7 +107,9 @@ pub fn run_repair_command(
     let state_path = config_dir.join(".rivet_state.db");
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
-    let reconcile_report = load_or_build_reconcile(&plan, &state, report_source)?;
+    // Before any report is read: a report or stored windows planned under another chunk plan would be repaired on the wrong column.
+    reconcile_cmd::latest_chunk_run_under_this_plan(&plan, &state, "repair", config_path)?;
+    let reconcile_report = load_or_build_reconcile(&plan, &state, report_source, config_path)?;
     let repair_plan = RepairPlan::from_reconcile(&reconcile_report);
 
     if !execute {
@@ -132,6 +134,7 @@ fn load_or_build_reconcile(
     plan: &ResolvedRunPlan,
     state: &StateStore,
     source: RepairReportSource,
+    config_path: &str,
 ) -> Result<ReconcileReport> {
     match source {
         RepairReportSource::File(path) => {
@@ -157,7 +160,9 @@ fn load_or_build_reconcile(
             }
             Ok(r)
         }
-        RepairReportSource::Auto => reconcile_cmd::reconcile_chunked_fresh(plan, state),
+        RepairReportSource::Auto => {
+            reconcile_cmd::reconcile_chunked_fresh(plan, state, config_path)
+        }
     }
 }
 
@@ -680,6 +685,32 @@ fn print_report_pretty(report: &RepairReport) {
 mod tests {
     use super::*;
     use crate::plan::{PartitionKind, PartitionResult, ReconcileReport};
+
+    /// The command refuses an export the config does not name, before any report, source or state is opened.
+    #[test]
+    fn repair_of_an_unknown_export_is_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &path,
+            "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+             exports:\n\
+             \x20 - name: orders\n    table: orders\n    mode: chunked\n    chunk_column: id\n\
+             \x20   chunk_size: 10\n    chunk_checkpoint: true\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/orders }\n",
+        )
+        .unwrap();
+        let err = run_repair_command(
+            path.to_str().unwrap(),
+            "absent",
+            None,
+            RepairReportSource::Auto,
+            false,
+            RepairOutputFormat::Pretty,
+        )
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_EXPORT_UNKNOWN", 1);
+    }
 
     /// A repair is refused by code while a live run holds the export's lease, before it opens a source or reads the state; with the lease free it goes on (and fails on the source this plan does not have).
     #[test]
@@ -1237,8 +1268,13 @@ mod tests {
         let state = StateStore::open_in_memory().unwrap();
         let plan = crate::pipeline::commit::tests::test_plan();
         let missing = dir.path().join("absent.json").to_str().unwrap().to_string();
-        let err =
-            load_or_build_reconcile(&plan, &state, RepairReportSource::File(missing)).unwrap_err();
+        let err = load_or_build_reconcile(
+            &plan,
+            &state,
+            RepairReportSource::File(missing),
+            "rivet.yaml",
+        )
+        .unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CLI_INPUT_UNREADABLE", 1);
         let garbage = dir.path().join("garbage.json");
         std::fs::write(&garbage, b"not json").unwrap();
@@ -1246,6 +1282,7 @@ mod tests {
             &plan,
             &state,
             RepairReportSource::File(garbage.to_str().unwrap().to_string()),
+            "rivet.yaml",
         )
         .unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CLI_REPORT_INVALID", 1);

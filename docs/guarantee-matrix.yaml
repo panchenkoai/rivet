@@ -286,9 +286,6 @@ guarantees:
       postgres: { test: repair_execute_reexports_mismatch_and_preserves_original_file, asserts: "RR5: repair must NOT overwrite the original chunk0 file" }
       mysql: { gap: "the repair cells on this engine cover the nothing-to-repair exit only" }
       mssql: { gap: "the repair cells on this engine cover the nothing-to-repair exit only" }
-    contradicted_by:
-      known_red:
-        - "live_reconcile_repair::open_defect_repair_after_a_chunk_column_edit_lists_each_row_once"
 
   - id: reconcile_exits_non_zero_on_a_mismatch
     stated:

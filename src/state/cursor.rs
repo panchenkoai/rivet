@@ -337,6 +337,11 @@ impl ProgressClaim<'_> {
 
     /// The latest range-chunk run of this stream in any status (one that recorded no source counts), for `reconcile` and `repair`.
     pub fn latest_chunk_run(&self) -> Result<Option<String>> {
+        Ok(self.latest_chunk_run_plan()?.map(|(run_id, _)| run_id))
+    }
+
+    /// The latest chunk run of this stream (any status) with the fingerprint of the chunk plan it was planned under.
+    pub fn latest_chunk_run_plan(&self) -> Result<Option<(String, String)>> {
         self.state
             .latest_chunk_run_of(&self.key.export_name, &self.key.source)
     }

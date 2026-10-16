@@ -59,7 +59,7 @@ pub fn run_reconcile_command(
     let state = StateStore::open(state_path.to_str().unwrap_or(".rivet_state.db"))?;
 
     let report = match &plan.strategy {
-        ExtractionStrategy::Chunked(_) => reconcile_chunked(&plan, &state, export)?,
+        ExtractionStrategy::Chunked(_) => reconcile_chunked(&plan, &state, export, config_path)?,
         ExtractionStrategy::TimeWindow { .. } => {
             crate::rivet_bail!(
                 crate::error::codes::CLI_OPTION_UNSUPPORTED,
@@ -126,22 +126,43 @@ fn enforce_reconcile_exit(summary: &ReconcileSummary) -> Result<()> {
 pub(crate) fn reconcile_chunked_fresh(
     plan: &ResolvedRunPlan,
     state: &StateStore,
+    config_path: &str,
 ) -> Result<ReconcileReport> {
-    reconcile_chunked_inner(plan, state)
+    reconcile_chunked_inner(plan, state, config_path)
 }
 
 fn reconcile_chunked(
     plan: &ResolvedRunPlan,
     state: &StateStore,
     _export: &ExportConfig,
+    config_path: &str,
 ) -> Result<ReconcileReport> {
-    reconcile_chunked_inner(plan, state)
+    reconcile_chunked_inner(plan, state, config_path)
 }
 
-fn reconcile_chunked_inner(plan: &ResolvedRunPlan, state: &StateStore) -> Result<ReconcileReport> {
-    let run_id = state
-        .claim(plan.progress_key())?
-        .latest_chunk_run()?
+/// The latest chunk run of `plan`, `None` when none is recorded; refused (`RIVET_STATE_CHUNK_PLAN_CHANGED`) when the config's chunk plan is not the one that run was planned under, so `reconcile` and `repair` never read stored windows on another column.
+pub(crate) fn latest_chunk_run_under_this_plan(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    action: &str,
+    config_path: &str,
+) -> Result<Option<String>> {
+    let Some((run_id, stored_hash)) = state.claim(plan.progress_key())?.latest_chunk_run_plan()?
+    else {
+        return Ok(None);
+    };
+    if let ExtractionStrategy::Chunked(cp) = &plan.strategy {
+        super::chunked::refuse_changed_chunk_plan(plan, cp, &stored_hash, action, config_path)?;
+    }
+    Ok(Some(run_id))
+}
+
+fn reconcile_chunked_inner(
+    plan: &ResolvedRunPlan,
+    state: &StateStore,
+    config_path: &str,
+) -> Result<ReconcileReport> {
+    let run_id = latest_chunk_run_under_this_plan(plan, state, "reconcile", config_path)?
         .ok_or_else(|| {
             crate::error::coded(
                 crate::error::codes::STATE_CHUNK_RUN_MISSING,
@@ -359,6 +380,30 @@ fn format_status_note(p: &PartitionResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The command refuses an export the config does not name, before any source or state is opened.
+    #[test]
+    fn reconcile_of_an_unknown_export_is_refused_by_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rivet.yaml");
+        std::fs::write(
+            &path,
+            "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+             exports:\n\
+             \x20 - name: orders\n    table: orders\n    mode: chunked\n    chunk_column: id\n\
+             \x20   chunk_size: 10\n    chunk_checkpoint: true\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/orders }\n",
+        )
+        .unwrap();
+        let err = run_reconcile_command(
+            path.to_str().unwrap(),
+            "absent",
+            None,
+            ReconcileOutputFormat::Pretty,
+        )
+        .unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_EXPORT_UNKNOWN", 1);
+    }
     use crate::config::{
         CompressionType, DestinationConfig, DestinationType, FormatType, MetaColumns, SourceConfig,
         SourceType,
@@ -648,7 +693,42 @@ mod tests {
     #[test]
     fn reconcile_without_a_recorded_chunk_run_is_refused_by_code() {
         let state = StateStore::open_in_memory().unwrap();
-        let err = reconcile_chunked_inner(&chunked_plan(), &state).unwrap_err();
+        let err = reconcile_chunked_inner(&chunked_plan(), &state, "rivet.yaml").unwrap_err();
         crate::error::assert_coded(&err, "RIVET_STATE_CHUNK_RUN_MISSING", 1);
+    }
+
+    /// The stored run was planned under another chunk plan (another `chunk_column`, here): reconcile is refused by the code `run --resume` uses, naming the remedy, before any window is read.
+    #[test]
+    fn reconcile_under_a_changed_chunk_plan_is_refused_by_code() {
+        let state = StateStore::open_in_memory().unwrap();
+        let plan = chunked_plan();
+        let ExtractionStrategy::Chunked(cp) = &plan.strategy else {
+            unreachable!()
+        };
+        let mut by_other_id = cp.clone();
+        by_other_id.column = "other_id".into();
+        let stored = super::super::chunked::chunk_plan_hash(&plan, &by_other_id);
+        state
+            .create_chunk_run("run_1", "orders", &stored, 3)
+            .unwrap();
+        let err = reconcile_chunked_inner(&plan, &state, "rivet.yaml").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_STATE_CHUNK_PLAN_CHANGED", 5);
+        let said = format!("{err:#}");
+        for want in [
+            "chunk_column",
+            "cannot reconcile it",
+            "`rivet state reset-chunks -c rivet.yaml -e orders`",
+        ] {
+            assert!(said.contains(want), "{want} in {said}");
+        }
+        let same = super::super::chunked::chunk_plan_hash(&plan, cp);
+        let state = StateStore::open_in_memory().unwrap();
+        state.create_chunk_run("run_2", "orders", &same, 3).unwrap();
+        let err = reconcile_chunked_inner(&plan, &state, "rivet.yaml").unwrap_err();
+        assert_ne!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_CHUNK_PLAN_CHANGED"),
+            "the plan the latest run had is not refused: {err:#}"
+        );
     }
 }

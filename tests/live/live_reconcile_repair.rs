@@ -378,18 +378,17 @@ fn repair_execute_reexports_mismatch_and_preserves_original_file() {
     );
 }
 
-/// P-21: a repair under an edited `chunk_column` is refused, or leaves every source row listed exactly once.
-#[test]
-#[ignore = "live+gate-only: postgres; open defect P-21, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_repair_after_a_chunk_column_edit_lists_each_row_once() {
-    let e = SqlEngine::Pg;
+/// P-21: `reconcile` and `repair` under an edited `chunk_column` are refused by `RIVET_STATE_CHUNK_PLAN_CHANGED` (the check `run --resume` uses), before any stored window is read on the new column, and the delivered parts still list every source row once.
+fn repair_after_a_chunk_column_edit_is_refused_by_code(e: SqlEngine) {
     e.alive();
     let (table, _guard) = e.create(
         "repair_plan_edit",
-        "id BIGINT PRIMARY KEY, other_id BIGINT NOT NULL",
+        "id BIGINT NOT NULL PRIMARY KEY, other_id BIGINT NOT NULL",
     );
+    let rows: Vec<String> = (1..=40).map(|g| format!("({g}, {})", g / 2)).collect();
     e.exec(&format!(
-        "INSERT INTO {table} SELECT g, g / 2 FROM generate_series(1, 40) g"
+        "INSERT INTO {table} (id, other_id) VALUES {}",
+        rows.join(", ")
     ));
     let (out, scratch) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let chunked_by = |rig: Rig, column: &str| {
@@ -405,46 +404,80 @@ fn open_defect_repair_after_a_chunk_column_edit_lists_each_row_once() {
     };
     let rig = chunked_by(e.rig(&table), "id").dest_path(out.path().to_path_buf());
     rig.run_ok();
-
-    let rig = chunked_by(rig, "other_id");
     let report = scratch.path().join("reconcile.json");
     let report = report.to_str().unwrap();
-    let reconcile = rig.cli(&[
-        "reconcile",
-        "--export",
-        &table,
-        "--format",
-        "json",
-        "--output",
-        report,
-    ]);
-    let repair = rig.cli(&[
-        "repair",
-        "--export",
-        &table,
-        "--report",
-        report,
-        "--execute",
-    ]);
-    if !repair.status.success() {
-        let said = format!(
-            "{}{}",
-            String::from_utf8_lossy(&reconcile.stderr),
-            String::from_utf8_lossy(&repair.stderr)
-        );
-        assert!(
-            said.contains("chunk_column"),
-            "a refusal must name the changed chunk_column:\n{said}"
-        );
-        return;
-    }
-    let listed = ids_of(&rig.read_declared_parts());
-    let mut distinct = listed.clone();
-    distinct.dedup();
+    let reconcile = |rig: &Rig| {
+        rig.cli(&[
+            "reconcile",
+            "--export",
+            &table,
+            "--format",
+            "json",
+            "--output",
+            report,
+        ])
+    };
+    let clean = reconcile(&rig);
     assert!(
-        listed == (1..=40).collect::<Vec<_>>(),
-        "P-21: a repair under an edited chunk_column left the manifest listing {} rows over {} distinct ids for 40 source ids",
-        listed.len(),
-        distinct.len()
+        clean.status.success(),
+        "a reconcile under the plan the run had: {}",
+        String::from_utf8_lossy(&clean.stderr)
     );
+
+    let rig = chunked_by(rig, "other_id");
+    let refused = |what: &str, out: std::process::Output| {
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "{what} under an edited chunk_column exits as a refusal:\n{said}"
+        );
+        for want in [
+            "[RIVET_STATE_CHUNK_PLAN_CHANGED]",
+            "chunk_column",
+            "rivet state reset-chunks",
+        ] {
+            assert!(said.contains(want), "{what}: {want} in\n{said}");
+        }
+    };
+    refused("reconcile", reconcile(&rig));
+    refused(
+        "repair --report (a report from the plan the run had)",
+        rig.cli(&[
+            "repair",
+            "--export",
+            &table,
+            "--report",
+            report,
+            "--execute",
+        ]),
+    );
+    refused(
+        "repair (a fresh reconcile)",
+        rig.cli(&["repair", "--export", &table, "--execute"]),
+    );
+    let listed = ids_of(&rig.read_declared_parts());
+    assert_eq!(
+        listed,
+        (1..=40).collect::<Vec<_>>(),
+        "P-21: the parts delivered under the plan the run had still list every source row once"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn repair_after_a_chunk_column_edit_is_refused_by_code_postgres() {
+    repair_after_a_chunk_column_edit_is_refused_by_code(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn repair_after_a_chunk_column_edit_is_refused_by_code_mysql() {
+    repair_after_a_chunk_column_edit_is_refused_by_code(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn repair_after_a_chunk_column_edit_is_refused_by_code_mssql() {
+    repair_after_a_chunk_column_edit_is_refused_by_code(SqlEngine::Mssql);
 }

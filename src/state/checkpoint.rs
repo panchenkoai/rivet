@@ -195,12 +195,12 @@ impl StateStore {
         &self,
         export_name: &str,
         source: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, String)>> {
         self.query_opt(
-            "SELECT run_id FROM chunk_run WHERE export_name = ?1
+            "SELECT run_id, plan_hash FROM chunk_run WHERE export_name = ?1
                AND (source = ?2 OR source IS NULL) ORDER BY updated_at DESC LIMIT 1",
             &[export_name.into(), source.into()],
-            |r| r.text(0),
+            |r| (r.text(0), r.text(1)),
         )
     }
 
