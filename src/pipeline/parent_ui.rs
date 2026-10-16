@@ -425,6 +425,7 @@ impl Renderer {
                 // this process's own counter.
                 dest_retries: _,
                 bytes_read: _,
+                mode: _,
             } => {
                 if let Some(card) = self.cards.get_mut(&export_name) {
                     card.finalize(
@@ -890,6 +891,7 @@ mod tests {
             error_message: None,
             dest_retries: 0,
             bytes_read: 200,
+            mode: "full".into(),
         }));
         let card = &r.cards["orders"];
         assert_eq!(

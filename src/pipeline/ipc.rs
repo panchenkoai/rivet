@@ -121,6 +121,9 @@ pub enum ChildEvent {
         /// Decoded bytes read from the source; `#[serde(default)]` so an older child's event still parses.
         #[serde(default)]
         bytes_read: u64,
+        /// The run's mode label; `#[serde(default)]` so an older child's event still parses.
+        #[serde(default)]
+        mode: String,
     },
 }
 
@@ -250,6 +253,7 @@ mod tests {
             error_message: Some("connection reset".into()),
             dest_retries: 3,
             bytes_read: 0,
+            mode: "full".into(),
         };
         let s = serde_json::to_string(&ev).unwrap();
         let back: ChildEvent = serde_json::from_str(&s).unwrap();

@@ -1889,9 +1889,12 @@ fn run_export_job_inner(
             }
             done
         };
-        return cdc_outcome_with_legs(&export.name, outcomes, || {
+        let outcome = cdc_outcome_with_legs(&export.name, outcomes, || {
             super::cdc_job::run_cdc_export(config_path, config, export, state, opts.strict)
         });
+        // The parent of a child process knows the export's run only by the id reported here.
+        outcome.1.emit_finished();
+        return outcome;
     }
     // A base-and-buffer table's rows carry the delete flag as DATA. `LOAD DATA`
     // fills a column the FILE lacks with NULL — never with the column's DEFAULT,

@@ -8,4 +8,8 @@
   `bytes_read`, whether the exports run in one process or as `--parallel-export-processes` children,
   and a failed leg fails the entry under the CDC export's name. The legs still have
   their own `export_metrics` rows, so `rivet metrics` counts each write once, and `duration_ms` stays the
-  drain's. **What to do:** nothing; summaries written by earlier runs are not rewritten.
+  drain's. Under `--parallel-export-processes` the parent also took each export's entry as the newest
+  finished metric row of the export's NAME, so on a shared state database a failed run was reported as
+  another config's success of the same export name, with that run's id (0.31.0 and earlier); **now**
+  each child reports its own run id and the parent reads that run's row, and a child with none is
+  reported failed. **What to do:** nothing; summaries written by earlier runs are not rewritten.

@@ -533,23 +533,29 @@ impl RunSummary {
         // `Finished` event and let the unified UI thread render the card.
         // No stderr block here — the renderer owns the screen.
         if ipc::capturing_events() {
-            ipc::emit_event(&ChildEvent::Finished {
-                export_name: self.export_name.clone(),
-                run_id: self.run_id.clone(),
-                status: self.status.clone(),
-                total_rows: self.total_rows,
-                files_produced: self.files_produced as u64,
-                bytes_written: self.bytes_written,
-                duration_ms: self.duration_ms,
-                peak_rss_mb: self.peak_rss_mb,
-                error_message: self.error_message.clone(),
-                dest_retries: crate::destination::transient_retries_total(),
-                bytes_read: self.bytes_read,
-            });
+            self.emit_finished();
             return;
         }
 
         self.print_stderr_block();
+    }
+
+    /// Report this run's outcome as a `Finished` event; a no-op outside capturing mode.
+    pub(super) fn emit_finished(&self) {
+        ipc::emit_event(&ChildEvent::Finished {
+            export_name: self.export_name.clone(),
+            run_id: self.run_id.clone(),
+            status: self.status.clone(),
+            total_rows: self.total_rows,
+            files_produced: self.files_produced as u64,
+            bytes_written: self.bytes_written,
+            duration_ms: self.duration_ms,
+            peak_rss_mb: self.peak_rss_mb,
+            error_message: self.error_message.clone(),
+            dest_retries: crate::destination::transient_retries_total(),
+            bytes_read: self.bytes_read,
+            mode: self.mode.clone(),
+        });
     }
 
     /// Write the per-export summary block to stderr, bypassing IPC capture.

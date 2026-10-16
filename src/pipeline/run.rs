@@ -572,7 +572,7 @@ pub fn run(
         // bracket the pool uses, so the pointer is not a dangling reference.
         let (run_harm, window_start) = RunHarmBracket::open(&config.source);
         started_at = window_start;
-        let (result, child_failures, stderr_dump, child_legs) =
+        let (result, child_failures, stderr_dump, child_reports) =
             parallel_children::run_exports_as_child_processes(
                 children_ok,
                 config_path,
@@ -601,9 +601,8 @@ pub fn run(
                 let entries = aggregate::collect_child_entries(
                     &state,
                     &exports,
-                    started_at,
                     &child_failures,
-                    &child_legs,
+                    &child_reports,
                 );
                 let agg = aggregate::build(
                     entries,
@@ -901,7 +900,7 @@ pub(crate) fn run_waves(
     let mut all_exports: Vec<&ExportConfig> = Vec::with_capacity(total);
     let mut child_failures: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut child_legs = parallel_children::ChildLegs::new();
+    let mut child_reports = aggregate::ChildReports::new();
     let mut combined_stderr = String::new();
     // The widest batch that ever ran at once, across every wave — the run's REAL
     // concurrency, which the cost gate (not the flag) decides. Frames the
@@ -986,7 +985,7 @@ pub(crate) fn run_waves(
                 .max()
                 .unwrap_or(0);
             for batch in &batches {
-                let (result, cf, stderr_dump, legs) =
+                let (result, cf, stderr_dump, reports) =
                     parallel_children::run_exports_as_child_processes(
                         children_ok,
                         config_path,
@@ -1000,7 +999,7 @@ pub(crate) fn run_waves(
                         wave_name_floor,
                     );
                 child_failures.extend(cf);
-                child_legs.extend(legs);
+                child_reports.extend(reports);
                 combined_stderr.push_str(&stderr_dump);
                 if let Err(e) = result {
                     failures.push(e);
@@ -1045,13 +1044,7 @@ pub(crate) fn run_waves(
     // whole invocation and skipping it there was the runner-bypass half of the
     // fix that only reached `run()` (bughunt 2026-08-14).
     let entries = if parallel {
-        aggregate::collect_child_entries(
-            &state,
-            &all_exports,
-            started_at,
-            &child_failures,
-            &child_legs,
-        )
+        aggregate::collect_child_entries(&state, &all_exports, &child_failures, &child_reports)
     } else {
         summaries
             .iter()
