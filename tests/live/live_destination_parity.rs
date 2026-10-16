@@ -356,7 +356,14 @@ fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_f
     let Some(old) = rig.as_previous_release() else {
         return;
     };
-    let run = old.run();
+    // A state database of the cell's own when the pass grades the shared Postgres state, which the previous release must not meet migrated past it.
+    let state = state_url_under_test().map(|_| ScratchStateDb::new("dest_rel_upgrade"));
+    let url = state.as_ref().map(ScratchStateDb::url);
+    let envs: Vec<(&str, &str)> = url
+        .iter()
+        .map(|u| ("RIVET_STATE_URL", u.as_str()))
+        .collect();
+    let run = old.run_with_envs(&envs);
     assert!(
         run.status.success(),
         "the previous release: {}",
@@ -373,7 +380,7 @@ fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_f
     let refused = Refused::by_code("RIVET_DEST_RELATIVE_PATH_MOVED", 5);
     let text = rig.refuses_twice_and_walks_out(
         &["run"],
-        &[],
+        &envs,
         refused,
         vec![
             Remedy::wrong(
