@@ -424,6 +424,11 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--clickhouse-user <USER>` — The ClickHouse user the load authenticates as (with `--clickhouse-url`)
 
   Default value: `default`
+* `--snowflake-connection <NAME>` — Scaffold a `load:` block for Snowflake through this `snow` CLI connection (key-pair / JWT auth). Needs the four companion `--snowflake-*` flags (the loader requires every one) and `--gcs-bucket`: Snowflake reads the export through a GCS external stage, so S3 or a local scaffold is refused
+* `--snowflake-warehouse <WAREHOUSE>` — The virtual warehouse the load runs on (with `--snowflake-connection`)
+* `--snowflake-database <DATABASE>` — The database the load creates its tables in (with `--snowflake-connection`)
+* `--snowflake-schema <SCHEMA>` — The schema the load creates its tables in (with `--snowflake-connection`)
+* `--snowflake-storage-integration <INTEGRATION>` — A pre-created GCS `STORAGE INTEGRATION` granting Snowflake read on the `--gcs-bucket` (with `--snowflake-connection`)
 * `--tls <MODE>` — TLS posture for BOTH the introspection connection init opens AND the `source.tls:` block written into the scaffold. Required (or `disable`, explicitly) for any non-loopback host — without it the TLS gate refuses before connecting, and at init time there is no config file to add a `tls:` block to yet
 
   Possible values:

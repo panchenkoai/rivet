@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **`rivet init` could not scaffold a Snowflake `load:` block.** It had flags for BigQuery and
+  ClickHouse only, so a Snowflake config needed a hand-written `load:` block (0.31.0 and earlier).
+  **Now** `--snowflake-connection`, `--snowflake-warehouse`, `--snowflake-database`,
+  `--snowflake-schema` and `--snowflake-storage-integration` (all five, with `--gcs-bucket`) write
+  a `target: snowflake` block with `pk: auto`, `cluster_by: auto`, `cleanup_source: true` and a
+  per-table `partition:` guess at `day` (a leading `DATE_TRUNC` clustering key on Snowflake). A
+  missing companion flag, `--s3-bucket`, no bucket, or a second warehouse's flags are refused at the
+  flag. **What to do:** nothing.
+
 - **The end-of-run summary of a failed export re-read its error text from every `; `.** The step
   that strips the inline `rivet …` recovery hint was quadratic in the message: a 512 KiB message
   made of `; ` took 21 s (×4 per doubling) before the summary printed (0.31.0 and earlier).

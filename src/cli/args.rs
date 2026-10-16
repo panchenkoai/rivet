@@ -380,6 +380,50 @@ pub enum Commands {
             requires = "clickhouse_url"
         )]
         clickhouse_user: String,
+        /// Scaffold a `load:` block for Snowflake through this `snow` CLI connection
+        /// (key-pair / JWT auth). Needs the four companion `--snowflake-*` flags
+        /// (the loader requires every one) and `--gcs-bucket`: Snowflake reads the
+        /// export through a GCS external stage, so S3 or a local scaffold is refused.
+        #[arg(
+            long = "snowflake-connection",
+            value_name = "NAME",
+            requires = "snowflake_warehouse",
+            requires = "snowflake_database",
+            requires = "snowflake_schema",
+            requires = "snowflake_storage_integration",
+            requires = "gcs_bucket",
+            conflicts_with_all = ["s3_bucket", "bigquery_project", "clickhouse_url"]
+        )]
+        snowflake_connection: Option<String>,
+        /// The virtual warehouse the load runs on (with `--snowflake-connection`).
+        #[arg(
+            long = "snowflake-warehouse",
+            value_name = "WAREHOUSE",
+            requires = "snowflake_connection"
+        )]
+        snowflake_warehouse: Option<String>,
+        /// The database the load creates its tables in (with `--snowflake-connection`).
+        #[arg(
+            long = "snowflake-database",
+            value_name = "DATABASE",
+            requires = "snowflake_connection"
+        )]
+        snowflake_database: Option<String>,
+        /// The schema the load creates its tables in (with `--snowflake-connection`).
+        #[arg(
+            long = "snowflake-schema",
+            value_name = "SCHEMA",
+            requires = "snowflake_connection"
+        )]
+        snowflake_schema: Option<String>,
+        /// A pre-created GCS `STORAGE INTEGRATION` granting Snowflake read on the
+        /// `--gcs-bucket` (with `--snowflake-connection`).
+        #[arg(
+            long = "snowflake-storage-integration",
+            value_name = "INTEGRATION",
+            requires = "snowflake_connection"
+        )]
+        snowflake_storage_integration: Option<String>,
         /// TLS posture for BOTH the introspection connection init opens AND the
         /// `source.tls:` block written into the scaffold. Required (or `disable`,
         /// explicitly) for any non-loopback host — without it the TLS gate
@@ -806,6 +850,82 @@ mod tests {
             &[src.as_slice(), bq.as_slice(), &["--gcs-bucket", "g"]].concat(),
             "--bigquery-* with --gcs-bucket",
         );
+    }
+
+    /// The Snowflake loader needs all five values and reads GCS only (a GCS external
+    /// stage), and one config loads into one warehouse: every combination that
+    /// cannot become a loadable config is refused at the flag.
+    #[test]
+    fn init_clap_ties_the_snowflake_flags_together_and_to_a_gcs_bucket() {
+        let src = ["--source", "postgresql://localhost/db"];
+        let sf = [
+            "--snowflake-connection",
+            "c",
+            "--snowflake-warehouse",
+            "w",
+            "--snowflake-database",
+            "d",
+            "--snowflake-schema",
+            "s",
+            "--snowflake-storage-integration",
+            "i",
+        ];
+        let gcs = ["--gcs-bucket", "g"];
+        assert_init_ok(
+            &[src.as_slice(), sf.as_slice(), gcs.as_slice()].concat(),
+            "--snowflake-* with --gcs-bucket",
+        );
+        assert_init_err(
+            &[src.as_slice(), sf.as_slice()].concat(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--snowflake-* without --gcs-bucket",
+        );
+        assert_init_err(
+            &[src.as_slice(), sf.as_slice(), &["--s3-bucket", "s"]].concat(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--snowflake-* with --s3-bucket only",
+        );
+        // Each companion flag missing in turn, and each companion without the connection.
+        for i in (0..sf.len()).step_by(2) {
+            let mut partial: Vec<&str> = [src.as_slice(), gcs.as_slice()].concat();
+            partial.extend(
+                sf.iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j / 2 != i / 2)
+                    .map(|(_, a)| *a),
+            );
+            assert_init_err(
+                &partial,
+                clap::error::ErrorKind::MissingRequiredArgument,
+                &format!("--snowflake-* without {}", sf[i]),
+            );
+            assert_init_err(
+                &[src.as_slice(), gcs.as_slice(), &sf[i..i + 2]].concat(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                &format!("{} alone", sf[i]),
+            );
+        }
+        for other in [
+            ["--bigquery-project", "p", "--bigquery-dataset", "d"],
+            [
+                "--clickhouse-url",
+                "http://ch:8123",
+                "--clickhouse-database",
+                "d",
+            ],
+        ] {
+            assert_init_err(
+                &[
+                    src.as_slice(),
+                    sf.as_slice(),
+                    gcs.as_slice(),
+                    other.as_slice(),
+                ]
+                .concat(),
+                clap::error::ErrorKind::ArgumentConflict,
+                &format!("--snowflake-* with {}", other[0]),
+            );
+        }
     }
 
     #[test]
