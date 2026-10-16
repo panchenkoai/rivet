@@ -12,6 +12,9 @@
 
 use std::fs;
 
+#[path = "offline/capture_markers.rs"]
+mod capture_markers;
+
 #[derive(Clone, Copy)]
 enum Expect {
     /// A test fn whose name contains this substring must exist in the file.
@@ -711,45 +714,9 @@ fn derived_capture_markers() -> &'static Vec<String> {
     use std::sync::OnceLock;
     static MARKERS: OnceLock<Vec<String>> = OnceLock::new();
     MARKERS.get_or_init(|| {
-        let mut out = Vec::new();
-        // The rig is a directory module (role split: render/materialize/
-        // invoke/oracle) — scan every .rs under it plus the runner module.
-        // The hollowing floor below fired the moment rig.rs became rig/ —
-        // exactly the failure mode it exists for.
-        let mut sources: Vec<std::path::PathBuf> = std::fs::read_dir("tests/common/rig")
-            .expect("derive capture markers: read tests/common/rig")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-            .collect();
-        sources.push("tests/common/runner.rs".into());
-        for src in sources {
-            let text = std::fs::read_to_string(&src)
-                .unwrap_or_else(|e| panic!("derive capture markers: read {}: {e}", src.display()));
-            for line in text.lines() {
-                let l = line.trim_start();
-                if let Some(rest) = l.strip_prefix("pub fn ")
-                    && let Some(name) = rest.split('(').next()
-                    && ["run", "cli", "spawn", "drain", "apply"]
-                        .iter()
-                        .any(|p| name.starts_with(p))
-                {
-                    out.push(format!("{name}("));
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        // An empty or shrunken derivation would silently hollow the gate
-        // (runs_capture=false SKIPS a test rather than failing it) — so the
-        // floor is a hard panic, and the trickiest historical miss is pinned
-        // by name: the trailing 's' that defeated the run_with_env( substring.
-        assert!(
-            out.len() >= 12,
-            "capture-marker derivation collapsed to {} markers — the harness \
-             sources moved or the regex rotted; the gate would silently skip \
-             every CDC test: {out:?}",
-            out.len()
-        );
+        let out: Vec<String> = capture_markers::capture_markers().into_iter().collect();
+        // The trickiest historical miss is pinned by name: the trailing 's'
+        // that defeated the run_with_env( substring.
         assert!(
             out.iter().any(|m| m == "run_with_envs("),
             "derived markers must include run_with_envs( — the spelling whose \
@@ -836,7 +803,7 @@ fn oracle_class_census_is_pinned() {
                 || chunk.contains("Command::new(RIVET_BIN)")
                 || derived_capture_markers()
                     .iter()
-                    .any(|m| chunk.contains(m.as_str()));
+                    .any(|m| capture_markers::calls(chunk, m));
             if !runs_capture {
                 continue;
             }
@@ -1139,7 +1106,7 @@ fn every_live_cdc_test_asserts_an_outcome() {
                 // dimension, never type it in".
                 || derived_capture_markers()
                     .iter()
-                    .any(|m| chunk.contains(m.as_str()));
+                    .any(|m| capture_markers::calls(chunk, m));
             // Outcome = the test READS BACK what the capture produced (files,
             // destination listing, or the state DB) — not merely that the
             // process exited 0.

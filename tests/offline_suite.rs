@@ -50,6 +50,9 @@ mod validate_cdc_union;
 #[path = "offline/batch_oracle_gate.rs"]
 mod batch_oracle_gate;
 
+#[path = "offline/capture_markers.rs"]
+mod capture_markers;
+
 #[path = "offline/cdc_cli_surface_guard.rs"]
 mod cdc_cli_surface_guard;
 
