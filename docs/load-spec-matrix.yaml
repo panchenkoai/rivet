@@ -158,7 +158,7 @@ scenarios:
   - id: changed_partition_of_a_full_table_refused
     what: "a full load onto rivet's own table with a different partition key or granularity is refused naming both, nothing touched (D5)"
     bigquery:   { test: bigquery_full_load_partitions_by_day_and_keeps_the_options_in_step }
-    snowflake:  { na: "a full load lands a new staging table with the new clustering key and swaps it in (ALTER TABLE … SWAP WITH) — Snowflake has no partition spec to conflict" }
+    snowflake:  { na: "a full load lands a new staging table with the new clustering key and clones it over the table (CREATE OR REPLACE TABLE … CLONE … COPY GRANTS) — Snowflake has no partition spec to conflict" }
     clickhouse: { na: "a ClickHouse full load re-creates its table (CREATE OR REPLACE, then EXCHANGE) in the declared partition — nothing to conflict (ADR-0035 CH1)" }
 
   - id: changelog_inherits_the_table_partition

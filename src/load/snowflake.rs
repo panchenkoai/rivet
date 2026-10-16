@@ -210,7 +210,7 @@ impl TargetLoader for SnowflakeLoader {
             let rows = extract_count(&result)
                 .context("COPY ran but the row count could not be read from snow output")?;
             super::check_loaded_rows(&self.fqtn(table), rows, expected_rows)?;
-            self.run_snow(&self.build_swap_sql(table, &staging, specs))?;
+            self.run_snow(&self.build_clone_in_sql(table, &staging))?;
             Ok(rows)
         });
         if landed.is_err() {
@@ -352,17 +352,14 @@ impl SnowflakeLoader {
         Ok(sql)
     }
 
-    /// The swap script: `table` (created when the name is free) trades places with the loaded `staging` in one statement, then the old rows are dropped.
-    fn build_swap_sql(&self, table: &str, staging: &str, specs: &[TargetColumnSpec]) -> String {
+    /// The publish script: `table` becomes a zero-copy clone of the loaded `staging` in one statement, keeping the grants made on it; then `staging` is dropped.
+    fn build_clone_in_sql(&self, table: &str, staging: &str) -> String {
         format!(
             "ALTER SESSION SET QUERY_TAG = '{tag}';\n\
-             CREATE TABLE IF NOT EXISTS {fqtn} (\n{ddl}\n){cluster};\n\
-             ALTER TABLE {staging} SWAP WITH {fqtn};\n\
+             CREATE OR REPLACE TABLE {fqtn} CLONE {staging} COPY GRANTS;\n\
              DROP TABLE {staging};",
             tag = self.query_tag(table),
             fqtn = self.fqtn(table),
-            ddl = Self::build_schema_ddl(specs),
-            cluster = Self::cluster_clause(&self.cluster_keys()),
             staging = self.fqtn(staging),
         )
     }
@@ -614,13 +611,13 @@ fn needs_parse_json(spec: &TargetColumnSpec) -> bool {
     spec.target_type == TargetType::Snowflake(SfType::Variant)
 }
 
-/// Keep a table name safe for a stage name / query tag (alnum + underscore).
 /// A staging table name of `table` no earlier load used: `<table>__rivet_load_<16 hex>`.
 fn staging_table(table: &str) -> String {
     use rand::RngExt;
     format!("{table}__rivet_load_{:016x}", rand::rng().random::<u64>())
 }
 
+/// Keep a table name safe for a stage name / query tag (alnum + underscore).
 fn sanitize_tag(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -1148,14 +1145,14 @@ mod tests {
             .to_string()
     }
 
-    /// A full load lands in a fresh staging table and swaps it in only after the COPY and the count; any failure before leaves the table alone and drops the staging table.
+    /// A full load lands in a fresh staging table and clones it over the table only after the COPY and the count; any failure before leaves the table alone and drops the staging table.
     #[test]
     fn a_full_load_swaps_in_only_a_counted_copy_and_drops_its_staging_table() {
         let specs = [col("id", SfType::NumberPs(38, 0))];
         let uris = ["gs://bkt/exports/orders/part-0.parquet".to_string()];
         let rows = |n: u64| format!(r#"[[{{"status":"ok"}}],[{{"ROWS_":{n}}}]]"#);
         let (two, three) = (rows(2), rows(3));
-        // (what the COPY answers, what the swap answers, expected rows, the code, sent a swap)
+        // (what the COPY answers, what the clone answers, expected rows, the code, sent the clone)
         type Case<'a> = (&'a str, i32, i32, Option<u64>, Option<&'a str>, bool);
         let cases: [Case; 5] = [
             (&two, 0, 0, Some(2), None, true),
@@ -1185,9 +1182,9 @@ mod tests {
                 true,
             ),
         ];
-        for (copy_out, copy_exit, swap_exit, expected, code, swapped) in cases {
+        for (copy_out, copy_exit, clone_exit, expected, code, cloned) in cases {
             let stand = Stand::scripted(&[
-                ("SWAP WITH", swap_exit, "[]", "swap refused"),
+                ("CLONE", clone_exit, "[]", "clone refused"),
                 ("DROP TABLE IF EXISTS", 0, "[]", ""),
                 (
                     "COPY INTO",
@@ -1201,7 +1198,7 @@ mod tests {
             l.storage_integration = "RIVET_GCS".into();
             let got = l.materialize("orders", &specs, &uris, expected);
             let sent = stand.sent();
-            let case = format!("{copy_exit}/{swap_exit}/{expected:?}: {sent:#?}");
+            let case = format!("{copy_exit}/{clone_exit}/{expected:?}: {sent:#?}");
             let staging = staging_in(&sent[0], "DB.SC.orders__rivet_load_");
             assert_eq!(
                 staging.len(),
@@ -1215,24 +1212,20 @@ mod tests {
                 "{case}"
             );
             assert!(
-                sent.iter().all(|q| !q.contains("OR REPLACE TABLE")
+                sent.iter().filter(|q| !q.contains(" CLONE ")).all(|q| !q
+                    .contains("OR REPLACE TABLE")
                     && !q.contains("TRUNCATE")
                     && !q.contains("DROP TABLE DB.SC.orders;")
                     && !q.contains("COPY INTO DB.SC.orders ")),
-                "no statement writes the table itself: {case}"
+                "no statement but the clone writes the table: {case}"
             );
-            assert_eq!(
-                sent.iter().any(|q| q.contains("SWAP WITH")),
-                swapped,
-                "{case}"
-            );
-            if swapped {
+            assert_eq!(sent.iter().any(|q| q.contains(" CLONE ")), cloned, "{case}");
+            if cloned {
                 assert_eq!(
                     sent[1],
                     format!(
                         "ALTER SESSION SET QUERY_TAG = '{}';\n\
-                         CREATE TABLE IF NOT EXISTS DB.SC.orders (\n  id NUMBER(38,0)\n);\n\
-                         ALTER TABLE {staging} SWAP WITH DB.SC.orders;\n\
+                         CREATE OR REPLACE TABLE DB.SC.orders CLONE {staging} COPY GRANTS;\n\
                          DROP TABLE {staging};",
                         l.query_tag("orders")
                     ),
