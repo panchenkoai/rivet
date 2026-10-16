@@ -98,7 +98,7 @@ Kept deliberately (bash behaviour that is defensible or load-bearing):
 
 * `cleanup()` runs at the start and, at the end, ONLY when nothing failed — a
   failing run leaves `dev/e2e/output/` for post-mortem. Preserved.
-* `dev/fixtures/test_params.yaml` writes into `dev/output/`, and every run leaves
+* `dev/fixtures/test_params.yaml` writes into `dev/fixtures/output/`, and every run leaves
   per-run summaries in `dev/e2e/.rivet/runs/<run_id>/`. `cleanup()` removes
   neither (it knows only `output/`, `.init_e2e_scratch` and `.rivet_state.db*`), so
   both accumulate untracked in the worktree — confirmed live after this port's own

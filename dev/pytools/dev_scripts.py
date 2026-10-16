@@ -376,7 +376,7 @@ def permissions(argv: Sequence[str] = ()) -> int:
     _mysql(_MYSQL_SETUP_SQL).check("MySQL restricted-user setup (CREATE USER / GRANT)")
     _say("  MySQL users created: rivet_noaccess, rivet_partial")
 
-    (ROOT / "dev/output/perms").mkdir(parents=True, exist_ok=True)
+    (ROOT / "dev/fixtures/output/perms").mkdir(parents=True, exist_ok=True)
 
     env = {"RUST_LOG": "error"}
     fx = "dev/fixtures"
@@ -498,7 +498,7 @@ def schema_evolution(argv: Sequence[str] = ()) -> int:
     t = Tally(expected_suffix="(expected '{pattern}' in output)", output_prefix="  Output was: ")
 
     _header("Setup: create test table")
-    (ROOT / "dev/output/schema").mkdir(parents=True, exist_ok=True)
+    (ROOT / "dev/fixtures/output/schema").mkdir(parents=True, exist_ok=True)
     shell.rm_rf(_STATE_DB)
     _psql(_SCHEMA_SETUP_SQL, stop_on_error=True).check("schema_test_table setup")
     _say("  Table created with columns: id, name, email, age")
@@ -985,7 +985,7 @@ def uat_smoke(argv: Sequence[str] = ()) -> int:
             env={"RUST_LOG": "info"})
 
     exit0("P1", "run", "--config", "dev/fixtures/test_file_split.yaml", "--validate")
-    n = len(list((ROOT / "dev/output").glob("users_split_*_part*.parquet")))
+    n = len(list((ROOT / "dev/fixtures/output").glob("users_split_*_part*.parquet")))
     if n >= 2:
         L.ok(f"P2(n={n})")
     else:
@@ -1230,13 +1230,6 @@ _REGEN_TABLES: tuple[str, ...] = (
     "orders_sparse_for_export",
 )
 
-# `sed 's|path: ./output|path: ./dev/output|'` — one substitution per line, and a
-# literal (sed read `.` as "any char", which nothing in a generated file relies
-# on). `./dev/output` is gitignored, matching the other dev configs.
-_SED_FROM = "path: ./output"
-_SED_TO = "path: ./dev/output"
-
-
 def _rel(path: Path) -> str:
     """Repo-relative when possible, absolute otherwise. `Path.relative_to` RAISES
     for a path outside the repo, and a message formatter that can raise turns a
@@ -1248,7 +1241,7 @@ def _rel(path: Path) -> str:
 
 
 def _init_config(source: str, out: Path, *args: str) -> None:
-    """`cargo run --release -q -- init … -o <out>`, then the path fixup, written
+    """`cargo run --release -q -- init … -o <out>`, written
     atomically.
 
     DEVIATION (12): `init` writes `-o` directly, truncating any previous content
@@ -1265,11 +1258,9 @@ def _init_config(source: str, out: Path, *args: str) -> None:
             cwd=ROOT,
             timeout=None,
         ).check(f"rivet init -o {_rel(out)}")
-        text = scratch.read_text()
-        fixed = "\n".join(
-            line.replace(_SED_FROM, _SED_TO, 1) for line in text.split("\n")
-        )
-        shell.atomic_write(out, fixed)
+        # The generated `path: ./output` is anchored to the config's directory, so
+        # it lands under the gitignored `dev/init_generated/` as written.
+        shell.atomic_write(out, scratch.read_text())
     finally:
         shell.rm_rf(scratch)
 

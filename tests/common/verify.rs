@@ -1152,8 +1152,13 @@ impl Case {
         };
         let (root, _) = split_partition(s(dest, field).unwrap_or(""), e)?;
         if s(dest, "type") == Some("local") {
-            // As rivet anchors it: a relative local path names the config's directory.
-            return Ok(self.config_dir.join(root));
+            // As rivet anchors it: the config's directory, unless only the working directory holds it (a run of a release before 0.32).
+            let (by_cfg, by_cwd) = (self.config_dir.join(&root), self.cwd.join(&root));
+            return Ok(if by_cwd.is_dir() && !by_cfg.is_dir() {
+                by_cwd
+            } else {
+                by_cfg
+            });
         }
         let root = object_key_prefix(&root);
         use std::hash::{Hash as _, Hasher as _};

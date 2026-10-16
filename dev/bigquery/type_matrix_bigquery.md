@@ -9,18 +9,18 @@ From the repository root:
 **PostgreSQL**
 
 ```bash
-mkdir -p dev/output/type_matrix/pg
+mkdir -p dev/workbench/output/type_matrix/pg
 rivet run --config dev/workbench/pg_type_matrix.yaml --export type_matrix_pg
-PG_PARQUET=$(ls -t dev/output/type_matrix/pg/*.parquet | head -1)
+PG_PARQUET=$(ls -t dev/workbench/output/type_matrix/pg/*.parquet | head -1)
 echo "$PG_PARQUET"
 ```
 
 **MySQL** (Parquet columns match PG via aliases in `dev/workbench/mysql_type_matrix.yaml`)
 
 ```bash
-mkdir -p dev/output/type_matrix/mysql
+mkdir -p dev/workbench/output/type_matrix/mysql
 rivet run --config dev/workbench/mysql_type_matrix.yaml --export type_matrix_mysql
-MYSQL_PARQUET=$(ls -t dev/output/type_matrix/mysql/*.parquet | head -1)
+MYSQL_PARQUET=$(ls -t dev/workbench/output/type_matrix/mysql/*.parquet | head -1)
 echo "$MYSQL_PARQUET"
 ```
 
@@ -68,7 +68,7 @@ Use **two BigQuery table names** if you load both engines side by side, e.g. **`
 
 ```bash
 export TABLE="type_matrix_pg"
-export PG_PARQUET=$(ls -t dev/output/type_matrix/pg/*.parquet | head -1)
+export PG_PARQUET=$(ls -t dev/workbench/output/type_matrix/pg/*.parquet | head -1)
 
 bq load \
   --project_id="${GCP_PROJECT}" \
@@ -83,7 +83,7 @@ bq load \
 
 ```bash
 export TABLE="type_matrix_pg"
-PQ=$(ls -t dev/output/type_matrix/pg/*.parquet | head -1)
+PQ=$(ls -t dev/workbench/output/type_matrix/pg/*.parquet | head -1)
 bq load --project_id="${GCP_PROJECT}" --source_format=PARQUET --replace --autodetect \
   "${GCP_PROJECT}:${BQ_DATASET}.${TABLE}" \
   "${PQ}"
@@ -95,7 +95,7 @@ bq load --project_id="${GCP_PROJECT}" --source_format=PARQUET --replace --autode
 
 ```bash
 export TABLE="type_matrix_mysql"
-export MYSQL_PARQUET=$(ls -t dev/output/type_matrix/mysql/*.parquet | head -1)
+export MYSQL_PARQUET=$(ls -t dev/workbench/output/type_matrix/mysql/*.parquet | head -1)
 
 bq load \
   --project_id="${GCP_PROJECT}" \
@@ -110,7 +110,7 @@ One-file pattern (same pitfall as Postgres if `*.parquet` expands):
 
 ```bash
 export TABLE="type_matrix_mysql"
-MQ=$(ls -t dev/output/type_matrix/mysql/*.parquet | head -1)
+MQ=$(ls -t dev/workbench/output/type_matrix/mysql/*.parquet | head -1)
 bq load --project_id="${GCP_PROJECT}" --source_format=PARQUET --replace --autodetect \
   "${GCP_PROJECT}:${BQ_DATASET}.${TABLE}" \
   "${MQ}"
@@ -122,7 +122,7 @@ Multiple local parts: loop one file per load, or **`gsutil cp`** then load with 
 
 ```bash
 # Example: Postgres shards to GCS (repeat pattern for mysql/ subfolder)
-gsutil cp dev/output/type_matrix/pg/*.parquet "gs://${GCS_BUCKET}/type_matrix/pg/"
+gsutil cp dev/workbench/output/type_matrix/pg/*.parquet "gs://${GCS_BUCKET}/type_matrix/pg/"
 bq load --project_id="${GCP_PROJECT}" --source_format=PARQUET --replace --autodetect \
   "${GCP_PROJECT}:${BQ_DATASET}.${TABLE}" \
   "gs://${GCS_BUCKET}/type_matrix/pg/*.parquet"

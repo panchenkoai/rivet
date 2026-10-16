@@ -111,17 +111,20 @@ impl DestinationConfig {
         }
     }
 
-    /// Anchor a relative local `path` (or the `prefix` a local destination uses as one) to `config_dir`, so one config names one directory from every working directory.
-    pub(crate) fn anchor(&mut self, config_dir: &Path) {
+    /// Anchor a relative local `path` (or the `prefix` a local destination uses as one) to `config_dir`, so one config names one directory from every working directory; returns the relative spelling it anchored.
+    pub(crate) fn anchor(&mut self, config_dir: &Path) -> Option<String> {
         if self.destination_type != DestinationType::Local {
-            return;
+            return None;
         }
-        if let Some(p) = self.path.as_mut().or(self.prefix.as_mut())
-            && !Path::new(p.as_str()).is_absolute()
-        {
-            let anchored: PathBuf = config_dir.join(p.as_str()).components().collect();
-            *p = anchored.to_string_lossy().into_owned();
+        let p = self.path.as_mut().or(self.prefix.as_mut())?;
+        if Path::new(p.as_str()).is_absolute() {
+            return None;
         }
+        let written = p.clone();
+        *p = normalized(&config_dir.join(p.as_str()))
+            .to_string_lossy()
+            .into_owned();
+        Some(written)
     }
 
     /// The state key of a CDC table's snapshot baseline: its destination.
@@ -155,9 +158,96 @@ pub(crate) fn anchors(written: &str, anchored: &str) -> bool {
         && Path::new(a).ends_with(&tail)
 }
 
+/// `path` with its `.` and `..` components folded lexically: one spelling of a directory for the files rivet names and compares.
+pub(crate) fn normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `path` up to its first `{placeholder}` component, normalised: the directory a templated destination lands under.
+pub(crate) fn literal_root(path: &Path) -> PathBuf {
+    normalized(path)
+        .components()
+        .take_while(|c| !c.as_os_str().to_string_lossy().contains('{'))
+        .collect()
+}
+
+/// The transition decision for a relative local path: `old` (under the working directory, where a release before 0.32 wrote) holds `export`'s files while `new` (beside the config) holds none; local stat and reads only, never the same directory.
+pub(crate) fn relative_path_moved(export: &str, old: &Path, new: &Path) -> bool {
+    old != new && holds_export(old, export) && !holds_export(new, export)
+}
+
+/// Whether `dir` holds a `manifest.json` rivet wrote for `export`, at the directory or one level down (a date or table sub-directory).
+fn holds_export(dir: &Path, export: &str) -> bool {
+    let manifest_of = |d: &Path| {
+        std::fs::read(d.join("manifest.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+            .is_some_and(|m| m.get("export_name").and_then(|v| v.as_str()) == Some(export))
+    };
+    manifest_of(dir)
+        || std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| e.file_type().is_ok_and(|t| t.is_dir()) && manifest_of(&e.path()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four cases of the transition decision: the same directory, the old place alone holds the export, both do, neither does; another export's manifest does not count.
+    #[test]
+    fn a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export() {
+        let root = tempfile::tempdir().unwrap();
+        let (old, new) = (root.path().join("cwd/out"), root.path().join("cfg/out"));
+        let plant = |dir: &Path, export: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("manifest.json"),
+                format!(r#"{{"export_name":"{export}","run_id":"r"}}"#),
+            )
+            .unwrap();
+        };
+        assert!(!relative_path_moved("orders", &old, &new), "neither holds");
+        plant(&old.join("2026-10-16"), "orders");
+        assert!(
+            relative_path_moved("orders", &old, &new),
+            "the old place alone holds it (one level down)"
+        );
+        assert!(
+            !relative_path_moved("items", &old, &new),
+            "another export's manifest is not this export's"
+        );
+        assert!(
+            !relative_path_moved("orders", &old, &old),
+            "the same directory"
+        );
+        plant(&new, "orders");
+        assert!(!relative_path_moved("orders", &old, &new), "both hold");
+        assert_eq!(
+            literal_root(Path::new("/etc/rivet/out/{date}/x")),
+            Path::new("/etc/rivet/out")
+        );
+        assert_eq!(
+            normalized(Path::new("/home/op/../etc/rivet/./out/..")),
+            Path::new("/home/etc/rivet")
+        );
+    }
 
     /// The one resolver: a relative local path lands under the CONFIG's directory, not the working directory the test runs in.
     #[test]
@@ -171,7 +261,7 @@ mod tests {
             ..Default::default()
         };
         let mut d = local(Some("./out/{date}/"), None);
-        d.anchor(config_dir);
+        assert_eq!(d.anchor(config_dir).as_deref(), Some("./out/{date}/"));
         assert_eq!(
             d.path.as_deref(),
             Some(config_dir.join("out/{date}").to_str().unwrap())
@@ -183,7 +273,7 @@ mod tests {
             Some(config_dir.join("out").to_str().unwrap())
         );
         let mut absolute = local(Some("/data/out"), None);
-        absolute.anchor(config_dir);
+        assert_eq!(absolute.anchor(config_dir), None);
         assert_eq!(absolute.path.as_deref(), Some("/data/out"));
         let mut cloud = DestinationConfig {
             destination_type: DestinationType::S3,

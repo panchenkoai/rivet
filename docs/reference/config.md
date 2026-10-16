@@ -447,7 +447,7 @@ is in the generated [config-reference.md](config-reference.md) (section
 
 A relative local `path` (`./output/orders`) names the directory beside the config file, whatever directory rivet is started from: `rivet run -c /etc/rivet/rivet.yaml` from a cron entry and from a shell in `/home/op` both deliver to `/etc/rivet/output/orders`, where the state (`.rivet_state.db`) and a `cdc.checkpoint` already live. Every command resolves it the same way, once, when the config is loaded: `run`, `plan`/`apply`, `validate`, `reconcile`, `repair`, `state`, `doctor` and `load`.
 
-Before 0.32 the path was relative to the working directory, so only a run started outside the config's directory lands elsewhere now; a cursor stored by such a run continues under the anchored path. A path that should not move with the config is written absolute.
+Before 0.32 the path was relative to the working directory, so only a run started outside the config's directory lands elsewhere now; a cursor stored by such a run continues under the anchored path. While the working-directory place still holds the export's files (its `manifest.json`) and the directory beside the config holds none, every command is refused with `RIVET_DEST_RELATIVE_PATH_MOVED` (exit 5) naming both directories: move the files beside the config, or make the path absolute. A path that should not move with the config is written absolute.
 
 ### Path and prefix placeholders
 

@@ -131,20 +131,46 @@ impl Config {
         let mut config =
             Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))?;
         config.record_queries_as_written(&contents);
-        config.anchor_paths(path);
+        config.anchor_paths(path)?;
         Ok(config)
     }
 
-    /// Anchor every relative local destination path to the config file's directory: the one place a path in the file is resolved, so every command reads and writes one location whatever directory rivet is started from.
-    fn anchor_paths(&mut self, config_path: &str) {
-        let config_dir = std::path::absolute(config_path)
+    /// Anchor every relative local destination path to the config file's directory: the one place a path in the file is resolved, so every command reads and writes one location whatever directory rivet is started from; refuses while the directory under the working directory (where a release before 0.32 wrote) alone holds the export's files.
+    fn anchor_paths(&mut self, config_path: &str) -> crate::error::Result<()> {
+        let Some(dir) = std::path::absolute(config_path)
             .ok()
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
-        if let Some(dir) = config_dir {
-            for export in &mut self.exports {
-                export.destination.anchor(&dir);
+            .and_then(|p| p.parent().map(destination::normalized))
+        else {
+            return Ok(());
+        };
+        let cwd = std::env::current_dir().ok().filter(|c| *c != dir);
+        for export in &mut self.exports {
+            let Some(written) = export.destination.anchor(&dir) else {
+                continue;
+            };
+            let Some(cwd) = &cwd else { continue };
+            let old = destination::literal_root(&cwd.join(&written));
+            let new = destination::literal_root(std::path::Path::new(
+                export
+                    .destination
+                    .path
+                    .as_deref()
+                    .or(export.destination.prefix.as_deref())
+                    .unwrap_or(""),
+            ));
+            if destination::relative_path_moved(&export.name, &old, &new) {
+                crate::rivet_bail!(
+                    crate::error::codes::DEST_RELATIVE_PATH_MOVED,
+                    "export '{}': `destination.path: {written}` is relative and names {} (beside the config) since 0.32, while {} (under the working directory, where a release before 0.32 wrote it) holds this export's files and {} holds none: move the files to {}, or make `destination.path` absolute",
+                    export.name,
+                    new.display(),
+                    old.display(),
+                    new.display(),
+                    new.display()
+                );
             }
         }
+        Ok(())
     }
 
     /// Record each export's inline `query:` as the file spells it, placeholders in place, where the unresolved document parses; `ExportConfig::resolve_query_and_template` uses a spelling only if it resolves to the export's query.

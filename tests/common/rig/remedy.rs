@@ -288,6 +288,7 @@ impl Rig {
             extra_exports: self.extra_exports.clone(),
             oracle_container_dir: self.oracle_container_dir.clone(),
             config_dir_override: self.config_dir_override.clone(),
+            cwd_override: self.cwd_override.clone(),
             ckpt_override: self.ckpt_override.clone(),
             cloud_dest: self.cloud_dest.clone(),
             dest_prefix_unslashed: self.dest_prefix_unslashed,
