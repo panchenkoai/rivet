@@ -315,7 +315,8 @@ def clippy(out: Path, label: str, extra: list[str]) -> tuple[str, str]:
 
 
 COMPILED = re.compile(r"^\s*Compiling rivet-cli\b", re.M)
-DONE = re.compile(r"(\d+) mutants tested in [^:]*: (.*)")
+# cargo-mutants says "1 mutant tested", "2 mutants tested": a one-mutant diff must still have a verdict.
+DONE = re.compile(r"(\d+) mutants? tested in [^:]*: (.*)")
 
 
 def mutant_verdict(mdir: Path, rc: int, log_text: str) -> tuple[str, str]:
@@ -492,6 +493,9 @@ def self_test() -> int:
         assert "Fresh" in mutant_verdict(m, 0, ok)[1], "a Fresh mutant build must fail"
         assert mutant_verdict(m, 0, "")[0] == "FAIL", "no summary line is no verdict"
         assert mutant_verdict(m, 1, ok)[0] == "FAIL", "a tool error is no verdict"
+        (m / "log/src_a.rs_line_4.log").unlink()
+        one = "1 mutant tested in 11m: 1 unviable"
+        assert mutant_verdict(m, 0, one) == ("PASS", one), "one mutant is still a verdict"
     print("pr_ready self-test: ok")
     return 0
 
