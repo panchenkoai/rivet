@@ -953,6 +953,18 @@ mod tests {
         );
     }
 
+    /// A `backfill:` baseline runs through the same legs as `initial: snapshot`, so it has their names.
+    #[test]
+    fn a_backfill_cdc_export_has_snapshot_legs() {
+        let legs = snapshot_leg_names(&cdc_export("cdc: { backfill: [items_base] }\n"));
+        assert_eq!(
+            legs,
+            ["pg_cdc__snapshot_items", "pg_cdc__snapshot_orders"]
+                .map(String::from)
+                .into()
+        );
+    }
+
     /// The throughput self-check compares the drain alone, as its baseline metric row holds it.
     #[test]
     fn the_throughput_pair_leaves_the_snapshot_legs_out() {
