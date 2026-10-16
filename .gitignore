@@ -104,7 +104,7 @@ pilot_bench.yaml
 # Shared host↔container bind mount used by live type-roundtrip tests
 # (DuckDB + ClickHouse read the same Parquet from here — see
 # docker-compose.yaml).
-/tests/.live-tmp/
+/tests/.live-tmp
 .claude/
 mutants.out/
 

@@ -110,7 +110,7 @@ FINISHED — it does a fresh full pass. Every run holds its export's run
 lease (an `flock` beside a SQLite state DB, a session advisory lock on a Postgres
 one) for as long as the process lives, and the OS releases it when the process
 dies, `kill -9` included. A second run of the same export while the first is alive
-is refused (`RIVET_STATE_RUN_IN_PROGRESS`, exit 5), whatever the mode, and so are
+is refused (`RIVET_STATE_RUN_IN_PROGRESS`, exit 2: retry once the first ends), whatever the mode, and so are
 `rivet repair --execute` and the `rivet state reset*` commands for that export.
 So when a plain run finds a chunk-checkpoint run still in progress:
 

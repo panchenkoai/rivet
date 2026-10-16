@@ -1,0 +1,31 @@
+diff --git a/src/error.rs b/src/error.rs
+index 82604a19..ac65e474 100644
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -843,7 +843,7 @@ pub mod codes {
+         "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run starts a fresh pass",
+     );
+     /// A command that rewrites an export's stored progress met a live run of that export.
+-    pub const STATE_RUN_IN_PROGRESS: Code = busy(
++    pub const STATE_RUN_IN_PROGRESS: Code = refusal(
+         "RIVET_STATE_RUN_IN_PROGRESS",
+         "wait for the run to finish, or stop its process, then repeat the command",
+     );
+@@ -922,7 +922,7 @@ pub mod codes {
+         "free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease",
+     );
+     /// A PostgreSQL-state lease stopped being this process's while the work it guards was under way.
+-    pub const STATE_LEASE_LOST: Code = busy(
++    pub const STATE_LEASE_LOST: Code = refusal(
+         "RIVET_STATE_LEASE_LOST",
+         "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse",
+     );
+@@ -1078,7 +1078,7 @@ pub mod codes {
+         "TRUNCATE the change log the message names, then re-run the same `rivet load`",
+     );
+     /// Another `rivet load` or `rivet compact` holds the table's lease.
+-    pub const LOAD_TABLE_BUSY: Code = busy(
++    pub const LOAD_TABLE_BUSY: Code = refusal(
+         "RIVET_LOAD_TABLE_BUSY",
+         "wait for the other `rivet load` or `rivet compact` of that table to end, then run again",
+     );
