@@ -359,8 +359,7 @@ fn a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused()
         !out.status.success(),
         "a load whose lease another holder took exited 0:\n{said}"
     );
-    assert_eq!(out.status.code(), Some(5), "a refusal:\n{said}");
-    assert!(said.contains("[RIVET_STATE_LEASE_LOST]"), "{said}");
+    assert_refused(&out, Refused::by_code("RIVET_STATE_LEASE_LOST", 2));
     assert_eq!(
         existing_tables(&bq, &[&t]),
         Vec::<String>::new(),
@@ -373,7 +372,7 @@ fn a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused()
         "the other holder's row is not released by the load that lost it"
     );
     let again = rig.load_args_env(&["--pool", "1"], &env);
-    assert!(!again.status.success() && stderr(&again).contains("is writing `"));
+    assert_refused(&again, Refused::by_code("RIVET_LOAD_TABLE_BUSY", 2));
     assert_eq!(
         existing_tables(&bq, &[&t]),
         Vec::<String>::new(),
@@ -388,6 +387,59 @@ fn a_load_whose_lease_is_taken_mid_load_writes_nothing_and_is_recorded_refused()
         loaded,
         source_rows(&t),
         "a refused load is loaded by the next"
+    );
+}
+
+/// A second `rivet load` beside a live one stopped while it holds the table's lease is refused `RIVET_LOAD_TABLE_BUSY` with the retryable exit 2 on both cycles and writes nothing; once the first ends, the same command exits 0 and the table holds the source.
+#[test]
+#[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds"]
+fn a_second_load_beside_a_live_one_is_busy_and_retryable_then_loads() {
+    let Some(bq) = BqLive::from_env("lease_busy") else {
+        return;
+    };
+    let Some(state) = ScratchState::create("lk_busy") else {
+        return;
+    };
+    let (t, rig, _guard) = loadable(&bq, "lk_busy");
+    let _cleanup = bq.cleanup(&[&t]);
+    let url = state.url();
+    let env = [("RIVET_STATE_URL", url.as_str()), LONG_TTL[0]];
+    let out = rig.run_args_env(&[], &env);
+    assert!(out.status.success(), "the extract:\n{}", stderr(&out));
+
+    let first = rig.twin();
+    let (out, beside) = stalled_under_its_lease(
+        &state,
+        &t,
+        At::LeaseTaken,
+        move || first.load_args_env(&["--pool", "1"], &env),
+        |_| {
+            let cycles: Vec<_> = (0..2)
+                .map(|_| rig.load_args_env(&["--pool", "1"], &env))
+                .collect();
+            (cycles, existing_tables(&bq, &[&t]))
+        },
+    );
+    let (cycles, tables_beside) = beside;
+    for second in &cycles {
+        assert_refused(second, Refused::by_code("RIVET_LOAD_TABLE_BUSY", 2));
+    }
+    assert_eq!(
+        tables_beside,
+        Vec::<String>::new(),
+        "a load refused as busy writes nothing beside the stopped holder"
+    );
+    assert!(
+        out.status.success(),
+        "the first load, let go, loads:\n{}",
+        stderr(&out)
+    );
+    rig.load_ok(&["--pool", "1"], &env);
+    let loaded: i64 = bq.read_bq_count(&t).parse().expect("a count");
+    assert_eq!(
+        loaded,
+        source_rows(&t),
+        "the retried load ends with the source in the table"
     );
 }
 

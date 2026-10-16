@@ -915,7 +915,7 @@ fn pg_cdc_missing_table_leaves_no_slot(baseline: bool) {
 
 // (d) the exit-code contract
 
-/// A second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as `RIVET_STATE_RUN_IN_PROGRESS`, and the first delivers.
+/// A second run of a `mode: cdc` export while the first holds its stream open (paused at `cdc_after_open`) is refused as `RIVET_STATE_RUN_IN_PROGRESS` with the retryable exit 2, the first delivers, and the same command run again delivers.
 fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
     s.rig.run_ok();
     for id in 1..=5 {
@@ -940,11 +940,11 @@ fn second_cdc_run_beside_a_live_one(mut s: CdcScenario) {
         "the live stream finishes:\n{}",
         String::from_utf8_lossy(&first.stderr)
     );
-    assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2));
     s.rig.run_ok();
 }
 
-/// 2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name, and a run on the same source is refused by code.
+/// 2026-10-15 gate class B: on one PostgreSQL state, a run of an export name on another source runs beside a live run of that name, and a run on the same source is refused by code with the retryable exit 2 and delivers once the live run ends.
 fn one_export_name_on_two_sources() {
     let Some(state) = pg_state_url() else {
         return;
@@ -969,7 +969,7 @@ fn one_export_name_on_two_sources() {
         .beside_a_live_run(
             &[
                 ("RIVET_STATE_URL", state.as_str()),
-                ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:6000"),
+                ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:20000"),
             ],
             opened,
             |_| {
@@ -985,15 +985,21 @@ fn one_export_name_on_two_sources() {
         "a run of `{name}` on another source runs beside the live one:\n{}",
         String::from_utf8_lossy(&beside.stderr)
     );
-    assert_refused(&refused, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    assert_refused(&refused, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2));
     assert!(
         live.status.success(),
         "the live run delivers:\n{}",
         String::from_utf8_lossy(&live.stderr)
     );
+    let retried = same_source.run_with_envs(&on_state);
+    assert!(
+        retried.status.success(),
+        "the refused command, run again once the live run ended, delivers:\n{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
 }
 
-/// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 5).
+/// RESULTS 11: a second run beside a live checkpointed run is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 2, retryable).
 fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     let (table, _guard) = range_table(engine, "oc_live", 300);
     let rig = engine
@@ -1006,7 +1012,7 @@ fn second_run_beside_a_live_checkpointed_one(engine: SqlEngine) {
     second_run_beside(rig, 300);
 }
 
-/// The second run of `rig` while its first is mid-export is refused as `RIVET_STATE_RUN_IN_PROGRESS`, and the first delivers `n` rows.
+/// The second run of `rig` while its first is mid-export is refused as `RIVET_STATE_RUN_IN_PROGRESS` (exit 2), the first delivers `n` rows, and the refused command run again delivers.
 fn second_run_beside(rig: Rig, n: usize) {
     let (first, second) = rig
         .beside_a_live_run(&[], Rig::has_a_part, Rig::run)
@@ -1020,7 +1026,8 @@ fn second_run_beside(rig: Rig, n: usize) {
         delivered, n,
         "the live run delivers every row beside the refused one"
     );
-    assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5));
+    assert_refused(&second, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2));
+    rig.run_ok();
 }
 
 /// Mac report C: a TRUNCATE inside the stream is refused as `RIVET_SOURCE_CDC_TRUNCATED` (exit 5), every cycle; the re-baseline (after `first`, the engine's own step) delivers the source. Returns the refusal text.

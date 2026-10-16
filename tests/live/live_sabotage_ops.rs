@@ -111,7 +111,7 @@ fn a_lease_nobody_can_see_dead(engine: SqlEngine, holder_sql: &str) {
     rig.refuses_twice_then(
         &["run"],
         &[],
-        Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5),
+        Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2),
         vec![Remedy::new(
             "wait for it to finish",
             Then::DeliversTheSource,

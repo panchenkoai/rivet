@@ -96,7 +96,7 @@ guarantees:
       - file: docs/semantics.md
         sentence: "**its process is alive** (the lease is held): the run is refused, and so is `--resume`"
     held_by:
-      sqlite_state: { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres, asserts: "assert_refused(&second, Refused::by_code(\"RIVET_STATE_RUN_IN_PROGRESS\", 5));" }
+      sqlite_state: { test: a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres, asserts: "assert_refused(&second, Refused::by_code(\"RIVET_STATE_RUN_IN_PROGRESS\", 2));" }
       postgres_state: { test: two_runs_of_one_export_through_a_transaction_pooler_never_both_proceed, asserts: "one run must proceed and the other be refused by the run lease" }
 
   - id: a_completed_chunk_is_never_reclaimed
