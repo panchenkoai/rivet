@@ -1,0 +1,13 @@
+--- a/src/pipeline/reconcile_cmd.rs
++++ b/src/pipeline/reconcile_cmd.rs
+@@ -151,9 +151,7 @@
+     else {
+         return Ok(None);
+     };
+-    if let ExtractionStrategy::Chunked(cp) = &plan.strategy {
+-        super::chunked::refuse_changed_chunk_plan(plan, cp, &stored_hash, action, config_path)?;
+-    }
++    let _ = (&stored_hash, action, config_path);
+     Ok(Some(run_id))
+ }
+ 
