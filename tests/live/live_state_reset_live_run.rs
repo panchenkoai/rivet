@@ -181,8 +181,8 @@ impl Scenario {
         );
         assert_eq!(
             code,
-            Some(5),
-            "`state {args:?}` against a live run must be a refusal (exit 5):\n{said}"
+            Some(2),
+            "`state {args:?}` against a live run must be a busy stop (exit 2, retryable):\n{said}"
         );
         assert!(
             said.contains(REFUSAL)

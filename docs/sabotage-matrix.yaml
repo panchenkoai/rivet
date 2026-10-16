@@ -519,7 +519,7 @@ scenarios:
 
   - id: refusal_load_table_busy
     what: "RIVET_LOAD_TABLE_BUSY: another `rivet load` or `rivet compact` holds the table's lease"
-    postgres: { gap: "asserted by its code offline (live_only_decisions::each_load_glue_stop_carries_its_code); the walk needs a load beside a live load (`RIVET_TEST_PAUSE_AT`): refused while the other holds the lease, loaded once it ends" }
+    postgres: { gap: "asserted by its code offline (live_only_decisions::each_load_glue_stop_carries_its_code); live on BigQuery (live_load_lease_keeper::a_second_load_beside_a_live_one_is_busy_and_retryable_then_loads): a second load beside a first stopped under its lease is refused by code with exit 2 on two cycles, writes nothing, and the same command loads once the first ends; not walked through the rig's refusal walk (one wrong remedy)" }
     mysql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
     mssql:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }
     mongo:    { na: "the refusal is the load's and does not depend on the source engine: the postgres column carries the row" }

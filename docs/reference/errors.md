@@ -7,7 +7,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | exit | meaning |
 |---|---|
 | 1 | usage — fix the config or the command; retrying fails the same way |
-| 2 | a transient failure — retry the same command |
+| 2 | a transient failure, or busy (another live rivet process holds the lease or lock this command needs) — retry the same command |
 | 3 | integrity — the data may be wrong; stop and investigate |
 | 4 | schema drift — the source shape changed; review before re-running |
 | 5 | refusal — rivet stopped on purpose to protect data; a human decides |
@@ -74,12 +74,12 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_STATE_CHUNK_RUN_OWNER_UNKNOWN` | refusal | 5 | `rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run of each config starts a fresh pass |
 | `RIVET_STATE_CHUNK_RUN_SUPERSEDED` | refusal | 5 | `rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run starts a fresh pass |
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
-| `RIVET_STATE_RUN_IN_PROGRESS` | refusal | 5 | wait for the run to finish, or stop its process, then repeat the command |
+| `RIVET_STATE_RUN_IN_PROGRESS` | busy | 2 | wait for the run to finish, or stop its process, then repeat the command |
 | `RIVET_STATE_CHUNK_CHECKPOINT_GONE` | refusal | 5 | run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest) |
 | `RIVET_STATE_CHUNK_PLAN_CHANGED` | refusal | 5 | restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over |
 | `RIVET_STATE_CHUNK_WINDOWS_BROKEN` | refusal | 5 | `rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run plans the export again and reads every key |
 | `RIVET_STATE_LEASE_KEEPER_UNAVAILABLE` | environment | 2 if transient, else 1 | free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease |
-| `RIVET_STATE_LEASE_LOST` | refusal | 5 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse |
+| `RIVET_STATE_LEASE_LOST` | busy | 2 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse |
 | `RIVET_PLAN_SOURCE_UNREADABLE` | environment | 2 if transient, else 1 | fix what the message names (the connection, the credentials, or the table the export reads), then run `rivet plan` again |
 | `RIVET_SOURCE_COLLECTION_NOT_FOUND` | environment | 2 if transient, else 1 | correct the export's `table:` (a dotted collection name is written whole), or create the collection |
 | `RIVET_DEST_CONTAINER_NOT_FOUND` | environment | 2 if transient, else 1 | create the bucket or container, or correct `destination.bucket` |
@@ -111,7 +111,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_LOAD_CHANGELOG_PARTITION_CHANGED` | refusal | 5 | keep the change log's partitioning in the config, or rebuild it as the message names (`rivet load --rebuild-changelog`, or by hand where policies must be kept) |
 | `RIVET_LOAD_BUFFER_NOT_COMPACTED` | refusal | 5 | run `rivet compact` first if the buffer belongs to the current base, or drop the buffer, then re-run the load |
 | `RIVET_LOAD_REBASELINE_OVER_CHANGES` | refusal | 5 | TRUNCATE the change log the message names, then re-run the same `rivet load` |
-| `RIVET_LOAD_TABLE_BUSY` | refusal | 5 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again |
+| `RIVET_LOAD_TABLE_BUSY` | busy | 2 | wait for the other `rivet load` or `rivet compact` of that table to end, then run again |
 | `RIVET_LOAD_MANIFEST_INCONSISTENT` | integrity | 3 | investigate the run's manifest and parts before loading; re-run the export to replace them |
 | `RIVET_LOAD_SOURCE_FILE_MISMATCH` | integrity | 3 | investigate the extract before loading; to accept the drift, set `allow_source_drift: true` in the export's `load:` block |
 | `RIVET_LOAD_COPY_COUNT_MISMATCH` | integrity | 3 | compare the tables the message names before re-running; rivet left them for inspection |
