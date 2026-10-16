@@ -1075,7 +1075,7 @@ fn chunk_checkpoint_gone(engine: SqlEngine) {
 
 /// RIVET_STATE_RUN_IN_PROGRESS: `rivet state reset` beside a live checkpointed run of `rig`'s export, walked out by waiting and by stopping the process.
 fn run_in_progress(live_rig: impl Fn() -> (String, Rig, Box<dyn std::any::Any>)) {
-    let refused = Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 5);
+    let refused = Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2);
     for stop in [false, true] {
         let (export, mut rig, _guard) = live_rig();
         let twin = rig.twin();

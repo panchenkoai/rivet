@@ -295,6 +295,7 @@ impl Rig {
             census_key: self.census_key.clone(),
             bin: self.bin.clone(),
             open_files: self.open_files,
+            state: self.state.clone(),
             oracle_off: self.oracle_off.clone(),
             oracle_xfail: self.oracle_xfail.clone(),
             oracle_xfailed: std::cell::Cell::new(true),
@@ -398,14 +399,9 @@ impl Rig {
             !(delivers && self.oracle_off.is_some()),
             "refuse-then-remedy: `DeliversTheSource` is graded by the default oracle, which this rig turned off"
         );
-        let state_url = envs
-            .iter()
-            .find(|(k, _)| *k == "RIVET_STATE_URL")
-            .map(|(_, v)| v.to_string())
-            .or_else(crate::common::state_url_under_test);
         let uncopied = if self.cloud_dest.is_some() {
             Some("a cloud destination")
-        } else if state_url.is_some_and(|u| u.starts_with("postgres")) {
+        } else if self.state_url(envs).is_some() {
             Some("a Postgres state")
         } else {
             None

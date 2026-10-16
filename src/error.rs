@@ -15,7 +15,7 @@ pub mod retry;
 /// |------|-------|------------------|
 /// | `0`  | success | — (handled separately, not in this enum) |
 /// | `1`  | [`Generic`](ExitClass::Generic): config / usage / unclassified error | fix the config; do **not** retry blindly |
-/// | `2`  | [`Retryable`](ExitClass::Retryable): transient (connection reset, lock-wait timeout, capacity) | safe to retry the *same* command |
+/// | `2`  | [`Retryable`](ExitClass::Retryable): transient (connection reset, lock-wait timeout, capacity), or busy (another live rivet holds the lease or lock) | safe to retry the *same* command |
 /// | `3`  | [`DataIntegrity`](ExitClass::DataIntegrity): quality gate / reconcile mismatch / `validate` verification failure / duplicate-guard / manifest inconsistency | **STOP** — data may be wrong, do **not** blindly retry |
 /// | `4`  | [`SchemaDrift`](ExitClass::SchemaDrift): `on_schema_drift: fail` tripped | the source shape changed — needs human review |
 /// | `5`  | [`Refusal`](ExitClass::Refusal): a protective stop (a foreign cursor, a newer state DB, a table rivet does not own) | a human decides; do **not** retry unchanged |
@@ -37,8 +37,8 @@ pub enum ExitClass {
     /// `1` — config / usage / unclassified error. Fix the input; retrying the
     /// identical command will fail the same way.
     Generic = 1,
-    /// `2` — transient failure (connection reset, lock-wait timeout, capacity).
-    /// Safe to retry the same command after a backoff.
+    /// `2` — transient failure (connection reset, lock-wait timeout, capacity), or a
+    /// [`Busy`](ErrorKind::Busy) stop. Safe to retry the same command after a backoff.
     Retryable = 2,
     /// `3` — data-integrity failure (quality gate, reconcile mismatch, `validate`
     /// verification failure, duplicate-guard, manifest inconsistency). The
@@ -358,6 +358,8 @@ pub enum ErrorKind {
     Environment,
     /// rivet stopped on purpose so as not to lose, duplicate or overwrite data.
     Refusal,
+    /// A live rivet process holds the lease or lock this command needs: the same command succeeds once it ends.
+    Busy,
     /// A verification found the data wrong.
     Integrity,
     /// An invariant did not hold: a bug.
@@ -371,6 +373,7 @@ impl ErrorKind {
             ErrorKind::Usage => "usage",
             ErrorKind::Environment => "environment",
             ErrorKind::Refusal => "refusal",
+            ErrorKind::Busy => "busy",
             ErrorKind::Integrity => "integrity",
             ErrorKind::Internal => "internal",
         }
@@ -522,6 +525,7 @@ pub(crate) fn stop_class(err: &anyhow::Error) -> Option<ExitClass> {
     // connection retries, a denied permission does not).
     match err.downcast_ref::<CodedError>()?.kind() {
         ErrorKind::Refusal => Some(ExitClass::Refusal),
+        ErrorKind::Busy => Some(ExitClass::Retryable),
         ErrorKind::Internal => Some(ExitClass::Internal),
         ErrorKind::Integrity => Some(ExitClass::DataIntegrity),
         ErrorKind::Usage => Some(ExitClass::Generic),
@@ -748,6 +752,13 @@ pub mod codes {
             action,
         }
     }
+    const fn busy(id: &'static str, action: &'static str) -> Code {
+        Code {
+            id,
+            kind: ErrorKind::Busy,
+            action,
+        }
+    }
     const fn integrity(id: &'static str, action: &'static str) -> Code {
         Code {
             id,
@@ -832,7 +843,7 @@ pub mod codes {
         "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run starts a fresh pass",
     );
     /// A command that rewrites an export's stored progress met a live run of that export.
-    pub const STATE_RUN_IN_PROGRESS: Code = refusal(
+    pub const STATE_RUN_IN_PROGRESS: Code = busy(
         "RIVET_STATE_RUN_IN_PROGRESS",
         "wait for the run to finish, or stop its process, then repeat the command",
     );
@@ -911,7 +922,7 @@ pub mod codes {
         "free a connection on the state database (rivet holds one per worker plus one for the lease keeper), raise the open-file limit, or lower `--pool`, then run again; nothing ran under the lease",
     );
     /// A PostgreSQL-state lease stopped being this process's while the work it guards was under way.
-    pub const STATE_LEASE_LOST: Code = refusal(
+    pub const STATE_LEASE_LOST: Code = busy(
         "RIVET_STATE_LEASE_LOST",
         "wait for the other `rivet load` or `rivet compact` of that table to end, then run again; nothing was written to the warehouse",
     );
@@ -1067,7 +1078,7 @@ pub mod codes {
         "TRUNCATE the change log the message names, then re-run the same `rivet load`",
     );
     /// Another `rivet load` or `rivet compact` holds the table's lease.
-    pub const LOAD_TABLE_BUSY: Code = refusal(
+    pub const LOAD_TABLE_BUSY: Code = busy(
         "RIVET_LOAD_TABLE_BUSY",
         "wait for the other `rivet load` or `rivet compact` of that table to end, then run again",
     );
@@ -1763,6 +1774,7 @@ fn kind_exit(kind: ErrorKind) -> &'static str {
         ErrorKind::Usage => "1",
         ErrorKind::Environment => "2 if transient, else 1",
         ErrorKind::Refusal => "5",
+        ErrorKind::Busy => "2",
         ErrorKind::Integrity => "3",
         ErrorKind::Internal => "6",
     }
@@ -1777,7 +1789,8 @@ pub fn codes_markdown() -> String {
          prefix on the text error line. The KIND decides the exit code.\n\n\
          | exit | meaning |\n|---|---|\n\
          | 1 | usage — fix the config or the command; retrying fails the same way |\n\
-         | 2 | a transient failure — retry the same command |\n\
+         | 2 | a transient failure, or busy (another live rivet process holds the lease or lock \
+         this command needs) — retry the same command |\n\
          | 3 | integrity — the data may be wrong; stop and investigate |\n\
          | 4 | schema drift — the source shape changed; review before re-running |\n\
          | 5 | refusal — rivet stopped on purpose to protect data; a human decides |\n\
@@ -2037,6 +2050,7 @@ mod tests {
             classify_exit(&anyhow::Error::new(CodedError::new(c, "permission denied")))
         };
         assert_eq!(with(ErrorKind::Refusal), 5);
+        assert_eq!(with(ErrorKind::Busy), 2, "busy, whatever its text says");
         assert_eq!(with(ErrorKind::Internal), 6);
         assert_eq!(with(ErrorKind::Integrity), 3);
         assert_eq!(with(ErrorKind::Usage), 1);
@@ -2045,6 +2059,40 @@ mod tests {
             1,
             "a non-transient environment failure"
         );
+    }
+
+    /// A stop held by another live rivet process exits retryable (2) with its code, bare and through a load's pre-write seam; no refusal's remedy is to wait.
+    #[test]
+    fn a_stop_held_by_a_live_holder_exits_retryable_with_its_code() {
+        let busy: Vec<Code> = codes::ALL
+            .iter()
+            .copied()
+            .filter(|c| c.kind == ErrorKind::Busy)
+            .collect();
+        assert_eq!(
+            busy.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [
+                "RIVET_STATE_RUN_IN_PROGRESS",
+                "RIVET_STATE_LEASE_LOST",
+                "RIVET_LOAD_TABLE_BUSY"
+            ]
+        );
+        let waits_refused: Vec<&str> = codes::ALL
+            .iter()
+            .filter(|c| c.kind == ErrorKind::Refusal && c.action.starts_with("wait for"))
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            waits_refused,
+            Vec::<&str>::new(),
+            "a refusal whose remedy is to wait"
+        );
+        for code in busy {
+            let bare = || anyhow::Error::new(CodedError::new(code, "held"));
+            assert_coded(&bare().context("export 'orders'"), code.id, 2);
+            let stop = crate::load::before_write::<()>(Err(bare())).unwrap_err();
+            assert_coded(&stop, code.id, 2);
+        }
     }
 
     /// A stop before the warehouse write exits as what stopped it, and names its code.

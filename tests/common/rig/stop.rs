@@ -167,9 +167,10 @@ impl Rig {
             staged,
             success: self.out_dir().join("_SUCCESS").exists(),
             running: self.state_count(&its_running_rows(pid)),
-            leases: self.state_count(
-                "SELECT COUNT(*) FROM state_lease WHERE lease_key = 'chunk-run:{export}'",
-            ),
+            leases: self.state_count(&format!(
+                "SELECT COUNT(*) FROM state_lease WHERE lease_key = '{}'",
+                self.lease_key()
+            )),
         }
     }
 

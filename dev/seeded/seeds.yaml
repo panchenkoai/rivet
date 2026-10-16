@@ -526,6 +526,37 @@ seeds:
         cells:
           - "lib:a_run_of_any_mode_holds_its_exports_lease_until_it_ends"
 
+  - name: busy-stop-not-retryable
+    class: "a stop whose holder is a live rivet process (another run, load or compact holds the export's or table's lease) exits 5, \"a human decides\", while its remedy is to wait and run again, so a scheduler never retries an overlap the next attempt completes"
+    history: "2026-10-16 - retry-matrix F2 - RIVET_STATE_RUN_IN_PROGRESS and RIVET_LOAD_TABLE_BUSY exited 5 on main 04c4a712f; a concurrent `rivet run`, a retry beside orphaned children and a concurrent `rivet load` each failed an Airflow task for good"
+    scope: source
+    patch: busy-stop-not-retryable/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_postgres
+          - a_second_cdc_run_beside_a_live_one_is_refused_by_code_postgres
+          - a_second_load_beside_a_live_one_is_busy_and_retryable_then_loads
+      mysql:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mysql
+          - a_second_cdc_run_beside_a_live_one_is_refused_by_code_mysql
+      mssql:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_mssql
+          - a_second_cdc_run_beside_a_live_one_is_refused_by_code_mssql
+      oracle:
+        cells:
+          - a_second_run_beside_a_live_checkpointed_run_is_refused_by_code_oracle
+          - a_second_cdc_run_beside_a_live_one_is_refused_by_code_oracle
+      mongo:
+        cells:
+          - a_second_run_beside_a_live_resumable_run_is_refused_by_code_mongo
+          - a_second_cdc_run_beside_a_live_one_is_refused_by_code_mongo
+      lib:
+        cells:
+          - "lib:a_stop_held_by_a_live_holder_exits_retryable_with_its_code"
+
   - name: live-run-refusal-without-a-code
     class: "a refusal that one command gives by code and another gives as plain text: a second run beside a live checkpointed run exited 1 with no `RIVET_*` code, while `state reset` in the same situation gave RIVET_STATE_RUN_IN_PROGRESS (5)"
     history: "2026-10-07 - operator-contract Sweep 11 - exit 1, no code, on PostgreSQL, MySQL, SQL Server, Oracle and MongoDB"
@@ -2635,3 +2666,15 @@ seeds:
         cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
       sqlite-state:
         cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]
+  - name: foreign-lease-taken-before-expiry
+    class: "a run lease whose holder names another host is judged by a local pid probe, so a run on a live host loses its lease to a run here before the lease expires"
+    history: "2026-10-16 - harness: the dead-owner cells damaged `chunk-run:<export>` after the run lease became `chunk-run:<export>@<source hash>`, so on a PostgreSQL state they failed on `changed 0 row(s)` and on SQLite they were skipped; no cell could catch a takeover rule that ignored the host (fixed by deriving the key through `run_lease_key` and keeping a Postgres state in the cell)"
+    scope: state
+    patch: foreign-lease-taken-before-expiry/shared.patch
+    engines:
+      postgres-state:
+        cells:
+          - a_lease_of_an_owner_on_a_host_that_is_gone_expires_and_the_run_delivers_postgres
+          - "lib:a_dead_holder_on_this_host_is_recognised_and_nothing_else_is"
+      sqlite-state:
+        na: the SQLite lease is an flock on a sidecar file that the kernel drops with its holder; there is no holder row naming a host to misjudge
