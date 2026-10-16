@@ -1,12 +1,12 @@
 diff --git a/src/load/snowflake.rs b/src/load/snowflake.rs
-index a2694f27..100a0f60 100644
+index eb7e0ae1..b82b7cbb 100644
 --- a/src/load/snowflake.rs
 +++ b/src/load/snowflake.rs
 @@ -210,7 +210,6 @@ impl TargetLoader for SnowflakeLoader {
              let rows = extract_count(&result)
                  .context("COPY ran but the row count could not be read from snow output")?;
              super::check_loaded_rows(&self.fqtn(table), rows, expected_rows)?;
--            self.run_snow(&self.build_swap_sql(table, &staging, specs))?;
+-            self.run_snow(&self.build_clone_in_sql(table, &staging))?;
              Ok(rows)
          });
          if landed.is_err() {
