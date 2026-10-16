@@ -2481,6 +2481,30 @@ seeds:
         na: "a MongoDB change row is two text cells, and the MySQL cell fix does not run"
       oracle:
         na: "Oracle has no TIME type, and the MySQL cell fix does not run"
+  - name: cursor-past-manifest-continued
+    class: a stored incremental cursor past the `cursor_high` of the destination's success manifest is continued from, so the rows between are never delivered
+    history: "2026-10-15 - `last_cursor_value` edited to N+2 after a run that delivered 1..=N: exit 0 with `COUNT(*): source 43, delivered 41` on PostgreSQL, MySQL and SQL Server, through 0.31.0 (open_defect_a_cursor_moved_forward_delivers_or_refuses_*); fixed by refuse_a_cursor_past_the_manifest at the one claim seam every batch run passes"
+    scope: source
+    patch: cursor-past-manifest-continued/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_postgres
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_postgres
+      mysql:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mysql
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_mysql
+      mssql:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mssql
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_mssql
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes), so it stores no incremental cursor"
+      oracle:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_oracle
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_oracle
   - name: empty-table-under-chunk-by-days
     class: "a planner probe reads an empty result (no row, so min and max are NULL) as an unreadable bound, so an empty table under `chunk_by_days` stops the run instead of exporting zero rows"
     history: "2026-10-15 - found while coding the src/pipeline error sites: the date planner stopped on `min(...) returned NULL — table may be empty` since date-native chunking (0.2.0-beta.3) through 0.31.0 (by source), exit 5 `RIVET_SOURCE_PROBE_UNREADABLE` once coded, while the same empty table range-chunked on its id exported zero rows with exit 0; fixed by `read_key_span`, the one span reader both chunk planners call"

@@ -782,6 +782,11 @@ pub mod codes {
         "RIVET_STATE_CURSOR_INCOMPARABLE",
         "`rivet state reset -c <config> --export <name>` starts the cursor over with a full pass",
     );
+    /// The stored cursor is past the `cursor_high` of the destination's last success manifest: the rows between were never delivered there.
+    pub const STATE_CURSOR_PAST_MANIFEST: Code = refusal(
+        "RIVET_STATE_CURSOR_PAST_MANIFEST",
+        "`rivet state reset -c <config> --export <name>` starts the cursor over with a full pass",
+    );
     /// Stored progress (cursor, keyset high-water, resume anchor) belongs to another table or collection, another schema, or other rows of it.
     pub const STATE_CURSOR_STREAM_MISMATCH: Code = refusal(
         "RIVET_STATE_CURSOR_STREAM_MISMATCH",
@@ -1576,6 +1581,7 @@ pub mod codes {
         STATE_SCHEMA_NEWER,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_INCOMPARABLE,
+        STATE_CURSOR_PAST_MANIFEST,
         STATE_CURSOR_STREAM_MISMATCH,
         STATE_CURSOR_DESTINATION_MISMATCH,
         STATE_INTERRUPTED_RUN_OWNER_MISMATCH,

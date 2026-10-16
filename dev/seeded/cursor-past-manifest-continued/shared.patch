@@ -1,0 +1,11 @@
+diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+--- a/src/pipeline/job.rs
++++ b/src/pipeline/job.rs
+@@ -1410,7 +1410,6 @@
+     let claim = lease.and_then(|lease| {
+         let progress = state.claim(plan.progress_key())?;
+         let recovered = chunked::recover_checkpoint_run(plan, &progress, tail.force)?;
+-        refuse_a_cursor_past_the_manifest(recovered.as_ref().unwrap_or(plan), &progress)?;
+         Ok((progress, lease, recovered))
+     });
+     let (progress, _run_lease, recovered) = match claim {

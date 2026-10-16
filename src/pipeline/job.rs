@@ -7,7 +7,9 @@ use crate::state::{ProgressClaim, StateStore};
 
 use super::RunOptions;
 use super::chunked::{self, run_chunked_parallel_checkpoint};
-use super::single::{commit_incremental_cursor, run_with_reconnect};
+use super::single::{
+    commit_incremental_cursor, refuse_a_cursor_past_the_manifest, run_with_reconnect,
+};
 use super::summary::RunSummary;
 use crate::journal::RunEvent;
 
@@ -1419,6 +1421,7 @@ fn execute_resolved_plan(
     let claim = lease.and_then(|lease| {
         let progress = state.claim(plan.progress_key())?;
         let recovered = chunked::recover_checkpoint_run(plan, &progress, tail.force)?;
+        refuse_a_cursor_past_the_manifest(recovered.as_ref().unwrap_or(plan), &progress)?;
         Ok((progress, lease, recovered))
     });
     let (progress, _run_lease, recovered) = match claim {
