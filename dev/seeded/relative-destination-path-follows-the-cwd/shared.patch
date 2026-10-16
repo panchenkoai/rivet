@@ -1,0 +1,11 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -124,7 +124,6 @@ impl Config {
+         let mut config =
+             Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))?;
+         config.record_queries_as_written(&contents);
+-        config.anchor_paths(path);
+         Ok(config)
+     }
+ 

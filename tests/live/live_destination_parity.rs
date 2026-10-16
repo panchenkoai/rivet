@@ -289,10 +289,10 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
     );
 }
 
-/// P-27: a relative `destination.path` names one place whatever directory rivet is started from.
+/// A relative `destination.path` is anchored to the config's directory: one config delivers to one place whatever directory rivet is started from (P-27).
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-27, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_relative_destination_path_does_not_follow_the_working_directory() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_relative_destination_path_follows_the_config() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("dest_relative");
@@ -324,9 +324,14 @@ fn open_defect_a_relative_destination_path_does_not_follow_the_working_directory
         }
     };
     let (first, second) = (held(a.path()), held(b.path()));
+    let beside = held(beside_config.parent().unwrap());
     let whole = (1..=13).collect::<Vec<_>>();
+    assert_eq!(
+        beside, whole,
+        "P-27: one config with a relative destination.path delivered ids {first:?} under the first working directory and {second:?} under the second: the directory beside the config holds {beside:?}, not the 13 source rows"
+    );
     assert!(
-        [&first, &second, &held(beside_config.parent().unwrap())].contains(&&whole),
-        "P-27: one config with a relative destination.path delivered ids {first:?} under the first working directory and {second:?} under the second: no directory holds the 13 source rows"
+        first.is_empty() && second.is_empty(),
+        "nothing lands under a working directory: {first:?} / {second:?}"
     );
 }

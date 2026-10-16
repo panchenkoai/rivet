@@ -1,6 +1,6 @@
 mod cdc;
 pub mod cursor;
-mod destination;
+pub(crate) mod destination;
 mod export;
 mod format;
 mod lints;
@@ -131,7 +131,20 @@ impl Config {
         let mut config =
             Self::from_yaml(&resolved).map_err(|e| e.context(format!("config file '{}'", path)))?;
         config.record_queries_as_written(&contents);
+        config.anchor_paths(path);
         Ok(config)
+    }
+
+    /// Anchor every relative local destination path to the config file's directory: the one place a path in the file is resolved, so every command reads and writes one location whatever directory rivet is started from.
+    fn anchor_paths(&mut self, config_path: &str) {
+        let config_dir = std::path::absolute(config_path)
+            .ok()
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+        if let Some(dir) = config_dir {
+            for export in &mut self.exports {
+                export.destination.anchor(&dir);
+            }
+        }
     }
 
     /// Record each export's inline `query:` as the file spells it, placeholders in place, where the unresolved document parses; `ExportConfig::resolve_query_and_template` uses a spelling only if it resolves to the export's query.

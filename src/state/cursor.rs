@@ -57,11 +57,12 @@ fn joins(parts: &[String], text: &str) -> bool {
         .is_some()
 }
 
-/// Whether two recorded destinations are one: the same text, or one as written and one that fills its `{date}`-style placeholders (what a plan sealed before destinations were recorded carries).
+/// Whether two recorded destinations are one: the same text, one as written and one that fills its `{date}`-style placeholders (what a plan sealed before destinations were recorded carries), or a local path as a run before 0.32 recorded it (relative to the working directory) and as it is anchored to the config's directory now.
 fn same_place(a: &str, b: &str) -> bool {
     let around = crate::destination::placeholder::literal_parts;
     let fills = |template: &str, text: &str| matches!((around(template), around(text)), (Some(parts), None) if joins(&parts, text));
-    a == b || fills(a, b) || fills(b, a)
+    let anchors = crate::config::destination::anchors;
+    a == b || fills(a, b) || fills(b, a) || anchors(a, b) || anchors(b, a)
 }
 
 /// Where the parts of an export land and in what format: the parts of a stored cursor's identity that are not what it reads.
@@ -2640,6 +2641,23 @@ mod tests {
             },
             ..key("orders", "pg/db", "id", "orders")
         }
+    }
+
+    /// A cursor stored by a run before 0.32 names the local path relative to the working directory; the same export anchored to the config's directory continues it, and another directory under that anchor is still refused.
+    #[test]
+    fn a_cursor_stored_under_the_relative_local_spelling_continues_under_its_anchored_form() {
+        let s = store();
+        let legacy = landing("file://./out/orders/", "parquet");
+        s.update_with_column(&legacy, "40").unwrap();
+        assert!(
+            s.claim(landing("file:///etc/rivet/out/orders", "parquet"))
+                .is_ok(),
+            "the anchored spelling of the same directory continues"
+        );
+        refusal(
+            s.claim(landing("file:///etc/rivet/out/items", "parquet")),
+            DESTINATION,
+        );
     }
 
     #[test]

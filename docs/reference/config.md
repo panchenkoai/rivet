@@ -443,6 +443,12 @@ is in the generated [config-reference.md](config-reference.md) (section
 [azure](../destinations/azure.md) · [stdout](../destinations/stdout.md), plus the
 [cloud auth matrix](../cloud-auth.md).
 
+### A relative `path` is anchored to the config file
+
+A relative local `path` (`./output/orders`) names the directory beside the config file, whatever directory rivet is started from: `rivet run -c /etc/rivet/rivet.yaml` from a cron entry and from a shell in `/home/op` both deliver to `/etc/rivet/output/orders`, where the state (`.rivet_state.db`) and a `cdc.checkpoint` already live. Every command resolves it the same way, once, when the config is loaded: `run`, `plan`/`apply`, `validate`, `reconcile`, `repair`, `state`, `doctor` and `load`.
+
+Before 0.32 the path was relative to the working directory, so only a run started outside the config's directory lands elsewhere now; a cursor stored by such a run continues under the anchored path. A path that should not move with the config is written absolute.
+
 ### Path and prefix placeholders
 
 The `path` (local) and `prefix` (S3 / GCS) fields support template placeholders, substituted at plan-build time:

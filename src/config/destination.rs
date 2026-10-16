@@ -1,5 +1,7 @@
 //! Output destination: cloud-bucket / local-path / stdout, with per-cloud auth.
 
+use std::path::{Path, PathBuf};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +12,9 @@ pub struct DestinationConfig {
     pub destination_type: DestinationType,
     pub bucket: Option<String>,
     pub prefix: Option<String>,
+    /// Local directory for the output files. A relative path is anchored to the directory of
+    /// the config file, whatever directory rivet is started from (since 0.32; before, it was
+    /// relative to the working directory).
     pub path: Option<String>,
     pub region: Option<String>,
     pub endpoint: Option<String>,
@@ -106,6 +111,19 @@ impl DestinationConfig {
         }
     }
 
+    /// Anchor a relative local `path` (or the `prefix` a local destination uses as one) to `config_dir`, so one config names one directory from every working directory.
+    pub(crate) fn anchor(&mut self, config_dir: &Path) {
+        if self.destination_type != DestinationType::Local {
+            return;
+        }
+        if let Some(p) = self.path.as_mut().or(self.prefix.as_mut())
+            && !Path::new(p.as_str()).is_absolute()
+        {
+            let anchored: PathBuf = config_dir.join(p.as_str()).components().collect();
+            *p = anchored.to_string_lossy().into_owned();
+        }
+    }
+
     /// The state key of a CDC table's snapshot baseline: its destination.
     pub fn state_key(&self) -> String {
         format!(
@@ -119,9 +137,108 @@ impl DestinationConfig {
     }
 }
 
+/// Whether `written` is the working-directory-relative `file://` URI a run before 0.32 recorded and `anchored` the same directory as [`DestinationConfig::anchor`] names it.
+pub(crate) fn anchors(written: &str, anchored: &str) -> bool {
+    let (Some(w), Some(a)) = (
+        written.strip_prefix("file://"),
+        anchored.strip_prefix("file://"),
+    ) else {
+        return false;
+    };
+    let tail: PathBuf = Path::new(w)
+        .components()
+        .skip_while(|c| *c == std::path::Component::CurDir)
+        .collect();
+    !Path::new(w).is_absolute()
+        && Path::new(a).is_absolute()
+        && tail.components().next().is_some()
+        && Path::new(a).ends_with(&tail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one resolver: a relative local path lands under the CONFIG's directory, not the working directory the test runs in.
+    #[test]
+    fn a_relative_local_path_is_anchored_to_the_config_directory() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let config_dir = elsewhere.path();
+        assert_ne!(std::env::current_dir().unwrap(), config_dir);
+        let local = |path: Option<&str>, prefix: Option<&str>| DestinationConfig {
+            path: path.map(Into::into),
+            prefix: prefix.map(Into::into),
+            ..Default::default()
+        };
+        let mut d = local(Some("./out/{date}/"), None);
+        d.anchor(config_dir);
+        assert_eq!(
+            d.path.as_deref(),
+            Some(config_dir.join("out/{date}").to_str().unwrap())
+        );
+        let mut as_prefix = local(None, Some("out"));
+        as_prefix.anchor(config_dir);
+        assert_eq!(
+            as_prefix.prefix.as_deref(),
+            Some(config_dir.join("out").to_str().unwrap())
+        );
+        let mut absolute = local(Some("/data/out"), None);
+        absolute.anchor(config_dir);
+        assert_eq!(absolute.path.as_deref(), Some("/data/out"));
+        let mut cloud = DestinationConfig {
+            destination_type: DestinationType::S3,
+            bucket: Some("b".into()),
+            prefix: Some("exports/".into()),
+            ..Default::default()
+        };
+        cloud.anchor(config_dir);
+        assert_eq!(cloud.prefix.as_deref(), Some("exports/"));
+    }
+
+    /// `Config::load` is where every command anchors: a config in another directory, loaded from this one, names its own directory.
+    #[test]
+    fn a_loaded_config_anchors_its_relative_local_paths_once() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let config_path = elsewhere.path().join("rivet.yaml");
+        std::fs::write(
+            &config_path,
+            "source: { type: postgres, url: \"postgresql://u:p@127.0.0.1:1/db\" }\n\
+             exports:\n\
+             \x20 - name: orders\n    table: orders\n    mode: full\n    format: parquet\n\
+             \x20   destination: { type: local, path: ./out/orders }\n\
+             \x20 - name: feed\n    table: feed\n    mode: full\n    format: csv\n\
+             \x20   destination: { type: s3, bucket: b, prefix: feed/, region: us-east-1 }\n",
+        )
+        .unwrap();
+        let cfg = crate::config::Config::load(config_path.to_str().unwrap()).unwrap();
+        let anchored = elsewhere.path().join("out/orders");
+        assert_eq!(
+            cfg.exports[0].destination.path.as_deref(),
+            anchored.to_str()
+        );
+        assert_eq!(
+            cfg.exports[0].destination.uri(),
+            format!("file://{}", anchored.display())
+        );
+        assert_eq!(cfg.exports[1].destination.prefix.as_deref(), Some("feed/"));
+    }
+
+    #[test]
+    fn a_legacy_relative_spelling_anchors_to_its_absolute_form_only() {
+        assert!(anchors(
+            "file://./out/orders/",
+            "file:///etc/rivet/out/orders"
+        ));
+        assert!(anchors("file://out/{date}", "file:///etc/rivet/out/{date}"));
+        assert!(!anchors(
+            "file://./out/orders",
+            "file:///etc/rivet/out/items"
+        ));
+        assert!(!anchors("file:///etc/rivet/out", "file:///etc/rivet/out"));
+        assert!(!anchors("file://./out", "file://./out"));
+        assert!(!anchors("file://.", "file:///etc/rivet"));
+        assert!(!anchors("s3://b/out", "file:///etc/rivet/out"));
+    }
 
     #[test]
     fn a_destination_state_key_is_its_bucket_and_path_or_prefix() {

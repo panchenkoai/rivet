@@ -2646,3 +2646,21 @@ seeds:
         cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
       sqlite-state:
         cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]
+  - name: relative-destination-path-follows-the-cwd
+    class: "a relative local `destination.path` is resolved against the directory rivet is started from while the cursor and state live beside the config, so one config run from two directories delivers each run's rows under a different directory, every run green"
+    history: "2026-10-16 - P-27 (live_destination_parity): one config with `path: ./out` run from two working directories delivered ids 1..10 under the first and 11..13 under the second, exit 0 both times, on main through 0.31.0; fixed by anchoring every relative local path to the config file's directory once at config load (`Config::anchor_paths`)"
+    scope: source
+    patch: relative-destination-path-follows-the-cwd/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:a_loaded_config_anchors_its_relative_local_paths_once"
+          - a_relative_destination_path_follows_the_config
+      mysql:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      mssql:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      mongo:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      oracle:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
