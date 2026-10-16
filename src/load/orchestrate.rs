@@ -4466,7 +4466,7 @@ mod live_only_decisions {
         let Err(busy) = take_table_lease(Some(&state), &key) else {
             panic!("a held table refuses a second taker");
         };
-        assert_eq!(code(busy), (Some("RIVET_LOAD_TABLE_BUSY"), 5));
+        assert_eq!(code(busy), (Some("RIVET_LOAD_TABLE_BUSY"), 2));
         let mut keyless = load::plan::test_plan(LoadMode::Cdc, "gs://b/p/");
         keyless.pk.clear();
         assert_eq!(
@@ -5711,13 +5711,13 @@ mod load_message_tests {
         );
     }
 
-    /// A lease lost before the warehouse write is a coded refusal the ledger records as `refused`.
+    /// A lease lost before the warehouse write is a coded, retryable stop the ledger records as `refused`.
     #[test]
     fn a_lease_lost_before_the_write_is_a_refusal() {
         let e = lease_still_held(false, "p.d.orders", false).unwrap_err();
         assert!(e.is::<load::Refused>());
         assert_eq!(crate::error::error_code(&e), Some("RIVET_STATE_LEASE_LOST"));
-        assert_eq!(crate::error::classify_exit(&e), 5);
+        assert_eq!(crate::error::classify_exit(&e), 2);
         assert_eq!(ledger_status(&e), "refused");
         assert_eq!(
             e.to_string(),
