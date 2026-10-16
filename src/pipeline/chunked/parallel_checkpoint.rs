@@ -31,6 +31,9 @@ use super::math::build_chunk_query_sql;
 
 use super::ChunkOutcome;
 
+/// The label of this runner's failures, the one `summary::compact_error` and `job::classify_error_message` read.
+const RUNNER: &str = "parallel checkpoint worker";
+
 pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
     config_path: &str,
     state: &StateStore,
@@ -218,33 +221,23 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                         std::thread::sleep(Duration::from_secs(2));
                     }
 
-                    let start: i64 = match sk.parse() {
-                        Ok(v) => v,
-                        Err(_) => {
+                    let (start, end): (i64, i64) = match (sk.parse(), ek.parse()) {
+                        (Ok(s), Ok(e)) => (s, e),
+                        _ => {
+                            let e = crate::error::coded(
+                                crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,
+                                format!("chunk {chunk_index}: invalid window {sk:?}..{ek:?}"),
+                            );
                             fan_r.fail_on_err(
                                 &format!("chunk {chunk_index} state"),
                                 st.fail_chunk_task(
                                     run_id_arc.as_str(),
                                     chunk_index,
-                                    "invalid start_key",
+                                    &format!("{e:#}"),
                                     false, // a malformed key parses the same way every time
                                 ),
                             );
-                            continue;
-                        }
-                    };
-                    let end: i64 = match ek.parse() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            fan_r.fail_on_err(
-                                &format!("chunk {chunk_index} state"),
-                                st.fail_chunk_task(
-                                    run_id_arc.as_str(),
-                                    chunk_index,
-                                    "invalid end_key",
-                                    false, // a malformed key parses the same way every time
-                                ),
-                            );
+                            fan_r.fail(&format!("chunk {chunk_index}"), e);
                             continue;
                         }
                     };
@@ -447,7 +440,8 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                                     crate::pipeline::retry::is_transient(&e),
                                 ),
                             );
-                            log::error!("chunk {chunk_index} failed: {msg}");
+                            // The typed failure stays with the run: its code and class decide the exit.
+                            fan_r.fail(&format!("chunk {chunk_index}"), e);
                         }
                     }
                 }
@@ -474,35 +468,21 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
             }
             other => unreachable!("chunked parts are recorded under a chunk unit, not {other:?}"),
         },
-        |errs| {
-            crate::error::coded(
-                crate::error::codes::RUN_UNITS_FAILED,
-                format!(
-                    "export '{}': parallel checkpoint worker errors:\n{}",
-                    plan.export_name,
-                    errs.join("\n")
-                ),
-            )
-        },
+        |errs| super::chunk_failures(&plan.export_name, RUNNER, errs),
     );
     // After the drain: record_part is what counts the rows.
     pb_cp.finish(summary.total_rows);
-    drained?;
 
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
     let tasks = state.list_chunk_tasks_for_run(&run_id)?;
-    if pending > 0 {
-        crate::rivet_bail!(
-            crate::error::codes::RUN_UNITS_FAILED,
-            "{}",
-            incomplete_run_error(
-                &plan.export_name,
-                pending,
-                &tasks,
-                &config_hint(config_path)
-            )
-        );
-    }
+    super::incomplete_run_check(
+        &plan.export_name,
+        RUNNER,
+        pending,
+        &tasks,
+        &config_hint(config_path),
+        drained,
+    )?;
 
     super::prune_superseded_attempts(summary, &tasks);
     state.finalize_chunk_run_completed(&run_id)?;
@@ -515,38 +495,6 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
         plan.export_name
     );
     Ok(())
-}
-
-/// The refusal for a run that ended with chunks not completed, naming each failed chunk's last error.
-fn incomplete_run_error(
-    export: &str,
-    pending: i64,
-    tasks: &[crate::state::ChunkTaskInfo],
-    config_hint: &str,
-) -> String {
-    let remedy = format!(
-        "{pending} chunk task(s) not completed; `rivet run {config_hint} --export {export} --resume` \
-         or inspect `rivet state chunks {config_hint} --export {export}`"
-    );
-    let failed: Vec<String> = tasks
-        .iter()
-        .filter(|t| t.status == "failed")
-        .map(|t| {
-            format!(
-                "chunk {}: {}",
-                t.chunk_index,
-                t.last_error.as_deref().unwrap_or("(no error recorded)")
-            )
-        })
-        .collect();
-    if failed.is_empty() {
-        format!("export '{export}': {remedy}")
-    } else {
-        format!(
-            "export '{export}': parallel checkpoint worker errors:\n{}\n{remedy}",
-            failed.join("\n")
-        )
-    }
 }
 
 /// Write one `file_log` row per durable part on the worker's store (the drain records with no state).
@@ -574,9 +522,6 @@ fn record_durable_parts(
 
 #[cfg(test)]
 mod tests {
-    use super::incomplete_run_error;
-    use crate::state::ChunkTaskInfo;
-
     #[test]
     fn every_durable_part_gets_its_own_file_log_row() {
         use crate::pipeline::commit::PartRecord;
@@ -613,53 +558,5 @@ mod tests {
             .collect();
         got.sort();
         assert_eq!(got, vec![("a.parquet".into(), 3), ("b.parquet".into(), 4)]);
-    }
-
-    fn task(idx: i64, status: &str, err: Option<&str>) -> ChunkTaskInfo {
-        ChunkTaskInfo {
-            chunk_index: idx,
-            start_key: String::new(),
-            end_key: String::new(),
-            status: status.into(),
-            attempts: 4,
-            last_error: err.map(Into::into),
-            rows_written: None,
-            file_name: None,
-        }
-    }
-
-    /// A chunk error no longer fails the run by itself (the ledger decides, so a
-    /// re-claimed chunk that completes lets the run succeed); the not-completed refusal
-    /// must therefore carry each failed chunk's cause in the worker-errors shape the
-    /// summary and the error classifier read.
-    #[test]
-    fn the_incomplete_run_refusal_names_each_failed_chunks_cause() {
-        let tasks = [
-            task(0, "completed", None),
-            task(
-                3,
-                "failed",
-                Some("ERROR 3024 (HY000): maximum statement execution time exceeded"),
-            ),
-            task(5, "failed", None),
-        ];
-        assert_eq!(
-            incomplete_run_error("orders", 2, &tasks, "--config rivet.yaml"),
-            "export 'orders': parallel checkpoint worker errors:\n\
-             chunk 3: ERROR 3024 (HY000): maximum statement execution time exceeded\n\
-             chunk 5: (no error recorded)\n\
-             2 chunk task(s) not completed; `rivet run --config rivet.yaml --export orders --resume` \
-             or inspect `rivet state chunks --config rivet.yaml --export orders`"
-        );
-        assert_eq!(
-            incomplete_run_error(
-                "orders",
-                1,
-                &[task(0, "pending", None)],
-                "--config rivet.yaml"
-            ),
-            "export 'orders': 1 chunk task(s) not completed; `rivet run --config rivet.yaml \
-             --export orders --resume` or inspect `rivet state chunks --config rivet.yaml --export orders`"
-        );
     }
 }

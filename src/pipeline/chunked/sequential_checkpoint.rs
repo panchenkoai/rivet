@@ -116,6 +116,9 @@ fn export_one_chunk_range(
     Ok((rows, recs, sink.take_checksums(), sink.take_shape()))
 }
 
+/// The label of this runner's failures.
+const RUNNER: &str = "chunk checkpoint";
+
 pub(crate) fn run_chunked_sequential_checkpoint(
     src: &mut dyn Source,
     state: &StateStore,
@@ -192,6 +195,8 @@ pub(crate) fn run_chunked_sequential_checkpoint(
     // One connection carried across chunks; a retry reconnects.
     let idle = super::IdleSources::default();
     let tally = super::attempt::RetryTally::default();
+    // Every failed chunk's typed error: the run's code and class come from these, not from `chunk_task`.
+    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
     while let Some((chunk_index, sk, ek)) = state.claim_next_chunk_task(&run_id)? {
         if !resource::check_memory(plan.tuning.memory_threshold_mb) {
             log::warn!(
@@ -316,7 +321,7 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                 });
                 // The failed chunk's durable parts are recorded; the error it hands
                 // back is `e`, already logged above.
-                let _ = crate::pipeline::fan_in::commit_unit(
+                let failed = crate::pipeline::fan_in::commit_unit(
                     plan,
                     summary,
                     Some(state),
@@ -328,25 +333,32 @@ pub(crate) fn run_chunked_sequential_checkpoint(
                     |_| Ok(()),
                 );
                 state.fail_chunk_task(&run_id, chunk_index, &msg, retryable)?;
+                if let Err(e) = failed {
+                    failures.push((format!("chunk {chunk_index}"), e));
+                }
             }
         }
     }
 
     let pending = state.count_chunk_tasks_not_completed(&run_id)?;
-    if pending > 0 {
-        crate::rivet_bail!(
-            crate::error::codes::RUN_UNITS_FAILED,
-            "export '{}': chunk checkpoint incomplete ({} tasks not completed); fix errors and `rivet run {} --export {} --resume` or `rivet state reset-chunks {} --export {}`",
-            plan.export_name,
-            pending,
-            config_hint(config_path),
-            plan.export_name,
-            config_hint(config_path),
-            plan.export_name
-        );
-    }
+    let tasks = state.list_chunk_tasks_for_run(&run_id)?;
+    let met = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::pipeline::fan_in::unit_failures(failures, |lines| {
+            super::chunk_failures(&plan.export_name, RUNNER, lines)
+        }))
+    };
+    super::incomplete_run_check(
+        &plan.export_name,
+        RUNNER,
+        pending,
+        &tasks,
+        &config_hint(config_path),
+        met,
+    )?;
 
-    super::prune_superseded_attempts(summary, &state.list_chunk_tasks_for_run(&run_id)?);
+    super::prune_superseded_attempts(summary, &tasks);
     pb.finish(summary.total_rows);
     state.finalize_chunk_run_completed(&run_id)?;
     // ADR-0008 PG2 committed boundary via the shared finalize seam — the

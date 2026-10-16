@@ -218,15 +218,13 @@ mod tests {
 
     #[test]
     fn strip_chunked_recovery_hint_strips_fix_errors_form() {
-        let m = "export 'a': chunk checkpoint incomplete (3 tasks not completed); \
-                 fix errors and `rivet run --config c.yaml --export a --resume` or \
-                 `rivet state reset-chunks --config c.yaml --export a`";
+        let m = "3 chunk task(s) of export 'a' not completed; fix the cause, then \
+                 `rivet run --config c.yaml --export a --resume`, or inspect \
+                 `rivet state chunks --config c.yaml --export a`: export 'a': chunk checkpoint \
+                 errors:\nchunk 1: boom";
         let (cause, hinted) = strip_chunked_recovery_hint(m);
         assert!(hinted);
-        assert_eq!(
-            cause,
-            "export 'a': chunk checkpoint incomplete (3 tasks not completed)"
-        );
+        assert_eq!(cause, "3 chunk task(s) of export 'a' not completed");
     }
 
     #[test]
