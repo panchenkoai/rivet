@@ -157,6 +157,13 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
         return result;
     }
 
+    // --- Object store: opendal's own verdict, before any text scan ---
+    // The store's answer is final by TYPE: a 404 whose response headers happen to
+    // carry `keep-alive: timeout=5` (Azurite) must not read as a timeout.
+    if let Some(class) = err.chain().find_map(opendal_error).map(classify_opendal) {
+        return class;
+    }
+
     // --- Fallback: string-based classification ---
     let msg = format!("{:#}", err).to_lowercase();
 
@@ -272,6 +279,26 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
 
     // Not transient
     PERMANENT
+}
+
+/// The opendal error one link of an error chain is, or the one an `io::Error` from opendal's std writer wraps.
+pub(crate) fn opendal_error<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a opendal::Error> {
+    e.downcast_ref::<opendal::Error>().or_else(|| {
+        e.downcast_ref::<std::io::Error>()?
+            .get_ref()?
+            .downcast_ref::<opendal::Error>()
+    })
+}
+
+/// opendal's verdict on a store answer: a temporary one is a blip the destination side rides out, any other is final.
+fn classify_opendal(e: &opendal::Error) -> RetryClass {
+    if e.is_temporary() {
+        transient(false, 500)
+    } else {
+        PERMANENT
+    }
 }
 
 /// Classify a Postgres SQLSTATE code.
@@ -1124,5 +1151,40 @@ mod tests {
         ] {
             assert!(!is_value_conversion(&anyhow::anyhow!("{msg}")), "{msg}");
         }
+    }
+
+    /// A store's final answer is classified by opendal's verdict, not by words in its header dump: Azurite's 404 carries `keep-alive: timeout=5`.
+    #[test]
+    fn an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text() {
+        let azurite_404 = || {
+            opendal::Error::new(
+                opendal::ErrorKind::NotFound,
+                "AzblobError { code: \"ContainerNotFound\" }",
+            )
+            .with_context("response", "headers: {\"keep-alive\": \"timeout=5\"}")
+        };
+        let raw = anyhow::Error::new(azurite_404()).context("upload");
+        assert!(format!("{raw:#}").contains("timeout"), "{raw:#}");
+        assert_eq!(classify_error(&raw), PERMANENT, "{raw:#}");
+        // The streamed writer hands the same answer back inside an `io::Error`.
+        let streamed = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            azurite_404(),
+        ));
+        assert_eq!(classify_error(&streamed), PERMANENT, "{streamed:#}");
+        let denied = anyhow::Error::new(opendal::Error::new(
+            opendal::ErrorKind::PermissionDenied,
+            "request timeout policy",
+        ));
+        assert_eq!(classify_error(&denied), PERMANENT);
+        let blip = anyhow::Error::new(
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "send http request")
+                .set_temporary(),
+        );
+        assert_eq!(classify_error(&blip), transient(false, 500));
+        assert!(
+            classify_error(&anyhow::anyhow!("i/o timeout")).is_transient(),
+            "text still decides for a non-store error"
+        );
     }
 }

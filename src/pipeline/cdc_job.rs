@@ -668,11 +668,7 @@ fn synth_snapshot_export(
     // The label travels WITH the leg, so every consumer that must agree with the
     // configured string can ask for it instead of re-deriving it.
     synth.snapshot_label = Some(table.to_string());
-    synth.name = format!(
-        "{}{}{table}",
-        export.name,
-        crate::manifest::SNAPSHOT_LEG_INFIX
-    );
+    synth.name = crate::manifest::snapshot_leg_name(&export.name, table);
     synth.mode = crate::config::ExportMode::Full;
     // The LABEL names the leg (and through it the prefix and the snapshot marker);
     // the READ names the relation. They differ only where a catalog knows better

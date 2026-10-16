@@ -300,7 +300,10 @@ const MATRICES: &[(&str, usize)] = &[
     // cdc cell remains.
     // Lowered 1 -> 0: the CDC drain cuts a flush at the partition budget under
     // log_view and notes every part (live on MySQL, PostgreSQL, SQL Server).
-    ("docs/runner-coverage-matrix.yaml", 0),
+    // Raised 0 -> 1 (2026-10-15): worker_failure_keeps_its_class on chunked_checkpoint; the
+    // checkpointed runners turn a chunk's coded stop into the incomplete-run refusal, a
+    // separate defect from FanIn's (one defect, one PR).
+    ("docs/runner-coverage-matrix.yaml", 1),
     // Mode transitions (ADR-0033). 3 gaps: MT6, pre-v26 incremental cursors carry no identity.
     // Raised 0 -> 14 (2026-09-26): the Oracle column's honest gaps (batch-only phase 1).
     // Raised 14 -> 17 (2026-10-07): three Oracle cells of the range-chunk rows. Range chunking refuses
@@ -365,7 +368,8 @@ const MATRICES: &[(&str, usize)] = &[
     // 100 -> 104 (2026-10-15): the four refusals that gained a registry code in the last batch
     // (init config exists, destination prefix mode mismatch, mixed split generations, load spec
     // missing) each get a `refusal_*` row; asserted by their codes offline, not walked by a live cell yet.
-    ("docs/sabotage-matrix.yaml", 104),
+    // 104 -> 103 (2026-10-15): the Oracle cell of corrupt_cursor_moved_forward is written with the fix.
+    ("docs/sabotage-matrix.yaml", 103),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

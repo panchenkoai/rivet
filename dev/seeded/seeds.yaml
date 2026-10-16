@@ -17,6 +17,27 @@
 
 seeds:
 
+  - name: worker-error-loses-its-class
+    class: a coded failure in one parallel worker reaches the run as text only (FanIn kept strings), so the run prints RIVET_RUN_UNITS_FAILED and exits 1 or 2 instead of the worker's own code and class
+    history: found 2026-10-15 reading FanIn::fail against the owner's "exit follows code class" rule; a PostgreSQL `infinity` met by a parallel keyset worker exited [RIVET_RUN_UNITS_FAILED] 1 where one worker exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0
+    scope: source
+    patch: worker-error-loses-its-class/shared.patch
+    engines:
+      postgres:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_postgres]
+      mysql:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_mysql]
+      mssql:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_mssql]
+      oracle:
+        cells: [a_refusal_in_one_worker_exits_as_with_one_worker_oracle]
+      mongo:
+        cells: [a_coded_failure_in_one_worker_keeps_its_code_mongo]
+      lib:
+        cells:
+          - "lib:a_coded_refusal_in_one_worker_decides_the_runs_exit_and_code"
+          - "lib:the_most_stop_worthy_coded_unit_failure_decides"
+
   - name: keyset-anchor-kept-without-a-part
     class: a keyset run that stops before its first part keeps its resume anchor, so the run of another mode the refusal names as the remedy is refused as continuing an interrupted run
     history: "Sweep 14, 2026-10-12: a resumed MongoDB keyset run refused for a mixed-type `_id` left its claim on the cursor row; removing `page_size` (the remedy it names) was refused RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH, exit 5 (v0.31.0)"
@@ -2481,6 +2502,30 @@ seeds:
         na: "a MongoDB change row is two text cells, and the MySQL cell fix does not run"
       oracle:
         na: "Oracle has no TIME type, and the MySQL cell fix does not run"
+  - name: cursor-past-manifest-continued
+    class: a stored incremental cursor past the `cursor_high` of the destination's success manifest is continued from, so the rows between are never delivered
+    history: "2026-10-15 - `last_cursor_value` edited to N+2 after a run that delivered 1..=N: exit 0 with `COUNT(*): source 43, delivered 41` on PostgreSQL, MySQL and SQL Server, through 0.31.0 (open_defect_a_cursor_moved_forward_delivers_or_refuses_*); fixed by refuse_a_cursor_past_the_manifest at the one claim seam every batch run passes"
+    scope: source
+    patch: cursor-past-manifest-continued/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_postgres
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_postgres
+      mysql:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mysql
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_mysql
+      mssql:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_mssql
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_mssql
+      mongo:
+        na: "a MongoDB export is `mode: full` or `cdc` only (validate_non_sql_source_modes), so it stores no incremental cursor"
+      oracle:
+        cells:
+          - a_cursor_moved_forward_delivers_or_is_refused_by_code_and_led_out_oracle
+          - a_cursor_past_the_manifest_is_refused_and_walked_out_oracle
   - name: empty-table-under-chunk-by-days
     class: "a planner probe reads an empty result (no row, so min and max are NULL) as an unreadable bound, so an empty table under `chunk_by_days` stops the run instead of exporting zero rows"
     history: "2026-10-15 - found while coding the src/pipeline error sites: the date planner stopped on `min(...) returned NULL — table may be empty` since date-native chunking (0.2.0-beta.3) through 0.31.0 (by source), exit 5 `RIVET_SOURCE_PROBE_UNREADABLE` once coded, while the same empty table range-chunked on its id exported zero rows with exit 0; fixed by `read_key_span`, the one span reader both chunk planners call"
@@ -2497,6 +2542,24 @@ seeds:
         na: "a Mongo export has no `mode: chunked`"
       oracle:
         cells: [stand_empty_table_under_chunk_by_days_oracle]
+  - name: cdc-entry-without-snapshot-legs
+    class: "a CDC export's run-aggregate entry carries the stream's counts only, so the first run of an `initial: snapshot` export reports `rows: 0, files: 0` to a scheduler while its snapshot legs wrote the whole table"
+    history: "2026-10-15 - confirmed live on PostgreSQL through the Airflow provider (`--summary-output` read into XCom): two tables of 1000 + 5000 rows reported `rows: 0, files: 0`, through 0.31.0; fixed by `with_snapshot_legs`, the one fold every entry writer calls"
+    scope: source
+    patch: cdc-entry-without-snapshot-legs/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_cdc_entry_counts_its_snapshot_legs_and_its_stream", "lib:a_cdc_childs_entry_counts_the_snapshot_legs_it_ran", "lib:a_failed_snapshot_leg_fails_the_cdc_entry_under_its_own_name"]
+      postgres:
+        cells: [cdc_entry_counts_the_snapshot_legs_postgres, cdc_entry_counts_the_snapshot_legs_under_child_processes_postgres, cdc_entries_of_one_name_on_two_sources_count_their_own_legs]
+      mysql:
+        cells: [cdc_entry_counts_the_snapshot_legs_mysql, cdc_entries_of_one_name_on_two_sources_count_their_own_legs]
+      mssql:
+        cells: [cdc_entry_counts_the_snapshot_legs_mssql]
+      mongo:
+        cells: [cdc_entry_counts_the_snapshot_legs_mongo]
+      oracle:
+        cells: [cdc_entry_counts_the_snapshot_legs_oracle]
 
   - name: load-refusal-not-journaled
     class: a `rivet load` stop raised before any warehouse write but outside the typed refusal seam reaches the ledger as something other than `refused` (no row, or `failed`), and a state-DB fault wears the missing-spec refusal code
@@ -2508,3 +2571,47 @@ seeds:
         cells: ["lib:a_mixed_split_generation_is_journaled_refused_and_refuses_again", "lib:a_missing_spec_and_an_unreadable_spec_store_are_two_codes"]
       postgres-state:
         cells: ["lib:pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"]
+  - name: postgres-dial-runtime-unwrapped
+    class: "a driver builds its own async runtime inside its connect call and unwraps the build, so a process out of file descriptors aborts with a panic instead of the environment stop the other drivers raise"
+    history: "2026-10-08 - the gate's PostgreSQL out-of-descriptors cell (live_sabotage): `rivet run` capped at 8 open files panicked at postgres-0.19 src/config.rs:463 (`Too many open files`), exit 101 with no `Error:` line, while MySQL, SQL Server, Oracle and MongoDB failed loudly through `driver_runtime`, through 0.31.0; fixed by proving a runtime build at the shared PostgreSQL dial (`connect_client`) before the driver builds its own"
+    scope: source
+    patch: postgres-dial-runtime-unwrapped/shared.patch
+    engines:
+      postgres:
+        cells: [a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_postgres]
+      mysql:
+        na: "the MySQL driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      mssql:
+        na: "the SQL Server driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      mongo:
+        na: "the MongoDB driver takes rivet's runtime through driver_runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+      oracle:
+        na: "the Oracle driver is synchronous and builds no runtime; the unwrapped build is the PostgreSQL crate's connect call only"
+  - name: missing-container-retried-as-timeout
+    class: "a store's final answer is classified by the words in its text, so a header such as `keep-alive: timeout=5` on a 404 reads as a timeout and the chunk is retried for minutes"
+    history: "2026-10-08 - the gate's Azure removed-container cell (live_sabotage) ran past its 180 s ceiling: each chunk's upload into the removed container was retried 16 times, 9 min 21 s to exit 1 by hand (Azurite answers its 404 with `keep-alive: timeout=5`, and the classifier's text scan matched `timeout`), through 0.31.0; fixed by classifying an opendal error by its own verdict before any text scan"
+    scope: source
+    patch: missing-container-retried-as-timeout/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"
+          - a_run_whose_azure_bucket_is_removed_delivers_or_fails_loudly_postgres
+      mysql:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      mssql:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      mongo:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+      oracle:
+        cells: ["lib:an_object_store_answer_is_classified_by_opendal_s_verdict_not_its_text"]
+  - name: child-entry-by-name-on-shared-state
+    class: "the parent of `--parallel-export-processes` takes a child's run-aggregate entry as the newest `export_metrics` row of the export's name, so on a state shared by two holders of the name a failed child is reported as the other holder's success"
+    history: "2026-10-16 - found by the verifier of #604: two holders of one export name on one PostgreSQL state, the PostgreSQL one failed its snapshot leg and exited 1 while its entry read `status: success` with the MySQL holder's run id, on main through 0.31.0; fixed by matching the run id each child reports in its `Finished` event (`collect_child_entries`, `StateStore::get_metric_by_run_id`)"
+    scope: state
+    patch: child-entry-by-name-on-shared-state/shared.patch
+    engines:
+      postgres-state:
+        cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
+      sqlite-state:
+        cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]

@@ -192,7 +192,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                 let st = match StateStore::open_at_ref(&state_ref) {
                     Ok(st) => st,
                     Err(e) => {
-                        fan_r.fail("state open", format!("{e:#}"));
+                        fan_r.fail("state open", e);
                         return;
                     }
                 };
@@ -205,7 +205,7 @@ pub(in crate::pipeline) fn run_chunked_parallel_checkpoint(
                     let claimed = match st.claim_next_chunk_task(run_id_arc.as_str()) {
                         Ok(c) => c,
                         Err(e) => {
-                            fan_r.fail("claim error", format!("{e:#}"));
+                            fan_r.fail("claim error", e);
                             break;
                         }
                     };
