@@ -222,6 +222,34 @@ For a whole-database CDC scaffold (one `tables:` stream with `backfill: auto`) t
 partition guesses are written on the stream's `load.tables.<table>` blocks — the
 place the load reads them — not on the per-table recipes, which the load never reads.
 
+## Warehouse scaffold: `--snowflake-*` / `--gcs-bucket`
+
+The same for Snowflake: `--snowflake-connection` (a `snow` CLI connection),
+`--snowflake-warehouse`, `--snowflake-database`, `--snowflake-schema` and
+`--snowflake-storage-integration` (a pre-created GCS `STORAGE INTEGRATION`) write a
+`load:` block with `target: snowflake`, `pk: auto`, `cluster_by: auto`,
+`cleanup_source: true` and a per-table `partition:` guess at `granularity: day`,
+which the loader turns into a leading `DATE_TRUNC('DAY', …)` clustering key
+(Snowflake has no partitions; a clustering key turns on billed Automatic
+Clustering, so drop the line to cluster by the key alone).
+
+```bash
+rivet init --source "$MYSQL_URL" --mode incremental --gcs-bucket my-bucket \
+  --snowflake-connection my_conn --snowflake-warehouse COMPUTE_WH \
+  --snowflake-database ANALYTICS --snowflake-schema PUBLIC \
+  --snowflake-storage-integration MY_GCS_INT -o rivet.yaml
+rivet run  -c rivet.yaml   # Parquet → gs://my-bucket/exports/<table>/
+rivet load -c rivet.yaml   # COPY → ANALYTICS.PUBLIC.<table>
+```
+
+All five flags are required together (the loader needs every value), and
+`--gcs-bucket` is required: Snowflake reads the export through a GCS external stage,
+so `--s3-bucket` is refused. One config loads into one warehouse, so the Snowflake
+flags are refused beside `--bigquery-*` or `--clickhouse-*`. There is no
+`rivet compact` on Snowflake: no `layout: base_buffer` is written, and an
+incremental or CDC table is a `<table>__changes` log read through the deduplicated
+`<table>` view.
+
 ---
 
 ## Limitations

@@ -657,6 +657,20 @@ pub struct InitYamlDestination {
     pub clickhouse_url: Option<String>,
     pub clickhouse_database: Option<String>,
     pub clickhouse_user: Option<String>,
+    /// `--snowflake-*`: the same, for a Snowflake load (all five, or none).
+    pub snowflake: Option<InitSnowflakeTarget>,
+}
+
+/// The five values a Snowflake `load:` block needs — every one is required by the loader.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitSnowflakeTarget {
+    /// The `snow` CLI connection name.
+    pub connection: String,
+    pub warehouse: String,
+    pub database: String,
+    pub schema: String,
+    /// A pre-created GCS `STORAGE INTEGRATION` granting Snowflake read on the bucket.
+    pub storage_integration: String,
 }
 
 impl InitYamlDestination {
@@ -666,6 +680,12 @@ impl InitYamlDestination {
             Some((
                 "month",
                 "ClickHouse advises month or coarser; one INSERT block may touch at most 100 partitions",
+            ))
+        } else if self.snowflake.is_some() {
+            Some((
+                "day",
+                "Snowflake has no partitions: this is a leading DATE_TRUNC clustering key, which \
+                 turns on billed Automatic Clustering; drop it to cluster by the key alone",
             ))
         } else if self.bigquery_project.is_some() {
             Some((
@@ -2840,6 +2860,7 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            snowflake: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -2995,6 +3016,7 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            snowflake: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3027,6 +3049,7 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            snowflake: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3064,6 +3087,7 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            snowflake: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3090,6 +3114,7 @@ mod tests {
             clickhouse_url: None,
             clickhouse_database: None,
             clickhouse_user: None,
+            snowflake: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

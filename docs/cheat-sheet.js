@@ -310,7 +310,11 @@
       INIT_LOAD: ch
         ? `${({ gcs: ` --gcs-bucket ${bucket}`, s3: ` --s3-bucket ${bucket} --s3-region ${g('region')}` })[g('dest')] || ' --gcs-bucket <bucket>'}` +
           ` \\\n  --clickhouse-url ${g('ch_url')} --clickhouse-database ${g('ch_db')} --clickhouse-user ${g('ch_user')}`
-        : ` --gcs-bucket ${bucket}` + (bq ? ` --bigquery-project ${p} --bigquery-dataset ${g('dataset')}` : ''),
+        : ` --gcs-bucket ${bucket}` + (bq
+          ? ` --bigquery-project ${p} --bigquery-dataset ${g('dataset')}`
+          : ` \\\n  --snowflake-connection ${g('sf_conn')} --snowflake-warehouse ${g('sf_wh')}` +
+            ` --snowflake-database ${g('sf_db')} --snowflake-schema ${g('sf_schema')}` +
+            ` --snowflake-storage-integration ${g('sf_int')}`),
       BUCKET: bucket,
     };
   }
