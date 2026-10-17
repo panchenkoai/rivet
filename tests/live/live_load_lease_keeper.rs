@@ -244,8 +244,18 @@ fn stalled_under_its_lease<T>(
         };
         let pid = holder_pid(&holder);
         signal(pid, libc::SIGSTOP);
+        // SIGCONT on every exit of `act`: a panic there used to leave the holder stopped and the
+        // scope joined on it until nextest's timeout, hiding the panic behind a TIMEOUT.
+        struct Continue(i32);
+        impl Drop for Continue {
+            fn drop(&mut self) {
+                // SAFETY: `kill` on the pid of a child this test started; its exit is not asserted here, this may run while panicking.
+                unsafe { libc::kill(self.0, libc::SIGCONT) };
+            }
+        }
+        let cont = Continue(pid);
         let acted = act(&holder);
-        signal(pid, libc::SIGCONT);
+        drop(cont);
         (running.join().expect("the load thread"), acted)
     })
 }

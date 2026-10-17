@@ -321,8 +321,10 @@ fn roll_all(
     // Every part that reached the store is recorded, even when a sibling's upload
     // failed: it is durable either way, and the error still stops the ack below.
     let mut first_err = None;
+    let mut wrote_parts = false;
     for (i, flushed) in pending.into_iter().zip(uploaded) {
         let (parts, outcome) = flushed.unwrap_or_else(|panicked| (Vec::new(), Err(panicked)));
+        wrote_parts |= !parts.is_empty();
         for (part, sums) in parts {
             sinks[i].record_part(
                 part,
@@ -341,6 +343,11 @@ fn roll_all(
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
     crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
+    // The same window, reached only by a roll that made a part durable: a row-less commit
+    // from an uncaptured table rolls too, and a fault timed to "the first roll" would land there.
+    if wrote_parts {
+        crate::test_hook::maybe_pause_at("cdc_after_parts_before_ack");
+    }
     if *unacked_commit && let Some(p) = last_commit {
         // Round-2 audit #11: make the just-flushed parts durably manifest-covered
         // BEFORE the checkpoint/ack advances past them. The ack advances a consume-
@@ -378,6 +385,9 @@ fn roll_all(
         // Fault point: fully durable + acked — a crash here loses nothing and
         // must not duplicate on resume (the checkpoint already advanced).
         crate::test_hook::maybe_panic_at("cdc_after_ack");
+        if wrote_parts {
+            crate::test_hook::maybe_panic_at("cdc_after_ack_of_parts");
+        }
         *unacked_commit = false;
     }
     Ok(())
