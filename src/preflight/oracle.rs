@@ -46,7 +46,11 @@ fn scalar_i64(conn: &mut OracleSource, sql: &str, what: &str) -> Option<i64> {
 fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<ExportDiagnostic> {
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
-    if let Some(fail) = schema_fail_oracle(conn, base_query, export) {
+    if let Some(fail) = conn
+        .parses(base_query)
+        .err()
+        .and_then(|e| oracle_schema_verdict(e, export))
+    {
         return Err(fail);
     }
 
@@ -130,20 +134,6 @@ fn diagnose_oracle(conn: &mut OracleSource, export: &ExportConfig) -> Result<Exp
             db_max_connections,
         },
     ))
-}
-
-/// Validate the query's relations by parsing it: a missing table (ORA-00942) is the shared
-/// `RIVET_SOURCE_TABLE_NOT_FOUND`, a missing column (ORA-00904) the loud preflight error,
-/// anything else fail-soft.
-fn schema_fail_oracle(
-    conn: &mut OracleSource,
-    base_query: &str,
-    export: &ExportConfig,
-) -> Option<anyhow::Error> {
-    let Err(e) = conn.parses(base_query) else {
-        return None;
-    };
-    oracle_schema_verdict(e, export)
 }
 
 /// The preflight's verdict on a failed parse: a missing relation (ORA-00942) as the shared refusal, a missing column (ORA-00904) as the loud schema error, `None` for anything else.

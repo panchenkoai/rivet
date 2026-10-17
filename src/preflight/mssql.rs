@@ -73,12 +73,14 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
     let base_query = resolve_preflight_base_query(export);
     let base_query = base_query.as_str();
 
-    // A missing table/column (or no SELECT grant) is permanent and
-    // author-fixable — fail preflight loudly instead of letting it surface only
-    // at run time. The catalog-based row-estimate below never touches the table,
-    // so this zero-row probe is the only check that validates the query's actual
-    // relations. Operational errors stay fail-soft (`None`).
-    if let Some(fail) = schema_fail_mssql(conn, base_query, export) {
+    // `TOP 0` over a derived table executes the relations without scanning rows; the
+    // catalog-based probes below never touch them, so this is the schema check.
+    let probe = format!("SELECT TOP 0 1 AS _ok FROM ({base_query}) AS _rivet_probe");
+    if let Some(fail) = conn
+        .query_scalar(&probe)
+        .err()
+        .and_then(|e| mssql_schema_verdict(e, export))
+    {
         return Err(fail);
     }
 
@@ -171,22 +173,6 @@ fn diagnose_mssql(conn: &mut MssqlSource, export: &ExportConfig) -> Result<Expor
 /// clustered index (`index_id IN (0,1)`), no `COUNT(*)` scan. `None` when the
 /// stats row is absent (view, no stats) or the probe fails; preflight is
 /// non-fatal, so a failure is logged at debug, never aborted.
-/// Validate the query's relations with a zero-row wrap: a missing relation (208) is the shared
-/// `RIVET_SOURCE_TABLE_NOT_FOUND`, a missing column (207) the loud preflight error. `None`
-/// (fail-soft) for success and operational errors.
-fn schema_fail_mssql(
-    conn: &mut MssqlSource,
-    base_query: &str,
-    export: &ExportConfig,
-) -> Option<anyhow::Error> {
-    // `TOP 0` over a derived table executes the relations without scanning rows.
-    let probe = format!("SELECT TOP 0 1 AS _ok FROM ({base_query}) AS _rivet_probe");
-    let Err(e) = conn.query_scalar(&probe) else {
-        return None;
-    };
-    mssql_schema_verdict(e, export)
-}
-
 /// The preflight's verdict on a failed probe: a missing relation (208) as the shared refusal, a missing column (207) as the loud schema error, `None` for an operational failure.
 fn mssql_schema_verdict(e: anyhow::Error, export: &ExportConfig) -> Option<anyhow::Error> {
     if crate::source::names_a_missing_relation(&e) {
@@ -216,7 +202,7 @@ fn mssql_schema_verdict(e: anyhow::Error, export: &ExportConfig) -> Option<anyho
 
 /// Pull the SQL Server error number from a tiberius error's Display string
 /// (`"… (code: 208, state: 1, class: 16)"`). `None` if tiberius ever changes the
-/// format — `schema_fail_mssql` then falls back to a generic label, never panics.
+/// format — `mssql_schema_verdict` then falls back to a generic label, never panics.
 fn mssql_error_code(msg: &str) -> Option<u16> {
     msg.split("code: ")
         .nth(1)?

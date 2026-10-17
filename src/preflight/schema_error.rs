@@ -9,9 +9,9 @@
 //! ADR-0015 pattern: the seam lives at this **named data shape**, not a trait.
 //! Each engine detects its own native error taxonomy and maps it here —
 //!
-//! - `postgres::schema_fail_pg`   — SQLSTATE class 42 (typed `postgres::Error`)
+//! - `postgres::schema_fail_pg`    — SQLSTATE class 42 (typed `postgres::Error`)
 //! - `mysql::mysql_schema_error`  — codes 1146/1054/1142/1064 (typed `mysql::Error`)
-//! - `mssql::schema_fail_mssql`    — "Invalid object/column name" + the SQL
+//! - `mssql::mssql_schema_verdict` — "Invalid object/column name" + the SQL
 //!   Server number parsed from the error string. The `query_scalar` seam erases
 //!   the *typed* tiberius error; the number survives only in its Display, so a
 //!   *typed* code would need probing off that seam (the ADR-0011 boundary).
