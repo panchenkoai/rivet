@@ -1228,6 +1228,11 @@ impl ReplayStand {
         plan
     }
 
+    /// `rivet apply <plan> <extra>` with this stand's env.
+    fn apply_args(&self, plan: &std::path::Path, extra: &[&str]) -> std::process::Output {
+        self.rig.apply_env(plan, extra, &self.envs())
+    }
+
     /// `rivet apply <plan>` with `envs` added.
     fn apply(&self, plan: &std::path::Path, envs: &[(&str, &str)]) -> std::process::Output {
         let mut all = self.envs().to_vec();
@@ -1285,6 +1290,93 @@ fn a_replayed_applied_plan_names_the_run_that_applied_it(engine: SqlEngine, shap
             stderr.contains(&named),
             "{shape:?}, replay {cycle}: names `{named}`: {stderr}"
         );
+    }
+}
+
+/// The summary document a `rivet apply` wrote: `--summary-output` at `path`, as JSON.
+fn summary_document(path: &std::path::Path, what: &str) -> serde_json::Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("{what}: no summary document at {}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{what}: not JSON: {e}: {text}"))
+}
+
+/// A replay of an applied plan answers in the machine channels too: `--summary-output` and `--json` carry the answering run's
+/// entry with `status: already_applied`, `answered_by_run` naming the run that applied the plan, and that run's rows, files and
+/// bytes as the first apply's own document reported them, on every replay; nothing is extracted again.
+fn a_replayed_applied_plan_answers_in_its_summary_document(engine: SqlEngine) {
+    let Some(stand) = ReplayStand::new(engine, ReplayShape::Full) else {
+        return;
+    };
+    let plan = stand.plan();
+    let first_path = stand.plan_dir.path().join("first.json");
+    let out = stand.apply_args(&plan, &["--summary-output", first_path.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "the apply: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let first = summary_document(&first_path, "the apply");
+    let applied = &first["per_export"][0];
+    assert_eq!(applied["status"], "success", "the apply's entry: {applied}");
+    assert!(
+        applied["answered_by_run"].is_null(),
+        "a run that extracted is not an answer: {applied}"
+    );
+    let run_id = applied["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the apply's run_id: {applied}"))
+        .to_string();
+    assert_eq!(applied["rows"], 20, "the apply's entry: {applied}");
+    let objects = stand.objects();
+    for cycle in 1..=2 {
+        let what = format!("replay {cycle}");
+        let replay_path = stand.plan_dir.path().join(format!("replay-{cycle}.json"));
+        let replay = stand.apply_args(
+            &plan,
+            &["--summary-output", replay_path.to_str().unwrap(), "--json"],
+        );
+        let stderr = String::from_utf8_lossy(&replay.stderr);
+        assert!(
+            replay.status.success(),
+            "{what}: an applied plan exits 0, got {:?}: {stderr}",
+            replay.status.code()
+        );
+        assert_eq!(
+            stand.objects(),
+            objects,
+            "{what}: nothing written under the prefix"
+        );
+        let file = summary_document(&replay_path, &what);
+        let printed: serde_json::Value =
+            serde_json::from_slice(&replay.stdout).unwrap_or_else(|e| {
+                panic!(
+                    "{what}: --json prints the document: {e}: {}",
+                    String::from_utf8_lossy(&replay.stdout)
+                )
+            });
+        assert_eq!(
+            printed, file,
+            "{what}: --json prints the document --summary-output wrote"
+        );
+        assert_eq!(
+            (
+                file["total_exports"].as_u64(),
+                file["success_count"].as_u64(),
+                file["skipped_count"].as_u64()
+            ),
+            (Some(1), Some(0), Some(1)),
+            "{what}: one answered export: {file}"
+        );
+        let entry = &file["per_export"][0];
+        assert_eq!(entry["status"], "already_applied", "{what}: {entry}");
+        assert_eq!(entry["answered_by_run"], run_id.as_str(), "{what}: {entry}");
+        assert_eq!(entry["run_id"], run_id.as_str(), "{what}: {entry}");
+        for key in ["export_name", "rows", "files", "bytes", "mode"] {
+            assert_eq!(
+                entry[key], applied[key],
+                "{what}: `{key}` is the answering run's: {entry} vs {applied}"
+            );
+        }
     }
 }
 
@@ -1386,6 +1478,12 @@ fn a_replayed_applied_full_plan_answers_with_its_run_postgres() {
 
 #[test]
 #[ignore = "live: requires docker compose postgres + GCS"]
+fn a_replayed_applied_plan_answers_in_its_summary_document_postgres() {
+    a_replayed_applied_plan_answers_in_its_summary_document(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + GCS"]
 fn a_replayed_first_incremental_plan_delivers_what_arrived_since_postgres() {
     a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Pg,
@@ -1439,6 +1537,12 @@ fn a_plan_whose_cursor_another_run_moved_is_refused_stale_postgres() {
 #[ignore = "live: requires docker compose mysql + GCS"]
 fn a_replayed_applied_full_plan_answers_with_its_run_mysql() {
     a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Mysql, ReplayShape::Full);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql + GCS"]
+fn a_replayed_applied_plan_answers_in_its_summary_document_mysql() {
+    a_replayed_applied_plan_answers_in_its_summary_document(SqlEngine::Mysql);
 }
 
 #[test]
@@ -1500,6 +1604,12 @@ fn a_replayed_applied_full_plan_answers_with_its_run_mssql() {
 
 #[test]
 #[ignore = "live: requires docker compose mssql + GCS"]
+fn a_replayed_applied_plan_answers_in_its_summary_document_mssql() {
+    a_replayed_applied_plan_answers_in_its_summary_document(SqlEngine::Mssql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql + GCS"]
 fn a_replayed_incremental_plan_delivers_what_arrived_since_mssql() {
     a_replayed_incremental_plan_delivers_what_arrived_since(
         SqlEngine::Mssql,
@@ -1518,6 +1628,13 @@ fn a_replayed_applied_keyset_plan_answers_with_its_run_mssql() {
 #[ignore = "live: requires docker compose oracle + GCS"]
 fn a_replayed_applied_full_plan_answers_with_its_run_oracle() {
     a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Oracle, ReplayShape::Full);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle + GCS"]
+fn a_replayed_applied_plan_answers_in_its_summary_document_oracle() {
+    a_replayed_applied_plan_answers_in_its_summary_document(SqlEngine::Oracle);
 }
 
 #[cfg(feature = "oracle")]

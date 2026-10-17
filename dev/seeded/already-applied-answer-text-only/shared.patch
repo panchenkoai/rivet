@@ -1,0 +1,15 @@
+--- a/src/pipeline/apply_cmd.rs
++++ b/src/pipeline/apply_cmd.rs
+@@ -160,11 +160,7 @@
+                 already_applied_report(&artifact, &run_id, metric.as_ref())
+             );
+             let entry = already_applied_entry(&artifact, &run_id, metric.as_ref());
+-            super::run::emit_machine_document(
+-                &apply_document(entry, started_at, &artifact),
+-                summary_output,
+-                json_output,
+-            );
++            let _ = apply_document(entry, started_at, &artifact);
+             return Ok(());
+         }
+         force_bypassed.push("already_applied".into());

@@ -486,6 +486,12 @@ pub enum Commands {
         /// Off by default; ignored without `--pool`.
         #[arg(long, requires = "pool")]
         split: bool,
+        /// Write the run summary as JSON to this file (in addition to .rivet_state.db); a replay of a sealed plan that already applied writes the answering run with `status: already_applied` and `answered_by_run`
+        #[arg(long, value_name = "PATH")]
+        summary_output: Option<String>,
+        /// Print the run summary as JSON to stdout at the end of the run
+        #[arg(long)]
+        json: bool,
     },
     /// Targeted repair of chunks flagged by reconcile: emit a repair plan, or re-export only mismatched ranges.
     Repair(RepairArgs),

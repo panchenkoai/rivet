@@ -277,6 +277,8 @@ rivet apply <PLAN_FILE | CONFIG> [OPTIONS]
 |---|---|---|
 | `PLAN_FILE` / `CONFIG` | string | Path to a plan JSON artifact, or a YAML config for wave-ordered execution **(required)** |
 | `--force` | bool | Overrides whichever safety gate refuses the run (ADR-0013). JSON-artifact mode: bypasses the staleness check of a full, chunked or keyset plan (> 24 h), extracts such a plan again after it already applied, **and** bypasses the incremental cursor-drift check (each logged and recorded in the run's `apply_context`). YAML config mode: meaningful only with `--resume`, where it goes past the refusal to resume into a destination whose `_SUCCESS` marker is already present (the export then continues an interrupted run, else runs as a plain run does, beside the complete one); without `--resume` it is a warned no-op |
+| `--summary-output` | PATH | Write the run summary as JSON to this file (the document `rivet run --summary-output` writes); a replay of a sealed plan that already applied writes the answering run's entry (see below) |
+| `--json` | bool | Print the run summary as JSON to stdout at the end of the run |
 
 ### Staleness rules
 
@@ -294,7 +296,45 @@ Every apply of an incremental plan reads the cursor from state and delivers what
 
 ### Replay of an applied plan
 
-A full, chunked or keyset plan that already applied to exit 0 is not run again: a replay of the same artifact (a scheduler retry) exits 0, prints `apply: plan <plan_id> of export '<export>' was already applied by run <run_id> (...)` and writes nothing. `--force` extracts it again.
+A full, chunked or keyset plan that already applied to exit 0 is not run again: a replay of the same artifact (a scheduler retry) exits 0, prints `apply: plan <plan_id> of export '<export>' was already applied by run <run_id> (...)` on stderr and writes nothing. `--force` extracts it again.
+
+The answer is machine-readable through the same channels a run uses: `--summary-output` and `--json` carry the run that applied the plan, read from its `export_metrics` row, with `status: "already_applied"` and `answered_by_run` naming it (`per_export[].answered_by_run` is `null` on every other entry; the aggregate counts the entry as skipped). No run, manifest or metrics row is written for the replay.
+
+```json
+{
+  "run_aggregate_id": "agg_20261017T130551070",
+  "started_at": "2026-10-17T13:05:51.070310+00:00",
+  "finished_at": "2026-10-17T13:05:51.072442+00:00",
+  "duration_ms": 2,
+  "config_path": "/srv/rivet/rivet.yaml",
+  "parallel_mode": "sequential",
+  "total_exports": 1,
+  "success_count": 0,
+  "failed_count": 0,
+  "skipped_count": 1,
+  "total_rows": 30,
+  "total_files": 1,
+  "total_bytes": 1225,
+  "total_bytes_read": 1420,
+  "per_export": [
+    {
+      "export_name": "pa_audit",
+      "status": "already_applied",
+      "run_id": "pa_audit_20261017T130550.929_55700",
+      "answered_by_run": "pa_audit_20261017T130550.929_55700",
+      "rows": 30,
+      "files": 1,
+      "bytes": 1225,
+      "bytes_read": 1420,
+      "duration_ms": 120,
+      "mode": "full",
+      "error_message": null
+    }
+  ]
+}
+```
+
+A scheduler tells the answer from a run by `status`, never by the stderr line.
 
 ### Examples
 
