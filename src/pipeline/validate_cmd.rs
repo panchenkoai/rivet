@@ -735,7 +735,7 @@ mod tests {
     fn target_default_uses_today() {
         let target = ValidateTarget::default();
         let ctx = target.placeholder_context("orders");
-        assert_eq!(ctx.date, chrono::Utc::now().date_naive());
+        assert_eq!(ctx.date, Some(chrono::Utc::now().date_naive()));
         assert_eq!(ctx.export_name, "orders");
         assert!(ctx.run_id.is_none());
     }
@@ -747,7 +747,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = target.placeholder_context("orders");
-        assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21).unwrap());
+        assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21));
         assert!(ctx.run_id.is_none());
     }
 
@@ -763,7 +763,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = target.placeholder_context("orders");
-        assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21).unwrap());
+        assert_eq!(ctx.date, NaiveDate::from_ymd_opt(2026, 5, 21));
         assert_eq!(ctx.run_id.as_deref(), Some("r-abc123"));
     }
 

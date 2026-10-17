@@ -1321,6 +1321,12 @@ pub struct PlanArgs {
     /// Output format: "pretty" (human summary) or "json" (machine-readable)
     #[arg(long, default_value = "pretty")]
     pub format: PlanFormat,
+    /// Freeze `{date}` in the destination to this ISO-8601 day (e.g. `2026-05-21`).
+    ///
+    /// Without it the sealed plan keeps `{date}` as written and `rivet apply`
+    /// resolves it to the UTC day it runs on, as `rivet run` does.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub date: Option<String>,
 }
 
 /// Arguments of `rivet run` — one struct instead of an 11-arg

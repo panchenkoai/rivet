@@ -102,6 +102,7 @@ mod tests {
             output: Some("out.json".into()),
             format: PlanFormat::Pretty,
             annotate_waves: false,
+            date: None,
         });
         assert!(validate_cli(&cmd).is_err());
     }
@@ -115,6 +116,7 @@ mod tests {
             output: Some("out.json".into()),
             format: PlanFormat::Json,
             annotate_waves: false,
+            date: None,
         });
         assert!(validate_cli(&cmd).is_ok());
     }

@@ -772,7 +772,9 @@ fn dispatch_plan(args: crate::cli::args::PlanArgs) -> Result<()> {
         output,
         annotate_waves,
         format,
+        date,
     } = args;
+    let date = date.map(|s| parse_iso_date("--date", &s)).transpose()?;
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     if let Some(name) = export.as_deref() {
@@ -782,7 +784,24 @@ fn dispatch_plan(args: crate::cli::args::PlanArgs) -> Result<()> {
         PlanFormat::Pretty => pipeline::PlanOutputFormat::Pretty,
         PlanFormat::Json => pipeline::PlanOutputFormat::Json(output),
     };
-    pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt, annotate_waves)
+    pipeline::run_plan_command(
+        &config,
+        export.as_deref(),
+        p.as_ref(),
+        fmt,
+        annotate_waves,
+        date,
+    )
+}
+
+/// The `YYYY-MM-DD` value of `flag`, refused as `RIVET_CLI_VALUE_INVALID` before any destination is opened.
+fn parse_iso_date(flag: &str, s: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::CLI_VALUE_INVALID,
+            format!("invalid {flag} '{s}': expected YYYY-MM-DD ({e})"),
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -806,17 +825,7 @@ fn dispatch_validate(args: crate::cli::args::ValidateArgs) -> Result<()> {
     };
     // Parse --date once here so a malformed value fails before we open a
     // destination — the pipeline layer never sees a half-validated date.
-    let parsed_date = match date {
-        Some(s) => Some(
-            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|e| {
-                crate::error::coded(
-                    crate::error::codes::CLI_VALUE_INVALID,
-                    format!("invalid --date '{}': expected YYYY-MM-DD ({})", s, e),
-                )
-            })?,
-        ),
-        None => None,
-    };
+    let parsed_date = date.map(|s| parse_iso_date("--date", &s)).transpose()?;
     // `--depth` is already the pipeline `ValidateDepth` (re-exported through
     // `args`), so it threads straight onto the target with no CLI→pipeline
     // mapping.

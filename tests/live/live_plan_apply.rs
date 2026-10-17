@@ -1024,10 +1024,10 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
     );
 }
 
-/// P-26: a sealed plan keeps the `{date}` placeholder, so an apply writes under the date it runs on.
+/// P-26: a sealed plan keeps the `{date}` placeholder, so an apply writes under the date it runs on (ADR-0005 PA1).
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-26, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_sealed_plan_keeps_the_date_placeholder() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(10);
     let root = tempfile::tempdir().unwrap();
@@ -1066,6 +1066,59 @@ fn open_defect_a_sealed_plan_keeps_the_date_placeholder() {
         sealed.contains("{date}"),
         "P-26: the sealed plan holds no `{{date}}` placeholder: its destination is frozen at the planning date, {:?}",
         dated[0].file_name().unwrap()
+    );
+    assert_eq!(
+        dated[0].file_name().unwrap().to_str().unwrap(),
+        chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        "the apply writes under its own UTC day"
+    );
+}
+
+/// `rivet plan --date <day>` freezes `{date}` into the sealed plan: the apply writes under that day, whenever it runs.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_plan_date_freezes_the_date_into_the_sealed_plan() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(10);
+    let root = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_batch(table.name())
+        .source_url_env("DATABASE_URL")
+        .dest_path(root.path().join("{date}"));
+    let envs = [("DATABASE_URL", POSTGRES_URL)];
+    let plan = root.path().join("plan.json");
+    let planned = rig.plan_json_env(&plan, &["--date", "2001-02-03"], &envs);
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let artifact: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&plan).unwrap()).unwrap();
+    let sealed = artifact["resolved_plan"]["destination"]["path"]
+        .as_str()
+        .expect("the sealed plan's destination path");
+    assert!(
+        sealed.ends_with("/2001-02-03"),
+        "the day the operator asked for is frozen into the sealed plan: {sealed}"
+    );
+    let applied = rig.apply_env(&plan, &[], &envs);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let frozen = root.path().join("2001-02-03");
+    let rows: usize = read_all_parts(&frozen).iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        rows, 10,
+        "the apply delivers the table under the frozen day"
+    );
+    let today = root
+        .path()
+        .join(chrono::Utc::now().format("%Y-%m-%d").to_string());
+    assert!(
+        !today.exists(),
+        "nothing is written under the apply's own day: {today:?}"
     );
 }
 

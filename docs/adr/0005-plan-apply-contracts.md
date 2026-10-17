@@ -31,6 +31,8 @@ Without explicit contracts, `rivet apply` cannot reason about whether the artifa
 
 **Consequence**: Any change to config, queries, or chunk boundaries after `rivet plan` requires regenerating the artifact with a new `rivet plan` invocation. Applying a stale artifact against a changed config is detected by staleness checks (PA3) and fingerprint logging (PA6), not by a config re-parse.
 
+**The one exception** (amendment 2026-10-17 below): apply reads the clock once, for `{date}` in the destination; it still recomputes no chunk, query or cursor.
+
 ---
 
 ### PA2 — Artifact Immutability (AI)
@@ -232,3 +234,17 @@ PA5 structural coverage is provided by `pipeline/chunked/math.rs` tests (`test_g
 every export live, wave by wave (or as a `--pool N` pool), so PA1–PA6 and PA10 do not apply
 to it. A JSON plan artifact still takes the sealed path — integrity, staleness and
 precomputed chunks — and `--pool` is refused for one.
+
+## Amendment 2026-10-17: PA1's one clock read, `{date}` resolves at apply
+
+A sealed plan keeps `{date}` in `resolved_plan.destination` as written, and `rivet apply`
+resolves it to its own UTC day through the one resolver `rivet run` resolves with
+(`destination::placeholder::resolve_destination`, before anything reads the destination), so
+the files, the manifest, the state rows and the load spec all land under the apply's day. This
+is the one value an apply reads from the clock; it still recomputes no chunk, query or cursor.
+`rivet plan --date <day>` freezes that day into the artifact instead: the operator asked for it.
+An artifact sealed by an earlier release holds an already-resolved path, which apply leaves as
+it is. PA10 covers the destination as written in the artifact, so an apply on another day is
+not an integrity failure. Measured before the amendment (P-26): a plan made before UTC midnight
+and applied after it wrote under the planning day while the data and the part names were of
+the apply.

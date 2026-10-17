@@ -96,6 +96,7 @@ pub fn run_plan_command(
     params: Option<&HashMap<String, String>>,
     format: PlanOutputFormat,
     annotate_waves: bool,
+    date: Option<chrono::NaiveDate>,
 ) -> Result<()> {
     // --annotate-waves packs a SCHEDULE across the whole config: it assigns each
     // export a wave relative to all the others. Scoped to a single --export it
@@ -128,6 +129,7 @@ pub fn run_plan_command(
             config_dir,
             params,
             &state,
+            date,
         )?);
     }
 
@@ -370,8 +372,9 @@ fn build_plan_artifact(
     config_dir: &Path,
     params: Option<&HashMap<String, String>>,
     state: &StateStore,
+    date: Option<chrono::NaiveDate>,
 ) -> Result<(PlanArtifact, PrioritizationInputs, ExportRecommendation)> {
-    let plan = build_plan(config, export, config_dir, false, false, false, params)?;
+    let mut plan = build_plan(config, export, config_dir, false, false, false, params)?;
     if let Some(note) = partitioned_preview_note(export) {
         log::warn!("{note}");
     }
@@ -482,6 +485,17 @@ fn build_plan_artifact(
     let inputs =
         build_prioritization_inputs(export, &plan, &computed, &plan_diagnostics, hints, history);
     let recommendation = recommend_export(&inputs, &plan_diagnostics);
+
+    // The sealed destination keeps `{date}` for the apply to resolve on its own
+    // day (ADR-0005 PA1); `--date` freezes the day the operator asked for.
+    let ctx = match date {
+        Some(d) => {
+            crate::destination::placeholder::PlaceholderContext::for_date(d, export.family())
+        }
+        None => crate::destination::placeholder::PlaceholderContext::keeping_date(export.family()),
+    };
+    (plan.destination, plan.destination_written) =
+        crate::destination::placeholder::resolve_destination(export.destination.clone(), &ctx);
 
     let mut artifact = PlanArtifact::new(
         plan.export_name.clone(),
@@ -1660,6 +1674,7 @@ mod tests {
             None,
             super::PlanOutputFormat::Pretty,
             true, // annotate_waves
+            None,
         )
         .expect_err("--annotate-waves + --export must refuse");
         let msg = format!("{err:#}");

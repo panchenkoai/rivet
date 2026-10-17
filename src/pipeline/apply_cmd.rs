@@ -250,7 +250,14 @@ pub fn run_apply_command(
         forced: force,
         force_bypassed,
     };
-    let plan = artifact.resolved_plan.clone();
+    // ADR-0005 PA1, the one clock read of an apply: the sealed plan keeps `{date}`
+    // as written and this apply resolves it to its own UTC day, as `rivet run`
+    // does; a plan frozen with `rivet plan --date`, or sealed by an earlier
+    // release, holds a resolved path and changes nothing here.
+    let mut plan = artifact.resolved_plan.clone();
+    plan.resolve_destination(
+        &crate::destination::placeholder::PlaceholderContext::for_today(&plan.export_name),
+    );
     // The config is read BEFORE the run so the open probe knows whether to read
     // the source primary key — the load spec recorded afterwards carries it.
     // Recording with the key never asked for cleared the key `rivet run` had

@@ -1,0 +1,11 @@
+--- a/src/destination/placeholder.rs
++++ b/src/destination/placeholder.rs
+@@ -67,7 +67,7 @@
+     /// plan's, so the apply resolves the day it runs on.
+     pub fn keeping_date(export_name: impl Into<String>) -> Self {
+         Self {
+-            date: None,
++            date: Some(Utc::now().date_naive()),
+             export_name: export_name.into(),
+             run_id: None,
+         }

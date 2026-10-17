@@ -279,6 +279,20 @@ impl ResolvedRunPlan {
     }
 
     /// Whose stored progress this plan reads and writes: the one place the identity is computed.
+    /// Resolve the placeholders `destination` still holds as of `ctx` (the sealed plan's `{date}`, at apply), keeping the destination as written as the progress identity; a plan with none left to resolve is unchanged.
+    pub(crate) fn resolve_destination(
+        &mut self,
+        ctx: &crate::destination::placeholder::PlaceholderContext,
+    ) {
+        let written = self.destination_written.take();
+        let (destination, as_written) = crate::destination::placeholder::resolve_destination(
+            std::mem::take(&mut self.destination),
+            ctx,
+        );
+        self.destination = destination;
+        self.destination_written = written.or(as_written);
+    }
+
     pub fn progress_key(&self) -> crate::state::ProgressKey {
         crate::state::ProgressKey {
             export_name: self.export_name.clone(),

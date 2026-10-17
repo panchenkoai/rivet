@@ -333,7 +333,7 @@ fn a_stack_without_mongo_skips_every_mongo_test() {
     );
 }
 
-/// A filter term that matches no ignored test in any binary is a stale line that reads as a decision.
+/// A filter term that matches no ignored test in any binary is a stale line that reads as a decision; the `open_defect_` CLASS term stays, empty, while no product defect is open.
 #[test]
 fn every_ci_skip_term_still_names_a_test() {
     let r = Runners::load();
@@ -350,6 +350,7 @@ fn every_ci_skip_term_still_names_a_test() {
     .collect();
     let stale: Vec<&String> = all
         .into_iter()
+        .filter(|term| term.as_str() != "open_defect_")
         .filter(|term| !paths.iter().any(|p| p.contains(term.as_str())))
         .collect();
     assert!(
