@@ -1095,6 +1095,11 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
 /// Where the restore procedure is written.
 const RESTORE_DOC: &str = "docs/reference/state.md, section \"Rolling back an upgrade\"";
 
+/// Whether a state at `current` is about to be migrated by this build: a copy is written first.
+fn needs_copy(current: i64) -> bool {
+    current > 0 && current < SCHEMA_VERSION
+}
+
 /// The pre-migration copy of a SQLite state file: `<state>.v<old>.<UTC stamp>.bak` beside it.
 fn backup_path(db: &str, old: i64) -> std::path::PathBuf {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
@@ -1146,24 +1151,20 @@ fn copy_state_before_migration(conn: &Connection, old: i64) -> Result<Option<std
 /// The table names a ladder's `CREATE TABLE` statements define (`IF NOT EXISTS` stripped).
 fn created_table_names(sql: &str) -> std::collections::BTreeSet<String> {
     let lower = sql.to_lowercase();
-    let mut rest = lower.as_str();
-    let mut out = std::collections::BTreeSet::new();
-    while let Some(i) = rest.find("create table") {
-        rest = &rest[i + "create table".len()..];
-        let after = rest
-            .trim_start()
-            .strip_prefix("if not exists")
-            .unwrap_or_else(|| rest.trim_start())
-            .trim_start();
-        let name: String = after
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            out.insert(name);
-        }
-    }
-    out
+    lower
+        .match_indices("create table")
+        .filter_map(|(i, kw)| {
+            let after = lower[i + kw.len()..].trim_start();
+            let after = after
+                .strip_prefix("if not exists")
+                .map_or(after, str::trim_start);
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
 }
 
 /// Every table the PostgreSQL ladder creates or renames to, plus the version table: what a pre-migration copy holds when present.
@@ -1485,8 +1486,7 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
         }
     }
 
-    if current > 0
-        && current < SCHEMA_VERSION
+    if needs_copy(current)
         && let Some(copy) = copy_state_before_migration(conn, current)?
     {
         log::warn!(
@@ -1623,7 +1623,7 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
         })?
         .get(0);
 
-    if current > 0 && current < SCHEMA_VERSION {
+    if needs_copy(current) {
         copy_pg_state_before_migration(client, current)?;
     }
 
@@ -2613,6 +2613,49 @@ mod tests {
         )
         .unwrap()
             > 0
+    }
+
+    /// A copy is written for a state behind this build only: never for a new one, a current one, or one a newer rivet migrated.
+    #[test]
+    fn the_copy_is_written_only_for_a_state_behind_this_build() {
+        assert!(!needs_copy(0), "a new state has nothing to go back to");
+        assert!(needs_copy(1));
+        assert!(needs_copy(32), "0.31.0's v32");
+        assert!(needs_copy(SCHEMA_VERSION - 1));
+        assert!(!needs_copy(SCHEMA_VERSION), "nothing to migrate");
+        assert!(
+            !needs_copy(SCHEMA_VERSION + 1),
+            "a newer state is refused, never rewritten"
+        );
+    }
+
+    /// The ladder parser names every table the copy holds, including the one the ladder renamed to; `IF NOT EXISTS` is not a name.
+    #[test]
+    fn the_ladder_parser_names_the_tables_the_copy_holds() {
+        let names = created_table_names(
+            "CREATE TABLE a (x INT); create table if not exists b_2 (y TEXT);\n\
+             ALTER TABLE a RENAME TO c; CREATE INDEX i ON a(x);",
+        );
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from(["a".to_string(), "b_2".to_string()])
+        );
+        let pg = pg_state_table_names();
+        for t in [
+            "rivet_schema_version",
+            "export_state",
+            "export_metrics",
+            "file_manifest",
+            "file_log",
+            "keyset_range",
+            "load_spec_version",
+            "state_lease",
+            "run_status",
+        ] {
+            assert!(pg.iter().any(|n| n == t), "{t} missing from {pg:?}");
+        }
+        assert!(pg.len() >= 20, "{pg:?}");
+        assert_eq!(pg_backup_schema(32), "rivet_state_backup_v32");
     }
 
     /// The copy is the state as the previous release left it: its version is the old one and it has none of the ladder's later columns.
