@@ -330,6 +330,55 @@ pub(crate) fn column_has_index_mysql(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_schema_verdict_codes_a_missing_table_and_names_the_other_schema_errors() {
+        use crate::config::ExportConfig;
+        let orders = ExportConfig {
+            table: Some("orders".to_string()),
+            ..crate::config::sample_export("orders")
+        };
+        let server = |code: u16, message: &str| {
+            mysql::Error::MySqlError(mysql::MySqlError {
+                state: "HY000".to_string(),
+                message: message.to_string(),
+                code,
+            })
+        };
+        let missing =
+            super::mysql_schema_error(server(1146, "Table 'rivet.orders' doesn't exist"), &orders)
+                .expect("a missing table is a verdict");
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_SOURCE_TABLE_NOT_FOUND"),
+            "{missing:#}"
+        );
+        assert!(
+            format!("{missing:#}").contains("(`table: orders`)"),
+            "{missing:#}"
+        );
+        for (code, message) in [
+            (1054, "Unknown column 'totl' in 'field list'"),
+            (
+                1142,
+                "SELECT command denied to user 'reader'@'%' for table 'orders'",
+            ),
+            (1064, "You have an error in your SQL syntax"),
+        ] {
+            let err = super::mysql_schema_error(server(code, message), &orders)
+                .unwrap_or_else(|| panic!("MySQL error {code} is a schema verdict"));
+            let text = format!("{err:#}");
+            assert!(
+                text.starts_with(&format!("preflight: {message} (MySQL error {code})."))
+                    && crate::error::error_code(&err) == Some("RIVET_SOURCE_QUERY_FAILED"),
+                "{text}"
+            );
+        }
+        assert!(
+            super::mysql_schema_error(server(1213, "Deadlock found"), &orders).is_none(),
+            "an operational error stays fail-soft"
+        );
+    }
+
     // ── regression: `table:` shortcut must NOT preflight the "SELECT 1" stub ──
     //
     // Mirrors the Postgres-side guard for audit_preflight_table: a

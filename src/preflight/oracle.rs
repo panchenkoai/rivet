@@ -143,6 +143,11 @@ fn schema_fail_oracle(
     let Err(e) = conn.parses(base_query) else {
         return None;
     };
+    oracle_schema_verdict(e, export)
+}
+
+/// The preflight's verdict on a failed parse: a missing relation (ORA-00942) as the shared refusal, a missing column (ORA-00904) as the loud schema error, `None` for anything else.
+fn oracle_schema_verdict(e: anyhow::Error, export: &ExportConfig) -> Option<anyhow::Error> {
     if crate::source::names_a_missing_relation(&e) {
         return Some(crate::source::code_a_missing_relation(
             e,
@@ -291,6 +296,48 @@ fn index_probe_sql(qualified: &str, column: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_schema_verdict_codes_a_missing_relation_and_names_a_missing_column() {
+        let orders = ExportConfig {
+            table: Some("ORDERS".to_string()),
+            ..crate::config::sample_export("orders")
+        };
+        let parse = |text: &str| {
+            crate::error::coded(
+                crate::error::codes::SOURCE_QUERY_FAILED,
+                format!("oracle: OracleError {{ code: 0, message: \"{text}\" }}"),
+            )
+        };
+        let missing = oracle_schema_verdict(
+            parse("ORA-00942: table or view \"RIVET\".\"ORDERS\" does not exist"),
+            &orders,
+        )
+        .expect("a missing relation is a verdict");
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_SOURCE_TABLE_NOT_FOUND"),
+            "{missing:#}"
+        );
+        assert!(
+            format!("{missing:#}").contains("(`table: ORDERS`)"),
+            "{missing:#}"
+        );
+        let column =
+            oracle_schema_verdict(parse("ORA-00904: \"TOTL\": invalid identifier"), &orders)
+                .expect("a missing column is a verdict");
+        let text = format!("{column:#}");
+        assert!(
+            text.starts_with(
+                "preflight: a column in the export's query does not exist (ORA-00904)."
+            ) && crate::error::error_code(&column) == Some("RIVET_SOURCE_QUERY_FAILED"),
+            "{text}"
+        );
+        assert!(
+            oracle_schema_verdict(parse("ORA-12541: TNS:no listener"), &orders).is_none(),
+            "anything else stays fail-soft"
+        );
+    }
 
     #[test]
     fn the_index_probe_folds_an_unquoted_column_like_oracle_does() {

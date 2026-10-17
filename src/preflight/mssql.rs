@@ -184,6 +184,11 @@ fn schema_fail_mssql(
     let Err(e) = conn.query_scalar(&probe) else {
         return None;
     };
+    mssql_schema_verdict(e, export)
+}
+
+/// The preflight's verdict on a failed probe: a missing relation (208) as the shared refusal, a missing column (207) as the loud schema error, `None` for an operational failure.
+fn mssql_schema_verdict(e: anyhow::Error, export: &ExportConfig) -> Option<anyhow::Error> {
     if crate::source::names_a_missing_relation(&e) {
         return Some(crate::source::code_a_missing_relation(
             e,
@@ -432,6 +437,50 @@ mod tests {
         );
         assert_eq!(base_table_of("SELECT * FROM orders, users"), None);
         assert_eq!(base_table_of("SELECT * FROM (SELECT 1 AS x) AS s"), None);
+    }
+
+    #[test]
+    fn the_schema_verdict_codes_a_missing_relation_and_names_a_missing_column() {
+        let orders = ExportConfig {
+            table: Some("orders".to_string()),
+            ..crate::config::sample_export("orders")
+        };
+        let probe = |text: &str| {
+            crate::error::coded(
+                crate::error::codes::SOURCE_QUERY_FAILED,
+                format!("mssql: scalar query failed: {text}"),
+            )
+        };
+        let missing = mssql_schema_verdict(
+            probe("Token error: 'Invalid object name 'orders'.' on server x executing  on line 1 (code: 208, state: 1, class: 16)"),
+            &orders,
+        )
+        .expect("a missing relation is a verdict");
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_SOURCE_TABLE_NOT_FOUND"),
+            "{missing:#}"
+        );
+        assert!(
+            format!("{missing:#}").contains("(`table: orders`)"),
+            "{missing:#}"
+        );
+        let column = mssql_schema_verdict(
+            probe("Token error: 'Invalid column name 'totl'.' on server x executing  on line 1 (code: 207, state: 1, class: 16)"),
+            &orders,
+        )
+        .expect("a missing column is a verdict");
+        let text = format!("{column:#}");
+        assert!(
+            text.starts_with(
+                "preflight: a column in the export's query does not exist (error 207)."
+            ) && crate::error::error_code(&column) == Some("RIVET_SOURCE_QUERY_FAILED"),
+            "{text}"
+        );
+        assert!(
+            mssql_schema_verdict(probe("connection reset by peer"), &orders).is_none(),
+            "an operational failure stays fail-soft"
+        );
     }
 
     #[test]
