@@ -200,6 +200,15 @@ crash_hooks:
       Fully durable and acked. What this case pins is the property below
       (`crashed_run_ledger_gap`): the parts are manifest-covered and the ledger
       has no row for them.
+  - id: cdc_after_ack_of_parts
+    coverage: test
+    detail: >-
+      The ack that followed a roll with parts: live_cdc::roast_pg_cdc_a_crash_mid_spilled_tail_loses_no_transaction_on_resume
+      and its MySQL sibling crash here, after the spilled transaction's whole replay. `cdc_after_ack`
+      fires on the first ack of the run, which on a shared source server is another test's row-less
+      commit on an uncaptured table. Its pause sibling `cdc_after_parts_before_ack` (the same roll,
+      before the ack) is where gremlin_cdc::gremlin_cdc_sigkill_mid_drain_recovers_without_gap parks
+      the stream for a real SIGKILL.
   - id: cdc_before_manifest
     coverage: swept
     case: crash_before_manifest

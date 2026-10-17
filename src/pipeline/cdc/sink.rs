@@ -296,6 +296,11 @@ impl TableSink<'_> {
 /// and ack happen only at a real commit boundary (`last_commit`); a trailing
 /// mid-transaction tail is flushed but never acked past — it is re-read (and
 /// deduped downstream) rather than lost.
+/// Whether a roll made at least one part durable, from the part count each flushed sink reported.
+pub(crate) fn roll_wrote_a_part(part_counts: &[usize]) -> bool {
+    part_counts.iter().any(|&n| n > 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn roll_all(
     sinks: &mut [TableSink<'_>],
@@ -321,8 +326,10 @@ fn roll_all(
     // Every part that reached the store is recorded, even when a sibling's upload
     // failed: it is durable either way, and the error still stops the ack below.
     let mut first_err = None;
+    let mut part_counts = Vec::new();
     for (i, flushed) in pending.into_iter().zip(uploaded) {
         let (parts, outcome) = flushed.unwrap_or_else(|panicked| (Vec::new(), Err(panicked)));
+        part_counts.push(parts.len());
         for (part, sums) in parts {
             sinks[i].record_part(
                 part,
@@ -338,9 +345,15 @@ fn roll_all(
     if let Some(e) = first_err {
         return Err(e);
     }
+    let wrote_parts = roll_wrote_a_part(&part_counts);
     // Fault point: the parts are durable but the checkpoint/ack have NOT run. A
     // crash here must re-read on resume (at-least-once) — never lose the change.
     crate::test_hook::maybe_panic_at("cdc_after_flush_before_ack");
+    // The same window, reached only by a roll that made a part durable: a row-less commit
+    // from an uncaptured table rolls too, and a fault timed to "the first roll" would land there.
+    if wrote_parts {
+        crate::test_hook::maybe_pause_at("cdc_after_parts_before_ack");
+    }
     if *unacked_commit && let Some(p) = last_commit {
         // Round-2 audit #11: make the just-flushed parts durably manifest-covered
         // BEFORE the checkpoint/ack advances past them. The ack advances a consume-
@@ -378,6 +391,9 @@ fn roll_all(
         // Fault point: fully durable + acked — a crash here loses nothing and
         // must not duplicate on resume (the checkpoint already advanced).
         crate::test_hook::maybe_panic_at("cdc_after_ack");
+        if wrote_parts {
+            crate::test_hook::maybe_panic_at("cdc_after_ack_of_parts");
+        }
         *unacked_commit = false;
     }
     Ok(())
@@ -2009,6 +2025,14 @@ mod tests {
 
     /// The drain loop's two decisions, every combination — four mutants that
     /// survived while they were `if` conditions inside live-only glue.
+    #[test]
+    fn a_roll_wrote_a_part_only_when_some_sink_flushed_one() {
+        assert!(!roll_wrote_a_part(&[]));
+        assert!(!roll_wrote_a_part(&[0, 0]));
+        assert!(roll_wrote_a_part(&[0, 1]));
+        assert!(roll_wrote_a_part(&[2, 0]));
+    }
+
     #[test]
     fn a_pass_rolls_for_rows_or_for_an_unacked_commit_and_the_drain_ends_only_when_dry() {
         // ROLL. The uncaptured-span case is the load-bearing one: nothing buffered,
