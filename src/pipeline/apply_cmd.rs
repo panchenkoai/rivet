@@ -613,9 +613,10 @@ mod tests {
 
     // ── cursor drift ─────────────────────────────────────────────────────────
 
+    /// A plan refused by validation if it ran, so a mutant that excuses the drift fails here at once instead of connecting to an unreachable source.
     #[test]
     fn cursor_drift_detected_no_prior_state() {
-        let mut artifact = fresh_artifact();
+        let mut artifact = validation_refused_artifact();
         // Plan recorded a cursor snapshot; state store starts empty → drift.
         artifact.computed.cursor_snapshot = Some("2025-06-01T00:00:00Z".into());
         let dir = tempfile::TempDir::new().unwrap();
