@@ -454,6 +454,11 @@ struct TailPlan {
     machine_output: bool,
 }
 
+/// Does EITHER machine channel ask for the document? `--summary-output` alone is the common scheduler shape, so `||`, never `&&`.
+fn machine_document_requested(summary_output: Option<&Path>, json_output: bool) -> bool {
+    summary_output.is_some() || json_output
+}
+
 /// The tail's routing rule, pure because the value-level oracle needs a live
 /// source (a real `run()` needs a database, a destination and a state DB).
 ///
@@ -783,15 +788,15 @@ pub fn run(
         Some(config_path),
         parallel_mode,
     );
-    // EITHER machine channel asks for the document — `--summary-output` alone is
-    // the common scheduler shape, so this is `||`, never `&&`. Live-only by
-    // construction (a real `run()` needs a source, a destination and a state
-    // DB); the oracle that goes RED on `&&` is
+    // EITHER machine channel asks for the document (`machine_document_requested`,
+    // the one predicate both this tail and the waves/pool tail ask). Live, the
+    // oracle that goes RED on a tail that drops the file is
     // `run_summary_output_writes_json_to_file` (tests/live/live_cli_flags.rs) —
     // one export, `--summary-output`, no `--json`, asserting the file exists.
-    // `run_json_flag_prints_aggregate_summary_to_stdout` does NOT grade this
-    // operator: `--json` prints from `json_output` directly a few lines below.
-    let plan = tail_plan(&agg, summary_output.is_some() || json_output);
+    let plan = tail_plan(
+        &agg,
+        machine_document_requested(summary_output, json_output),
+    );
     if plan.aggregate {
         aggregate::print(&agg);
     }
@@ -1159,7 +1164,10 @@ fn finish_run_tail(
         Some(config_path),
         mode_label,
     );
-    let plan = tail_plan(&agg, summary_output.is_some() || json_output);
+    let plan = tail_plan(
+        &agg,
+        machine_document_requested(summary_output, json_output),
+    );
     if plan.aggregate {
         aggregate::print(&agg);
     }
@@ -3453,6 +3461,16 @@ pub(crate) mod run_tail_tests {
     /// `aggregate::a_zero_export_run_still_builds_a_valid_document`.
     ///
     /// RED against restoring `n_exports == 1`: the zero case reads `false`.
+    #[test]
+    fn either_machine_channel_asks_for_the_document() {
+        use super::machine_document_requested;
+        let out = std::path::Path::new("summary.json");
+        assert!(machine_document_requested(Some(out), false));
+        assert!(machine_document_requested(None, true));
+        assert!(machine_document_requested(Some(out), true));
+        assert!(!machine_document_requested(None, false));
+    }
+
     #[test]
     fn tail_plan_emits_a_machine_document_for_a_zero_export_run() {
         // Zero exports (partition_by over an empty table) — the regression.
