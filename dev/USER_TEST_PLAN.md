@@ -198,7 +198,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 ```
 
 

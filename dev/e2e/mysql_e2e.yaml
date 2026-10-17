@@ -15,7 +15,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       balance: decimal(12,2)
 
@@ -25,7 +25,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       balance: decimal(12,2)
 
@@ -37,7 +37,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       price: decimal(10,2)
 
@@ -51,7 +51,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       price: decimal(10,2)
 
@@ -64,7 +64,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       price: decimal(10,2)
 
@@ -77,4 +77,4 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output

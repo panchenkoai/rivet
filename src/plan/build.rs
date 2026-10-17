@@ -1128,14 +1128,18 @@ mod tests {
         .expect("plan")
     }
 
-    /// The destination part of the progress identity is the destination as written: a `{date}` prefix is one place on every day, and a plan with no placeholder seals as before.
+    /// The destination part of the progress identity is the destination as written (a relative local path as `Config::load` anchors it): a `{date}` prefix is one place on every day, and a plan with no placeholder seals as before.
     #[test]
     fn a_dated_destination_enters_the_progress_identity_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let plain = planned(dir.path(), "    table: orders", &[]);
         assert_eq!(plain.destination_written, None);
         let landing = plain.progress_key().landing;
-        assert_eq!(landing.destination, "file://./out");
+        let anchored = format!("file://{}", dir.path().join("out").display());
+        assert_eq!(
+            landing.destination, anchored,
+            "anchored to the config's directory"
+        );
         assert_eq!(landing.format, "parquet");
         let sealed = serde_json::to_value(&plain).unwrap();
         assert!(sealed.get("destination_written").is_none(), "{sealed}");

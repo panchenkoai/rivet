@@ -10,7 +10,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: pg_events_incremental
     query: "SELECT id, user_id, event_type, payload::text as payload, ip_address, created_at FROM events"
@@ -19,7 +19,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   # ADR-0007 COALESCE(updated_at, created_at); seed: orders_coalesce (dev/postgres/init.sql)
   - name: pg_orders_coalesce
@@ -31,4 +31,4 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
