@@ -1,0 +1,9 @@
+--- a/src/pipeline/apply_cmd.rs
++++ b/src/pipeline/apply_cmd.rs
+@@ -132,5 +132,4 @@
+     let reusable = artifact.is_reusable();
+     if !reusable
+-        && let Some(run_id) =
+-            state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)?
++        && let Some(run_id) = None::<String>
+     {

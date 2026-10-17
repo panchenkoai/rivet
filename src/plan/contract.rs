@@ -363,7 +363,7 @@ impl ExtractionStrategy {
     }
 
     /// Whether a clean run seeks from the stored cursor (incremental, `keyset_incremental`, Mongo `resume`).
-    fn continues_stored_cursor(&self) -> bool {
+    pub fn continues_stored_cursor(&self) -> bool {
         matches!(self, ExtractionStrategy::Incremental(_))
             || matches!(self, ExtractionStrategy::Keyset(kp) if kp.incremental)
     }

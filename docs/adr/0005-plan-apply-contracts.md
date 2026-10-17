@@ -4,6 +4,8 @@
 **Date**: 2026-04  
 **Context**: Rivet implements a Terraform-style plan/apply workflow for data extracts. `rivet plan` generates a sealed `PlanArtifact` that captures the full execution intent at a point in time. `rivet apply` consumes the artifact and executes it. Because plan time and apply time are separated, the contracts between them must be explicit to ensure predictable, auditable execution.
 
+**Two kinds of plan (owner decision, 2026-10-16).** A plan whose strategy reads no stored cursor (`mode: full`, chunked ranges, keyset without `keyset_incremental`, time window) is a **point-in-time snapshot**: it is applied once, it ages (PA3), and a replay of it after an exit-0 apply extracts nothing (PA11). An incremental plan (`mode: incremental`, `keyset_incremental`, Mongo `resume`) is a **reusable description** of the extraction: it freezes the query, the strategy and the chunk parameters, not the position; every apply reads the cursor from state as `rivet run` does and delivers what arrived since — new rows or none, never a duplicate. `PlanArtifact::is_reusable` (the strategy's `continues_stored_cursor`) is the one place this is decided.
+
 ---
 
 ## Problem
@@ -43,7 +45,7 @@ Without explicit contracts, `rivet apply` cannot reason about whether the artifa
 
 ### PA3 — Staleness Boundary (SB)
 
-> `rivet apply` enforces a maximum age between plan time and apply time:
+> For a point-in-time plan, `rivet apply` enforces a maximum age between plan time and apply time (a reusable incremental plan has no age: it is checked by PA10 and PA4 instead):
 >
 > - **Age < 1 hour**: apply proceeds silently.
 > - **1 hour ≤ age < 24 hours**: apply emits a `WARN` log and proceeds.
@@ -51,7 +53,9 @@ Without explicit contracts, `rivet apply` cannot reason about whether the artifa
 
 **Rationale**: The value of a pre-computed plan degrades as the source drifts. An artifact that is hours old may describe chunk boundaries that are no longer representative of the current data distribution. The hard error threshold prevents accidentally applying a week-old plan that was forgotten in a directory.
 
-**Current implementation**: `PlanArtifact::staleness(warn_after, error_after)` computes the age from `created_at` to `Utc::now()`. `apply_cmd::run_apply_command` calls this and either warns, bails, or proceeds. The `expires_at` field in the artifact JSON provides the deadline in a human-readable form.
+**Reusable plans**: a 24 h expiry would forbid the use an incremental plan exists for (one reviewed plan applied by a schedule for weeks), so PA3 does not apply to it. What still invalidates one: PA10 (an edited artifact is refused), PA4 (another run moved the cursor), and the source's own answer to the frozen query (a dropped column fails the query; the schema-drift policy judges a changed one). **Proposed, not implemented here**: refuse an incremental plan whose source config no longer matches (`plan_fingerprint` against the config at `config_path` when that file exists) or whose table's column set changed since planning (a column-list fingerprint taken at plan time), each with a code and the remedy `rivet plan`.
+
+**Current implementation**: `PlanArtifact::staleness(warn_after, error_after)` computes the age from `created_at` to `Utc::now()`. `apply_cmd::run_apply_command` calls this for a point-in-time plan and either warns, bails, or proceeds. The `expires_at` field in the artifact JSON provides the deadline in a human-readable form.
 
 **Test coverage**: `test staleness_fresh`, `test staleness_expired_artifact` in `plan/artifact.rs`.
 
@@ -59,9 +63,9 @@ Without explicit contracts, `rivet apply` cannot reason about whether the artifa
 
 ### PA4 — Cursor Snapshot Integrity (CSI)
 
-> For `Incremental` exports, `rivet apply` verifies that the cursor value in `StateStore` at apply time equals the cursor value captured in `ComputedPlanData.cursor_snapshot` at plan time. If they differ, apply rejects the artifact.
+> For `Incremental` exports, `rivet apply` verifies that the cursor value in `StateStore` at apply time equals the cursor value captured in `ComputedPlanData.cursor_snapshot` at plan time, **or** that the newest successful run of the export from the same source applied this same plan (`run_status.plan_id`). A cursor moved by an earlier apply of the same plan is the plan's own progress, not drift. Any other difference rejects the artifact.
 
-**Rationale**: If another `rivet run` completed between plan and apply, the cursor has advanced. Applying the artifact would re-extract rows that were already exported and written to the destination, producing duplicate output. The cursor snapshot check makes this divergence explicit rather than silently producing duplicates.
+**Rationale**: the apply reads its starting cursor from state, never from the snapshot, so a moved cursor cannot make it re-extract rows; what the check guards is the review: a plan reviewed against one position must not run silently after another process (a `rivet run`, another plan) took the window it was reviewed for. Its own earlier applies took nothing from anyone else, so they do not drift it (owner decision 2026-10-16; before, the plan's first apply moved the cursor and every later apply of the same artifact was refused `RIVET_PLAN_ARTIFACT_STALE`).
 
 **Failure mode**: If cursor drift is detected and `--force` is not passed, apply exits with:
 ```
@@ -74,7 +78,7 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 **Cursor policy**: How the snapshot string is produced (single column vs `COALESCE` progression) is defined in [ADR-0007](0007-cursor-policy-contracts.md); PA4 compares opaque strings regardless of mode.
 
-**Current implementation**: `apply_cmd::run_apply_command` calls `PlanArtifact::cursor_matches(current)`. `cursor_matches` returns `true` when `cursor_snapshot` is `None` (all non-incremental strategies).
+**Current implementation**: `apply_cmd::run_apply_command` calls `PlanArtifact::cursor_matches(current)`, then `StateStore::cursor_last_moved_by_plan`. `cursor_matches` returns `true` when `cursor_snapshot` is `None` (all non-incremental strategies, and an incremental plan made before any cursor was stored).
 
 **Test coverage**: `test cursor_matches_none_snapshot`, `test cursor_matches_incremental` in `plan/artifact.rs`.
 
@@ -160,20 +164,33 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 
 ---
 
+### PA11 — An Applied Point-in-Time Plan Answers Its Replay (APR)
+
+> The run that applies a plan to exit 0 records the plan's `plan_id` on its `run_status` row (state schema v37). `rivet apply` of a **point-in-time** artifact (`mode: full`, chunked ranges, keyset without `keyset_incremental`, time window) whose `plan_id` a finished run of the export recorded exits 0 WITHOUT extracting and prints `apply: plan <plan_id> of export '<export>' was already applied by run <run_id> (<status>, <rows> rows, <files> files, <bytes> bytes, finished <time>); nothing was extracted again. To extract new data, make a new plan with `rivet plan`.` on stderr. It writes no run, no manifest and no metrics row, so `rivet metrics --last 1` still names the run that applied the plan. `--force` extracts again (`already_applied` in the run report's `force_bypassed`).
+
+A **reusable** (incremental) artifact is never answered: each apply, a scheduler retry included, continues from the stored cursor and delivers what arrived since, new rows or none, never a duplicate. Answering it would leave those rows undelivered with exit 0 (measured on this PR's first version: `keyset_incremental` applied twice with 50 rows inserted between, source 150, delivered 100).
+
+**Rationale**: a scheduler retries a task whose process died after `rivet apply` exited 0, with the same sealed artifact. Before PA11 that retry extracted the whole table again (`mode: full`, chunked, keyset). A plan whose run failed, was interrupted, or died before exit 0 recorded nothing and replays as before.
+
+**Current implementation**: `StateStore::record_applied_plan` (after an exit-0 run) and `StateStore::run_that_applied_plan` (before staleness and PA4, asked only when `!PlanArtifact::is_reusable`), both called from `apply_cmd::run_apply_command`.
+
+---
+
 ## Contract Summary Table
 
 | ID | Name | Enforced? | On Violation |
 |----|------|-----------|-------------|
 | PA1 | Artifact Is the Communication Channel | yes | apply cannot run without an artifact |
 | PA2 | Artifact Immutability | yes (integrity checksum, PA10) | `bail!` — not `--force`-bypassable |
-| PA3 | Staleness Boundary | yes (hard at 24 h) | `bail!` unless `--force` |
-| PA4 | Cursor Snapshot Integrity | yes (Incremental only) | `bail!` — regenerate plan |
+| PA3 | Staleness Boundary | yes (hard at 24 h; point-in-time plans only) | `bail!` unless `--force` |
+| PA4 | Cursor Snapshot Integrity | yes (Incremental only; a cursor its own earlier apply moved is not drift) | `bail!` — regenerate plan |
 | PA5 | Chunk Range Monotonicity | by construction | no explicit runtime gate |
 | PA6 | Fingerprint Stability | advisory (plan-time display only) | operator responsibility |
 | PA7 | State Writes Unchanged | yes (ADR-0001) | same failure modes as `rivet run` |
 | PA8 | Diagnostics Are Advisory | explicit non-enforcement | verdict visible in artifact; no gate |
 | PA9 | Artifact Credential Redaction | yes (on `PlanArtifact::new`) | plaintext `password`/URL userinfo silently stripped; WARN logged |
 | PA10 | Artifact Tamper-Evidence | yes (`verify_integrity` before any query) | `bail!` — not `--force`-bypassable |
+| PA11 | An Applied Point-in-Time Plan Answers Its Replay | yes (`run_status.plan_id`, before PA3/PA4; not for incremental plans) | exit 0, nothing extracted; `--force` extracts again |
 
 ---
 
@@ -196,6 +213,10 @@ Regenerate with `rivet plan` or pass --force to skip this check.
 | Plan generated, other incremental run completed, apply attempted | Fresh | Drift detected → bail | No state written (apply never ran) |
 | Plan generated, applied 25h later | Error | not checked | bail (unless --force) |
 | Plan generated, applied with --force after 25h | Warn override | Checked | Proceeds; operator takes responsibility |
+| Full / chunked / keyset plan applied to exit 0, then the same artifact applied again (a retry) | not checked | not checked | PA11: exit 0, names the run that applied it; nothing written |
+| Incremental / `keyset_incremental` plan applied again (a retry or a schedule), any age | not checked | Own earlier apply moved the cursor → not drift | A new run reads what arrived since the previous apply |
+| Incremental plan applied, then a `rivet run` moved the cursor, plan applied again | not checked | Drift detected → bail | No state written |
+| Plan's apply died (kill, panic) or failed, artifact applied again | Checked | Checked | Replays: a new run extracts |
 
 ---
 

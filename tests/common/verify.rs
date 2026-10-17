@@ -68,6 +68,8 @@ pub(crate) struct Case {
     resume: bool,
     /// The chunk ranges a sealed plan replays (computed when it was planned), else `null`.
     replay: serde_json::Value,
+    /// The id of the sealed plan an `apply <plan.json>` replays.
+    plan_id: Option<String>,
     /// A `rivet cdc` invocation's own surface, graded as the `run` of the config it is equivalent to.
     cli: Option<CdcCli>,
     /// Per export, the NDJSON change lines this `rivet cdc` run printed for its table.
@@ -310,6 +312,7 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
     // A sealed plan artifact names its export and the config it was planned from; its resolved destination and query win.
     let mut sealed: Option<(String, Value, String)> = None;
     let mut replay = serde_json::Value::Null;
+    let mut plan_id = None;
     let cfg_path = if cdc_cli {
         // `rivet cdc` anchors its relative paths to its working directory (src/cli/dispatch.rs `dispatch_cdc`).
         verb = "run".into();
@@ -338,6 +341,7 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
             let dest = serde_yaml_ng::to_value(&plan["destination"]).ok()?;
             let query = plan["base_query"].as_str().unwrap_or_default().to_string();
             replay = doc["computed"]["chunk_ranges"].clone();
+            plan_id = doc["plan_id"].as_str().map(str::to_string);
             sealed = Some((name.to_string(), dest, query));
             PathBuf::from(cfg)
         }
@@ -435,6 +439,7 @@ fn parse(argv: &[String], envs: &[(&str, &str)], cwd: Option<&Path>) -> Option<C
         before: Vec::new(),
         resume: argv.iter().any(|a| a == "--resume"),
         replay,
+        plan_id,
         cli,
         events: Vec::new(),
         snapshot: None,
@@ -486,7 +491,10 @@ fn finish(case: Case, envs: &[(&str, &str)], opts: &Opts) -> bool {
         };
         match verdict {
             Err(why) => log("SKIP", &name, &why),
-            Ok((spec, verb)) => xfailed |= verdict_of(&name, &spec, verb, opts),
+            Ok((spec, verb)) => {
+                xfailed |= verdict_of(&name, &spec, verb, opts);
+                case.record_plan_delivery(e, &spec);
+            }
         }
     }
     if case.verb == "run" && deferred.is_none() {
@@ -791,6 +799,7 @@ impl Case {
                 "resume": self.resume,
                 "replay": self.replay.as_array().is_some_and(|r| !r.is_empty()),
                 "ranges": self.replay,
+                "plan_applied": if nothing_new && !cumulative { self.plan_delivery(e, &now) } else { Vec::new() },
                 "range_column": e.get("chunk_by_days").is_none().then(|| s(e, "chunk_column")).flatten(),
                 "settle": e.get("settle").is_some(),
                 "consumed": ([e.get("load"), self.cfg.get("load")]
@@ -1042,6 +1051,51 @@ impl Case {
         image_dir().join(format!("{:016x}-{kind}", h.finish()))
     }
 
+    /// The Success manifests an exit-0 apply of this invocation's sealed plan wrote for `e`, as this harness saw them, when every one is still among `now`.
+    fn plan_delivery(&self, e: &Value, now: &BTreeSet<String>) -> Vec<String> {
+        let Some(id) = &self.plan_id else {
+            return Vec::new();
+        };
+        let path = with_ext(&self.image(e, "plans"), "json");
+        let record: serde_json::Value = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let wrote: Vec<String> = record[id.as_str()]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.as_str().map(str::to_string))
+            .collect();
+        if wrote.iter().all(|m| now.contains(m)) {
+            wrote
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Remember the Success manifests an exit-0 apply of a sealed plan wrote for `e` (graded in `spec`), so a replay of that plan is graded by them.
+    fn record_plan_delivery(&self, e: &Value, spec: &serde_json::Value) {
+        let (Some(id), None) = (&self.plan_id, &self.unrecorded) else {
+            return;
+        };
+        let wrote = &spec["new_manifests"];
+        if wrote.as_array().is_none_or(Vec::is_empty)
+            || spec["plan_applied"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty())
+        {
+            return;
+        }
+        let path = with_ext(&self.image(e, "plans"), "json");
+        let mut record: serde_json::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        record[id.as_str()] = wrote.clone();
+        std::fs::write(&path, record.to_string()).expect("keep the sealed plan's delivery");
+    }
+
     /// Every file the oracle keeps for this export's stream, existing or not.
     fn stream_records(&self, e: &Value) -> Vec<PathBuf> {
         let kinds = [
@@ -1052,6 +1106,7 @@ impl Case {
             "dests",
             "cursor",
             "events",
+            "plans",
         ];
         let exts = ["parquet", "parquet.missing", "txt", "json", "jsonl"];
         kinds

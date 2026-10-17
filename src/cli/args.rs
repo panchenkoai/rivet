@@ -459,9 +459,10 @@ pub enum Commands {
         #[arg(long)]
         resume: bool,
         /// Override whichever safety gate refuses the run: in JSON-artifact
-        /// mode the plan staleness check (> 24 h) and the incremental
-        /// cursor-drift check (each bypass is recorded in the run's
-        /// `apply_context`); in YAML config mode, with `--resume`, the refusal
+        /// mode the staleness check of a full, chunked or keyset plan (> 24 h),
+        /// its "already applied" answer, and the incremental cursor-drift check
+        /// (each bypass is recorded in the run's `apply_context`); in YAML
+        /// config mode, with `--resume`, the refusal
         /// to resume into a prefix whose `_SUCCESS` marker is already present
         #[arg(long)]
         force: bool,

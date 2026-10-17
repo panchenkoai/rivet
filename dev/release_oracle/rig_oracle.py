@@ -1286,6 +1286,11 @@ def grade(spec: dict) -> dict:
     fmt = spec.get("format") or "parquet"
     out_dir, snap_dir = spec["out_dir"], spec["snapshot_dir"]
     low = None
+    applied = (spec.get("plan_applied") or []) if spec.get("nothing_new") and not cumulative else []
+    if applied:
+        # A sealed plan replayed after an exit-0 apply of it owes nothing new: the delivery of that apply must still stand.
+        spec = {**spec, "manifests": applied, "new_manifests": applied, "nothing_new": False}
+        notes.append(f"a replay of a sealed plan that an earlier apply delivered to exit 0: nothing new owed; graded that apply's {len(applied)} manifest(s)")
     graded = in_run_order(out_dir, spec["manifests"])
     snaps = declared_parts(snap_dir, spec["snapshot_manifests"])
     others = spec.get("stream_dirs") or []
@@ -1418,6 +1423,8 @@ def grade(spec: dict) -> dict:
     failures = grade_findings(f, rows, forms, native, engine != "mongo" and fmt == "parquet", spec.get("overrides") or {}, collapse)
     failures += (f.get("text_form") or []) + extra
     facts = {k: v for k, v in f.items() if k not in ("pairs", "dst_cols", "src_stats", "dst_stats")}
+    if applied:
+        facts["replay_graded_by_earlier_apply"] = applied
     out = {"failures": failures, "notes": notes, "facts": facts, "key": key}
     if partial:
         out["partial"] = "; ".join(partial)

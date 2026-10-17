@@ -319,6 +319,20 @@ impl PlanArtifact {
         }
     }
 
+    /// When this plan stops being appliable without `--force`: its `expires_at`, or never for a reusable plan.
+    fn expiry_text(&self) -> String {
+        if self.is_reusable() {
+            "never (an incremental plan is reusable)".into()
+        } else {
+            self.expires_at.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+        }
+    }
+
+    /// Whether this plan is a reusable description whose every apply continues the stored cursor (incremental, `keyset_incremental`), not a point-in-time snapshot (full, chunked, keyset, time window).
+    pub fn is_reusable(&self) -> bool {
+        self.resolved_plan.strategy.continues_stored_cursor()
+    }
+
     /// One compact row for the multi-export plan table — `wave  rec  export
     /// strategy  rows  verdict`: `apply_wave` is the `wave:` apply reads ("—" when
     /// unset), `rec` the cost model's recommendation.
@@ -382,10 +396,7 @@ impl PlanArtifact {
             "  Created  : {}",
             self.created_at.format("%Y-%m-%d %H:%M:%S UTC")
         );
-        println!(
-            "  Expires  : {}",
-            self.expires_at.format("%Y-%m-%d %H:%M:%S UTC")
-        );
+        println!("  Expires  : {}", self.expiry_text());
         println!("  Export   : {}", self.export_name);
         println!("  Strategy : {}", self.strategy);
         if !self.plan_fingerprint.is_empty() {
@@ -980,6 +991,32 @@ mod tests {
         assert!(artifact.cursor_matches(Some("2026-01-01T00:00:00Z")));
         assert!(!artifact.cursor_matches(Some("2026-01-02T00:00:00Z")));
         assert!(!artifact.cursor_matches(None));
+    }
+
+    /// A point-in-time plan shows its `expires_at`; an incremental plan, reusable, never expires.
+    #[test]
+    fn only_a_point_in_time_plan_shows_an_expiry() {
+        let mut artifact = minimal_artifact();
+        assert!(!artifact.is_reusable());
+        assert_eq!(
+            artifact.expiry_text(),
+            artifact
+                .expires_at
+                .format("%Y-%m-%d %H:%M:%S UTC")
+                .to_string()
+        );
+        artifact.resolved_plan.strategy =
+            crate::plan::ExtractionStrategy::Incremental(crate::plan::IncrementalCursorPlan {
+                primary_column: "updated_at".into(),
+                fallback_column: None,
+                mode: crate::config::IncrementalCursorMode::SingleColumn,
+                settle: None,
+            });
+        assert!(artifact.is_reusable());
+        assert_eq!(
+            artifact.expiry_text(),
+            "never (an incremental plan is reusable)"
+        );
     }
 
     #[test]

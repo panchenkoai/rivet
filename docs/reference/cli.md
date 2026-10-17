@@ -275,11 +275,13 @@ rivet apply <PLAN_FILE | CONFIG> [OPTIONS]
 | Argument/Flag | Type | Description |
 |---|---|---|
 | `PLAN_FILE` / `CONFIG` | string | Path to a plan JSON artifact, or a YAML config for wave-ordered execution **(required)** |
-| `--force` | bool | Overrides whichever safety gate refuses the run (ADR-0013). JSON-artifact mode: bypasses the staleness check (plans > 24 h) **and** the incremental cursor-drift check (both logged and recorded in the run's `apply_context`). YAML config mode: meaningful only with `--resume`, where it goes past the refusal to resume into a destination whose `_SUCCESS` marker is already present (the export then continues an interrupted run, else runs as a plain run does, beside the complete one); without `--resume` it is a warned no-op |
+| `--force` | bool | Overrides whichever safety gate refuses the run (ADR-0013). JSON-artifact mode: bypasses the staleness check of a full, chunked or keyset plan (> 24 h), extracts such a plan again after it already applied, **and** bypasses the incremental cursor-drift check (each logged and recorded in the run's `apply_context`). YAML config mode: meaningful only with `--resume`, where it goes past the refusal to resume into a destination whose `_SUCCESS` marker is already present (the export then continues an interrupted run, else runs as a plain run does, beside the complete one); without `--resume` it is a warned no-op |
 
 ### Staleness rules
 
-| Plan age | Behavior |
+A full, chunked or keyset plan is a point-in-time snapshot and ages; an incremental plan (`mode: incremental`, `keyset_incremental`) is a reusable description with no age limit ([ADR-0005](../adr/0005-plan-apply-contracts.md)).
+
+| Plan age (full, chunked, keyset) | Behavior |
 |----------|----------|
 | < 1 hour | Proceeds silently |
 | 1–24 hours | Warns and proceeds |
@@ -287,7 +289,11 @@ rivet apply <PLAN_FILE | CONFIG> [OPTIONS]
 
 ### Cursor drift (Incremental exports)
 
-If another `rivet run` completed after the plan was generated, the cursor will have advanced. `rivet apply` detects this and rejects the artifact to prevent re-exporting already-exported rows. Regenerate with `rivet plan`.
+Every apply of an incremental plan reads the cursor from state and delivers what arrived since; a cursor moved by an earlier apply of the same plan is its own progress. If another `rivet run` moved the cursor after the plan was generated, `rivet apply` rejects the artifact (`RIVET_PLAN_ARTIFACT_STALE`): the plan was reviewed for a window another run took. Regenerate with `rivet plan`.
+
+### Replay of an applied plan
+
+A full, chunked or keyset plan that already applied to exit 0 is not run again: a replay of the same artifact (a scheduler retry) exits 0, prints `apply: plan <plan_id> of export '<export>' was already applied by run <run_id> (...)` and writes nothing. `--force` extracts it again.
 
 ### Examples
 

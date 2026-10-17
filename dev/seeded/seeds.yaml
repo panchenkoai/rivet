@@ -17,6 +17,66 @@
 
 seeds:
 
+  - name: incremental-plan-replay-answered
+    class: "`rivet apply` treats an incremental plan (`mode: incremental`, `keyset_incremental`) as a point-in-time snapshot: a replay after its first exit-0 apply answers \"already applied\", so every row that arrived since is never delivered with exit 0, and the plan is refused past 24 h"
+    history: "found 2026-10-16 on PR #616 CI (run 38911927276): the first F3 replay answer keyed on plan_id alone; `incremental_keyset_apply_rotates_run_id_across_repeated_applies` read COUNT(*) source 150, delivered 100; owner decision (PR #616 comment 6219074059): an incremental plan is a reusable description"
+    scope: source
+    patch: incremental-plan-replay-answered/shared.patch
+    engines:
+      postgres:
+        cells:
+          - a_replayed_first_incremental_plan_delivers_what_arrived_since_postgres
+          - a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres
+          - a_replayed_incremental_plan_delivers_what_arrived_since_postgres
+          - incremental_keyset_apply_rotates_run_id_across_repeated_applies
+          - "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"
+      mysql:
+        cells:
+          - a_replayed_first_incremental_plan_delivers_what_arrived_since_mysql
+          - a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql
+          - a_replayed_incremental_plan_delivers_what_arrived_since_mysql
+          - "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"
+      mssql:
+        cells: [a_replayed_incremental_plan_delivers_what_arrived_since_mssql, "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+      oracle:
+        cells: [a_replayed_incremental_plan_delivers_what_arrived_since_oracle, "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+      mongo:
+        cells: ["lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+
+  - name: own-apply-cursor-read-as-drift
+    class: "`rivet apply` of an incremental plan made after a cursor was stored is refused RIVET_PLAN_ARTIFACT_STALE (exit 5, \"cursor has drifted\") on every apply after its first, because PA4 reads the cursor the plan's own earlier apply moved as drift"
+    history: "retry matrix F3, 2026-10-16: measured on main 04c4a712 (PostgreSQL, GCS): the second apply of one incremental plan exit 5 \"cursor has drifted\"; owner decision (PR #616 comment 6219074059): a cursor moved by an earlier apply of the same plan is not drift"
+    scope: source
+    patch: own-apply-cursor-read-as-drift/shared.patch
+    engines:
+      postgres:
+        cells: [a_replayed_incremental_plan_delivers_what_arrived_since_postgres, "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+      mysql:
+        cells: [a_replayed_incremental_plan_delivers_what_arrived_since_mysql, "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+      mssql:
+        cells: [a_replayed_incremental_plan_delivers_what_arrived_since_mssql, "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+      oracle:
+        cells: [a_replayed_incremental_plan_delivers_what_arrived_since_oracle, "lib:a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor"]
+      mongo:
+        na: "a MongoDB plan holds no cursor snapshot (keyset `resume` continues the stored key), so PA4 never runs for it"
+
+  - name: applied-plan-replayed
+    class: "`rivet apply` of a full, chunked or keyset plan whose apply already exited 0 runs it again: a scheduler retry extracts the whole table a second time"
+    history: "retry matrix F3, 2026-10-16: a scheduler retry after the task process died right after a successful apply replayed the same artifact; measured on main 04c4a712 (PostgreSQL, GCS): the retry rc 0 with a second run"
+    scope: source
+    patch: applied-plan-replayed/shared.patch
+    engines:
+      postgres:
+        cells: [a_replayed_applied_full_plan_answers_with_its_run_postgres, a_replayed_applied_keyset_plan_answers_with_its_run_postgres, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      mysql:
+        cells: [a_replayed_applied_full_plan_answers_with_its_run_mysql, a_replayed_applied_keyset_plan_answers_with_its_run_mysql, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      mssql:
+        cells: [a_replayed_applied_full_plan_answers_with_its_run_mssql, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      oracle:
+        cells: [a_replayed_applied_full_plan_answers_with_its_run_oracle, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      mongo:
+        cells: ["lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+
   - name: checkpointed-chunk-loses-its-class
     class: a coded failure met by one chunk of a checkpointed export (chunk_checkpoint true, one worker or several) ends the run as the incomplete run RIVET_RUN_UNITS_FAILED with exit 1 and a --resume hint instead of the chunk's own code and class, and the --resume meets it again and ends the same way
     history: the second half of worker-error-loses-its-class, found 2026-10-15 fixing it; both checkpoint runners recorded a failed chunk's cause as text in chunk_task and stopped on the not-completed count; a PostgreSQL `infinity` met by a checkpointed chunk exited [RIVET_RUN_UNITS_FAILED] 1 where the same export without chunk_checkpoint exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0
