@@ -745,6 +745,21 @@ def _self_test() -> int:
     assert measured_harm("postgresql://h", {"pg_tup_returned": 5}, {"pg_tup_returned": 9}, {}) == {
         "pg_tup_returned": 4}
     assert measured_harm("", None, None, {"mongo_docs_scanned": 3}) == {"mongo_docs_scanned": 3}
+    # A probe the harness reads itself that answered nothing is not a measurement, and never
+    # rivet's own report: the @50ms cells graded the self-report through the proxy container.
+    assert measured_harm("postgresql://h", None, {"pg_tup_returned": 9}, {"pg_tup_returned": 9}) is None
+    assert measured_harm("postgresql://h", {"pg_tup_returned": 5}, None, {"pg_tup_returned": 9}) is None
+    from .perf import _best, _grade, harness_read
+    unread = Sample(False, 1.0, 0.02, 50 * 1024 * 1024, {}, why="harm not measured: no counters from 127.0.0.1:15432/rivet")
+    assert _best([base, unread]) is unread, "a failed sample travels with its why"
+    not_measured = Ledger(colour=False)
+    _grade(not_measured, "postgres", "full@50ms", base, _best([base, unread]))
+    assert not_measured.red and unread.why in not_measured.cells[-1].detail, not_measured.cells[-1]
+    # The counters of a cell behind toxiproxy are read on the database, never on the proxy container.
+    from .failure import PG_TOXI_URL
+    assert harness_read("postgres", PG_TOXI_URL) == "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
+    plain = "postgresql://rivet:rivet@127.0.0.1:5432/rivet"
+    assert harness_read("postgres", plain) == plain and harness_read("mysql", PG_TOXI_URL) == ""
     # cdc-conns: the ceiling holds even when the previous release was worse, and one
     # connection more than the previous release is a regression under the ceiling too.
     from .perf import conns_verdict

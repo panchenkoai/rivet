@@ -38,6 +38,7 @@ __all__ = ["verify_failed_run_tail", "verify_transient_retry_exact"]
 
 PG_URL = os.environ.get("RIVET_CONC_SRC_URL", "postgresql://rivet:rivet@localhost:5432/rivet")
 PG_TOXI_URL = "postgresql://rivet:rivet@127.0.0.1:15432/rivet"
+PG_TOXI_UPSTREAM = "postgres:5432"
 MONGO_URL = os.environ.get("RIVET_FAILURE_MONGO_URL", "mongodb://127.0.0.1:27017")
 TOXI_API = "http://127.0.0.1:8474"
 TOXI_PROXY = "postgres"
@@ -480,7 +481,7 @@ def _reset_peer_case(led: Ledger, after_part: bool, tok: str) -> None:
                "RIVET_TEST_PAUSE_MARKER": str(marker)}
         with _toxi_lock():
             _toxi("POST", "/proxies", {"name": TOXI_PROXY, "listen": "0.0.0.0:15432",
-                                       "upstream": "postgres:5432", "enabled": True})
+                                       "upstream": PG_TOXI_UPSTREAM, "enabled": True})
             proc = subprocess.Popen([str(rivet_bin()), "run", "-c", str(cfg)], env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             injected, part_seen_at_inject = False, 0
