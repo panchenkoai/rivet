@@ -977,4 +977,44 @@ mod tests {
         let err = run_apply_command(&path, false, false, false, Some(2), false).unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CLI_OPTION_UNSUPPORTED", 1);
     }
+
+    /// The apply-side resolver: a sealed `{date}` becomes the apply's day with the template kept as the progress identity; a resolved path (a `--date` plan, an earlier release's artifact) is unchanged.
+    #[test]
+    fn a_sealed_date_resolves_to_the_apply_day_and_a_resolved_path_is_unchanged() {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        let ctx = crate::destination::placeholder::PlaceholderContext::for_today("orders");
+        let mut kept = unreachable_plan();
+        kept.destination.path = Some("/out/{date}".into());
+        kept.resolve_destination(&ctx);
+        assert_eq!(
+            kept.destination.path.as_deref(),
+            Some(format!("/out/{today}").as_str())
+        );
+        assert_eq!(
+            kept.destination_written.as_deref(),
+            Some("file:///out/{date}")
+        );
+        assert_eq!(
+            kept.progress_key().landing.destination,
+            "file:///out/{date}"
+        );
+
+        let mut frozen = unreachable_plan();
+        frozen.destination.path = Some("/out/2001-02-03".into());
+        frozen.destination_written = Some("file:///out/{date}".into());
+        frozen.resolve_destination(&ctx);
+        assert_eq!(frozen.destination.path.as_deref(), Some("/out/2001-02-03"));
+        assert_eq!(
+            frozen.destination_written.as_deref(),
+            Some("file:///out/{date}")
+        );
+
+        let mut legacy = unreachable_plan();
+        legacy.resolve_destination(&ctx);
+        assert_eq!(
+            legacy.destination.uri(),
+            unreachable_plan().destination.uri()
+        );
+        assert_eq!(legacy.destination_written, None);
+    }
 }

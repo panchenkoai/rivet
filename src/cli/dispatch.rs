@@ -1376,6 +1376,17 @@ mod error_code_tests {
         let err = super::parse_cli_target("nope").unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CONFIG_TARGET_UNKNOWN", 1);
     }
+
+    #[test]
+    fn a_date_flag_parses_one_iso_day_and_refuses_the_rest_by_code() {
+        assert_eq!(
+            super::parse_iso_date("--date", "2026-05-21").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 21).unwrap()
+        );
+        let err = super::parse_iso_date("--date", "21/05/2026").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_VALUE_INVALID", 1);
+        assert!(format!("{err:#}").contains("invalid --date '21/05/2026'"));
+    }
 }
 
 #[cfg(test)]
