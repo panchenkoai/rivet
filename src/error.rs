@@ -793,6 +793,11 @@ pub mod codes {
         "RIVET_STATE_SCHEMA_NEWER",
         "upgrade rivet, or point this binary at a state DB it created",
     );
+    /// The pre-migration copy of the state (the SQLite `.bak` beside the file, the PostgreSQL `rivet_state_backup_v<N>` schema) could not be written; the schema was not migrated.
+    pub const STATE_BACKUP_FAILED: Code = environment(
+        "RIVET_STATE_BACKUP_FAILED",
+        "free disk space or make the state writable for the copy (SQLite: the directory beside the state file; PostgreSQL: CREATE on the database) and run again; the state was not migrated, and the previous rivet release still opens it",
+    );
     /// A parallel incremental keyset run met an unfinished sequential run's anchor, whose cursor ran past its unmanifested pages.
     pub const STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED: Code = refusal(
         "RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED",
@@ -1614,6 +1619,7 @@ pub mod codes {
         STATE_NOT_WRITABLE,
         STATE_CURSOR_NOT_STORED,
         STATE_SCHEMA_NEWER,
+        STATE_BACKUP_FAILED,
         STATE_CURSOR_OWNER_MISMATCH,
         STATE_CURSOR_INCOMPARABLE,
         STATE_CURSOR_PAST_MANIFEST,
