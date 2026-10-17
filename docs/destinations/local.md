@@ -8,7 +8,7 @@ destination:
   path: ./output                    # directory for output files
 ```
 
-`path` can be absolute (`/data/exports`) or relative to the working directory.
+`path` can be absolute (`/data/exports`) or relative. A relative path is anchored to the directory of the config file, so `./output` beside `/etc/rivet/rivet.yaml` is `/etc/rivet/output` whatever directory rivet is started from (before 0.32 it was relative to the working directory, and only a run started outside the config's directory lands elsewhere now; while the old place alone still holds the export's files, the command is refused with `RIVET_DEST_RELATIVE_PATH_MOVED` naming both directories).
 
 Rivet creates the directory if it does not exist.
 

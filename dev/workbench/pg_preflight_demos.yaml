@@ -14,7 +14,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: content_items_full
     query: >
@@ -28,7 +28,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: page_views_incremental
     query: >
@@ -45,7 +45,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: page_views_full
     query: >
@@ -57,4 +57,4 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output
+      path: ./output

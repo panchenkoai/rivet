@@ -2686,6 +2686,42 @@ seeds:
         cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
       sqlite-state:
         cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]
+  - name: relative-destination-path-follows-the-cwd
+    class: "a relative local `destination.path` is resolved against the directory rivet is started from while the cursor and state live beside the config, so one config run from two directories delivers each run's rows under a different directory, every run green"
+    history: "2026-10-16 - P-27 (live_destination_parity): one config with `path: ./out` run from two working directories delivered ids 1..10 under the first and 11..13 under the second, exit 0 both times, on main through 0.31.0; fixed by anchoring every relative local path to the config file's directory once at config load (`Config::anchor_paths`)"
+    scope: source
+    patch: relative-destination-path-follows-the-cwd/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:a_loaded_config_anchors_its_relative_local_paths_once"
+          - a_relative_destination_path_follows_the_config
+      mysql:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      mssql:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      mongo:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      oracle:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+  - name: relative-destination-path-moved-by-the-upgrade
+    class: "the transition guard for a relative local `destination.path` does not fire, so the upgrade to the config-anchored path silently moves an export's output: old rows under the working directory, new rows beside the config, exit 0"
+    history: "2026-10-16 - the first #617 head: a run of 0.31.0 from directory A with `path: ./out` wrote under A, and this build from A delivered the next rows beside the config, exit 0 (`refusal contract: the invocation ended with success (exit 0), expected [RIVET_DEST_RELATIVE_PATH_MOVED] (exit 5)`); fixed by `destination::relative_path_moved`, the one decision `Config::anchor_paths` makes before any command reads or writes the directory"
+    scope: source
+    patch: relative-destination-path-moved-by-the-upgrade/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"
+          - a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow
+      mysql:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
+      mssql:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
+      mongo:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
+      oracle:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
   - name: foreign-lease-taken-before-expiry
     class: "a run lease whose holder names another host is judged by a local pid probe, so a run on a live host loses its lease to a run here before the lease expires"
     history: "2026-10-16 - harness: the dead-owner cells damaged `chunk-run:<export>` after the run lease became `chunk-run:<export>@<source hash>`, so on a PostgreSQL state they failed on `changed 0 row(s)` and on SQLite they were skipped; no cell could catch a takeover rule that ignored the host (fixed by deriving the key through `run_lease_key` and keeping a Postgres state in the cell)"

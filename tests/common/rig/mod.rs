@@ -83,6 +83,8 @@ pub struct Rig {
     /// tempdir, which is right for every test that does not read the state DB from
     /// inside a container.
     config_dir_override: Option<PathBuf>,
+    /// The working directory every invocation starts in; `None` inherits the test harness's own. See [`Rig::in_dir`].
+    cwd_override: Option<PathBuf>,
     ckpt_override: Option<PathBuf>,
     /// Cloud destination override when the exports write to a bucket/container
     /// instead of the tempdir. See [`Rig::dest_s3`] / [`Rig::dest_gcs`] /
@@ -174,6 +176,7 @@ impl Rig {
             extra_exports: Vec::new(),
             oracle_container_dir: None,
             config_dir_override: None,
+            cwd_override: None,
             ckpt_override: None,
             dest_stdout: false,
             census_key: None,
@@ -518,6 +521,12 @@ impl Rig {
     pub fn unwritable_dest_path(mut self, path: PathBuf) -> Self {
         self.dest_override = Some(path);
         self.dest_precreate = false;
+        self
+    }
+
+    /// Start every invocation of this rig (and of its twins) in `dir`, another working directory than the config's: what [`Rig::run_in_dir`] does for one run, for a whole refuse-then-remedy walk.
+    pub fn in_dir(mut self, dir: &Path) -> Self {
+        self.cwd_override = Some(dir.to_path_buf());
         self
     }
 

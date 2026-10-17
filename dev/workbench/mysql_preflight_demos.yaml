@@ -13,7 +13,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: mysql_content_items
     query: >
@@ -26,7 +26,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: mysql_page_views_full
     query: >
@@ -40,7 +40,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
 
   - name: mysql_page_views_incremental
     query: >
@@ -52,4 +52,4 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output
+      path: ./output
