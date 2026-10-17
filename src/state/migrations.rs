@@ -1107,22 +1107,24 @@ fn copy_state_before_migration(conn: &Connection, old: i64) -> Result<Option<std
         return Ok(None);
     };
     let copy = backup_path(db, old);
-    let write = || -> Result<()> {
-        let reader = Connection::open(db)?;
-        reader.execute_batch(&format!(
-            "VACUUM INTO '{}';",
-            copy.display().to_string().replace('\'', "''")
-        ))?;
-        let dst = Connection::open(&copy)?;
-        let ver: i64 = dst.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-            [],
-            |r| r.get(0),
-        )?;
-        anyhow::ensure!(
-            ver == old,
-            "the copy reads schema v{ver}, the state is v{old}"
-        );
+    let write = || -> std::result::Result<(), String> {
+        let open = |p: &std::path::Path| Connection::open(p).map_err(|e| e.to_string());
+        open(std::path::Path::new(db))?
+            .execute_batch(&format!(
+                "VACUUM INTO '{}';",
+                copy.display().to_string().replace('\'', "''")
+            ))
+            .map_err(|e| e.to_string())?;
+        let ver: i64 = open(&copy)?
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if ver != old {
+            return Err(format!("the copy reads schema v{ver}, the state is v{old}"));
+        }
         Ok(())
     };
     if let Err(e) = write() {
@@ -1131,7 +1133,7 @@ fn copy_state_before_migration(conn: &Connection, old: i64) -> Result<Option<std
             crate::error::codes::STATE_BACKUP_FAILED,
             format!(
                 "state: could not write a copy of the v{old} state at `{}` before migrating it to \
-                 v{SCHEMA_VERSION}: {e:#}. Nothing was migrated; the state is as the previous rivet \
+                 v{SCHEMA_VERSION}: {e}. Nothing was migrated; the state is as the previous rivet \
                  left it. Free the space or make the directory writable and run again, or keep \
                  running the previous release.",
                 copy.display()
