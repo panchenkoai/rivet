@@ -41,8 +41,12 @@ pub struct RunAggregate {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunAggregateEntry {
     pub export_name: String,
+    /// `success` | `failed` | `skipped`, or `already_applied` for a replay of a sealed plan answered by an earlier run.
     pub status: String,
     pub run_id: String,
+    /// The run that already applied the replayed plan: set with `status: already_applied`, `null` otherwise.
+    #[serde(default)]
+    pub answered_by_run: Option<String>,
     pub rows: i64,
     pub files: i64,
     pub bytes: u64,
@@ -159,6 +163,7 @@ mod tests {
                     export_name: "orders".into(),
                     status: "success".into(),
                     run_id: "orders_20260427T100000".into(),
+                    answered_by_run: None,
                     rows: 1_000_000,
                     files: 10,
                     bytes: 600 * 1024 * 1024,
@@ -172,6 +177,7 @@ mod tests {
                     export_name: "users".into(),
                     status: "failed".into(),
                     run_id: "users_20260427T100000".into(),
+                    answered_by_run: None,
                     rows: 500_000,
                     files: 2,
                     bytes: 150 * 1024 * 1024,

@@ -2,6 +2,7 @@
   "export_name": "orders_cdc",
   "status": "failed",
   "run_id": "20261006T101500.123-orders_cdc",
+  "answered_by_run": null,
   "rows": 0,
   "files": 0,
   "bytes": 0,

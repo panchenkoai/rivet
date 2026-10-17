@@ -2,6 +2,7 @@
   "export_name": "orders_cdc",
   "status": "success",
   "run_id": "20261006T101500.123-orders_cdc",
+  "answered_by_run": null,
   "rows": 6000,
   "files": 2,
   "bytes": 241066,

@@ -10,17 +10,18 @@
 //!    artifact are replayed without re-running `SELECT min/max` queries.
 //! 6. Persist outcomes (manifest, cursor, metrics) via `StateStore` as usual, and the plan id on the run that applied it.
 
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 use std::path::Path;
 
 use crate::error::Result;
 use crate::plan::{PlanArtifact, StalenessCheck};
-use crate::state::StateStore;
+use crate::state::{ExportMetric, RunAggregate, RunAggregateEntry, StateStore};
 
 use super::chunked::ChunkSource;
 use super::summary::ApplyContext;
 
-/// Entry point for `rivet apply <plan-file> [--parallel-export-processes] [--resume] [--force]`.
+/// Entry point for `rivet apply <plan-file> [--parallel-export-processes] [--resume] [--force] [--summary-output PATH] [--json]`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_apply_command(
     plan_file: &str,
     force: bool,
@@ -28,6 +29,8 @@ pub fn run_apply_command(
     resume: bool,
     pool: Option<usize>,
     split: bool,
+    summary_output: Option<&Path>,
+    json_output: bool,
 ) -> Result<()> {
     // A YAML config selects the wave-ordered multi-export path (plan→apply
     // cycle): run every export wave-by-wave in ascending `wave:` order — or,
@@ -35,7 +38,15 @@ pub fn run_apply_command(
     // artifact falls through to the sealed single-export replay below.
     if plan_file.ends_with(".yaml") || plan_file.ends_with(".yml") {
         if let Some(m) = pool {
-            return super::run::run_pool(plan_file, force, resume, m, split);
+            return super::run::run_pool(
+                plan_file,
+                force,
+                resume,
+                m,
+                split,
+                summary_output,
+                json_output,
+            );
         }
         if split {
             log::warn!(
@@ -43,7 +54,14 @@ pub fn run_apply_command(
                  floor); ignored without --pool."
             );
         }
-        return super::run::run_waves(plan_file, force, parallel, resume);
+        return super::run::run_waves(
+            plan_file,
+            force,
+            parallel,
+            resume,
+            summary_output,
+            json_output,
+        );
     }
     if pool.is_some() {
         crate::rivet_bail!(
@@ -60,6 +78,7 @@ pub fn run_apply_command(
     }
 
     // 1. Load artifact
+    let started_at = Utc::now();
     let artifact = PlanArtifact::from_file(plan_file)?;
 
     // 1a. Tamper-evidence (ADR-0005 PA10, finding #16): reject a plan whose
@@ -135,7 +154,17 @@ pub fn run_apply_command(
             state.run_that_applied_plan(&artifact.export_name, &artifact.plan_id)?
     {
         if !force {
-            eprintln!("{}", already_applied_report(&state, &artifact, &run_id));
+            let metric = state.get_metric_by_run_id(&run_id).ok().flatten();
+            eprintln!(
+                "{}",
+                already_applied_report(&artifact, &run_id, metric.as_ref())
+            );
+            let entry = already_applied_entry(&artifact, &run_id, metric.as_ref());
+            super::run::emit_machine_document(
+                &apply_document(entry, started_at, &artifact),
+                summary_output,
+                json_output,
+            );
             return Ok(());
         }
         force_bypassed.push("already_applied".into());
@@ -309,13 +338,57 @@ pub fn run_apply_command(
     // producer every other runner asks, never spelled here: this replay runs one
     // export in this process, overlapping nothing, so the self-check must keep
     // its ACTIONABLE tail rather than excusing a regression as source sharing.
-    let entries = vec![super::aggregate::entry_from_summary(&summary)];
+    let entry = super::aggregate::entry_from_summary(&summary);
     super::run::self_check_throughput(
         &state,
-        &entries,
+        std::slice::from_ref(&entry),
         &super::run::RunModes::uniform(super::run::run_mode_label(1, false)),
     );
+    super::run::emit_machine_document(
+        &apply_document(entry, started_at, &artifact),
+        summary_output,
+        json_output,
+    );
     result
+}
+
+/// The one-export document `rivet apply` writes on `--summary-output` / `--json`: the run it ran, or the run that already applied the plan.
+fn apply_document(
+    entry: RunAggregateEntry,
+    started_at: DateTime<Utc>,
+    artifact: &PlanArtifact,
+) -> RunAggregate {
+    super::aggregate::build(
+        vec![entry],
+        started_at,
+        Utc::now(),
+        artifact.config_path.as_deref(),
+        super::run::run_mode_label(1, false),
+    )
+}
+
+/// The document entry of a replay answered by `run_id`: that run's counts from its metrics row, marked `already_applied`.
+fn already_applied_entry(
+    artifact: &PlanArtifact,
+    run_id: &str,
+    metric: Option<&ExportMetric>,
+) -> RunAggregateEntry {
+    RunAggregateEntry {
+        export_name: artifact.export_name.clone(),
+        status: "already_applied".into(),
+        run_id: run_id.into(),
+        answered_by_run: Some(run_id.into()),
+        rows: metric.map_or(0, |m| m.total_rows),
+        files: metric.map_or(0, |m| m.files_produced),
+        bytes: metric.map_or(0, |m| m.bytes_written.max(0) as u64),
+        bytes_read: metric.map_or(0, |m| m.bytes_read.max(0) as u64),
+        duration_ms: metric.map_or(0, |m| m.duration_ms),
+        mode: metric.and_then(|m| m.mode.clone()).unwrap_or_default(),
+        error_message: metric
+            .is_none()
+            .then(|| format!("metrics row of run {run_id} is not readable")),
+        snapshot_rows: 0,
+    }
 }
 
 /// Record that `run_id` applied this plan, so a replay answers with it; returns the warning of a miss (the replay then extracts again).
@@ -337,13 +410,17 @@ fn record_applied_plan(
 }
 
 /// The line `rivet apply` prints for a plan that run `run_id` already applied, with that run's outcome.
-fn already_applied_report(state: &StateStore, artifact: &PlanArtifact, run_id: &str) -> String {
-    let outcome = match state.get_metric_by_run_id(run_id) {
-        Ok(Some(m)) => format!(
+fn already_applied_report(
+    artifact: &PlanArtifact,
+    run_id: &str,
+    metric: Option<&ExportMetric>,
+) -> String {
+    let outcome = match metric {
+        Some(m) => format!(
             "{}, {} rows, {} files, {} bytes, finished {}",
             m.status, m.total_rows, m.files_produced, m.bytes_written, m.run_at
         ),
-        _ => "its metrics row is not readable".into(),
+        None => "its metrics row is not readable".into(),
     };
     format!(
         "apply: plan {} of export '{}' was already applied by run {run_id} ({outcome}); nothing \
@@ -602,7 +679,8 @@ mod tests {
             artifact.created_at = Utc::now() - Duration::hours(hours);
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_artifact(&dir, &artifact);
-            let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+            let err = run_apply_command(&path, false, false, false, None, false, None, false)
+                .unwrap_err();
             crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
             let want = format!(
                 "plan 'orders' is {phrase} (limit: 24 h). Regenerate with `rivet plan` or pass --force to override."
@@ -622,7 +700,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &artifact);
 
-        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+        let err =
+            run_apply_command(&path, false, false, false, None, false, None, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("drifted") || msg.contains("cursor"),
@@ -689,7 +768,8 @@ mod tests {
         })
     }
 
-    /// Replayed after its own apply exited 0, a point-in-time plan answers with that run on every cycle and touches nothing.
+    /// Replayed after its own apply exited 0, a point-in-time plan answers with that run on every cycle and touches nothing;
+    /// `--summary-output` holds that run's entry, marked `already_applied` and naming the run that answered.
     #[test]
     fn a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing() {
         for strategy in [ExtractionStrategy::Snapshot, keyset(false)] {
@@ -699,12 +779,129 @@ mod tests {
             applied_state(&dir, &artifact, "success", true);
             let before = state_rows(&dir);
             for cycle in 1..=2 {
-                run_apply_command(&path, false, false, false, None, false).unwrap_or_else(|e| {
+                let summary = dir.path().join(format!("replay-{cycle}.json"));
+                run_apply_command(
+                    &path,
+                    false,
+                    false,
+                    false,
+                    None,
+                    false,
+                    Some(&summary),
+                    false,
+                )
+                .unwrap_or_else(|e| {
                     panic!("{strategy:?}, replay {cycle}: already applied, got {e:#}")
                 });
                 assert_eq!(state_rows(&dir), before, "replay {cycle} wrote no run");
+                let doc: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&summary)
+                        .unwrap_or_else(|e| panic!("{strategy:?}, replay {cycle}: {e}")),
+                )
+                .unwrap();
+                assert_eq!(
+                    doc["total_exports"], 1,
+                    "{strategy:?}, replay {cycle}: {doc}"
+                );
+                let entry = &doc["per_export"][0];
+                assert_eq!(entry["status"], "already_applied", "{strategy:?}: {entry}");
+                assert_eq!(entry["answered_by_run"], "r1", "{strategy:?}: {entry}");
+                assert_eq!(entry["run_id"], "r1", "{strategy:?}: {entry}");
+                assert_eq!(entry["export_name"], "orders", "{strategy:?}: {entry}");
+                assert_eq!(
+                    (
+                        entry["rows"].as_i64(),
+                        entry["files"].as_i64(),
+                        entry["bytes"].as_u64()
+                    ),
+                    (Some(1000), Some(2), Some(4096)),
+                    "{strategy:?}: the answering run's counts: {entry}"
+                );
             }
         }
+    }
+
+    /// One builder writes the apply document for both answers: a run it ran keeps its status and `answered_by_run: null`;
+    /// a replay carries the answering run's counts under `already_applied` and names it.
+    #[test]
+    fn the_apply_document_marks_a_replay_and_leaves_a_run_unmarked() {
+        let artifact = fresh_artifact();
+        let metric = ExportMetric {
+            export_name: "orders".into(),
+            run_id: Some("r1".into()),
+            run_at: "2026-01-01T00:01:00Z".into(),
+            duration_ms: 60_000,
+            total_rows: 1000,
+            status: "success".into(),
+            mode: Some("full".into()),
+            files_produced: 2,
+            bytes_written: 4096,
+            bytes_read: 8192,
+            peak_rss_mb: None,
+            error_message: None,
+            tuning_profile: None,
+            format: None,
+            retries: 0,
+            validated: None,
+            schema_changed: None,
+            source_type: None,
+        };
+        let started = Utc::now();
+        let replay = apply_document(
+            already_applied_entry(&artifact, "r1", Some(&metric)),
+            started,
+            &artifact,
+        );
+        assert_eq!(
+            (
+                replay.total_exports,
+                replay.success_count,
+                replay.failed_count,
+                replay.skipped_count
+            ),
+            (1, 0, 0, 1)
+        );
+        let e = &replay.per_export[0];
+        assert_eq!(e.status, "already_applied");
+        assert_eq!(e.answered_by_run.as_deref(), Some("r1"));
+        assert_eq!(e.run_id, "r1");
+        assert_eq!(
+            (e.rows, e.files, e.bytes, e.bytes_read),
+            (1000, 2, 4096, 8192)
+        );
+        assert_eq!(
+            (e.mode.as_str(), e.duration_ms, &e.error_message),
+            ("full", 60_000, &None)
+        );
+        assert_eq!(
+            (replay.total_rows, replay.total_files, replay.total_bytes),
+            (1000, 2, 4096)
+        );
+        assert_eq!(replay.config_path, artifact.config_path);
+        assert_eq!(replay.parallel_mode, "sequential");
+        let json = serde_json::to_value(&replay).unwrap();
+        assert_eq!(json["per_export"][0]["answered_by_run"], "r1");
+
+        let unreadable = already_applied_entry(&artifact, "r9", None);
+        assert_eq!(unreadable.status, "already_applied");
+        assert_eq!(unreadable.answered_by_run.as_deref(), Some("r9"));
+        assert_eq!(
+            (unreadable.rows, unreadable.files, unreadable.bytes),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            unreadable.error_message.as_deref(),
+            Some("metrics row of run r9 is not readable")
+        );
+
+        let mut ran = already_applied_entry(&artifact, "r2", Some(&metric));
+        ran.status = "success".into();
+        ran.answered_by_run = None;
+        let run = apply_document(ran, started, &artifact);
+        assert_eq!((run.success_count, run.skipped_count), (1, 0));
+        let json = serde_json::to_value(&run).unwrap();
+        assert!(json["per_export"][0]["answered_by_run"].is_null(), "{json}");
+        assert_eq!(json["per_export"][0]["status"], "success");
     }
 
     /// Replayed after its own apply exited 0, a reusable plan runs again on every cycle from the stored cursor, even when that apply moved the cursor its snapshot pinned and the plan is days old.
@@ -723,7 +920,8 @@ mod tests {
             let path = write_artifact(&dir, &artifact);
             applied_state(&dir, &artifact, "success", true);
             for cycle in 1..=2 {
-                let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+                let err = run_apply_command(&path, false, false, false, None, false, None, false)
+                    .unwrap_err();
                 assert!(
                     format!("{err:#}").contains("max_file_size cannot be used with stdout"),
                     "{strategy:?}, snapshot {snapshot:?}, replay {cycle}: the replay must run the \
@@ -753,7 +951,8 @@ mod tests {
                     .unwrap();
                 state.update_legacy("orders", "1020").unwrap();
             }
-            let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+            let err = run_apply_command(&path, false, false, false, None, false, None, false)
+                .unwrap_err();
             crate::error::assert_coded(&err, "RIVET_PLAN_ARTIFACT_STALE", 5);
             assert!(
                 format!("{err:#}").contains("cursor has drifted"),
@@ -806,13 +1005,15 @@ mod tests {
             let dir = tempfile::TempDir::new().unwrap();
             let path = write_artifact(&dir, &artifact);
             applied_state(&dir, &artifact, status, exit0);
-            let err = run_apply_command(&path, force, false, false, None, false).unwrap_err();
+            let err = run_apply_command(&path, force, false, false, None, false, None, false)
+                .unwrap_err();
             ran(err, &format!("{status}, exit0 {exit0}, force {force}"));
         }
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &artifact);
         applied_state(&dir, &validation_refused_artifact(), "success", true);
-        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+        let err =
+            run_apply_command(&path, false, false, false, None, false, None, false).unwrap_err();
         ran(err, "another plan's run");
     }
 
@@ -823,7 +1024,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         applied_state(&dir, &artifact, "success", true);
         let state = StateStore::open(dir.path().join(".rivet_state.db").to_str().unwrap()).unwrap();
-        let line = already_applied_report(&state, &artifact, "r1");
+        let metric = state.get_metric_by_run_id("r1").unwrap();
+        let line = already_applied_report(&artifact, "r1", metric.as_ref());
         let (head, tail) = line.split_once(", finished ").expect(&line);
         assert_eq!(
             head,
@@ -840,7 +1042,7 @@ mod tests {
             "{line}"
         );
         assert!(
-            already_applied_report(&state, &artifact, "r9")
+            already_applied_report(&artifact, "r9", None)
                 .contains("(its metrics row is not readable)")
         );
     }
@@ -884,6 +1086,8 @@ mod tests {
             false,
             None,
             false,
+            None,
+            false,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -898,8 +1102,17 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("plan.json");
         std::fs::write(&path, b"not valid json at all").unwrap();
-        let err = run_apply_command(path.to_str().unwrap(), false, false, false, None, false)
-            .unwrap_err();
+        let err = run_apply_command(
+            path.to_str().unwrap(),
+            false,
+            false,
+            false,
+            None,
+            false,
+            None,
+            false,
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("invalid plan") || msg.contains("JSON") || msg.contains("expected"),
@@ -930,7 +1143,8 @@ mod tests {
         let tampered = json.replace("SELECT 1", "SELECT * FROM secrets");
         std::fs::write(&path, &tampered).unwrap();
 
-        let err = run_apply_command(&path, false, false, false, None, false).unwrap_err();
+        let err =
+            run_apply_command(&path, false, false, false, None, false, None, false).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("integrity check failed") && msg.contains("modified after planning"),
@@ -938,7 +1152,8 @@ mod tests {
         );
 
         // And --force must NOT override it — a hand-edited contract is not opt-in.
-        let err_forced = run_apply_command(&path, true, false, false, None, false).unwrap_err();
+        let err_forced =
+            run_apply_command(&path, true, false, false, None, false, None, false).unwrap_err();
         let msg_forced = format!("{err_forced:#}");
         assert!(
             msg_forced.contains("integrity check failed"),
@@ -967,7 +1182,8 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_artifact(&dir, &fresh_artifact());
-        let err = run_apply_command(&path, false, false, false, Some(2), false).unwrap_err();
+        let err =
+            run_apply_command(&path, false, false, false, Some(2), false, None, false).unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CLI_OPTION_UNSUPPORTED", 1);
     }
 }
