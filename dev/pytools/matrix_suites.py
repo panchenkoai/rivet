@@ -121,6 +121,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -456,27 +457,42 @@ class CliMatrix:
         it with the stdlib removes the dependency and lets the failure be loud.
         `plan_fingerprint` covers the chunk plan's fields, not the file's bytes,
         so re-serializing is safe for `apply`.
+
+        Each derived plan gets its own `plan_id`: it models a plan that was never
+        applied. With the applied plan's id, `_stale.json` would be answered
+        "already applied" (ADR-0005 PA11) and `_drifted.json` would read its cursor
+        move as the plan's own progress (PA4), and neither cell would reach the gate
+        it exists for. The stale plan is derived from `pg_plan_full`: only a
+        point-in-time plan ages; an incremental plan is reusable at any age.
         """
         # `echo "not json {" > "$LM/_corrupt.json"` — independent of the plan,
         # and the point of the cell is that it is NOT valid JSON.
         atomic_write(self.logs / "_corrupt.json", "not json {\n")
 
-        src = self.logs / "pg_plan_incr" / "plan.json"
-        try:
-            doc = json.loads(src.read_text())
-        except (OSError, ValueError) as e:
-            bad(f"cannot derive stale/drifted apply inputs from {src}: {e}")
-            return False
-        if not isinstance(doc, dict):
-            bad(f"cannot derive stale/drifted apply inputs from {src}: not a JSON object")
+        def load(name: str) -> dict | None:
+            src = self.logs / name / "plan.json"
+            try:
+                doc = json.loads(src.read_text())
+            except (OSError, ValueError) as e:
+                bad(f"cannot derive stale/drifted apply inputs from {src}: {e}")
+                return None
+            if not isinstance(doc, dict):
+                bad(f"cannot derive stale/drifted apply inputs from {src}: not a JSON object")
+                return None
+            return doc
+
+        full, incr = load("pg_plan_full"), load("pg_plan_incr")
+        if full is None or incr is None:
             return False
 
-        stale = dict(doc)
+        stale = dict(full)
+        stale["plan_id"] = secrets.token_hex(16)
         stale["created_at"] = "2020-01-01T00:00:00Z"
         stale["expires_at"] = "2020-01-02T00:00:00Z"
         atomic_write(self.logs / "_stale.json", json.dumps(stale, indent=2, ensure_ascii=False) + "\n")
 
-        drifted = dict(doc)
+        drifted = dict(incr)
+        drifted["plan_id"] = secrets.token_hex(16)
         # `.computed.cursor_snapshot = "99999"` — jq creates the container when
         # it is absent or null, so mirror that rather than raising on it.
         computed = drifted.get("computed")
@@ -723,7 +739,7 @@ def cli(*, root: str | None = None, rivet_bin: str | None = None) -> int:
     m.cell("pg_apply_missing", "apply missing file", [R, "apply", "/tmp/no_such_plan_xyz.json"])
     m.cell("pg_apply_no_arg", "apply (no arg)", [R, "apply"])
 
-    # Build derived stale + drifted from pg_plan_incr
+    # Build derived stale (from pg_plan_full) + drifted (from pg_plan_incr), each under its own plan_id
     derived = m.derive_apply_inputs()
     if derived:
         m.cell("pg_apply_stale_no_force", "apply stale (no --force)", [R, "apply", lm / "_stale.json"])

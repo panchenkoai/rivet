@@ -1736,6 +1736,126 @@ mod tests {
         range("pg/a").expect_err("one range per index and source");
     }
 
+    /// v37 adds `run_status.plan_id` on a populated v36 state and on a fresh one: a run written before it reads NULL, a run that applied a plan is found by the plan.
+    #[test]
+    fn v37_adds_the_applied_plan_to_run_status_on_a_v36_state_and_on_a_fresh_one() {
+        for from_v36 in [true, false] {
+            let conn = Connection::open_in_memory().unwrap();
+            ensure_schema_version_table(&conn);
+            if from_v36 {
+                for &(ver, sql) in MIGRATIONS {
+                    if ver <= 36 {
+                        conn.execute_batch(&format!(
+                            "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                        ))
+                        .unwrap();
+                    }
+                }
+                conn.execute_batch(
+                    "INSERT INTO run_status (run_id, export_name, prefix, status, started_at) \
+                     VALUES ('r0', 'orders', 'file:///out', 'success', '2026-01-01T00:00:00Z');",
+                )
+                .unwrap();
+            }
+            migrate(&conn).unwrap();
+            assert_eq!(
+                get_current_version(&conn),
+                SCHEMA_VERSION,
+                "from v36 {from_v36}"
+            );
+            conn.execute_batch(
+                "INSERT INTO run_status (run_id, export_name, prefix, status, started_at, plan_id) \
+                 VALUES ('r1', 'orders', 'file:///out', 'success', '2026-01-02T00:00:00Z', 'p1');",
+            )
+            .unwrap();
+            let mut q = conn
+                .prepare("SELECT run_id || ':' || COALESCE(plan_id, 'none') FROM run_status ORDER BY run_id")
+                .unwrap();
+            let rows: Vec<String> = q
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let want: Vec<String> = if from_v36 {
+                vec!["r0:none".into(), "r1:p1".into()]
+            } else {
+                vec!["r1:p1".into()]
+            };
+            assert_eq!(rows, want, "from v36 {from_v36}");
+        }
+    }
+
+    /// The Postgres ladder's v37: `run_status.plan_id` lands on a populated v36 schema and on a fresh one. Skips without RIVET_TEST_STATE_URL.
+    #[test]
+    fn pg_v37_adds_the_applied_plan_to_run_status_on_a_v36_state_and_on_a_fresh_one() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let mut client = connect_pg(&url).expect("connect pg state");
+        for (schema, from_v36) in [
+            ("rivet_v37_from_v36_test", true),
+            ("rivet_v37_fresh_test", false),
+        ] {
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+                     SET search_path TO {schema}; \
+                     CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);"
+                ))
+                .unwrap();
+            if from_v36 {
+                for &(ver, sql) in PG_MIGRATIONS {
+                    if ver <= 36 {
+                        client
+                            .batch_execute(&format!(
+                                "BEGIN; {sql} INSERT INTO rivet_schema_version (version) VALUES ({ver}); COMMIT;"
+                            ))
+                            .unwrap();
+                    }
+                }
+                client
+                    .batch_execute(
+                        "INSERT INTO run_status (run_id, export_name, prefix, status, started_at) \
+                         VALUES ('r0', 'orders', 'file:///out', 'success', '2026-01-01T00:00:00Z');",
+                    )
+                    .unwrap();
+            }
+            migrate_pg(&mut client).unwrap_or_else(|e| panic!("{schema}: {e:#}"));
+            let version: i64 = client
+                .query_one("SELECT MAX(version) FROM rivet_schema_version", &[])
+                .unwrap()
+                .get(0);
+            assert_eq!(version, SCHEMA_VERSION, "{schema}");
+            client
+                .batch_execute(
+                    "INSERT INTO run_status (run_id, export_name, prefix, status, started_at, plan_id) \
+                     VALUES ('r1', 'orders', 'file:///out', 'success', '2026-01-02T00:00:00Z', 'p1');",
+                )
+                .unwrap();
+            let rows: Vec<String> = client
+                .query(
+                    "SELECT run_id || ':' || COALESCE(plan_id, 'none') FROM run_status ORDER BY run_id",
+                    &[],
+                )
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<_, String>(0))
+                .collect();
+            let want: Vec<String> = if from_v36 {
+                vec!["r0:none".into(), "r1:p1".into()]
+            } else {
+                vec!["r1:p1".into()]
+            };
+            assert_eq!(rows, want, "{schema}");
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"))
+                .unwrap();
+        }
+    }
+
     /// v29 rebuilds `cdc_snapshot` with the prefix in its key: a row written
     /// before it keeps prefix '' (done for every prefix), and two prefixes for one
     /// `(export, table)` are two rows. `keyset_range` gains `key_column`.
