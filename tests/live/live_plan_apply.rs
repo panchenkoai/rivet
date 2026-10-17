@@ -999,7 +999,9 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
         "each apply must rotate the run_id → two distinct manifest-<run_id>.json copies; 1 means the apply wrapper left the resume anchor frozen (the run_id-collision silent-delta-skip class)"
     );
     // Option B (PR #616): an incremental plan is reusable, so the second apply of the
-    // same artifact delivers the 50 keys that arrived; 100 means it answered "already applied".
+    // same artifact delivers the 50 keys that arrived. Under the seed
+    // `incremental-plan-replay-answered` the rig oracle fires first (COUNT(*) source 150,
+    // delivered 100) and the copy count second; this sum is reached only with both off.
     assert_eq!(
         dir_manifest_copy_total_rows(&rig.out_dir()),
         150,
