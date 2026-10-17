@@ -207,6 +207,26 @@ impl Drop for CardUi {
     }
 }
 
+/// Write `--summary-output` and print `--json` from `agg`, for a tail whose aggregate path did not write the file.
+pub(super) fn emit_machine_document(
+    agg: &crate::state::RunAggregate,
+    summary_output: Option<&Path>,
+    json_output: bool,
+) {
+    if let Some(out) = summary_output
+        && let Err(e) = aggregate::write_json(out, agg)
+    {
+        log::warn!(
+            "aggregate: failed to write summary JSON to {}: {:#}",
+            out.display(),
+            e
+        );
+    }
+    if json_output {
+        print_json_summary(agg);
+    }
+}
+
 fn print_json_summary(agg: &crate::state::RunAggregate) {
     match serde_json::to_string_pretty(agg) {
         Ok(json) => println!("{json}"),
@@ -432,6 +452,11 @@ struct TailPlan {
     /// Write `--summary-output` from the tail itself (the aggregate path writes
     /// it through [`aggregate::persist`], so exactly one of the two does).
     machine_output: bool,
+}
+
+/// Does EITHER machine channel ask for the document? `--summary-output` alone is the common scheduler shape, so `||`, never `&&`.
+fn machine_document_requested(summary_output: Option<&Path>, json_output: bool) -> bool {
+    summary_output.is_some() || json_output
 }
 
 /// The tail's routing rule, pure because the value-level oracle needs a live
@@ -763,15 +788,15 @@ pub fn run(
         Some(config_path),
         parallel_mode,
     );
-    // EITHER machine channel asks for the document — `--summary-output` alone is
-    // the common scheduler shape, so this is `||`, never `&&`. Live-only by
-    // construction (a real `run()` needs a source, a destination and a state
-    // DB); the oracle that goes RED on `&&` is
+    // EITHER machine channel asks for the document (`machine_document_requested`,
+    // the one predicate both this tail and the waves/pool tail ask). Live, the
+    // oracle that goes RED on a tail that drops the file is
     // `run_summary_output_writes_json_to_file` (tests/live/live_cli_flags.rs) —
     // one export, `--summary-output`, no `--json`, asserting the file exists.
-    // `run_json_flag_prints_aggregate_summary_to_stdout` does NOT grade this
-    // operator: `--json` prints from `json_output` directly a few lines below.
-    let plan = tail_plan(&agg, summary_output.is_some() || json_output);
+    let plan = tail_plan(
+        &agg,
+        machine_document_requested(summary_output, json_output),
+    );
     if plan.aggregate {
         aggregate::print(&agg);
     }
@@ -830,6 +855,8 @@ pub(crate) fn run_waves(
     force: bool,
     parallel_cli: bool,
     resume: bool,
+    summary_output: Option<&Path>,
+    json_output: bool,
 ) -> Result<()> {
     let config = Config::load_with_params(config_path, None)?;
     let config_dir = Path::new(config_path)
@@ -1070,6 +1097,8 @@ pub(crate) fn run_waves(
         Some((&combined_stderr, &config_dir)),
         failures,
         " across waves",
+        summary_output,
+        json_output,
     )
 }
 
@@ -1125,6 +1154,8 @@ fn finish_run_tail(
     stderr_artifact: Option<(&str, &Path)>,
     failures: Vec<anyhow::Error>,
     failure_context: &str,
+    summary_output: Option<&Path>,
+    json_output: bool,
 ) -> crate::error::Result<()> {
     let agg = aggregate::build(
         entries,
@@ -1133,13 +1164,26 @@ fn finish_run_tail(
         Some(config_path),
         mode_label,
     );
-    if reports_run_aggregate(&agg) {
+    let plan = tail_plan(
+        &agg,
+        machine_document_requested(summary_output, json_output),
+    );
+    if plan.aggregate {
         aggregate::print(&agg);
     }
     self_check_throughput(state, &agg.per_export, modes);
-    if reports_run_aggregate(&agg) {
-        aggregate::persist(state, &agg, None);
+    if plan.aggregate {
+        aggregate::persist(state, &agg, summary_output);
     }
+    emit_machine_document(
+        &agg,
+        if plan.machine_output {
+            summary_output
+        } else {
+            None
+        },
+        json_output,
+    );
     if let Some((dump, dir)) = stderr_artifact {
         emit_child_stderr(dump, dir);
     }
@@ -1688,6 +1732,8 @@ pub(crate) fn run_pool(
     resume: bool,
     m: usize,
     split: bool,
+    summary_output: Option<&Path>,
+    json_output: bool,
 ) -> Result<()> {
     let m = m.max(1);
     let config = Config::load_with_params(config_path, None)?;
@@ -2132,6 +2178,8 @@ pub(crate) fn run_pool(
         None,
         failures,
         " in the pool",
+        summary_output,
+        json_output,
     )
 }
 
@@ -3368,6 +3416,7 @@ pub(crate) mod run_tail_tests {
                 export_name: format!("export_{i}"),
                 status: "success".to_string(),
                 run_id: "this-run".to_string(),
+                answered_by_run: None,
                 rows: 10,
                 files: 1,
                 bytes: 0,
@@ -3412,6 +3461,16 @@ pub(crate) mod run_tail_tests {
     /// `aggregate::a_zero_export_run_still_builds_a_valid_document`.
     ///
     /// RED against restoring `n_exports == 1`: the zero case reads `false`.
+    #[test]
+    fn either_machine_channel_asks_for_the_document() {
+        use super::machine_document_requested;
+        let out = std::path::Path::new("summary.json");
+        assert!(machine_document_requested(Some(out), false));
+        assert!(machine_document_requested(None, true));
+        assert!(machine_document_requested(Some(out), true));
+        assert!(!machine_document_requested(None, false));
+    }
+
     #[test]
     fn tail_plan_emits_a_machine_document_for_a_zero_export_run() {
         // Zero exports (partition_by over an empty table) — the regression.
@@ -3566,6 +3625,7 @@ pub(crate) mod run_tail_tests {
             export_name: export.to_string(),
             status: "success".to_string(),
             run_id: "this-run".to_string(),
+            answered_by_run: None,
             rows: 20_000,
             files: 1,
             bytes: 0,
@@ -3662,6 +3722,7 @@ pub(crate) mod run_tail_tests {
                 export_name: name.to_string(),
                 status: "success".to_string(),
                 run_id: "this-run".to_string(),
+                answered_by_run: None,
                 rows: 20_000,
                 files: 1,
                 bytes: 0,
@@ -3750,6 +3811,7 @@ pub(crate) mod run_tail_tests {
                 export_name: name.to_string(),
                 status: "success".to_string(),
                 run_id: "this-run".to_string(),
+                answered_by_run: None,
                 rows: 20_000,
                 files: 1,
                 bytes: 0,
@@ -3923,15 +3985,22 @@ pub(crate) mod run_tail_tests {
             .map(|l| l.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
+        // The gate is asked directly or through `tail_plan`, which wraps it for
+        // the two tails that also honour the machine channels (`run`'s and the
+        // waves/pool seam); either way the FIRST argument is the built aggregate.
         let mut sites = 0;
-        for (at, _) in code.match_indices(concat!("reports_run", "_aggregate(")) {
+        let gates = [
+            concat!("reports_run", "_aggregate("),
+            concat!("tail", "_plan("),
+        ];
+        for (at, _) in gates.iter().flat_map(|g| code.match_indices(g)) {
             if code[..at].trim_end().ends_with("fn") {
                 continue; // the definition, not a call
             }
             let arg = code[at..]
                 .split_once('(')
                 .and_then(|(_, rest)| rest.split_once(')'))
-                .map(|(a, _)| a.trim().to_string())
+                .map(|(a, _)| a.split(',').next().unwrap_or("").trim().to_string())
                 .expect("a call has arguments");
             assert!(
                 arg == "&agg" || arg == "agg",
@@ -3943,15 +4012,16 @@ pub(crate) mod run_tail_tests {
             sites += 1;
         }
         // Down from 5: the waves/pool tails now route through ONE
-        // `finish_run_tail` (arch-roast 2026-08-21), so the gate's call sites
-        // are that seam's two (print + persist) plus `tail_plan`'s one. Fewer
-        // sites is the point — the invariant this test protects (ask about the
-        // BUILT aggregate, never a re-derived count) now holds by construction
-        // for every tail the seam serves.
+        // `finish_run_tail` (arch-roast 2026-08-21), which asks `tail_plan` as
+        // `run`'s tail does since apply gained `--summary-output`/`--json`, so
+        // the gate's call sites are `tail_plan`'s own plus those two routings.
+        // Fewer sites is the point — the invariant this test protects (ask
+        // about the BUILT aggregate, never a re-derived count) now holds by
+        // construction for every tail the seam serves.
         assert!(
             sites >= 3,
-            "expected the gate at `finish_run_tail`'s two sites plus \
-             `tail_plan` — found {sites}"
+            "expected the gate inside `tail_plan` plus `run`'s and \
+             `finish_run_tail`'s routing through it — found {sites}"
         );
         // The floor dropped 5→3 because waves/pool no longer gate inline — so
         // PIN that they still route through the shared tail, or an ungated
@@ -4233,14 +4303,24 @@ pub(crate) mod run_tail_tests {
     #[test]
     fn every_orchestrator_tail_routes_the_self_check_through_one_seam() {
         // (file, fn) -> why this candidate is not a run tail.
-        let exempt: &[(&str, &str, &str)] = &[(
-            "job.rs",
-            "run_export_job_inner",
-            "a PER-EXPORT job, not a run tail: it calls itself only to dispatch a \
-             CDC initial-snapshot child. The orchestrator that drives it (run / \
-             run_waves / run_pool) owns the run's self-check, and emitting one \
-             here too would report every export twice.",
-        )];
+        let exempt: &[(&str, &str, &str)] = &[
+            (
+                "job.rs",
+                "run_export_job_inner",
+                "a PER-EXPORT job, not a run tail: it calls itself only to dispatch a \
+                 CDC initial-snapshot child. The orchestrator that drives it (run / \
+                 run_waves / run_pool) owns the run's self-check, and emitting one \
+                 here too would report every export twice.",
+            ),
+            (
+                "apply_cmd.rs",
+                "apply_document",
+                "the DOCUMENT `rivet apply` emits on --summary-output / --json, built \
+                 from one entry after `run_apply_command`'s tail has already run the \
+                 self-check on that entry (or from the answering run of a replay, \
+                 which ran nothing); a second check here would report it twice.",
+            ),
+        ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/pipeline");
         let mut files: Vec<(String, String)> = Vec::new();

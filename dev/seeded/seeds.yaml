@@ -77,6 +77,23 @@ seeds:
       mongo:
         cells: ["lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
 
+  - name: already-applied-answer-text-only
+    class: "`rivet apply` of a full, chunked or keyset plan that already applied answers only in prose on stderr: `--summary-output` writes no file and `--json` prints no document, so a scheduler reads the replay as a success with no result"
+    history: "found by the Airflow provider after #616, 2026-10-17, verified on main 74cb6daa: the replay path returned before any summary (`eprintln!` of the report, exit 0), and `rivet apply` had no `--summary-output` / `--json` at all; fixed by one builder (`apply_document`) writing the same document for a run and for the answering run, with `status: already_applied` and `answered_by_run`"
+    scope: source
+    patch: already-applied-answer-text-only/shared.patch
+    engines:
+      postgres:
+        cells: [a_replayed_applied_plan_answers_in_its_summary_document_postgres, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      mysql:
+        cells: [a_replayed_applied_plan_answers_in_its_summary_document_mysql, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      mssql:
+        cells: [a_replayed_applied_plan_answers_in_its_summary_document_mssql, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      oracle:
+        cells: [a_replayed_applied_plan_answers_in_its_summary_document_oracle, "lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+      mongo:
+        cells: ["lib:a_plan_that_applied_answers_every_replay_with_its_run_and_extracts_nothing"]
+
   - name: checkpointed-chunk-loses-its-class
     class: a coded failure met by one chunk of a checkpointed export (chunk_checkpoint true, one worker or several) ends the run as the incomplete run RIVET_RUN_UNITS_FAILED with exit 1 and a --resume hint instead of the chunk's own code and class, and the --resume meets it again and ends the same way
     history: the second half of worker-error-loses-its-class, found 2026-10-15 fixing it; both checkpoint runners recorded a failed chunk's cause as text in chunk_task and stopped on the not-completed count; a PostgreSQL `infinity` met by a checkpointed chunk exited [RIVET_RUN_UNITS_FAILED] 1 where the same export without chunk_checkpoint exits [RIVET_SOURCE_VALUE_UNREPRESENTABLE] 5, on main through 0.31.0

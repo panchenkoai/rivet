@@ -193,6 +193,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             force,
             pool,
             split,
+            summary_output,
+            json,
         } => pipeline::run_apply_command(
             &plan_file,
             force,
@@ -200,6 +202,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             resume,
             pool,
             split,
+            summary_output.as_deref().map(std::path::Path::new),
+            json,
         ),
         Commands::Validate(args) => dispatch_validate(args),
         Commands::Reconcile {

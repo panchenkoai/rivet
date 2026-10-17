@@ -34,7 +34,7 @@ use Ty::*;
 /// A key, its type, and whether `null` is allowed.
 type Field = (&'static str, Ty, bool);
 
-const RUN_STATUS: &[&str] = &["success", "failed", "skipped"];
+const RUN_STATUS: &[&str] = &["success", "failed", "skipped", "already_applied"];
 const STOP_REASON: &[&str] = &["caught_up", "max_events"];
 const LOAD_STATUS: &[&str] = &["loaded", "skipped", "failed"];
 const LOAD_SKIP: &[&str] = &["up_to_date"];
@@ -78,6 +78,7 @@ const RUN_ENTRY: &[Field] = &[
     ("export_name", Str, false),
     ("status", Word(RUN_STATUS), false),
     ("run_id", Str, false),
+    ("answered_by_run", Str, true),
     ("rows", Int, false),
     ("files", Int, false),
     ("bytes", Int, false),
@@ -164,6 +165,7 @@ const SHAPES: &[(&str, Rule)] = &[
     ("run_entry_skipped.json", check_run_entry),
     ("run_entry_failed.json", check_run_entry),
     ("run_entry_crashed.json", check_run_entry),
+    ("run_entry_already_applied.json", check_run_entry),
     ("json_errors.json", |v, at| {
         check_json_errors(v, at, Fold::Exports)
     }),
@@ -294,6 +296,18 @@ fn check_run_entry(v: &Value, at: &str) -> Check {
     require(failed != v["error"].is_null(), || {
         format!("{at}: error iff failed")
     })?;
+    require(
+        (v["status"] == "already_applied") != v["answered_by_run"].is_null(),
+        || format!("{at}: answered_by_run iff already_applied"),
+    )?;
+    require(
+        v["status"] != "already_applied" || v["answered_by_run"] == v["run_id"],
+        || {
+            format!(
+                "{at}: an already_applied entry is the answering run's entry: run_id is answered_by_run"
+            )
+        },
+    )?;
     if failed {
         check_error(&v["error"], &format!("{at}.error"), true, &[])?;
         require(
@@ -953,6 +967,7 @@ fn the_run_entry_is_what_the_product_serializes_plus_the_pending_keys() {
         export_name: "orders_cdc".into(),
         status: "failed".into(),
         run_id: "r".into(),
+        answered_by_run: None,
         rows: 1,
         files: 1,
         bytes: 1,
