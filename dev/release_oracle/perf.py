@@ -53,7 +53,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from .core import Ledger, rivet_bin, run
+from .core import Ledger, port_of, rivet_bin, run
 from .regression import (
     HARM_GRADED,
     _TIME_BIN,
@@ -95,6 +95,7 @@ class Sample:
     rss: int
     harm: dict[str, int]
     typical: float = 0.0
+    why: str = ""
 
 
 def _cpu(text: str) -> float:
@@ -138,8 +139,17 @@ def _mssql_reads(url: str, own: str) -> dict[str, int] | None:
 
 
 def harness_read(engine: str, url: str) -> str:
-    """`url` when the harness reads this engine's harm counters itself, else "" (rivet's own report grades)."""
-    return url if engine in ("postgres", "mssql") else ""
+    """The URL the harness reads this engine's harm counters at, else "" (rivet's own report grades)."""
+    return upstream_url(url) if engine in ("postgres", "mssql") else ""
+
+
+def upstream_url(url: str) -> str:
+    """`url` with toxiproxy's listen port swapped for the database's: the counters live upstream, and the proxy container runs no client."""
+    from .failure import PG_TOXI_UPSTREAM, PG_TOXI_URL
+
+    if port_of(url) != port_of(PG_TOXI_URL):
+        return url
+    return re.sub(rf":{port_of(url)}(?=/|$)", f":{PG_TOXI_UPSTREAM.rsplit(':', 1)[1]}", url, count=1)
 
 
 def source_counters(probe: str, own: str) -> dict[str, int] | None:
@@ -151,18 +161,20 @@ def source_counters(probe: str, own: str) -> dict[str, int] | None:
 
 def measured_harm(probe: str, before: dict[str, int] | None, after: dict[str, int] | None,
                   reported: dict[str, int]) -> dict[str, int] | None:
-    """The run's harm from two `source_counters` readings, over rivet's own report; None when a SQL Server reading did not answer.
+    """The run's harm from two `source_counters` readings; rivet's own report only without a probe, and None when a reading did not answer.
 
     A SQL Server plan evicted between the readings takes nothing away: only statements
     still cached count, each by its own growth. One whose counter went down was compiled
     again in between and restarted at zero, so its growth is its total.
     """
+    if not probe:
+        return reported
+    if before is None or after is None:
+        return None
     if probe.startswith("mssql"):
-        if before is None or after is None:
-            return None
         grown = (v - before.get(k, 0) if v >= before.get(k, 0) else v for k, v in after.items())
         return reported | {"mssql_logical_reads": sum(grown)}
-    return {k: after[k] - before[k] for k in after} if before and after else reported
+    return {k: after[k] - before[k] for k in after}
 
 
 def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str, probe: str = "",
@@ -177,8 +189,9 @@ def _timed(binary: Path, cwd: Path, env: dict[str, str], *args: str, probe: str 
     before = source_counters(probe, own)
     p = run([str(_TIME_BIN), flag, str(binary), *args], timeout=None, env=env, cwd=cwd)
     harm = measured_harm(probe, before, source_counters(probe, own), _last_run_harm(cwd))
-    return Sample(p.returncode == 0 and harm is not None, _parse_wall(p.stderr)[1], _cpu(p.stderr),
-                  _parse_rss(p.stderr), harm or {})
+    why = (f"exit {p.returncode}" if p.returncode else
+           "" if harm is not None else f"harm not measured: no counters from {probe.rsplit('@', 1)[-1]}")
+    return Sample(not why, _parse_wall(p.stderr)[1], _cpu(p.stderr), _parse_rss(p.stderr), harm or {}, why=why)
 
 
 def measured_reps(warm_up_wall: float) -> int:
@@ -186,10 +199,17 @@ def measured_reps(warm_up_wall: float) -> int:
     return SHORT_REPS if warm_up_wall < SHORT_WALL else REPS
 
 
+def _ran(s: Sample | None) -> bool:
+    """A sample that measured a run; a failed one carries its `why`."""
+    return s is not None and s.ok
+
+
 def _best(samples: list[Sample]) -> Sample | None:
-    """The per-metric minimum over successful samples, or None when any run failed."""
-    if not samples or not all(s.ok for s in samples):
+    """The per-metric minimum over successful samples; the first failed sample (with its `why`) when any run failed, None when there are none."""
+    if not samples:
         return None
+    if not all(s.ok for s in samples):
+        return next(s for s in samples if not s.ok)
     keys = set.intersection(*(set(s.harm) for s in samples)) if samples else set()
     return Sample(True, min(s.wall for s in samples), min(s.cpu for s in samples),
                   min(s.rss for s in samples), {k: min(s.harm[k] for s in samples) for k in keys},
@@ -220,13 +240,17 @@ def perf_verdict(engine: str, prev: Sample, cur: Sample) -> list[str]:
 def _grade(led: Ledger, engine: str, path: str, prev: Sample | None, cur: Sample | None,
            wall: bool = True) -> None:
     """Record one path's verdict; `wall=False` grades CPU, RSS and harm but only shows the wall."""
-    if prev is None or cur is None:
-        led.failed(engine, "-", SCEN, path, f"perf[{engine}/{path}]: a run failed "
-                   f"(prev ok={prev is not None}, this ok={cur is not None})", "run failed")
+    if not (_ran(prev) and _ran(cur)):
+        why = [f"{side} {'ok' if _ran(s) else (s.why if s is not None and s.why else 'failed')}"
+               for side, s in (("prev", prev), ("this", cur))]
+        led.failed(engine, "-", SCEN, path, f"perf[{engine}/{path}]: a run failed ({', '.join(why)})",
+                   ", ".join(why))
         return
     worse = [w for w in perf_verdict(engine, prev, cur) if wall or not w.startswith("wall")]
+    harm = " ".join(f"{m} {cur.harm[m]}/{prev.harm[m]}" for m in HARM_GRADED.get(engine, ())
+                    if m in cur.harm and m in prev.harm)
     shown = (f"wall {cur.wall:.2f}/{prev.wall:.2f}s cpu {cur.cpu:.2f}/{prev.cpu:.2f}s "
-             f"rss {cur.rss // MIB}/{prev.rss // MIB}MB")
+             f"rss {cur.rss // MIB}/{prev.rss // MIB}MB{' ' + harm if harm else ''}")
     if worse:
         led.failed(engine, "-", SCEN, path, f"perf[{engine}/{path}]: {'; '.join(worse)}", shown)
     else:
@@ -432,7 +456,7 @@ def _load(led: Ledger, prev: Path, root: Path) -> None:
     wt = _tolerance(os.environ.get("RIVET_PERF_BQ_WALL_TOL") or "2.0")
     for step in ("load", "load-delta", "compact"):
         ps, cs = (p or {}).get(step), (c or {}).get(step)
-        if ps is None or cs is None:
+        if not (_ran(ps) and _ran(cs)):
             _grade(led, "bigquery", step, ps, cs)
             continue
         worse = [w for w in perf_verdict("bigquery", ps, cs) if not w.startswith("wall")]
@@ -447,7 +471,7 @@ def _load(led: Ledger, prev: Path, root: Path) -> None:
 
 def _off_happy_path(led: Ledger, prev: Path, root: Path) -> None:
     """A 50 ms link, a table ten times larger, and a document store — the paths a lab never sees."""
-    from .failure import PG_TOXI_URL, TOXI_PROXY, _toxi, _toxi_lock
+    from .failure import PG_TOXI_UPSTREAM, PG_TOXI_URL, TOXI_PROXY, _toxi, _toxi_lock
 
     url = os.environ.get("RIVET_ORACLE_POSTGRES_URL", "")
     if url:
@@ -456,7 +480,7 @@ def _off_happy_path(led: Ledger, prev: Path, root: Path) -> None:
             try:
                 with _toxi_lock():
                     _toxi("POST", "/proxies", {"name": TOXI_PROXY, "listen": "0.0.0.0:15432",
-                                               "upstream": "postgres:5432", "enabled": True})
+                                               "upstream": PG_TOXI_UPSTREAM, "enabled": True})
                     code = _toxi("POST", f"/proxies/{TOXI_PROXY}/toxics",
                                  {"name": "perf_latency", "type": "latency", "stream": "downstream",
                                   "attributes": {"latency": 50}})
@@ -855,7 +879,7 @@ def _aa(led: Ledger, prev: Path, root: Path) -> None:
     finally:
         _sql("postgres", url, f"DROP TABLE IF EXISTS {table};")
     for path, a, b in pairs:
-        if a is None or b is None:
+        if not (_ran(a) and _ran(b)):
             led.failed("postgres", "-", SCEN, "a/a", f"perf A/A[{path}]: a run failed", "run failed")
             continue
         noise = perf_verdict("postgres", a, b) + perf_verdict("postgres", b, a)
