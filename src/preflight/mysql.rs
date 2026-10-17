@@ -40,23 +40,22 @@ fn fetch_max_connections_mysql(conn: &mut mysql::PooledConn) -> Option<u32> {
     val.try_into().ok()
 }
 
-/// `EXPLAIN` the export's query purely to validate the schema; map an
-/// author-fixable failure to a loud preflight error. `None` (fail-soft) for
-/// success and for operational/transient errors.
-fn schema_fail_mysql(conn: &mut mysql::PooledConn, query: &str) -> Option<anyhow::Error> {
-    use mysql::prelude::Queryable;
-    match conn.query_drop(format!("EXPLAIN {query}")) {
-        Ok(()) => None,
-        Err(e) => mysql_schema_error(&e),
+/// A missing table (ER_NO_SUCH_TABLE, 1146) as the shared `RIVET_SOURCE_TABLE_NOT_FOUND`; the
+/// other author-fixable schema errors, ER_BAD_FIELD_ERROR (1054), ER_TABLEACCESS_DENIED_ERROR
+/// (1142) and a parse error (1064), as the loud preflight schema error. Every other
+/// code/variant is operational → `None` (fail-soft).
+fn mysql_schema_error(e: mysql::Error, export: &ExportConfig) -> Option<anyhow::Error> {
+    let cause = anyhow::Error::new(e);
+    if crate::source::names_a_missing_relation(&cause) {
+        return Some(crate::source::code_a_missing_relation(
+            cause,
+            &export.name,
+            export.table.as_deref(),
+            export.query.as_deref(),
+        ));
     }
-}
-
-/// MySQL author-fixable schema errors: ER_NO_SUCH_TABLE (1146),
-/// ER_BAD_FIELD_ERROR (1054), ER_TABLEACCESS_DENIED_ERROR (1142), parse error
-/// (1064). Every other code/variant is operational → `None` (fail-soft).
-fn mysql_schema_error(e: &mysql::Error) -> Option<anyhow::Error> {
-    if let mysql::Error::MySqlError(me) = e
-        && matches!(me.code, 1146 | 1054 | 1142 | 1064)
+    if let Some(mysql::Error::MySqlError(me)) = cause.downcast_ref::<mysql::Error>()
+        && matches!(me.code, 1054 | 1142 | 1064)
     {
         return Some(
             PreflightSchemaError::new(me.message.as_str(), format!("MySQL error {}", me.code))
@@ -94,11 +93,12 @@ fn diagnose_mysql(
         base_query.to_string()
     };
 
-    // A schema-class error (missing table/column, no SELECT grant, syntax) is
-    // permanent and author-fixable — fail preflight loudly instead of letting it
-    // sail through to run time. Operational errors stay fail-soft in the probes
-    // below (which `unwrap_or_default` / log at debug and continue).
-    if let Some(fail) = schema_fail_mysql(conn, &effective_query) {
+    // `EXPLAIN` the query purely to validate its schema; operational errors stay fail-soft.
+    if let Some(fail) = conn
+        .query_drop(format!("EXPLAIN {effective_query}"))
+        .err()
+        .and_then(|e| mysql_schema_error(e, export))
+    {
         return Err(fail);
     }
 
@@ -316,6 +316,55 @@ pub(crate) fn column_has_index_mysql(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_schema_verdict_codes_a_missing_table_and_names_the_other_schema_errors() {
+        use crate::config::ExportConfig;
+        let orders = ExportConfig {
+            table: Some("orders".to_string()),
+            ..crate::config::sample_export("orders")
+        };
+        let server = |code: u16, message: &str| {
+            mysql::Error::MySqlError(mysql::MySqlError {
+                state: "HY000".to_string(),
+                message: message.to_string(),
+                code,
+            })
+        };
+        let missing =
+            super::mysql_schema_error(server(1146, "Table 'rivet.orders' doesn't exist"), &orders)
+                .expect("a missing table is a verdict");
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_SOURCE_TABLE_NOT_FOUND"),
+            "{missing:#}"
+        );
+        assert!(
+            format!("{missing:#}").contains("(`table: orders`)"),
+            "{missing:#}"
+        );
+        for (code, message) in [
+            (1054, "Unknown column 'totl' in 'field list'"),
+            (
+                1142,
+                "SELECT command denied to user 'reader'@'%' for table 'orders'",
+            ),
+            (1064, "You have an error in your SQL syntax"),
+        ] {
+            let err = super::mysql_schema_error(server(code, message), &orders)
+                .unwrap_or_else(|| panic!("MySQL error {code} is a schema verdict"));
+            let text = format!("{err:#}");
+            assert!(
+                text.starts_with(&format!("preflight: {message} (MySQL error {code})."))
+                    && crate::error::error_code(&err) == Some("RIVET_SOURCE_QUERY_FAILED"),
+                "{text}"
+            );
+        }
+        assert!(
+            super::mysql_schema_error(server(1213, "Deadlock found"), &orders).is_none(),
+            "an operational error stays fail-soft"
+        );
+    }
+
     // ── regression: `table:` shortcut must NOT preflight the "SELECT 1" stub ──
     //
     // Mirrors the Postgres-side guard for audit_preflight_table: a

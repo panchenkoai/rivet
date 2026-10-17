@@ -936,6 +936,11 @@ pub mod codes {
         "RIVET_SOURCE_COLLECTION_NOT_FOUND",
         "correct the export's `table:` (a dotted collection name is written whole), or create the collection",
     );
+    /// The relation an export reads does not exist, by the engine's own verdict (dropped, or misspelt in `table:` / `query:`).
+    pub const SOURCE_TABLE_NOT_FOUND: Code = environment(
+        "RIVET_SOURCE_TABLE_NOT_FOUND",
+        "correct the export's `table:` (or the relation its `query:` reads), or remove the export from `exports:` if the table was dropped on purpose",
+    );
     /// The bucket or container a cloud destination names does not exist.
     pub const DEST_CONTAINER_NOT_FOUND: Code = environment(
         "RIVET_DEST_CONTAINER_NOT_FOUND",
@@ -1627,6 +1632,7 @@ pub mod codes {
         STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
+        SOURCE_TABLE_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
         DEST_RELATIVE_PATH_MOVED,
         DEST_ALREADY_COMPLETE,

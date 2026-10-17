@@ -1523,7 +1523,12 @@ fn execute_resolved_plan(
         Ok(()) => super::finalize::finalize_export(plan, Some(state), &mut summary),
         Err(e) => {
             super::finalize::finalize_export_records(&mut summary);
-            Err(e)
+            Err(crate::source::code_a_missing_relation(
+                e,
+                &plan.export_name,
+                plan.source_table.as_deref(),
+                Some(&plan.base_query),
+            ))
         }
     };
 
@@ -1931,6 +1936,12 @@ fn run_export_job_inner(
     ) {
         Ok(p) => p,
         Err(e) => {
+            let e = crate::source::code_a_missing_relation(
+                e,
+                &export.name,
+                export.table.as_deref(),
+                export.query.as_deref(),
+            );
             let summary = synthetic_failed_summary(&export.name, &e);
             return (Err(e), summary);
         }

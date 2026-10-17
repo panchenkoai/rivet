@@ -74,7 +74,7 @@ fn diagnose_pg(
         base_query.to_string()
     };
 
-    let (row_estimate, avg_row_bytes) = estimate_rows_pg(client, &effective_query)?;
+    let (row_estimate, avg_row_bytes) = estimate_rows_pg(client, &effective_query, export)?;
 
     let (range_min, range_max) = if export.mode == ExportMode::Incremental {
         if let Some(expr) = incremental_key_expr(export, SourceType::Postgres) {
@@ -145,6 +145,7 @@ fn diagnose_pg(
 fn estimate_rows_pg(
     client: &mut postgres::Client,
     query: &str,
+    export: &ExportConfig,
 ) -> Result<(Option<i64>, Option<i64>)> {
     let explain = format!("EXPLAIN {}", query);
     let rows = match read_pinned(client, |c| c.query(&explain, &[])) {
@@ -153,13 +154,14 @@ fn estimate_rows_pg(
             // A SQLSTATE *class 42* failure (undefined table/column, no
             // privilege, syntax) is permanent and author-fixable — let it fail
             // preflight loudly instead of sailing through to run time.
-            if let Some(fail) = schema_fail_pg(&e) {
+            let text = e.to_string();
+            if let Some(fail) = schema_fail_pg(e, export) {
                 return Err(fail);
             }
             // Everything else (08 connection, 53 resources, 55 lock, 57 cancel,
             // …) is operational and stays FAIL-SOFT: preflight is non-fatal, so
             // surface at debug (visible under `RUST_LOG=debug`) and continue.
-            log::debug!("preflight: EXPLAIN for row-estimate failed: {e}");
+            log::debug!("preflight: EXPLAIN for row-estimate failed: {text}");
             return Ok((None, None));
         }
     };
@@ -171,10 +173,20 @@ fn estimate_rows_pg(
     ))
 }
 
-/// Map a Postgres SQLSTATE *class 42* (syntax/access-rule violation) connect-time
-/// EXPLAIN failure to a loud, author-facing preflight error. Returns `None` for
-/// every other class so operational/transient failures stay fail-soft.
-fn schema_fail_pg(e: &postgres::Error) -> Option<anyhow::Error> {
+/// A missing relation as the shared `RIVET_SOURCE_TABLE_NOT_FOUND`; any other SQLSTATE
+/// *class 42* (undefined column, no privilege, syntax) as the loud preflight schema error;
+/// `None` for every other class, which stays fail-soft.
+fn schema_fail_pg(e: postgres::Error, export: &ExportConfig) -> Option<anyhow::Error> {
+    let cause = anyhow::Error::new(e);
+    if crate::source::names_a_missing_relation(&cause) {
+        return Some(crate::source::code_a_missing_relation(
+            cause,
+            &export.name,
+            export.table.as_deref(),
+            export.query.as_deref(),
+        ));
+    }
+    let e = cause.downcast_ref::<postgres::Error>()?;
     let code = e.code()?;
     // Class 42 = undefined_table (42P01), undefined_column (42703),
     // insufficient_privilege (42501), syntax_error (42601), … — all permanent
@@ -743,10 +755,18 @@ mod tests {
         (out, sent(queries))
     }
 
+    /// The export the estimate probes run for: `orders`, read by `table:`.
+    fn orders() -> ExportConfig {
+        ExportConfig {
+            table: Some("orders".to_string()),
+            ..crate::config::sample_export("orders")
+        }
+    }
+
     #[test]
     fn the_row_estimate_and_the_width_are_read_from_the_plan_the_server_returns() {
         let (got, saw) = probed(Answer::Rows(1, vec![vec![Some(INDEX_PLAN)]]), |c| {
-            estimate_rows_pg(c, "SELECT * FROM orders")
+            estimate_rows_pg(c, "SELECT * FROM orders", &orders())
         });
         assert_eq!(got.unwrap(), (Some(5000), Some(120)));
         assert_eq!(
@@ -755,7 +775,7 @@ mod tests {
         );
         let two_lines = vec![vec![Some("Sort  (cost=1.00..2.00)")], vec![Some(SEQ_PLAN)]];
         let (got, _) = probed(Answer::Rows(1, two_lines), |c| {
-            estimate_rows_pg(c, "SELECT * FROM orders ORDER BY id")
+            estimate_rows_pg(c, "SELECT * FROM orders ORDER BY id", &orders())
         });
         assert_eq!(got.unwrap(), (Some(70), Some(9)));
     }
@@ -763,18 +783,35 @@ mod tests {
     #[test]
     fn a_refused_estimate_fails_the_preflight_only_for_a_schema_error() {
         let (got, saw) = probed(Answer::Error("42P01"), |c| {
-            estimate_rows_pg(c, "SELECT * FROM gone")
+            estimate_rows_pg(c, "SELECT * FROM orders", &orders())
         });
-        let why = format!("{:#}", got.unwrap_err());
+        let missing = got.unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&missing),
+            Some("RIVET_SOURCE_TABLE_NOT_FOUND"),
+            "{missing:#}"
+        );
+        let why = format!("{missing:#}");
         assert!(
-            why.contains("refused") && why.contains("SQLSTATE 42P01"),
-            "{why}"
+            why.contains("export 'orders': the table it reads does not exist (`table: orders`)")
+                && why.contains("refused"),
+            "the shared refusal, over the server's own words: {why}"
         );
         assert_eq!(
             saw,
-            [BEGIN_PINNED, "EXPLAIN SELECT * FROM gone", "ROLLBACK"]
+            [BEGIN_PINNED, "EXPLAIN SELECT * FROM orders", "ROLLBACK"]
         );
-        let (got, _) = probed(Answer::Error("57014"), |c| estimate_rows_pg(c, "SELECT 1"));
+        let (got, _) = probed(Answer::Error("42703"), |c| {
+            estimate_rows_pg(c, "SELECT totl FROM orders", &orders())
+        });
+        let why = format!("{:#}", got.unwrap_err());
+        assert!(
+            why.contains("refused") && why.contains("SQLSTATE 42703"),
+            "a missing column is the preflight's own schema error: {why}"
+        );
+        let (got, _) = probed(Answer::Error("57014"), |c| {
+            estimate_rows_pg(c, "SELECT 1", &orders())
+        });
         assert_eq!(got.unwrap(), (None, None), "a cancelled probe is not fatal");
     }
 

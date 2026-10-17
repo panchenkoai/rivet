@@ -194,11 +194,19 @@ scenarios:
 
   - id: check_refuses_what_run_refuses_missing_collection
     what: "`check` and `run` both fail as RIVET_SOURCE_COLLECTION_NOT_FOUND (exit 1) over a MongoDB collection that does not exist (2026-10-14 sweep P6: `run` printed the sentence with no code)"
-    postgres: { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
-    mysql:    { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
-    mssql:    { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
+    postgres: { na: "a missing SQL table is RIVET_SOURCE_TABLE_NOT_FOUND on `check` and `run` (dropped_source_table_is_coded); the absent-collection guard is MongoDB's" }
+    mysql:    { na: "a missing SQL table is RIVET_SOURCE_TABLE_NOT_FOUND on `check` and `run` (dropped_source_table_is_coded); the absent-collection guard is MongoDB's" }
+    mssql:    { na: "a missing SQL table is RIVET_SOURCE_TABLE_NOT_FOUND on `check` and `run` (dropped_source_table_is_coded); the absent-collection guard is MongoDB's" }
     mongo:    { test: check_refuses_a_collection_that_does_not_exist_as_run_does_mongo }
-    oracle:   { na: "a missing SQL table already failed `check` (the preflight's schema error); the absent-collection guard is MongoDB's" }
+    oracle:   { na: "a missing SQL table is RIVET_SOURCE_TABLE_NOT_FOUND on `check` and `run` (dropped_source_table_is_coded); the absent-collection guard is MongoDB's" }
+
+  - id: dropped_source_table_is_coded
+    what: "2026-10-16 (by hand, the pilot's shape): a run whose source table was dropped after a green run stops as RIVET_SOURCE_TABLE_NOT_FOUND (exit 1) on that run and the next, naming the export's `table:` and the remedy, while the sibling export of the same config delivers (`1 success · 1 failed`); 0.30.0 and 0.31.0 printed the raw driver error, uncoded on MySQL and PostgreSQL and RIVET_SOURCE_QUERY_FAILED on SQL Server and Oracle, and `check` refused the same table as RIVET_SOURCE_QUERY_FAILED"
+    postgres: { test: a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_postgres }
+    mysql:    { test: a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mysql }
+    mssql:    { test: a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mssql }
+    mongo:    { na: "a MongoDB collection that does not exist is RIVET_SOURCE_COLLECTION_NOT_FOUND, the row above; a dropped collection is the same absence" }
+    oracle:   { test: a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_oracle }
 
   - id: unusable_state_url
     what: "RESULTS 9: a `RIVET_STATE_URL` rivet cannot use is refused (RIVET_STATE_URL_SCHEME_UNSUPPORTED, exit 1); unsetting it runs on SQLite, and the corrected URL runs on PostgreSQL state (the postgres cell, which has the state server)"

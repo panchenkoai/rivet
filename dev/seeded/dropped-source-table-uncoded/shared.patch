@@ -1,0 +1,24 @@
+--- a/src/source/mod.rs
++++ b/src/source/mod.rs
+@@ -394,19 +394,8 @@
+ 
+ /// Whether `err` is an engine's typed verdict that a relation the export reads does not exist: PostgreSQL SQLSTATE 42P01, MySQL 1146, SQL Server 208, Oracle ORA-00942.
+ pub(crate) fn names_a_missing_relation(err: &anyhow::Error) -> bool {
+-    if let Some(db) = err
+-        .chain()
+-        .find_map(|e| e.downcast_ref::<::postgres::Error>())
+-        .and_then(::postgres::Error::as_db_error)
+-    {
+-        return *db.code() == ::postgres::error::SqlState::UNDEFINED_TABLE;
+-    }
+-    if let Some(e) = err.chain().find_map(|e| e.downcast_ref::<::mysql::Error>()) {
+-        return matches!(e, ::mysql::Error::MySqlError(me) if me.code == 1146);
+-    }
+-    // SQL Server and Oracle errors arrive as the driver's own rendering of the server number (src/source/mssql, src/source/oracle); MySQL's rendering covers a wrapper that re-rendered the typed error.
+-    let text = format!("{err:#}");
+-    text.contains("(code: 208,") || text.contains("ORA-00942") || text.contains("ERROR 1146 (")
++    let _ = err;
++    false
+ }
+ 
+ /// `err` as `RIVET_SOURCE_TABLE_NOT_FOUND` when [`names_a_missing_relation`], naming what `export` reads (its `table:`, or the one relation of a simple `query:`); any other error, or one already so coded, as it came.
