@@ -1007,6 +1007,21 @@ fn incremental_keyset_apply_rotates_run_id_across_repeated_applies() {
         150,
         "the two applies of one keyset_incremental plan deliver every row: 100 + 50"
     );
+    // The manifests are rivet's own record; read the parquet files back as well,
+    // so a second apply that re-read old keys instead of the new ones cannot sum to 150.
+    let out = rig.out_dir();
+    assert_eq!(
+        total_parquet_rows(&out),
+        150,
+        "the files of the two applies hold 150 rows: no key read twice, none skipped"
+    );
+    assert_eq!(
+        dir_parquet_distinct_strings(&out, "k"),
+        (1..=150)
+            .map(|g| format!("k{g:06}"))
+            .collect::<std::collections::BTreeSet<String>>(),
+        "the two applies deliver exactly the keys k000001..k000150"
+    );
 }
 
 /// P-26: a sealed plan keeps the `{date}` placeholder, so an apply writes under the date it runs on.
