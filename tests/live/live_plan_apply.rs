@@ -1577,6 +1577,7 @@ fn a_replayed_applied_full_plan_answers_with_its_run_oracle() {
     a_replayed_applied_plan_names_the_run_that_applied_it(SqlEngine::Oracle, ReplayShape::Full);
 }
 
+#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires docker compose oracle + GCS"]
 fn a_replayed_applied_plan_answers_in_its_summary_document_oracle() {
