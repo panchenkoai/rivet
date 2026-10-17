@@ -1090,6 +1090,187 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     ),
 ];
 
+// ─── The way back: a copy of the state before a migration ─────────────────────
+
+/// Where the restore procedure is written.
+const RESTORE_DOC: &str = "docs/reference/state.md, section \"Rolling back an upgrade\"";
+
+/// The pre-migration copy of a SQLite state file: `<state>.v<old>.<UTC stamp>.bak` beside it.
+fn backup_path(db: &str, old: i64) -> std::path::PathBuf {
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    std::path::PathBuf::from(format!("{db}.v{old}.{stamp}.bak"))
+}
+
+/// Write a consistent copy of the state file beside it through a second connection (`VACUUM INTO` and the backup API both refuse a connection holding the write transaction); a copy that cannot be written refuses the migration, and an in-memory state has no file to copy.
+fn copy_state_before_migration(conn: &Connection, old: i64) -> Result<Option<std::path::PathBuf>> {
+    let Some(db) = conn.path().filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let copy = backup_path(db, old);
+    let write = || -> Result<()> {
+        let reader = Connection::open(db)?;
+        reader.execute_batch(&format!(
+            "VACUUM INTO '{}';",
+            copy.display().to_string().replace('\'', "''")
+        ))?;
+        let dst = Connection::open(&copy)?;
+        let ver: i64 = dst.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            ver == old,
+            "the copy reads schema v{ver}, the state is v{old}"
+        );
+        Ok(())
+    };
+    if let Err(e) = write() {
+        let _ = std::fs::remove_file(&copy);
+        return Err(crate::error::coded(
+            crate::error::codes::STATE_BACKUP_FAILED,
+            format!(
+                "state: could not write a copy of the v{old} state at `{}` before migrating it to \
+                 v{SCHEMA_VERSION}: {e:#}. Nothing was migrated; the state is as the previous rivet \
+                 left it. Free the space or make the directory writable and run again, or keep \
+                 running the previous release.",
+                copy.display()
+            ),
+        ));
+    }
+    Ok(Some(copy))
+}
+
+/// The table names a ladder's `CREATE TABLE` statements define (`IF NOT EXISTS` stripped).
+fn created_table_names(sql: &str) -> std::collections::BTreeSet<String> {
+    let lower = sql.to_lowercase();
+    let mut rest = lower.as_str();
+    let mut out = std::collections::BTreeSet::new();
+    while let Some(i) = rest.find("create table") {
+        rest = &rest[i + "create table".len()..];
+        let after = rest
+            .trim_start()
+            .strip_prefix("if not exists")
+            .unwrap_or_else(|| rest.trim_start())
+            .trim_start();
+        let name: String = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// Every table the PostgreSQL ladder creates or renames to, plus the version table: what a pre-migration copy holds when present.
+fn pg_state_table_names() -> Vec<String> {
+    let mut out = std::collections::BTreeSet::from(["rivet_schema_version".to_string()]);
+    for &(_, sql) in PG_MIGRATIONS {
+        out.extend(created_table_names(sql));
+        let lower = sql.to_lowercase();
+        for (i, kw) in lower.match_indices("rename to ") {
+            let name: String = lower[i + kw.len()..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                out.insert(name);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The schema holding the pre-migration copy of a v`old` PostgreSQL state.
+fn pg_backup_schema(old: i64) -> String {
+    format!("rivet_state_backup_v{old}")
+}
+
+/// Copy every state table (rows, keys, indexes, defaults; a serial column gets its own sequence at the same position) into `rivet_state_backup_v<old>` inside the migration transaction; an existing copy is kept, a copy that cannot be written aborts the migration.
+fn copy_pg_state_before_migration(client: &mut postgres::Transaction<'_>, old: i64) -> Result<()> {
+    let schema = pg_backup_schema(old);
+    let failed = |what: &str, e: &postgres::Error| {
+        crate::error::coded(
+            crate::error::codes::STATE_BACKUP_FAILED,
+            format!(
+                "state(pg): could not write a copy of the v{old} state into schema `{schema}` \
+                 before migrating it to v{SCHEMA_VERSION} ({what}: {}). Nothing was migrated; \
+                 the state is as the previous rivet left it. Give the state role CREATE on the \
+                 database (or free the space) and run again, or keep running the previous release.",
+                super::pg_detail(e)
+            ),
+        )
+    };
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)",
+            &[&schema],
+        )
+        .map_err(|e| failed("look for an earlier copy", &e))?
+        .get(0);
+    if exists {
+        log::warn!(
+            "state(pg): upgrading the state schema v{old} -> v{SCHEMA_VERSION}; schema `{schema}` \
+             already holds a copy of a v{old} state from an earlier attempt and is kept as it is — \
+             to go back to the previous rivet release, see {RESTORE_DOC}"
+        );
+        return Ok(());
+    }
+    let tables: Vec<String> = client
+        .query(
+            "SELECT tablename::text FROM pg_tables \
+             WHERE schemaname = current_schema() AND tablename::text = ANY($1::text[]) ORDER BY 1",
+            &[&pg_state_table_names()],
+        )
+        .map_err(|e| failed("list the state tables", &e))?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let serials: Vec<(String, String, String)> = client
+        .query(
+            "SELECT c.relname::text, a.attname::text, \
+                    pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname::text) \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = current_schema() AND c.relname::text = ANY($1::text[]) \
+               AND a.attnum > 0 AND NOT a.attisdropped \
+               AND pg_get_serial_sequence(format('%I.%I', n.nspname, c.relname), a.attname::text) \
+                   IS NOT NULL",
+            &[&tables],
+        )
+        .map_err(|e| failed("list the serial columns", &e))?
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    let mut sql = format!("CREATE SCHEMA {schema};");
+    for t in &tables {
+        sql.push_str(&format!(
+            " CREATE TABLE {schema}.{t} (LIKE {t} INCLUDING ALL); \
+             INSERT INTO {schema}.{t} SELECT * FROM {t};"
+        ));
+    }
+    for (t, col, seq) in &serials {
+        let own = format!("{schema}.{t}_{col}_seq");
+        sql.push_str(&format!(
+            " CREATE SEQUENCE {own} OWNED BY {schema}.{t}.{col}; \
+             SELECT setval('{own}', last_value, is_called) FROM {seq}; \
+             ALTER TABLE {schema}.{t} ALTER COLUMN {col} SET DEFAULT nextval('{own}');"
+        ));
+    }
+    client.batch_execute(&sql).map_err(|e| failed("copy", &e))?;
+    log::warn!(
+        "state(pg): upgrading the state schema v{old} -> v{SCHEMA_VERSION}; a copy of the v{old} \
+         state ({} tables) is in schema `{schema}` — to go back to the previous rivet release, \
+         see {RESTORE_DOC}",
+        tables.len()
+    );
+    Ok(())
+}
+
 // ─── SQLite migration ─────────────────────────────────────────────────────────
 
 fn ensure_schema_version_table(conn: &Connection) {
@@ -1302,6 +1483,17 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
         }
     }
 
+    if current > 0
+        && current < SCHEMA_VERSION
+        && let Some(copy) = copy_state_before_migration(conn, current)?
+    {
+        log::warn!(
+            "state: upgrading the state schema v{current} -> v{SCHEMA_VERSION}; a copy of the \
+             v{current} state is at `{}` — to go back to the previous rivet release, see {RESTORE_DOC}",
+            copy.display()
+        );
+    }
+
     for &(ver, sql) in MIGRATIONS {
         if ver > current {
             log::debug!("state: applying migration v{}", ver);
@@ -1429,6 +1621,10 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
         })?
         .get(0);
 
+    if current > 0 && current < SCHEMA_VERSION {
+        copy_pg_state_before_migration(client, current)?;
+    }
+
     for &(ver, sql) in PG_MIGRATIONS {
         if ver > current {
             log::debug!("state(pg): applying migration v{}", ver);
@@ -1544,27 +1740,7 @@ mod tests {
         // CREATEs matches — so a table added to one backend but not the other
         // (a query that works on SQLite and errors on PG) fails loudly here.
         use std::collections::{BTreeSet, HashMap};
-        fn table_names(sql: &str) -> BTreeSet<String> {
-            let lower = sql.to_lowercase();
-            let mut rest = lower.as_str();
-            let mut out = BTreeSet::new();
-            while let Some(i) = rest.find("create table") {
-                rest = &rest[i + "create table".len()..];
-                let after = rest
-                    .trim_start()
-                    .strip_prefix("if not exists")
-                    .unwrap_or_else(|| rest.trim_start())
-                    .trim_start();
-                let name: String = after
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '_')
-                    .collect();
-                if !name.is_empty() {
-                    out.insert(name);
-                }
-            }
-            out
-        }
+        let table_names = created_table_names;
         let mut pg: HashMap<i64, BTreeSet<String>> = HashMap::new();
         for &(v, sql) in PG_MIGRATIONS {
             pg.entry(v).or_default().extend(table_names(sql));
@@ -2143,6 +2319,7 @@ mod tests {
         client
             .batch_execute(
                 "DROP SCHEMA IF EXISTS rivet_upgrade_test CASCADE; \
+                 DROP SCHEMA IF EXISTS rivet_state_backup_v18 CASCADE; \
                  CREATE SCHEMA rivet_upgrade_test; SET search_path TO rivet_upgrade_test;",
             )
             .unwrap();
@@ -2202,7 +2379,10 @@ mod tests {
         );
 
         client
-            .batch_execute("DROP SCHEMA IF EXISTS rivet_upgrade_test CASCADE;")
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS rivet_upgrade_test CASCADE; \
+                 DROP SCHEMA IF EXISTS rivet_state_backup_v18 CASCADE;",
+            )
             .unwrap();
     }
 
@@ -2218,6 +2398,7 @@ mod tests {
         client
             .batch_execute(
                 "DROP SCHEMA IF EXISTS rivet_v32_replay_test CASCADE; \
+                 DROP SCHEMA IF EXISTS rivet_state_backup_v31 CASCADE; \
                  CREATE SCHEMA rivet_v32_replay_test; SET search_path TO rivet_v32_replay_test; \
                  CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);",
             )
@@ -2268,7 +2449,10 @@ mod tests {
             "every run row still resolves to its spec version"
         );
         client
-            .batch_execute("DROP SCHEMA IF EXISTS rivet_v32_replay_test CASCADE;")
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS rivet_v32_replay_test CASCADE; \
+                 DROP SCHEMA IF EXISTS rivet_state_backup_v31 CASCADE;",
+            )
             .unwrap();
     }
 
@@ -2378,5 +2562,437 @@ mod tests {
             )
             .unwrap();
         assert!(exists, "v14 migration must create the cdc_snapshot table");
+    }
+
+    // ─── The way back ─────────────────────────────────────────────────────────
+
+    /// A SQLite state file staged at exactly schema v`upto`, with one incremental cursor row.
+    fn stage_sqlite(path: &std::path::Path, upto: i64) -> Connection {
+        let conn = open_connection(path).unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= upto {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO export_state (export_name, prefix, last_cursor_value) \
+             VALUES ('orders', 'local/a', '42');",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The `.bak` copies beside a state file, by name.
+    fn copies_beside(db: &std::path::Path) -> Vec<String> {
+        let name = db.file_name().unwrap().to_str().unwrap().to_string();
+        let mut out: Vec<String> = std::fs::read_dir(db.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
+            .filter(|f| f.starts_with(&name) && f.ends_with(".bak"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn version_of(path: &std::path::Path) -> i64 {
+        let c = Connection::open(path).unwrap();
+        get_current_version(&c)
+    }
+
+    fn has_column(c: &Connection, table: &str, column: &str) -> bool {
+        c.query_row(
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+            [column],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// The copy is the state as the previous release left it: its version is the old one and it has none of the ladder's later columns.
+    #[test]
+    fn a_migration_copies_the_old_state_beside_it_before_the_first_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".rivet_state.db");
+        let conn = stage_sqlite(&db, 32);
+        assert_eq!(
+            copies_beside(&db),
+            Vec::<String>::new(),
+            "no copy before the migration"
+        );
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
+        let copies = copies_beside(&db);
+        assert_eq!(copies.len(), 1, "exactly one copy: {copies:?}");
+        let re = regex::Regex::new(r"^\.rivet_state\.db\.v32\.\d{8}T\d{6}Z\.bak$").unwrap();
+        assert!(
+            re.is_match(&copies[0]),
+            "the copy names the version and the UTC time: {}",
+            copies[0]
+        );
+        let copy = Connection::open(dir.path().join(&copies[0])).unwrap();
+        assert_eq!(get_current_version(&copy), 32, "the copy is the v32 state");
+        assert!(
+            !has_column(&copy, "export_state", "stream"),
+            "the copy predates the first DDL (v33 adds export_state.stream)"
+        );
+        assert!(
+            has_column(&conn, "export_state", "stream"),
+            "the state itself was migrated"
+        );
+        let cursor: String = copy
+            .query_row(
+                "SELECT last_cursor_value FROM export_state WHERE export_name = 'orders'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor, "42", "the copy holds the previous release's cursor");
+    }
+
+    /// A state that is new (version 0) or already current is migrated or opened with no copy; a newer one is refused with no copy.
+    #[test]
+    fn a_new_or_current_or_newer_state_gets_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".rivet_state.db");
+        let conn = open_connection(&db).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            copies_beside(&db),
+            Vec::<String>::new(),
+            "a new state: nothing to go back to"
+        );
+        migrate(&conn).unwrap();
+        assert_eq!(
+            copies_beside(&db),
+            Vec::<String>::new(),
+            "an already-current state: no migration"
+        );
+        conn.execute(
+            "INSERT INTO schema_version (version) VALUES (?1)",
+            [SCHEMA_VERSION + 1],
+        )
+        .unwrap();
+        let e = migrate(&conn).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&e),
+            Some("RIVET_STATE_SCHEMA_NEWER")
+        );
+        assert_eq!(
+            copies_beside(&db),
+            Vec::<String>::new(),
+            "a newer state: nothing is rewritten, nothing copied"
+        );
+    }
+
+    /// Puts the permission bits back when dropped, so the temp dir can be removed.
+    #[cfg(unix)]
+    struct Mode(std::path::PathBuf, u32);
+    #[cfg(unix)]
+    impl Drop for Mode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// A copy that cannot be written (the directory is read-only; the `-wal`/`-shm` files exist, so SQLite itself can still write) refuses the migration by code, and the state file is byte-identical afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn a_copy_that_cannot_be_written_refuses_the_migration_and_leaves_the_state_as_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".rivet_state.db");
+        let conn = stage_sqlite(&db, 32);
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        let before = std::fs::read(&db).unwrap();
+        for suffix in ["-wal", "-shm"] {
+            let p = dir.path().join(format!(".rivet_state.db{suffix}"));
+            if !p.exists() {
+                std::fs::write(&p, b"").unwrap();
+            }
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = Mode(dir.path().to_path_buf(), 0o755);
+        if std::fs::write(dir.path().join("probe"), b"").is_ok() {
+            // Root ignores directory modes; the refusal cannot be provoked this way here.
+            return crate::test_hook::skip_live("a read-only directory is writable for this user");
+        }
+
+        let e = migrate(&conn).unwrap_err();
+
+        crate::error::assert_coded(&e, "RIVET_STATE_BACKUP_FAILED", 1);
+        let said = format!("{e:#}");
+        assert!(
+            said.contains(".rivet_state.db.v32."),
+            "names the copy it could not write: {said}"
+        );
+        assert!(said.contains("Nothing was migrated"), "{said}");
+        assert_eq!(get_current_version(&conn), 32, "the state is still v32");
+        assert!(!has_column(&conn, "export_state", "stream"), "no DDL ran");
+        assert_eq!(
+            copies_beside(&db),
+            Vec::<String>::new(),
+            "no half-written copy is left behind"
+        );
+        drop(conn);
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "the state file is byte-identical"
+        );
+        assert_eq!(version_of(&db), 32);
+    }
+
+    /// The PostgreSQL copy holds every state table with the old version's rows, keys and its own serial sequences; a second attempt from the same version keeps the first copy.
+    #[test]
+    fn pg_a_migration_copies_every_state_table_into_a_backup_schema_before_the_first_ddl() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let mut client = connect_pg(&url).expect("connect pg state");
+        let reset = "DROP SCHEMA IF EXISTS rivet_wayback_test CASCADE; \
+                     DROP SCHEMA IF EXISTS rivet_state_backup_v32 CASCADE;";
+        let stage = |client: &mut postgres::Client, metrics_rows: i64| {
+            client
+                .batch_execute(
+                    "CREATE SCHEMA rivet_wayback_test; SET search_path TO rivet_wayback_test; \
+                     CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);",
+                )
+                .unwrap();
+            for &(ver, sql) in PG_MIGRATIONS {
+                if ver <= 32 {
+                    client
+                        .batch_execute(&format!(
+                            "BEGIN; {sql} INSERT INTO rivet_schema_version (version) VALUES ({ver}); COMMIT;"
+                        ))
+                        .unwrap();
+                }
+            }
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO export_state (export_name, prefix, last_cursor_value) VALUES ('orders', 'pg/a', '42'); \
+                     INSERT INTO export_metrics (export_name, run_at, duration_ms, total_rows, status) \
+                         SELECT 'orders', 't', 1, g, 'ok' FROM generate_series(1, {metrics_rows}) g;"
+                ))
+                .unwrap();
+        };
+        client.batch_execute(reset).unwrap();
+        stage(&mut client, 3);
+        let tables = |client: &mut postgres::Client, schema: &str| -> Vec<(String, i64)> {
+            let names: Vec<String> = client
+                .query(
+                    "SELECT tablename::text FROM pg_tables WHERE schemaname = $1 ORDER BY 1",
+                    &[&schema],
+                )
+                .unwrap()
+                .iter()
+                .map(|r| r.get(0))
+                .collect();
+            names
+                .into_iter()
+                .map(|t| {
+                    let n: i64 = client
+                        .query_one(&format!("SELECT COUNT(*) FROM {schema}.{t}"), &[])
+                        .unwrap()
+                        .get(0);
+                    (t, n)
+                })
+                .collect()
+        };
+        let before = tables(&mut client, "rivet_wayback_test");
+        assert!(before.iter().any(|(t, n)| t == "export_metrics" && *n == 3));
+
+        migrate_pg(&mut client).expect("v32 -> HEAD on a populated db");
+
+        let copy = tables(&mut client, "rivet_state_backup_v32");
+        assert_eq!(
+            copy, before,
+            "the copy holds every table with the old version's row counts"
+        );
+        let ver: i64 = client
+            .query_one(
+                "SELECT MAX(version) FROM rivet_state_backup_v32.rivet_schema_version",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(ver, 32, "the copy is the v32 state");
+        let stream_cols: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'rivet_state_backup_v32' \
+                 AND table_name = 'export_state' AND column_name = 'stream'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            stream_cols, 0,
+            "the copy predates the first DDL (v33 adds export_state.stream)"
+        );
+        let pkeys: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'rivet_state_backup_v32' AND indexdef LIKE 'CREATE UNIQUE INDEX%'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert!(
+            pkeys >= 5,
+            "the copy keeps the keys the previous release's upserts need: {pkeys}"
+        );
+        let seq: String = client
+            .query_one(
+                "SELECT pg_get_serial_sequence('rivet_state_backup_v32.export_metrics', 'id')",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert!(
+            seq.starts_with("rivet_state_backup_v32."),
+            "the copy's serial column has its own sequence: {seq}"
+        );
+        let next: i64 = client
+            .query_one(
+                "INSERT INTO rivet_state_backup_v32.export_metrics (export_name, run_at, duration_ms, total_rows, status) \
+                 VALUES ('orders', 't', 1, 0, 'ok') RETURNING id",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            next, 4,
+            "the copy's sequence continues where the state's was"
+        );
+
+        // A second attempt from v32 keeps the first copy.
+        client
+            .batch_execute("DROP SCHEMA rivet_wayback_test CASCADE;")
+            .unwrap();
+        stage(&mut client, 7);
+        migrate_pg(&mut client).expect("a second v32 -> HEAD beside an existing copy");
+        let kept: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM rivet_state_backup_v32.export_metrics",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            kept, 4,
+            "the earlier copy is kept, not replaced by the 7-row state"
+        );
+
+        client.batch_execute(reset).unwrap();
+    }
+
+    /// A role that cannot CREATE on the database cannot write the copy: the migration is refused by code and the state is untouched. Staged at v30: v18, v31 and v32 are the other PG tests' copies, and the tests run beside each other.
+    #[test]
+    fn pg_a_copy_that_cannot_be_written_refuses_the_migration_and_leaves_the_state_as_it_was() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let mut admin = connect_pg(&url).expect("connect pg state");
+        let superuser: bool = admin
+            .query_one(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        if !superuser {
+            return crate::test_hook::skip_live(
+                "RIVET_TEST_STATE_URL is not a superuser: cannot create the test role",
+            );
+        }
+        let reset = "DROP SCHEMA IF EXISTS rivet_wayback_nocreate CASCADE; \
+                     DROP SCHEMA IF EXISTS rivet_state_backup_v30 CASCADE; \
+                     DROP ROLE IF EXISTS rivet_wayback_nocreate;";
+        admin.batch_execute(reset).unwrap();
+        admin
+            .batch_execute(
+                "CREATE SCHEMA rivet_wayback_nocreate; SET search_path TO rivet_wayback_nocreate; \
+                 CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);",
+            )
+            .unwrap();
+        for &(ver, sql) in PG_MIGRATIONS {
+            if ver <= 30 {
+                admin
+                    .batch_execute(&format!(
+                        "BEGIN; {sql} INSERT INTO rivet_schema_version (version) VALUES ({ver}); COMMIT;"
+                    ))
+                    .unwrap();
+            }
+        }
+        admin
+            .batch_execute(
+                "INSERT INTO export_state (export_name, prefix, last_cursor_value) VALUES ('orders', 'pg/a', '42'); \
+                 CREATE ROLE rivet_wayback_nocreate LOGIN PASSWORD 'nocreate'; \
+                 GRANT USAGE, CREATE ON SCHEMA rivet_wayback_nocreate TO rivet_wayback_nocreate; \
+                 GRANT ALL ON ALL TABLES IN SCHEMA rivet_wayback_nocreate TO rivet_wayback_nocreate; \
+                 GRANT ALL ON ALL SEQUENCES IN SCHEMA rivet_wayback_nocreate TO rivet_wayback_nocreate;",
+            )
+            .unwrap();
+        // The same server and database, as the role, reading the test schema.
+        let host_db = url
+            .rsplit_once('@')
+            .map_or(url.as_str(), |(_, rest)| rest)
+            .split('?')
+            .next()
+            .unwrap();
+        let role_url = format!(
+            "postgresql://rivet_wayback_nocreate:nocreate@{host_db}?options=-c%20search_path%3Drivet_wayback_nocreate"
+        );
+        let mut role = connect_pg(&role_url).expect("connect as the role without CREATE");
+
+        let e = migrate_pg(&mut role).unwrap_err();
+
+        crate::error::assert_coded(&e, "RIVET_STATE_BACKUP_FAILED", 1);
+        let said = format!("{e:#}");
+        assert!(
+            said.contains("rivet_state_backup_v30"),
+            "names the schema it could not write: {said}"
+        );
+        assert!(said.contains("Nothing was migrated"), "{said}");
+        let ver: i64 = admin
+            .query_one(
+                "SELECT MAX(version) FROM rivet_wayback_nocreate.rivet_schema_version",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(ver, 30, "the state is still v30");
+        let stream_cols: i64 = admin
+            .query_one(
+                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'rivet_wayback_nocreate' \
+                 AND table_name = 'export_state' AND column_name = 'stream'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(stream_cols, 0, "no DDL ran");
+        let copies: i64 = admin
+            .query_one(
+                "SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'rivet_state_backup_v30'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(copies, 0, "no half-written copy is left behind");
+        drop(role);
+        admin.batch_execute(reset).unwrap();
     }
 }
