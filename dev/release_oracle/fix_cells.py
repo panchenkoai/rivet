@@ -73,6 +73,10 @@ SESSION_PIN_CHUNKS = ("control of 801df12f: v0.31.0 pinned TimeZone with a sessi
                       "direct connection reads alike on both")
 
 #: Fix cells allowed to pass on the previous release, each with its reason. Shrink-only.
+MIXED_ID_ORACLE = ("edited by 1b7ffa1f, not written for it: the commit dropped the cell's `.no_oracle` once the rig "
+                   "oracle could read a mixed-type `_id`; the heterogeneous-_id refusal and the whole full scan it "
+                   "asserts predate v0.31.0")
+
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
     "a_crashed_keyset_incremental_run_is_resumed_not_reread_postgres": UNTRIAGED,
     "a_query_that_does_not_rename_the_chunk_column_delivers_its_rows_postgres": UNTRIAGED,
@@ -85,6 +89,7 @@ GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-re
     "apply_child_processes_partitions_like_run_postgres": UNTRIAGED,
     "full_then_resume_mongo": UNTRIAGED,
     "keyset_then_resume_mongo": UNTRIAGED,
+    "mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works": MIXED_ID_ORACLE,
     "mongo_resume_crash_after_keyset_page_recovers_manifest_driven": UNTRIAGED,
     "parallel_keyset_incremental_on_a_float_key_delivers_the_source_rows_mysql": UNTRIAGED,
     "parallel_keyset_incremental_on_a_number5_key_delivers_the_source_rows_oracle": UNTRIAGED,
@@ -98,6 +103,8 @@ GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-re
     "pg_cdc_an_undecodable_old_cell_beside_an_unchanged_key_is_delivered": UNTRIAGED,
     "pg_cdc_an_update_of_a_replica_identity_index_that_is_not_the_key_stays_one_update": UNTRIAGED,
     "pg_table_added_to_tables_mid_stream_is_baselined": UNTRIAGED,
+    "roast_nan_id_refused_for_keyset_and_parallel_full_scan_complete": MIXED_ID_ORACLE,
+    "roast_null_and_object_id_must_not_slip_past_the_bracket_guard": MIXED_ID_ORACLE,
     "run_child_processes_flag_keeps_its_partition_fallback_postgres": UNTRIAGED,
     "run_partitions_the_fixture_postgres": UNTRIAGED,
     "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql": KEYSET_GROWS,

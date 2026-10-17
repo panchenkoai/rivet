@@ -388,7 +388,13 @@ impl TargetLoader for BigQueryLoader {
         Some(self)
     }
 
-    fn materialize(&self, table: &str, specs: &[TargetColumnSpec], uris: &[String]) -> Result<u64> {
+    fn materialize(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        uris: &[String],
+        _expected_rows: Option<u64>,
+    ) -> Result<u64> {
         self.check_cluster_by()?;
         let target = self.fqtn(table);
         let schema = build_file_schema(specs, &self.renames);

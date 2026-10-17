@@ -1,6 +1,6 @@
 //! A live Snowflake target for a rig: the `load:` line, and the cleanup of what a cell created.
 
-use super::bigquery::{gcs_delete_prefix, warehouse_or_skip};
+use super::bigquery::{gcs_delete_prefix, gcs_list, gcs_put, warehouse_or_skip};
 
 /// One cell's Snowflake target: a schema the stand owns and the cell's own GCS prefix.
 pub struct SfLive {
@@ -84,6 +84,56 @@ impl SfLive {
             other => other.as_i64().expect("a count"),
         };
         (n(&rows[0][0]), n(&rows[0][1]))
+    }
+
+    /// The `(id, v)` integer pairs of `table`, ordered by id, read through the second client.
+    pub fn id_v_pairs(&self, table: &str) -> Vec<(i64, i64)> {
+        let n = |v: &serde_json::Value| match v {
+            serde_json::Value::String(s) => s.parse().expect("an integer"),
+            other => other.as_i64().expect("an integer"),
+        };
+        self.read(&format!("SELECT id, v FROM {} ORDER BY id", self.fq(table)))
+            .iter()
+            .map(|r| (n(&r[0]), n(&r[1])))
+            .collect()
+    }
+
+    /// Every table or view of the schema whose name starts with `table`'s, upper-cased and sorted.
+    pub fn names_from(&self, table: &str) -> Vec<String> {
+        self.read(&format!(
+            "SELECT table_name FROM {}.INFORMATION_SCHEMA.TABLES WHERE table_schema = '{}' \
+             AND STARTSWITH(table_name, '{}') ORDER BY table_name",
+            self.database,
+            self.schema.to_uppercase(),
+            table.to_uppercase()
+        ))
+        .iter()
+        .map(|r| r[0].as_str().expect("table_name").to_string())
+        .collect()
+    }
+
+    /// `privilege grantee` of every grant on `table`, sorted.
+    pub fn grants(&self, table: &str) -> Vec<String> {
+        self.read(&format!(
+            "SELECT privilege_type || ' ' || grantee FROM {}.INFORMATION_SCHEMA.TABLE_PRIVILEGES \
+             WHERE table_schema = '{}' AND table_name = '{}' ORDER BY 1",
+            self.database,
+            self.schema.to_uppercase(),
+            table.to_uppercase()
+        ))
+        .iter()
+        .map(|r| r[0].as_str().expect("a grant").to_string())
+        .collect()
+    }
+
+    /// Every object name under this cell's GCS prefix.
+    pub fn gcs_objects(&self) -> Vec<String> {
+        gcs_list(&self.bucket, &self.prefix)
+    }
+
+    /// Overwrite the object `name` with bytes no Parquet reader accepts.
+    pub fn corrupt(&self, name: &str) {
+        gcs_put(&self.bucket, name, b"not a parquet file");
     }
 
     /// Run one statement as the stand's own setup (through `snow`); panics with what Snowflake said.

@@ -32,6 +32,8 @@
 //! | `clickhouse_full_before_swap_in` | `load/clickhouse.rs` (every part in the swap table, the old table still served) | `RIVET_TEST_PANIC_AT=clickhouse_full_before_swap_in` |
 //! | `clickhouse_full_after_exchange` | `load/clickhouse.rs` (the swap exchanged in, the old table not yet dropped) | `RIVET_TEST_PANIC_AT=clickhouse_full_after_exchange` |
 //! | `compact_after_merge` | `load/bigquery/mod.rs` (MERGEs + DROP already committed) | `RIVET_TEST_PANIC_AT=compact_after_merge` |
+//! | `cdc_after_parts_before_ack` | `pipeline/cdc/sink.rs` (pause: a roll that made at least one part durable, the ack not yet sent; a row-less commit's roll does not reach it) | `RIVET_TEST_PAUSE_AT=cdc_after_parts_before_ack:60000` |
+//! | `cdc_after_ack_of_parts` | `pipeline/cdc/sink.rs` (the ack that followed a roll with parts; a row-less commit's ack does not reach it) | `RIVET_TEST_PANIC_AT=cdc_after_ack_of_parts` |
 //!
 //! # Test usage
 //!

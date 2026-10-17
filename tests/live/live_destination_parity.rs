@@ -289,10 +289,10 @@ fn destination_parity_row_counts_match_across_local_s3_gcs() {
     );
 }
 
-/// P-27: a relative `destination.path` names one place whatever directory rivet is started from.
+/// A relative `destination.path` is anchored to the config's directory: one config delivers to one place whatever directory rivet is started from (P-27).
 #[test]
-#[ignore = "live+gate-only: postgres; open defect P-27, acknowledged in dev/release_oracle/known_red.py"]
-fn open_defect_a_relative_destination_path_does_not_follow_the_working_directory() {
+#[ignore = "live: requires docker compose postgres"]
+fn a_relative_destination_path_follows_the_config() {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("dest_relative");
@@ -324,9 +324,99 @@ fn open_defect_a_relative_destination_path_does_not_follow_the_working_directory
         }
     };
     let (first, second) = (held(a.path()), held(b.path()));
+    let beside = held(beside_config.parent().unwrap());
     let whole = (1..=13).collect::<Vec<_>>();
+    assert_eq!(
+        beside, whole,
+        "P-27: one config with a relative destination.path delivered ids {first:?} under the first working directory and {second:?} under the second: the directory beside the config holds {beside:?}, not the 13 source rows"
+    );
     assert!(
-        [&first, &second, &held(beside_config.parent().unwrap())].contains(&&whole),
-        "P-27: one config with a relative destination.path delivered ids {first:?} under the first working directory and {second:?} under the second: no directory holds the 13 source rows"
+        first.is_empty() && second.is_empty(),
+        "nothing lands under a working directory: {first:?} / {second:?}"
+    );
+}
+
+/// Upgrade: the previous release, started from directory A with `path: ./out`, wrote under A; this build started from A refuses by code, twice and through `validate` alike, with nothing written in either place; the printed remedy, moving the files beside the config, lets the next run continue the cursor there, every source row once (P-27).
+#[test]
+#[ignore = "live: requires docker compose postgres and RIVET_PREV_RELEASE_BIN"]
+fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow() {
+    let e = SqlEngine::Pg;
+    e.alive();
+    let (table, _guard) = e.table("dest_rel_upgrade");
+    e.insert(&table, 1..=10, 180, Some(10));
+    let rig = e
+        .rig(&table)
+        .restage("incremental", &["cursor_column: id"])
+        .unwritable_dest_path(std::path::PathBuf::from("./out"));
+    let beside = rig.config_path().parent().unwrap().join("out");
+    // Directory A under the rig's own, so the remedy's move is one rename.
+    let a = tempfile::tempdir_in(beside.parent().unwrap()).unwrap();
+    let under_cwd = a.path().join("out");
+    let mut rig = rig.in_dir(a.path());
+    let Some(old) = rig.as_previous_release() else {
+        return;
+    };
+    // A state database of the cell's own when the pass grades the shared Postgres state, which the previous release must not meet migrated past it.
+    let state = state_url_under_test().map(|_| ScratchStateDb::new("dest_rel_upgrade"));
+    let url = state.as_ref().map(ScratchStateDb::url);
+    let envs: Vec<(&str, &str)> = url
+        .iter()
+        .map(|u| ("RIVET_STATE_URL", u.as_str()))
+        .collect();
+    let run = old.run_with_envs(&envs);
+    assert!(
+        run.status.success(),
+        "the previous release: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let first = (1..=10).collect::<Vec<_>>();
+    assert_eq!(
+        read_ids(&under_cwd),
+        first,
+        "the previous release delivers under the working directory"
+    );
+    e.insert(&table, 11..=13, 170, Some(10));
+
+    let refused = Refused::by_code("RIVET_DEST_RELATIVE_PATH_MOVED", 5);
+    let text = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &envs,
+        refused,
+        vec![
+            Remedy::wrong(
+                "runs `rivet validate`, which meets the same refusal",
+                Then::Refuses(refused),
+                |_| {},
+            )
+            .rerun_as(&["validate"])
+            .in_place(),
+            Remedy::new(
+                &format!("move the files to {}", beside.display()),
+                Then::DeliversTheSource,
+                |_| {
+                    assert!(!beside.exists(), "nothing written beside the config");
+                    assert_eq!(
+                        read_ids(&under_cwd),
+                        first,
+                        "nothing written under the working directory"
+                    );
+                    std::fs::rename(&under_cwd, &beside).unwrap();
+                },
+            )
+            .in_place(),
+        ],
+    );
+    assert!(
+        text.contains(under_cwd.to_str().unwrap()),
+        "the refusal names the working-directory place:\n{text}"
+    );
+    assert_eq!(
+        read_ids(&beside),
+        (1..=13).collect::<Vec<_>>(),
+        "the destination holds every source row once"
+    );
+    assert!(
+        !under_cwd.exists(),
+        "nothing lands under the working directory again"
     );
 }

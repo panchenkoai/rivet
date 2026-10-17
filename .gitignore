@@ -14,6 +14,9 @@
 /dev/init_generated/
 /dev/scenarios/.rivet_state.db*
 /dev/legacy/output/
+/dev/fixtures/output/
+/dev/workbench/output/
+/dev/scenarios/output/
 /dev/legacy/.init_*.yaml
 .cursor/
 .vscode/

@@ -19,7 +19,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/legacy/output
+      path: ./output
 
   - name: legacy_orders_chunked
     query: "SELECT id, user_id, product, quantity, price, status, ordered_at, updated_at FROM orders"
@@ -29,7 +29,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/legacy/output
+      path: ./output
 
   - name: legacy_orders_incremental
     query: "SELECT id, user_id, product, quantity, price, ordered_at, updated_at FROM orders"
@@ -38,7 +38,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/legacy/output
+      path: ./output
 
   - name: legacy_events_timewindow
     query: "SELECT id, user_id, event_type, payload::text AS payload, ip_address, created_at FROM events"
@@ -48,4 +48,4 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/legacy/output
+      path: ./output

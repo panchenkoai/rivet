@@ -639,10 +639,21 @@ fn state_changes(
                 (true, Some("running")) => Leftover::UnfinishedRecord,
                 (true, _) => Leftover::UnknownStatus,
             };
+            // The same run's row was already there: a record this invocation did not leave. It is
+            // a leftover only when its status moved; a column a schema migration added (this tree
+            // opening the previous release's state) changes the row's text and nothing else.
+            let was = field(row, "run_id").and_then(|id| {
+                b.difference(a)
+                    .find(|w| field(w, "run_id").as_deref() == Some(&id))
+            });
+            if journal && was.is_some_and(|w| field(w, "status") == status) {
+                continue;
+            }
+            let was = was.map_or(String::new(), |w| format!(" (was: {w})"));
             out.push(Finding {
                 kind,
                 export: field(row, "export_name"),
-                what: format!("{t} + {row}"),
+                what: format!("{t} + {row}{was}"),
             });
         }
         for row in b.difference(a).filter(|_| !journal) {
@@ -1188,6 +1199,27 @@ mod tests {
             kind(r#"{"export_name":"e","last_cursor_value":"10","resume_run_id":null}"#),
             Leftover::ResumePoint
         );
+    }
+
+    #[test]
+    fn a_journal_row_that_only_gained_a_column_is_not_a_leftover_but_a_status_flip_is() {
+        let rows = |row: &str| {
+            BTreeMap::from([("run_status".to_string(), BTreeSet::from([row.to_string()]))])
+        };
+        let before = rows(
+            r#"{"export_name":"e","run_id":"e_20261017T014701.735_74675","status":"success"}"#,
+        );
+        // This tree migrated the previous release's state under a refused load: `source` appeared, null.
+        let migrated = rows(
+            r#"{"export_name":"e","run_id":"e_20261017T014701.735_74675","source":null,"status":"success"}"#,
+        );
+        assert_eq!(state_changes(&before, &migrated), vec![]);
+        let flipped =
+            rows(r#"{"export_name":"e","run_id":"e_20261017T014701.735_74675","status":"failed"}"#);
+        let found = state_changes(&before, &flipped);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, Leftover::FailureRecord);
+        assert!(found[0].what.contains("(was: "), "{}", found[0].what);
     }
 
     #[test]

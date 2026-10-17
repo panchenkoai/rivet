@@ -32,7 +32,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output/sparse_chunk
+      path: ./output/sparse_chunk
 
   - name: orders_sparse_keyset
     table: orders_sparse
@@ -42,7 +42,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output/sparse_chunk
+      path: ./output/sparse_chunk
 
   - name: orders_sparse_dense
     query: "SELECT id, payload, chunk_rownum FROM orders_sparse_for_export"
@@ -53,7 +53,7 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output/sparse_chunk
+      path: ./output/sparse_chunk
 
   # One output file for the whole table (if rows ≤ chunk_size on dense key). Raise chunk_size for bigger seeds.
   - name: orders_sparse_dense_onefile
@@ -64,4 +64,4 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output/sparse_chunk
+      path: ./output/sparse_chunk

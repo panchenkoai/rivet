@@ -12,4 +12,4 @@ exports:
     max_file_size: 10KB
     destination:
       type: local
-      path: ./dev/output
+      path: ./output

@@ -708,6 +708,26 @@ seeds:
       mongo:
         na: "a Mongo export has no range chunking"
 
+  - name: snowflake-full-load-empties-before-copy
+    class: a whole-table Snowflake load replaces the target before its COPY succeeds, so a failed or lost COPY leaves the table empty until a retry succeeds
+    history: "2026-10-16 retry matrix F6: `CREATE OR REPLACE TABLE` then `COPY` in one script; a COPY of an unreadable part left the target with 0 rows (read through DuckDB's snowflake extension), exit 1, on main through 0.31.0"
+    scope: source
+    patch: snowflake-full-load-empties-before-copy/shared.patch
+    engines:
+      postgres:
+        cells: [snowflake_full_load_that_fails_keeps_the_last_table_postgres]
+      mysql:
+        cells: [snowflake_full_load_that_fails_keeps_the_last_table_mysql]
+      mssql:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cell and the postgres/mysql cells"
+      mongo:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cell and the postgres/mysql cells"
+      oracle:
+        na: "the load driver never reads the source engine: one code path, graded by the lib cell and the postgres/mysql cells"
+      lib:
+        cells:
+          - "lib:a_full_load_swaps_in_only_a_counted_copy_and_drops_its_staging_table"
+
   - name: load-append-writes-before-asking
     class: a load writes a warehouse name before asking whether the ledger has a record of it, or journals a stop before the write in a way the next load reads as ownership
     history: "2026-10-06 triage P-03, P-08, P-10 - an incremental or CDC load replaced a foreign view and appended to a foreign `__changes`, exit 0; the stale-buffer stop was journaled `failed` and the `writing` row preceded the ownership check, so the next load overwrote a table it had refused"
@@ -1991,6 +2011,22 @@ seeds:
         cells: [check_refuses_a_collection_that_does_not_exist_as_run_does_mongo]
       oracle:
         na: "a missing SQL table fails the query, read by the engine; the absent-collection guard is MongoDB's"
+  - name: dropped-source-table-uncoded
+    class: "a verdict every engine types (the relation the export reads does not exist) is recognised by no path, so each path ends with the raw driver error or a generic query-failed code instead of the one refusal"
+    history: "2026-10-16 - found by hand on the pilot client's shape (MySQL -> GCS -> BigQuery, cron): an export whose source table was dropped failed as `MySqlError { ERROR 1146 (42S02): Table 'rivet.drop_probe_b' doesn't exist }` with no RIVET_* code (PostgreSQL too), RIVET_SOURCE_QUERY_FAILED on SQL Server and Oracle, through 0.31.0; fixed by one `names_a_missing_relation` / `code_a_missing_relation` on every path that reads the table"
+    scope: source
+    patch: dropped-source-table-uncoded/shared.patch
+    engines:
+      postgres:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_postgres]
+      mysql:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mysql]
+      mssql:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mssql]
+      mongo:
+        na: "a missing collection is MongoDB's own RIVET_SOURCE_COLLECTION_NOT_FOUND (collection-refusal-uncoded-on-run); no SQL verdict exists to recognise"
+      oracle:
+        cells: [a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_oracle]
   - name: cursor-case-uncoded
     class: "a refusal the product raises from the result set is never reached on an engine where the same config fails the query first, so that engine exits with the raw database error instead of the code"
     history: "2026-10-14 - found by the by-hand CLI sweep (P6): `cursor_column` in another case was RIVET_CONFIG_CURSOR_COLUMN_CASE on MySQL and SQL Server but a raw 42703 / ORA-00904 on PostgreSQL and Oracle, through 0.31.0; fixed by `refuse_a_cursor_case_miss`"
@@ -2726,6 +2762,42 @@ seeds:
         cells: [a_failed_holder_of_a_shared_name_is_reported_under_its_own_run_id]
       sqlite-state:
         cells: ["lib:another_holders_row_of_the_same_name_is_not_this_childs_entry", "lib:a_childs_entry_is_the_row_of_the_run_it_reported"]
+  - name: relative-destination-path-follows-the-cwd
+    class: "a relative local `destination.path` is resolved against the directory rivet is started from while the cursor and state live beside the config, so one config run from two directories delivers each run's rows under a different directory, every run green"
+    history: "2026-10-16 - P-27 (live_destination_parity): one config with `path: ./out` run from two working directories delivered ids 1..10 under the first and 11..13 under the second, exit 0 both times, on main through 0.31.0; fixed by anchoring every relative local path to the config file's directory once at config load (`Config::anchor_paths`)"
+    scope: source
+    patch: relative-destination-path-follows-the-cwd/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:a_loaded_config_anchors_its_relative_local_paths_once"
+          - a_relative_destination_path_follows_the_config
+      mysql:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      mssql:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      mongo:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+      oracle:
+        cells: ["lib:a_loaded_config_anchors_its_relative_local_paths_once"]
+  - name: relative-destination-path-moved-by-the-upgrade
+    class: "the transition guard for a relative local `destination.path` does not fire, so the upgrade to the config-anchored path silently moves an export's output: old rows under the working directory, new rows beside the config, exit 0"
+    history: "2026-10-16 - the first #617 head: a run of 0.31.0 from directory A with `path: ./out` wrote under A, and this build from A delivered the next rows beside the config, exit 0 (`refusal contract: the invocation ended with success (exit 0), expected [RIVET_DEST_RELATIVE_PATH_MOVED] (exit 5)`); fixed by `destination::relative_path_moved`, the one decision `Config::anchor_paths` makes before any command reads or writes the directory"
+    scope: source
+    patch: relative-destination-path-moved-by-the-upgrade/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"
+          - a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow
+      mysql:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
+      mssql:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
+      mongo:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
+      oracle:
+        cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
   - name: foreign-lease-taken-before-expiry
     class: "a run lease whose holder names another host is judged by a local pid probe, so a run on a live host loses its lease to a run here before the lease expires"
     history: "2026-10-16 - harness: the dead-owner cells damaged `chunk-run:<export>` after the run lease became `chunk-run:<export>@<source hash>`, so on a PostgreSQL state they failed on `changed 0 row(s)` and on SQLite they were skipped; no cell could catch a takeover rule that ignored the host (fixed by deriving the key through `run_lease_key` and keeping a Postgres state in the cell)"
@@ -2738,3 +2810,25 @@ seeds:
           - "lib:a_dead_holder_on_this_host_is_recognised_and_nothing_else_is"
       sqlite-state:
         na: the SQLite lease is an flock on a sidecar file that the kernel drops with its holder; there is no holder row naming a host to misjudge
+  - name: repair-under-a-changed-chunk-plan
+    class: "`reconcile` and `repair` read the stored chunk run without comparing the chunk plan it was planned under with the config, so after a `chunk_column` edit they re-read the stored windows on the new column and a repair supersedes parts: the manifest lists fewer rows than the source has"
+    history: "2026-10-16 - P-21 (live_reconcile_repair): a repair --execute after chunk_column was edited from id to other_id left the manifest listing 39 rows over 39 distinct ids for 40 source ids, exit 0, on main through 0.31.0; fixed by routing reconcile and repair through the check `run --resume` already runs (`chunked::refuse_changed_chunk_plan`, via `reconcile_cmd::latest_chunk_run_under_this_plan`)"
+    scope: source
+    patch: repair-under-a-changed-chunk-plan/shared.patch
+    engines:
+      postgres:
+        cells:
+          - "lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"
+          - repair_after_a_chunk_column_edit_is_refused_by_code_postgres
+      mysql:
+        cells:
+          - "lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"
+          - repair_after_a_chunk_column_edit_is_refused_by_code_mysql
+      mssql:
+        cells:
+          - "lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"
+          - repair_after_a_chunk_column_edit_is_refused_by_code_mssql
+      mongo:
+        na: "`rivet reconcile` and `rivet repair` take a `mode: chunked` export; MongoDB exports have none"
+      oracle:
+        cells: ["lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"]

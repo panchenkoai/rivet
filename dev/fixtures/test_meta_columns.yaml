@@ -12,4 +12,4 @@ exports:
       row_hash: true
     destination:
       type: local
-      path: ./dev/output
+      path: ./output

@@ -618,15 +618,18 @@ fn resolve_chunked_strategy(
             ));
         }
         Err(e) => {
-            return Err(crate::error::recoded(
-                &e,
-                crate::error::codes::PLAN_SOURCE_UNREADABLE,
+            // The cause stays in the chain (its typed verdict is what the pipeline recodes a
+            // dropped table by); its own code, when it has one, stays the code.
+            let code =
+                crate::error::code_of(&e).unwrap_or(crate::error::codes::PLAN_SOURCE_UNREADABLE);
+            return Err(e.context(crate::error::CodedError::new(
+                code,
                 format!(
-                    "export '{}': chunked-mode introspection probe failed: {e}. \
-                     Set `chunk_column:` (and `chunk_size:`) explicitly or check connectivity.",
+                    "export '{}': chunked-mode introspection probe failed; set `chunk_column:` \
+                     (and `chunk_size:`) explicitly or check connectivity",
                     export.name
                 ),
-            ));
+            )));
         }
     };
 
@@ -1128,14 +1131,18 @@ mod tests {
         .expect("plan")
     }
 
-    /// The destination part of the progress identity is the destination as written: a `{date}` prefix is one place on every day, and a plan with no placeholder seals as before.
+    /// The destination part of the progress identity is the destination as written (a relative local path as `Config::load` anchors it): a `{date}` prefix is one place on every day, and a plan with no placeholder seals as before.
     #[test]
     fn a_dated_destination_enters_the_progress_identity_as_written() {
         let dir = tempfile::tempdir().unwrap();
         let plain = planned(dir.path(), "    table: orders", &[]);
         assert_eq!(plain.destination_written, None);
         let landing = plain.progress_key().landing;
-        assert_eq!(landing.destination, "file://./out");
+        let anchored = format!("file://{}", dir.path().join("out").display());
+        assert_eq!(
+            landing.destination, anchored,
+            "anchored to the config's directory"
+        );
         assert_eq!(landing.format, "parquet");
         let sealed = serde_json::to_value(&plain).unwrap();
         assert!(sealed.get("destination_written").is_none(), "{sealed}");

@@ -577,6 +577,38 @@ pub(super) fn incomplete_run_check(
     )))
 }
 
+/// The fingerprint of the chunk plan `plan` runs under.
+pub(crate) fn chunk_plan_hash(plan: &ResolvedRunPlan, cp: &ChunkedPlan) -> String {
+    chunk_plan_fingerprint(
+        &plan.base_query,
+        &cp.column,
+        cp.chunk_size,
+        cp.chunk_count,
+        cp.by_days,
+    )
+}
+
+/// Refuse to `action` a stored chunk run planned under `stored_hash` when `plan` is not that plan: the one check `run --resume`, `reconcile` and `repair` share.
+pub(crate) fn refuse_changed_chunk_plan(
+    plan: &ResolvedRunPlan,
+    cp: &ChunkedPlan,
+    stored_hash: &str,
+    action: &str,
+    config_path: &str,
+) -> Result<()> {
+    if stored_hash != chunk_plan_hash(plan, cp) {
+        crate::rivet_bail!(
+            crate::error::codes::STATE_CHUNK_PLAN_CHANGED,
+            "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot {action} it. \
+             To finish it: restore the query and the chunk settings the interrupted run had and run once to finish it. \
+             To abandon it: `rivet state reset-chunks -c {config_path} -e {}` abandons it and the next run starts over",
+            plan.export_name,
+            plan.export_name
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn ensure_chunk_checkpoint_plan(
     state: &StateStore,
     plan: &ResolvedRunPlan,
@@ -586,13 +618,7 @@ pub(super) fn ensure_chunk_checkpoint_plan(
     config_path: &str,
     progress: &crate::state::ProgressClaim<'_>,
 ) -> Result<String> {
-    let plan_hash = chunk_plan_fingerprint(
-        &plan.base_query,
-        &cp.column,
-        cp.chunk_size,
-        cp.chunk_count,
-        cp.by_days,
-    );
+    let plan_hash = chunk_plan_hash(plan, cp);
     let max_att = cp.max_attempts;
 
     // A CDC baseline leg is rivet's OWN export: the operator never named it, so the
@@ -608,16 +634,7 @@ pub(super) fn ensure_chunk_checkpoint_plan(
     if resume {
         match crashed {
             Some((rid, stored_hash)) => {
-                if stored_hash != plan_hash {
-                    crate::rivet_bail!(
-                        crate::error::codes::STATE_CHUNK_PLAN_CHANGED,
-                        "export '{}': chunk plan fingerprint mismatch (query, chunk_column, chunk_size, chunk_count or chunk_by_days changed); cannot resume. \
-                         To finish it: restore the query and the chunk settings the interrupted run had and run once to finish it. \
-                         To abandon it: `rivet state reset-chunks -c {config_path} -e {}` abandons it and the next run starts over",
-                        plan.export_name,
-                        plan.export_name
-                    );
-                }
+                refuse_changed_chunk_plan(plan, cp, &stored_hash, "resume", config_path)?;
                 if let Err(why) = stored_windows(&state.list_chunk_tasks_for_run(&rid)?) {
                     crate::rivet_bail!(
                         crate::error::codes::STATE_CHUNK_WINDOWS_BROKEN,

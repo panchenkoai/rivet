@@ -74,7 +74,7 @@ impl Rig {
 
     /// Run to completion and collect the output.
     fn invoke(&self, argv: &[String], envs: &[(&str, &str)]) -> std::process::Output {
-        self.invoke_in(argv, envs, None)
+        self.invoke_in(argv, envs, self.cwd_override.as_deref())
     }
 
     /// The one blocking bracket: snapshot, run (in `cwd` when given), absorb config writes, grade by the exit.

@@ -359,6 +359,38 @@ fn cursor_column_in_another_case(engine: SqlEngine) {
     );
 }
 
+/// A source table dropped after a green run: the export stops as `RIVET_SOURCE_TABLE_NOT_FOUND` (exit 1)
+/// on that run and the next, naming its `table:` and the remedy, while the sibling export of the same
+/// config keeps delivering.
+fn dropped_source_table(engine: SqlEngine) {
+    let (table, _guard) = id_v_table(engine, "oc_dropped", ROWS);
+    let (sibling, _sibling_guard) = id_v_table(engine, "oc_sibling", ROWS);
+    let rig = engine
+        .rig(&table)
+        .also_batch_export("sibling", &sibling, "full");
+    rig.run_ok();
+    engine.exec(&format!("DROP TABLE {table}"));
+    for cycle in 1..=2 {
+        let out = rig.run();
+        assert_refused(&out, Refused::by_code("RIVET_SOURCE_TABLE_NOT_FOUND", 1));
+        let said = text(&out);
+        assert!(
+            said.contains(&format!("(`table: {table}`)"))
+                && said.contains("remove the export from `exports:`"),
+            "cycle {cycle}: the refusal names the export's `table:` and the remedy\n{said}"
+        );
+        assert!(
+            said.contains("1 success · 1 failed"),
+            "cycle {cycle}: the sibling export of the same run still delivers\n{said}"
+        );
+        assert_eq!(
+            parquet_rows(&rig.out_dir_for("sibling")),
+            ROWS as usize * (cycle + 1),
+            "cycle {cycle}: every run so far delivered the sibling"
+        );
+    }
+}
+
 /// RESULTS 4: a second `full` run beside a live one is refused, or the prefix still holds each key once.
 fn concurrent_full_runs(engine: SqlEngine) {
     let (table, _guard) = id_v_table(engine, "oc_twofull", 200);
@@ -1897,6 +1929,31 @@ fn a_cursor_column_in_another_case_is_refused_by_code_mssql() {
 #[ignore = "live: requires docker compose oracle"]
 fn a_cursor_column_in_another_case_is_refused_by_code_oracle() {
     cursor_column_in_another_case(SqlEngine::Oracle);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_postgres() {
+    dropped_source_table(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mysql() {
+    dropped_source_table(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_mssql() {
+    dropped_source_table(SqlEngine::Mssql);
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_dropped_source_table_is_refused_by_code_and_its_sibling_delivers_oracle() {
+    dropped_source_table(SqlEngine::Oracle);
 }
 
 #[test]

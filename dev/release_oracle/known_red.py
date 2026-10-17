@@ -23,25 +23,15 @@ class KnownRed:
 
 
 _EXPIRES = "2026-10-31"
-_PROGRESS_KEY = ("stored progress has no single owner key (export, normalised source, stream, mode); the work item is the "
-                 "progress key, PROGRESS-KEY-DESIGN.md")
-
-
 def _open(cell: str, symptom: str, reason: str) -> KnownRed:
     """The entry of one `open_defect_*` live cell: its test path and the first line of its panic."""
     return KnownRed(f"{cell} — {symptom}", reason, _EXPIRES)
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
-    _open("live_reconcile_repair::open_defect_repair_after_a_chunk_column_edit_lists_each_row_once",
-          "P-21: a repair under an edited chunk_column left the manifest listing 39 rows over 39 distinct ids for 40 source ids",
-          f"P-21: reconcile and repair do not compare the stored plan fingerprint, so a repair re-reads the stored windows on the new column and supersedes the parts; {_PROGRESS_KEY}"),
     _open("live_plan_apply::open_defect_a_sealed_plan_keeps_the_date_placeholder",
           "P-26: the sealed plan holds no `{date}` placeholder",
           "P-26: `rivet plan` resolves `{date}` into the artifact, so an apply after UTC midnight writes under the planning date; the work item is the planner-and-paths PR (TRIAGE PR-M), pending the ADR-0005 decision on what a sealed plan freezes"),
-    _open("live_destination_parity::open_defect_a_relative_destination_path_does_not_follow_the_working_directory",
-          "P-27: one config with a relative destination.path delivered ids [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] under the first working directory and [11, 12, 13] under the second",
-          "P-27: a relative `destination.path` resolves against the working directory while the cursor lives beside the config; the work item is the planner-and-paths PR (TRIAGE PR-M): anchor it to the config directory"),
     KnownRed('upgrade[oracle/cdc-load]: cycle1/load: prev exit 1: Error: config has no top-level `load:` block',
              "Oracle CDC does not load yet (ADR-0037; the Oracle GA work). The previous release's `rivet init --mode cdc` writes no `load:` block, and this cell still drives the previous release through `load`, which refuses. `upgrade[oracle/cdc-load/init=this]` grades what the scaffold does promise (the baseline Parquet equals the source). The cycle stays unsupported until Oracle CDC loads",
              "2026-10-31"),

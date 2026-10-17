@@ -7,8 +7,8 @@
 days: 7
 
 cells:
-  a: { green: '2026-10-16', by: gate, at: 2f701429, in: m }
-  c: { green: '2026-10-16', by: gate, at: 2f701429, in: m }
+  a: { green: '2026-10-17', by: gate, at: 86267e84, in: m }
+  c: { green: '2026-10-17', by: gate, at: 86267e84, in: m }
   cdc_into_bigquery_three_cycles_mongo: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
   cdc_into_bigquery_three_cycles_mssql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }
   cdc_into_bigquery_three_cycles_mysql: { green: '2026-10-14', by: local, at: 621fcaa2, in: live_three_cycles }

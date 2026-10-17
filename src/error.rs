@@ -847,7 +847,7 @@ pub mod codes {
         "RIVET_STATE_RUN_IN_PROGRESS",
         "wait for the run to finish, or stop its process, then repeat the command",
     );
-    /// A resume met an unfinished chunk run opened under another query or other chunk settings.
+    /// A resume, reconcile or repair met a stored chunk run planned under another query or other chunk settings.
     pub const STATE_CHUNK_PLAN_CHANGED: Code = refusal(
         "RIVET_STATE_CHUNK_PLAN_CHANGED",
         "restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over",
@@ -936,10 +936,20 @@ pub mod codes {
         "RIVET_SOURCE_COLLECTION_NOT_FOUND",
         "correct the export's `table:` (a dotted collection name is written whole), or create the collection",
     );
+    /// The relation an export reads does not exist, by the engine's own verdict (dropped, or misspelt in `table:` / `query:`).
+    pub const SOURCE_TABLE_NOT_FOUND: Code = environment(
+        "RIVET_SOURCE_TABLE_NOT_FOUND",
+        "correct the export's `table:` (or the relation its `query:` reads), or remove the export from `exports:` if the table was dropped on purpose",
+    );
     /// The bucket or container a cloud destination names does not exist.
     pub const DEST_CONTAINER_NOT_FOUND: Code = environment(
         "RIVET_DEST_CONTAINER_NOT_FOUND",
         "create the bucket or container, or correct `destination.bucket`",
+    );
+    /// A relative local `destination.path` names a directory beside the config since 0.32, while the one under the working directory (where a release before 0.32 wrote it) still holds the export's files.
+    pub const DEST_RELATIVE_PATH_MOVED: Code = refusal(
+        "RIVET_DEST_RELATIVE_PATH_MOVED",
+        "move the export's files from the directory under the working directory to the one beside the config, or make `destination.path` absolute",
     );
     /// `run --resume` met a destination prefix that already holds a complete export.
     pub const DEST_ALREADY_COMPLETE: Code = refusal(
@@ -1622,7 +1632,9 @@ pub mod codes {
         STATE_LEASE_LOST,
         PLAN_SOURCE_UNREADABLE,
         SOURCE_COLLECTION_NOT_FOUND,
+        SOURCE_TABLE_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
+        DEST_RELATIVE_PATH_MOVED,
         DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,
