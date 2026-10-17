@@ -116,21 +116,21 @@ fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap() {
     assert!(st.success());
     seed_backlog(&mut c, &tbl, 5_000);
 
-    // Start the drain; SIGKILL as soon as the first part exists.
-    let mut child = rig.spawn_args_env(&[], &[]);
+    // Start the drain; SIGKILL while the product is parked at its own sequence point: the
+    // first roll's part is durable and the ack has not run. A kill timed on "the first part
+    // exists" landed after the whole drain under gate load (gate 2026-10-16: 5000 of 5000).
+    let marker = d.path().join("paused");
+    let marker_env = marker.display().to_string();
+    let mut child = rig.spawn_args_env(
+        &[],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "cdc_after_parts_before_ack:120000"),
+            ("RIVET_TEST_PAUSE_MARKER", &marker_env),
+        ],
+    );
     let mut killed_mid_drain = false;
-    for _ in 0..600 {
-        let parts = std::fs::read_dir(&out)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .is_some_and(|x| x == "parquet")
-            })
-            .count();
-        if parts >= 1 {
+    for _ in 0..6_000 {
+        if marker.is_file() {
             let _ = std::process::Command::new("kill")
                 .args(["-9", &child.id().to_string()])
                 .status();
@@ -138,32 +138,25 @@ fn gremlin_cdc_sigkill_mid_drain_recovers_without_gap() {
             break;
         }
         if let Some(_status) = child.try_wait().unwrap() {
-            break; // drained before the kill landed — asserted against below
+            break; // ended before the pause was reached — asserted against below
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let _ = child.wait();
 
-    // The fault must have FIRED. `killed_mid_drain` used to be computed and only
-    // interpolated into the failure message, so a run that drained before the kill
-    // landed passed having verified nothing about crash recovery — the test's own
-    // comment said "too fast; still assert below", and what it asserted below was
-    // an ordinary complete export.
+    // The fault must have FIRED: the pause marker is the product saying the window is open.
     assert!(
         killed_mid_drain,
-        "the SIGKILL never landed — this run drained to completion, so nothing here \
-         says anything about recovery. Not a pass: a fault-injection test whose fault \
-         did not fire has no subject"
+        "the SIGKILL never landed — the run ended before it reached cdc_after_parts_before_ack, \
+         so nothing here says anything about recovery. Not a pass: a fault-injection test whose \
+         fault did not fire has no subject"
     );
-    // ...and it must have MATTERED. A kill that lands at the finish line fires the
-    // flag while leaving a complete export behind, which grades the same as no kill
-    // at all. MEASURED 3/3: exactly 500 of 5000 rows survive, the first rollover.
+    // ...and it must have MATTERED: the first roll's parts, and only those, are on disk.
     let after_kill = distinct_ids(&out).len();
     assert!(
-        after_kill < 5_000,
-        "the kill landed but left a COMPLETE export ({after_kill} of 5000) — the \
-         recovery legs below then have nothing to recover and would pass over a \
-         resume that captured zero"
+        (1..5_000).contains(&after_kill),
+        "the kill landed at the pause but left {after_kill} of 5000 rows — the window is a roll \
+         with parts durable and unacked, so some but not all of the backlog must be on disk"
     );
 
     // Recovery run(s): drain whatever the killed run left behind.

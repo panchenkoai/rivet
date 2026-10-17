@@ -69,6 +69,11 @@ VERDICT = re.compile(r"^\s*(?:(status:)\s*(\w+)|((?:CDC )?LOAD|COMPACT) (OK|SKIP
 #: A wrapper-visible difference between an old release and this build that is intended, with its reason:
 #: `<situation> · <step>: <was> -> <is>`.
 ACCEPTED_DIFFERENCES: dict[str, str] = {  # ratchet-pin: field-state-accepted-differences strings
+    "a warehouse table dropped · compact: exit 1; 1x COMPACT FAILED; 1x COMPACT OK; 1x Error -> exit 5; 1x COMPACT FAILED; "
+    "1x COMPACT OK; 1x Error RIVET_LOAD_COMPACT_BASE_MISSING":
+        "the exit follows the code class: a compact over a dropped base table is the refusal "
+        "RIVET_LOAD_COMPACT_BASE_MISSING, exit 5, where 0.31.0 and earlier exited 1 (0ba4c93ba, #586; "
+        "changelog.d/fix-load-errors-carry-codes.md)",
 }  # ratchet-pin: end
 #: A step that died on the road to the warehouse or its token service said nothing about rivet's contract.
 TRANSPORT = re.compile(r"ADC token request failed|HTTP 5\d\d|Timeout was reached|timed out|connection reset|Connection refused", re.I)

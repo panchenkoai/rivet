@@ -3590,12 +3590,15 @@ fn roast_mysql_cdc_large_transaction_is_atomic_across_a_mid_flush_crash() {
 /// Rows of the spilled transaction in the two crash-mid-tail tests: over the cap of 4 and past 2× the rollover of 5.
 const SPILL_CRASH_ROWS: i64 = 12;
 
-/// Run 1 spills the transaction's tail and crashes at the first ack; returns its stderr.
+/// Run 1 spills the transaction's tail and crashes at the first ack that follows a roll with parts; returns its stderr.
+///
+/// Not `cdc_after_ack`: on a shared source server another test's commit on an uncaptured table
+/// rolls and acks a row-less span first, and a crash there leaves this fixture inert (gate 2026-10-16).
 fn crash_with_a_spilled_tail(rig: &Rig) -> String {
     let crashed = rig.run_with_envs(&[
         ("RIVET_CDC_MAX_TX_ROWS", "4"),
         ("RIVET_CDC_SPILL_DIR", "1"),
-        ("RIVET_TEST_PANIC_AT", "cdc_after_ack"),
+        ("RIVET_TEST_PANIC_AT", "cdc_after_ack_of_parts"),
     ]);
     assert!(
         !crashed.status.success(),

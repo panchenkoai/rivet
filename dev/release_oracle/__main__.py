@@ -641,6 +641,8 @@ def _self_test() -> int:
         # A self-skip in the battery fails its row unless another stage grades that test.
         for skipped, want in (("other::t — X unset", Status.FAIL),
                               ("state::row::tests::pg_accessor_reads_every_integer_width_and_refuses_other_types"
+                               " — RIVET_TEST_STATE_URL unset", Status.PASS),
+                              ("load::orchestrate::load_ledger_tests::pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again"
                                " — RIVET_TEST_STATE_URL unset", Status.PASS)):
             def _skipping_run(argv, env=None, _line=skipped, **_k):
                 if "llvm-cov" in argv:
@@ -680,6 +682,9 @@ def _self_test() -> int:
         "`make release-oracle-full` must depend on sweep-test-db: the gate starts on a swept stand"
     print("self-test ok: the full gate sweeps the stand's leftovers before it starts")
     from . import state_lib as _sl
+    assert set(_sl.filters()) >= {"state::row::", "load::orchestrate::"}, _sl.filters()
+    assert _sl.selected("load::orchestrate::load_ledger_tests::pg_a_mixed_split_generation_is_journaled_refused_and_refuses_again")
+    assert not _sl.selected("pipeline::cli::tests::x"), "the selection is the modules that read the state URL, not the lib"
     assert _sl.vacuous("running 0 tests\ntest result: ok. 0 passed; 0 failed", {}), "a zero-match filter graded nothing"
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {"state::x::t": "RIVET_TEST_STATE_URL unset"})
     assert _sl.vacuous("test result: ok. 9 passed; 0 failed", {}) == []
@@ -1697,7 +1702,12 @@ def main(argv: list[str] | None = None) -> int:
         version = rivet("--version").stdout.splitlines()
         print(f"  rivet: {rivet_bin()} ({version[0] if version else 'unknown'})")
         run_stages(led, gate_stages(ns))
-        skip_census.verify_oracle_verdict_census(led)
+        # Kept outside the work dir the gate deletes: a census row must name a log that still exists.
+        kept = ROOT / "target" / "gate-failures" / f"rivet-oracle-{os.getpid()}.log"
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        if (work / "rivet-oracle.log").is_file():
+            shutil.copy2(work / "rivet-oracle.log", kept)
+        skip_census.verify_oracle_verdict_census(led, kept)
         verify_seeded_recall(led, ns.with_seeded_recall)
         verify_no_invariant_violations(led)
         # Only a FULL run can say a known red no longer fires, and only one writes a verdict line.
