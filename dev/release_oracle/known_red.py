@@ -29,9 +29,6 @@ def _open(cell: str, symptom: str, reason: str) -> KnownRed:
 
 
 KNOWN_RED: tuple[KnownRed, ...] = (
-    _open("live_plan_apply::open_defect_a_sealed_plan_keeps_the_date_placeholder",
-          "P-26: the sealed plan holds no `{date}` placeholder",
-          "P-26: `rivet plan` resolves `{date}` into the artifact, so an apply after UTC midnight writes under the planning date; the work item is the planner-and-paths PR (TRIAGE PR-M), pending the ADR-0005 decision on what a sealed plan freezes"),
     KnownRed('upgrade[oracle/cdc-load]: cycle1/load: prev exit 1: Error: config has no top-level `load:` block',
              "Oracle CDC does not load yet (ADR-0037; the Oracle GA work). The previous release's `rivet init --mode cdc` writes no `load:` block, and this cell still drives the previous release through `load`, which refuses. `upgrade[oracle/cdc-load/init=this]` grades what the scaffold does promise (the baseline Parquet equals the source). The cycle stays unsupported until Oracle CDC loads",
              "2026-10-31"),

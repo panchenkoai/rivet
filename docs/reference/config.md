@@ -451,7 +451,7 @@ Before 0.32 the path was relative to the working directory, so only a run starte
 
 ### Path and prefix placeholders
 
-The `path` (local) and `prefix` (S3 / GCS) fields support template placeholders, substituted at plan-build time:
+The `path` (local) and `prefix` (S3 / GCS) fields support template placeholders, substituted when the export runs. A plan sealed by `rivet plan` keeps `{date}` as written and `rivet apply` resolves it to the UTC day it runs on; `rivet plan --date YYYY-MM-DD` freezes that day into the plan instead.
 
 | Placeholder | Value |
 |---|---|

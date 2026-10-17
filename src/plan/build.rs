@@ -232,8 +232,10 @@ pub(crate) fn build_plan_on(
     // units write into ONE shared prefix and the load view recombines them as
     // one logical table (the merge-back). An ordinary export's family IS its
     // name, so this is a no-op off the split path.
-    let destination = expand_destination_templates(export.destination.clone(), &export.family());
-    let destination_written = Some(export.destination.uri()).filter(|w| *w != destination.uri());
+    let (destination, destination_written) = crate::destination::placeholder::resolve_destination(
+        export.destination.clone(),
+        &crate::destination::placeholder::PlaceholderContext::for_today(export.family()),
+    );
     Ok(ResolvedRunPlan {
         export_name: export.name.clone(),
         bytes_read: Default::default(),

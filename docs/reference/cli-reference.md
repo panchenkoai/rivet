@@ -468,6 +468,9 @@ Generate an execution plan artifact (no data exported)
   - `json`:
     Pretty-printed JSON (written to --output file or stdout)
 
+* `--date <YYYY-MM-DD>` — Freeze `{date}` in the destination to this ISO-8601 day (e.g. `2026-05-21`).
+
+   Without it the sealed plan keeps `{date}` as written and `rivet apply` resolves it to the UTC day it runs on, as `rivet run` does.
 
 
 

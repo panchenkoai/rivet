@@ -776,7 +776,9 @@ fn dispatch_plan(args: crate::cli::args::PlanArgs) -> Result<()> {
         output,
         annotate_waves,
         format,
+        date,
     } = args;
+    let date = date.map(|s| parse_iso_date("--date", &s)).transpose()?;
     let p = parse_params(&params)?;
     let p = if p.is_empty() { None } else { Some(p) };
     if let Some(name) = export.as_deref() {
@@ -786,7 +788,24 @@ fn dispatch_plan(args: crate::cli::args::PlanArgs) -> Result<()> {
         PlanFormat::Pretty => pipeline::PlanOutputFormat::Pretty,
         PlanFormat::Json => pipeline::PlanOutputFormat::Json(output),
     };
-    pipeline::run_plan_command(&config, export.as_deref(), p.as_ref(), fmt, annotate_waves)
+    pipeline::run_plan_command(
+        &config,
+        export.as_deref(),
+        p.as_ref(),
+        fmt,
+        annotate_waves,
+        date,
+    )
+}
+
+/// The `YYYY-MM-DD` value of `flag`, refused as `RIVET_CLI_VALUE_INVALID` before any destination is opened.
+fn parse_iso_date(flag: &str, s: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
+        crate::error::coded(
+            crate::error::codes::CLI_VALUE_INVALID,
+            format!("invalid {flag} '{s}': expected YYYY-MM-DD ({e})"),
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -810,17 +829,7 @@ fn dispatch_validate(args: crate::cli::args::ValidateArgs) -> Result<()> {
     };
     // Parse --date once here so a malformed value fails before we open a
     // destination — the pipeline layer never sees a half-validated date.
-    let parsed_date = match date {
-        Some(s) => Some(
-            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(|e| {
-                crate::error::coded(
-                    crate::error::codes::CLI_VALUE_INVALID,
-                    format!("invalid --date '{}': expected YYYY-MM-DD ({})", s, e),
-                )
-            })?,
-        ),
-        None => None,
-    };
+    let parsed_date = date.map(|s| parse_iso_date("--date", &s)).transpose()?;
     // `--depth` is already the pipeline `ValidateDepth` (re-exported through
     // `args`), so it threads straight onto the target with no CLI→pipeline
     // mapping.
@@ -1370,6 +1379,17 @@ mod error_code_tests {
         crate::error::assert_coded(&err, "RIVET_CLI_RUN_ID_UNKNOWN", 1);
         let err = super::parse_cli_target("nope").unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CONFIG_TARGET_UNKNOWN", 1);
+    }
+
+    #[test]
+    fn a_date_flag_parses_one_iso_day_and_refuses_the_rest_by_code() {
+        assert_eq!(
+            super::parse_iso_date("--date", "2026-05-21").unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 21).unwrap()
+        );
+        let err = super::parse_iso_date("--date", "21/05/2026").unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_CLI_VALUE_INVALID", 1);
+        assert!(format!("{err:#}").contains("invalid --date '21/05/2026'"));
     }
 }
 

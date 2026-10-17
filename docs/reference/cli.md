@@ -158,6 +158,7 @@ rivet plan --config <PATH> [OPTIONS]
 | `--param` | `-p` | KEY=VALUE | — | Query parameter (repeatable) |
 | `--output` | `-o` | string | stdout | Write plan JSON to this file |
 | `--format` | | `pretty`\|`json` | `pretty` | `pretty` prints a human summary; `json` writes the full artifact |
+| `--date` | | YYYY-MM-DD | — | Freeze `{date}` in the destination to this day. Without it the sealed plan keeps `{date}` as written and `rivet apply` resolves it to the UTC day it runs on, as `rivet run` does |
 
 ### Examples
 
@@ -350,6 +351,7 @@ rivet apply plan.json --force
 - Does not re-read the config file
 - Does not re-run preflight queries
 - Does not recompute chunk boundaries (uses pre-computed ranges from the artifact)
+- Does not read the clock, except once for `{date}`: the sealed plan keeps the placeholder as written and apply resolves it to its own UTC day, through the same resolver `rivet run` uses, so a plan made before midnight and applied after it writes under the apply day. A plan made with `rivet plan --date` holds that day already ([ADR-0005](../adr/0005-plan-apply-contracts.md), amendment 2026-10-17)
 - Does not enforce preflight verdict (diagnostics are advisory — see ADR-0005)
 
 ### State location

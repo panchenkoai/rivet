@@ -2860,3 +2860,20 @@ seeds:
         na: "`rivet reconcile` and `rivet repair` take a `mode: chunked` export; MongoDB exports have none"
       oracle:
         cells: ["lib:reconcile_under_a_changed_chunk_plan_is_refused_by_code"]
+
+  - name: sealed-plan-freezes-the-date
+    class: "`rivet plan` resolves `{date}` in the destination into the sealed plan, so an apply after UTC midnight writes under the planning day while the data and the part names are of the apply"
+    history: "P-26, found 2026-10-16 (TRIAGE PR-M), on main through 0.31.0: the planner sealed the destination through the today's-date context `rivet run` resolves with; fixed 2026-10-17 by the context that keeps `{date}` for the apply to resolve (ADR-0005 PA1 amendment), with `rivet plan --date` freezing a day on request"
+    scope: source
+    patch: sealed-plan-freezes-the-date/shared.patch
+    engines:
+      postgres:
+        cells: [a_sealed_plan_keeps_the_date_placeholder, "lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
+      mysql:
+        cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
+      mssql:
+        cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
+      oracle:
+        cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
+      mongo:
+        cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]

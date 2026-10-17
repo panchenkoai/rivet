@@ -4,8 +4,13 @@
 //! substitution in `destination.path` and `destination.prefix`.
 //!
 //! Every command that touches a destination prefix — `run`, `doctor`,
-//! `validate`, `reconcile`, `repair`, `plan` — MUST resolve placeholders
+//! `validate`, `reconcile`, `repair`, `plan`, `apply` — MUST resolve placeholders
 //! through this module so they all look at the same physical bytes.
+//!
+//! A sealed plan keeps `{date}` as written ([`PlaceholderContext::keeping_date`])
+//! and `rivet apply` resolves it to its own UTC day through
+//! [`resolve_destination`], the function `rivet run` resolves with; `rivet plan
+//! --date` freezes the day into the artifact instead (ADR-0005 PA1).
 //!
 //! Why this exists as its own module (ADR carveout for v0.7.2):
 //! the v0.7.1 lineage carried two divergent substitution paths
@@ -16,7 +21,8 @@
 //! re-running the export.
 //!
 //! Supported placeholders:
-//! - `{date}`   → context date, formatted `YYYY-MM-DD` (UTC by default).
+//! - `{date}`   → context date, formatted `YYYY-MM-DD` (UTC by default); kept
+//!   verbatim by a context with no date (a plan sealed for a later apply).
 //! - `{export}` → export name.
 //! - `{table}`  → alias for `{export}`.
 //! - `{run_id}` → run identifier; substituted only when the context carries
@@ -35,8 +41,9 @@ use crate::config::DestinationConfig;
 /// prefixes.
 #[derive(Debug, Clone)]
 pub struct PlaceholderContext {
-    /// Date used for `{date}` substitution.
-    pub date: NaiveDate,
+    /// Date used for `{date}` substitution; `None` leaves the literal
+    /// `{date}` in place for the apply that resolves it.
+    pub date: Option<NaiveDate>,
     /// Export name used for `{export}` and `{table}`.
     pub export_name: String,
     /// Optional run identifier used for `{run_id}`.  `None` leaves the
@@ -50,7 +57,17 @@ impl PlaceholderContext {
     /// override the resolution target.
     pub fn for_today(export_name: impl Into<String>) -> Self {
         Self {
-            date: Utc::now().date_naive(),
+            date: Some(Utc::now().date_naive()),
+            export_name: export_name.into(),
+            run_id: None,
+        }
+    }
+
+    /// Context that resolves the names and keeps `{date}` as written: the sealed
+    /// plan's, so the apply resolves the day it runs on.
+    pub fn keeping_date(export_name: impl Into<String>) -> Self {
+        Self {
+            date: None,
             export_name: export_name.into(),
             run_id: None,
         }
@@ -61,7 +78,7 @@ impl PlaceholderContext {
     /// a prior day's prefix.
     pub fn for_date(date: NaiveDate, export_name: impl Into<String>) -> Self {
         Self {
-            date,
+            date: Some(date),
             export_name: export_name.into(),
             run_id: None,
         }
@@ -80,11 +97,12 @@ impl PlaceholderContext {
 /// `{run_id}` is left intact so the eventual destination open fails fast
 /// rather than silently aliasing to an unintended prefix.
 pub fn apply(s: &str, ctx: &PlaceholderContext) -> String {
-    let date = ctx.date.format("%Y-%m-%d").to_string();
     let mut out = s
-        .replace("{date}", &date)
         .replace("{export}", &ctx.export_name)
         .replace("{table}", &ctx.export_name);
+    if let Some(date) = ctx.date {
+        out = out.replace("{date}", &date.format("%Y-%m-%d").to_string());
+    }
     if let Some(rid) = &ctx.run_id {
         out = out.replace("{run_id}", rid);
     }
@@ -128,6 +146,17 @@ pub fn expand_destination(
     dest.path = dest.path.map(|s| apply(&s, ctx));
     dest.prefix = dest.prefix.map(|s| apply(&s, ctx));
     dest
+}
+
+/// `dest` resolved as of `ctx`, with the destination as written when the two differ (the progress identity reads it, so a new day's prefix is not a moved destination).
+pub fn resolve_destination(
+    dest: DestinationConfig,
+    ctx: &PlaceholderContext,
+) -> (DestinationConfig, Option<String>) {
+    let written = dest.uri();
+    let resolved = expand_destination(dest, ctx);
+    let written = Some(written).filter(|w| *w != resolved.uri());
+    (resolved, written)
 }
 
 #[cfg(test)]
@@ -229,6 +258,45 @@ mod tests {
         let expanded = expand_destination(dest, &ctx);
         assert_eq!(expanded.path.as_deref(), Some("./out"));
         assert!(expanded.prefix.is_none());
+    }
+
+    #[test]
+    fn keeping_date_resolves_the_names_and_leaves_date_for_the_apply() {
+        let ctx = PlaceholderContext::keeping_date("orders");
+        assert_eq!(
+            apply("runs/{date}/{export}/{table}", &ctx),
+            "runs/{date}/orders/orders"
+        );
+        let later = apply(
+            &apply("runs/{date}/{export}/", &ctx),
+            &ctx_on("2026-05-22", "orders"),
+        );
+        assert_eq!(later, "runs/2026-05-22/orders/");
+    }
+
+    #[test]
+    fn resolve_destination_keeps_the_destination_as_written_only_when_it_differs() {
+        let dest = DestinationConfig {
+            destination_type: DestinationType::S3,
+            bucket: Some("b".into()),
+            prefix: Some("runs/{date}/{export}/".into()),
+            ..Default::default()
+        };
+        let (kept, written) =
+            resolve_destination(dest.clone(), &PlaceholderContext::keeping_date("orders"));
+        assert_eq!(kept.prefix.as_deref(), Some("runs/{date}/orders/"));
+        assert_eq!(written.as_deref(), Some("s3://b/runs/{date}/{export}/"));
+        let (frozen, written) = resolve_destination(dest, &ctx_on("2026-05-21", "orders"));
+        assert_eq!(frozen.prefix.as_deref(), Some("runs/2026-05-21/orders/"));
+        assert_eq!(written.as_deref(), Some("s3://b/runs/{date}/{export}/"));
+        let plain = DestinationConfig {
+            destination_type: DestinationType::Local,
+            path: Some("/out/2026-05-21".into()),
+            ..Default::default()
+        };
+        let (same, written) = resolve_destination(plain.clone(), &ctx_on("2026-05-22", "orders"));
+        assert_eq!(same.path, plain.path);
+        assert_eq!(written, None);
     }
 
     #[test]
