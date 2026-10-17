@@ -384,6 +384,17 @@ seeds:
           - "lib:a_refused_run_releases_its_keyset_anchor_so_the_next_run_is_graded_again"
           - "lib:a_refused_or_finished_run_releases_anchor_and_ranges_and_a_broken_off_one_keeps_both"
 
+  - name: migration-without-a-way-back
+    class: a state schema migration that runs with no copy of the state as the previous release left it, so an upgrade cannot be rolled back
+    history: "0.32.0 release blocker: the first run of a newer rivet migrated the state in place and 0.31.0 then refused it (RIVET_STATE_SCHEMA_NEWER, exit 5) with no copy and no restore path"
+    scope: state
+    patch: migration-without-a-way-back/shared.patch
+    engines:
+      postgres-state:
+        cells: ["lib:pg_a_migration_copies_every_state_table_into_a_backup_schema_before_the_first_ddl"]
+      sqlite-state:
+        cells: ["lib:a_migration_copies_the_old_state_beside_it_before_the_first_ddl"]
+
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
     history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"

@@ -64,6 +64,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_STATE_NOT_WRITABLE` | environment | 2 if transient, else 1 | make the state database writable (the SQLite file and its directory, a read-only filesystem, a read-only role) and run again; the export did not start |
 | `RIVET_STATE_CURSOR_NOT_STORED` | environment | 2 if transient, else 1 | repair the state database before the next run; the rows are delivered, and the next run delivers them again from the previous cursor |
 | `RIVET_STATE_SCHEMA_NEWER` | refusal | 5 | upgrade rivet, or point this binary at a state DB it created |
+| `RIVET_STATE_BACKUP_FAILED` | environment | 2 if transient, else 1 | free disk space or make the state writable for the copy (SQLite: the directory beside the state file; PostgreSQL: CREATE on the database) and run again; the state was not migrated, and the previous rivet release still opens it |
 | `RIVET_STATE_CURSOR_OWNER_MISMATCH` | refusal | 5 | `rivet state reset -c <config> --export <name>` to start the new cursor with a full pass, or restore the previous cursor column |
 | `RIVET_STATE_CURSOR_INCOMPARABLE` | refusal | 5 | `rivet state reset -c <config> --export <name>` starts the cursor over with a full pass |
 | `RIVET_STATE_CURSOR_PAST_MANIFEST` | refusal | 5 | `rivet state reset -c <config> --export <name>` starts the cursor over with a full pass |

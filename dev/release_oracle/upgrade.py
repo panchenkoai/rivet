@@ -12,6 +12,13 @@ Per SQL engine, on the downloaded previous binary and this one:
              same strategy (the config file is the artifact).
   cursor     previous incremental run → source changes → this binary's run: every id
              once, every latest value right (the cursor in state is the artifact).
+  way-back   previous incremental run twice → a later delta → this binary's run (it migrates the
+             state and leaves the pre-migration copy) → the restore in docs/reference/state.md,
+             run AS WRITTEN there (its sh / sql block) → the previous release runs again: exit 0,
+             from its own cursor; every id delivered, the overlap exactly this binary's delta.
+  no-way-back the copy cannot be written (SQLite: a read-only state directory; Postgres: a role
+             without CREATE on the database): this binary stops RIVET_STATE_BACKUP_FAILED, exit 1,
+             writes no part; the previous release still opens the state and delivers the delta.
   crash      the previous binary crashes mid keyset run → this binary resumes it: every
              id exactly once, and no part the crashed run left is written again (the crash
              checkpoint is the artifact; a restart from scratch rewrites the same part names).
@@ -58,7 +65,8 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from .core import Ledger, Proc, first_error, isolate_state_db, rivet_bin, run, run_lanes, server_of
+from .core import (ROOT, Ledger, Proc, container_for_port, docker_exec, first_error, isolate_state_db, rivet_bin, run,
+                   run_lanes, server_of)
 from .engines import sql as _sql
 from .regression import _require_prev_binary
 from .upgrade_cdc_load import cdc_load_lane_cells
@@ -116,6 +124,28 @@ def _mutate(engine: str, url: str, table: str) -> bool:
                f"FROM (SELECT TOP ({hi - lo + 1}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {lo - 1} "
                "AS n FROM sys.all_objects) q; "
                f"UPDATE {table} SET v = -v, updated_at = '2026-07-01' WHERE id <= 50;")
+    return _sql(engine, url, sql).ok
+
+
+LATER_ROWS = 100
+
+
+def _later_rows(engine: str, url: str, table: str) -> bool:
+    """Add ids ROWS+301..ROWS+400 with a cursor newer than every row `_mutate` wrote: the delta only this binary's run sees."""
+    lo, hi = ROWS + 301, ROWS + 300 + LATER_ROWS
+    if engine == "oracle":
+        sql = (f"INSERT INTO {table} SELECT level + {lo - 1}, level + {lo - 1}, TIMESTAMP '2026-08-01 00:00:00' "
+               f"+ NUMTODSINTERVAL(level + {lo - 1}, 'SECOND') FROM dual CONNECT BY level <= {hi - lo + 1};")
+    elif engine == "postgres":
+        sql = (f"INSERT INTO {table} SELECT g, g, TIMESTAMPTZ '2026-08-01' + g * INTERVAL '1 second' "
+               f"FROM generate_series({lo}, {hi}) g;")
+    elif engine == "mysql":
+        sql = (f"INSERT INTO {table} WITH RECURSIVE g(n) AS (SELECT {lo} UNION ALL SELECT n + 1 FROM g "
+               f"WHERE n < {hi}) SELECT n, n, TIMESTAMP('2026-08-01') + INTERVAL n SECOND FROM g;")
+    else:
+        sql = (f"INSERT INTO {table} SELECT n, n, DATEADD(SECOND, n, CAST('2026-08-01' AS DATETIME2)) "
+               f"FROM (SELECT TOP ({hi - lo + 1}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) + {lo - 1} "
+               "AS n FROM sys.all_objects) q;")
     return _sql(engine, url, sql).ok
 
 
@@ -273,6 +303,137 @@ def _fresh_leg(led: Ledger, e: _Env, engine: str, want: int) -> None:
     else:
         led.failed(engine, "-", SCEN, "fresh", f"upgrade[{engine}/fresh]: ok={p.ok} {got}: "
                    f"{first_error(p.stderr)[:300]}", "fresh")
+
+
+RESTORE_DOC = ROOT / "docs/reference/state.md"
+RESTORE_SECTION = "## Rolling back an upgrade"
+
+
+def restore_block(lang: str, text: str | None = None) -> str:
+    """The fenced ```<lang> block under "Rolling back an upgrade" in docs/reference/state.md: the cell runs the doc as written."""
+    text = RESTORE_DOC.read_text() if text is None else text
+    if RESTORE_SECTION not in text:
+        raise RuntimeError(f"{RESTORE_DOC.name}: no section {RESTORE_SECTION!r}")
+    m = re.search(rf"```{re.escape(lang)}\n(.*?)```", text.split(RESTORE_SECTION, 1)[1], re.S)
+    if m is None:
+        raise RuntimeError(f"{RESTORE_DOC.name}: no ```{lang} block under {RESTORE_SECTION!r}")
+    return m.group(1)
+
+
+def _state_psql(state_url: str, sql: str) -> Proc:
+    """`sql` on the Postgres state database, as its own user, through the container that publishes it."""
+    import urllib.parse
+    u = urllib.parse.urlsplit(state_url)
+    c = container_for_port(u.port or 5432)
+    if c is None:
+        return Proc(["psql", state_url], 1, "", f"no running container publishes port {u.port or 5432}")
+    return docker_exec(c, "psql", "-U", urllib.parse.unquote(u.username or "rivet"), "-d", u.path.lstrip("/"),
+                       "-v", "ON_ERROR_STOP=1", "-Atq", stdin=sql)
+
+
+def _copies(e: _Env, state_url: str) -> list[str]:
+    """The pre-migration copies a migration left: `.bak` files beside a SQLite state, `rivet_state_backup_v*` schemas in a Postgres one."""
+    if not state_url:
+        return sorted(p.name for p in e.dir.glob(".rivet_state.db.v*.bak"))
+    p = _state_psql(state_url, "SELECT nspname FROM pg_namespace WHERE nspname LIKE 'rivet_state_backup_v%' ORDER BY 1;")
+    return p.stdout.split() if p.ok else []
+
+
+def _restore(e: _Env, state_url: str) -> Proc:
+    """The restore doc, run as written: its sh block in the config dir (SQLite), its sql block on the state database (Postgres)."""
+    if not state_url:
+        return run(["bash", "-euo", "pipefail", "-c", restore_block("sh")], cwd=e.dir)
+    return _state_psql(state_url, restore_block("sql"))
+
+
+def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
+    """The previous release runs twice, this binary once (migrates, leaves the copy), the doc's restore runs as written, the previous release runs again from its own cursor: every id delivered, the overlap exactly this binary's delta."""
+    store = "pg-state" if state_url else "sqlite"
+    tag = f"upgrade[{engine}/way-back/{store}]"
+    table = _case(engine, f"upg_back_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}")
+    if not _seed(engine, url, table, ROWS, with_cursor=True):
+        return led.failed(engine, "-", SCEN, store, f"{tag}: seed failed", "seed")
+    e = _Env(prev, root, engine, url, table, "incremental", state_url)
+    try:
+        r1 = e.rivet(prev, "run", "-c", "c.yaml")
+        ok = e.init.ok and r1.ok and _mutate(engine, url, table)
+        r2 = e.rivet(prev, "run", "-c", "c.yaml")
+        ok = ok and r2.ok and _later_rows(engine, url, table)
+        r3 = e.rivet(rivet_bin(), "run", "-c", "c.yaml")
+        copies = _copies(e, state_url)
+        restore = _restore(e, state_url)
+        r4 = e.rivet(prev, "run", "-c", "c.yaml")
+        got = _declared(e.dir / "output", "SELECT count(DISTINCT id), count(*) FROM {parts}")
+        want = (ROWS + 300 + LATER_ROWS, ROWS + 350 + 2 * LATER_ROWS)
+        if ok and r3.ok and copies and restore.ok and r4.ok and got and got[0] == want:
+            led.passed(engine, "-", SCEN, store, f"{tag}: this binary migrated the state and left {copies[0]}; the doc's "
+                       f"restore put it back; the previous release ran again (exit 0) from its own cursor — {want[0]} ids "
+                       f"each at least once, the overlap exactly this binary's {LATER_ROWS} rows")
+        else:
+            led.failed(engine, "-", SCEN, store, f"{tag}: prev ok={r1.ok},{r2.ok} this ok={r3.ok} copies={copies} "
+                       f"restore ok={restore.ok} prev again exit={r4.returncode} (ids, rows)={got} want {want}: "
+                       f"{first_error(r4.stderr if restore.ok else restore.stderr + restore.stdout)[:300]}", "way back")
+    finally:
+        _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
+
+
+def _role_without_create(state_url: str) -> str | None:
+    """A URL to the state database as a login role with every right on `public` and its tables and no CREATE on the database (the copy's CREATE SCHEMA is denied); dropped at exit."""
+    import atexit
+    import urllib.parse
+    u = urllib.parse.urlsplit(state_url)
+    role = f"rivet_nocreate_{os.getpid()}"
+    grant = (f"DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'nocreate'; "
+             f"GRANT USAGE, CREATE ON SCHEMA public TO {role}; "
+             f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}; GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role};")
+    if not _state_psql(state_url, grant).ok:
+        return None
+    atexit.register(lambda: _state_psql(state_url, f"DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"))
+    return urllib.parse.urlunsplit((u.scheme, f"{role}:nocreate@{u.hostname}:{u.port or 5432}", u.path, u.query, u.fragment))
+
+
+def _no_way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
+    """The copy cannot be written: this binary stops by code and migrates nothing; the previous release still opens the state and delivers the delta."""
+    store = "pg-state" if state_url else "sqlite"
+    tag = f"upgrade[{engine}/no-way-back/{store}]"
+    table = _case(engine, f"upg_noback_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}")
+    if not _seed(engine, url, table, ROWS, with_cursor=True):
+        return led.failed(engine, "-", SCEN, store, f"{tag}: seed failed", "seed")
+    e = _Env(prev, root, engine, url, table, "incremental", state_url)
+    try:
+        r1 = e.rivet(prev, "run", "-c", "c.yaml")
+        ok = e.init.ok and r1.ok and _mutate(engine, url, table)
+        before = e.parquet_count()
+        if not state_url:
+            # SQLite itself can still write (its -wal/-shm exist); only the copy beside the state cannot be created.
+            for suffix in ("-wal", "-shm"):
+                (e.dir / f".rivet_state.db{suffix}").touch()
+            os.chmod(e.dir, 0o555)
+            try:
+                r2 = e.rivet(rivet_bin(), "run", "-c", "c.yaml")
+            finally:
+                os.chmod(e.dir, 0o755)
+            how = "a read-only state directory"
+        else:
+            role_url = _role_without_create(state_url)
+            if role_url is None:
+                return led.failed(engine, "-", SCEN, store, f"{tag}: could not create a role without CREATE", "role")
+            r2 = e.rivet(rivet_bin(), "run", "-c", "c.yaml", extra={"RIVET_STATE_URL": role_url})
+            how = "a role without CREATE on the database"
+        refused = r2.returncode == 1 and "[RIVET_STATE_BACKUP_FAILED]" in r2.stderr and e.parquet_count() == before
+        r3 = e.rivet(prev, "run", "-c", "c.yaml")
+        got = _declared(e.dir / "output", "SELECT count(DISTINCT id), count(*) FROM {parts}")
+        want = (ROWS + 300, ROWS + 350)
+        if ok and refused and r3.ok and got and got[0] == want:
+            led.passed(engine, "-", SCEN, store, f"{tag}: with {how}, this binary stopped RIVET_STATE_BACKUP_FAILED "
+                       f"(exit 1) and wrote no part; the previous release then ran (exit 0) and delivered the delta — "
+                       f"{want[0]} ids, {want[1]} rows")
+        else:
+            led.failed(engine, "-", SCEN, store, f"{tag}: prev ok={r1.ok} this exit={r2.returncode} refused by code="
+                       f"{'[RIVET_STATE_BACKUP_FAILED]' in r2.stderr} parts {before}->{e.parquet_count()} prev again "
+                       f"exit={r3.returncode} (ids, rows)={got} want {want}: {first_error(r2.stderr)[:300]}", "no way back")
+    finally:
+        _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
 
 
 def _crash_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
@@ -669,7 +830,7 @@ def verify_upgrade_continuity(led: Ledger) -> None:
             led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}]: no {uvar}", "no url")
             continue
         for state_url in states:
-            for leg in (_cursor_leg, _crash_leg):
+            for leg in (_cursor_leg, _crash_leg, _way_back_leg, _no_way_back_leg):
                 # Each Postgres-state leg gets a DB the PREVIOUS release creates: the gate's own
                 # DB is already migrated by this binary, which the previous one rightly refuses.
                 fresh = isolate_state_db(state_url, f"{os.getpid()}_{engine}_{leg.__name__}") \

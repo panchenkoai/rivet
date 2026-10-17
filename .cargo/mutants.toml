@@ -991,4 +991,13 @@ exclude_re = [
     #   the split reads the event's own old image. Its decisions are the unit-tested old_image,
     #   no_old_key_warning and row_image_verdict; the row mapping needs a `postgres::Row`.
     "replace PgChangeStream::old_images_on -> Vec<\\(String, OldImage\\)> with vec!\\[\\]$",
+    # - copy_pg_state_before_migration (state/migrations.rs) is the PostgreSQL pre-migration
+    #   copy: CREATE SCHEMA + CREATE TABLE (LIKE …) + INSERT … SELECT through a live
+    #   `postgres::Transaction`, so its stub is unkillable OFFLINE. Its decisions are the
+    #   unit-tested needs_copy, pg_backup_schema and pg_state_table_names; the body is glue
+    #   (one `if exists`, no comparison). Live oracle: pg_a_migration_copies_every_state_table_
+    #   into_a_backup_schema_before_the_first_ddl (RIVET_TEST_STATE_URL), RED under the seeded
+    #   patch migration-without-a-way-back, which removes exactly this call: seeded recall
+    #   postgres-state CAUGHT, 2026-10-17.
+    "replace copy_pg_state_before_migration -> Result<\\(\\)> with Ok\\(\\(\\)\\)$",
 ]

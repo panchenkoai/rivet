@@ -24,7 +24,8 @@ declare; the source by its own scanner.
             `ACCEPTED_DIFFERENCES` does not list fails.
   empty     a table EMPTY at baseline, loaded and compacted by the old release; rows arrive; this build's
             cycle must exit 0 and leave the warehouse table equal to the source.
-  way back  KNOWN GAP: the previous release refuses the state this build migrated.
+  way back  the previous release refuses the MIGRATED state itself (a downgrade never rewrites the schema);
+            the way back is the pre-migration copy, graded by upgrade[*/way-back] in upgrade.py.
 
 A red row names its kind: re-baseline, restart, duplicate, loss, refuses its own old state, config no
 longer loads, contract, empty table.
@@ -533,10 +534,10 @@ def config_row(led: Ledger, row: tuple, name: str, e, ver: str, old: Path) -> No
 
 
 def way_back(led: Ledger, row: tuple, name: str, e, prev: Path, before: int, after: int, out: Path) -> None:
-    """KNOWN GAP, pinned: the previous release refuses the state this build migrated. Rewrite when a downgrade path lands."""
+    """The previous release refuses the MIGRATED state itself; the way back is the copy beside it (docs/reference/state.md), graded by upgrade[*/way-back]."""
     from .upgrade import _part_stats
 
-    gap = f"{name} way back (KNOWN GAP: no downgrade path)"
+    gap = f"{name} way back"
     if before == after:
         return led.skipped(*row, f"{gap}: this build left the state at schema v{after}, the previous release's own", "same schema")
     held = _part_stats(out)
@@ -545,7 +546,7 @@ def way_back(led: Ledger, row: tuple, name: str, e, prev: Path, before: int, aft
         return led.passed(*row, f"{gap}: the previous release refuses the v{after} state with RIVET_STATE_SCHEMA_NEWER "
                                 "(exit 5) and writes no part", "way back")
     led.failed(*row, f"{gap}: the previous release on a v{after} state answered exit {p.returncode}, not exit 5 "
-                     f"RIVET_STATE_SCHEMA_NEWER — if a downgrade path landed, rewrite this cell to grade it: "
+                     f"RIVET_STATE_SCHEMA_NEWER — a downgrade never rewrites the schema; the way back is the copy: "
                      f"{p.why}", "way back")
 
 

@@ -1,0 +1,33 @@
+diff --git a/src/state/migrations.rs b/src/state/migrations.rs
+index eabc9fff..24497ce3 100644
+--- a/src/state/migrations.rs
++++ b/src/state/migrations.rs
+@@ -1483,17 +1483,6 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
+         }
+     }
+ 
+-    if current > 0
+-        && current < SCHEMA_VERSION
+-        && let Some(copy) = copy_state_before_migration(conn, current)?
+-    {
+-        log::warn!(
+-            "state: upgrading the state schema v{current} -> v{SCHEMA_VERSION}; a copy of the \
+-             v{current} state is at `{}` — to go back to the previous rivet release, see {RESTORE_DOC}",
+-            copy.display()
+-        );
+-    }
+-
+     for &(ver, sql) in MIGRATIONS {
+         if ver > current {
+             log::debug!("state: applying migration v{}", ver);
+@@ -1621,10 +1610,6 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
+         })?
+         .get(0);
+ 
+-    if current > 0 && current < SCHEMA_VERSION {
+-        copy_pg_state_before_migration(client, current)?;
+-    }
+-
+     for &(ver, sql) in PG_MIGRATIONS {
+         if ver > current {
+             log::debug!("state(pg): applying migration v{}", ver);
