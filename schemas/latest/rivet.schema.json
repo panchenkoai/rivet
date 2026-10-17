@@ -1086,6 +1086,7 @@
           ]
         },
         "path": {
+          "description": "Local directory for the output files. A relative path is anchored to the directory of\nthe config file, whatever directory rivet is started from (since 0.32; before, it was\nrelative to the working directory).",
           "type": [
             "string",
             "null"

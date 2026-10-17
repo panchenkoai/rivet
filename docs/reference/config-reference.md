@@ -147,7 +147,7 @@ Rendered from the JSON Schema `rivet schema config` emits (schemars ← the Rust
 | `type` | `local` \| `s3` \| `gcs` \| `azure` \| `stdout` | **yes** |  |
 | `bucket` | `string` |  |  |
 | `prefix` | `string` |  |  |
-| `path` | `string` |  |  |
+| `path` | `string` |  | Local directory for the output files. A relative path is anchored to the directory of the config file, whatever directory rivet is started from (since 0.32; before, it was relative to the working directory). |
 | `region` | `string` |  |  |
 | `endpoint` | `string` |  |  |
 | `credentials_file` | `string` |  |  |

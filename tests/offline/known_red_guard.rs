@@ -16,7 +16,9 @@ const LEDGER: &str = "dev/release_oracle/known_red.py";
 // 8 -> 7 (2026-10-16): the PostgreSQL out-of-descriptors cell is a plain cell again (fix/postgres-client-runtime-is-coded).
 // 6 -> 10 (2026-10-16): the dropped-source-table cells on four SQL engines (fix/dropped-source-table-is-coded).
 // 10 -> 6 (2026-10-16): the four dropped-source-table cells are plain cells again (fix/dropped-source-table-is-coded).
-const ENTRY_CEILING: usize = 6; // ratchet-pin: known-red-entries
+// 7 -> 6 (2026-10-16): the changed-chunk-plan repair cell is a plain cell again (P-21, #618).
+// 6 -> 5 (2026-10-16): the relative destination.path cell is a plain cell again (P-27, fix/relative-destination-path-follows-the-config).
+const ENTRY_CEILING: usize = 5; // ratchet-pin: known-red-entries
 
 /// The horizon every `_open` entry expires at; moves only here and in the ledger together.
 const EXPIRES: &str = "2026-10-31"; // pinned: the ledger's `_EXPIRES`, moved only together with it

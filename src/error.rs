@@ -946,6 +946,11 @@ pub mod codes {
         "RIVET_DEST_CONTAINER_NOT_FOUND",
         "create the bucket or container, or correct `destination.bucket`",
     );
+    /// A relative local `destination.path` names a directory beside the config since 0.32, while the one under the working directory (where a release before 0.32 wrote it) still holds the export's files.
+    pub const DEST_RELATIVE_PATH_MOVED: Code = refusal(
+        "RIVET_DEST_RELATIVE_PATH_MOVED",
+        "move the export's files from the directory under the working directory to the one beside the config, or make `destination.path` absolute",
+    );
     /// `run --resume` met a destination prefix that already holds a complete export.
     pub const DEST_ALREADY_COMPLETE: Code = refusal(
         "RIVET_DEST_ALREADY_COMPLETE",
@@ -1629,6 +1634,7 @@ pub mod codes {
         SOURCE_COLLECTION_NOT_FOUND,
         SOURCE_TABLE_NOT_FOUND,
         DEST_CONTAINER_NOT_FOUND,
+        DEST_RELATIVE_PATH_MOVED,
         DEST_ALREADY_COMPLETE,
         LOAD_VALUE_OUT_OF_TARGET_RANGE,
         LOAD_COUNT_MISMATCH,

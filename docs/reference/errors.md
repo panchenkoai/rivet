@@ -84,6 +84,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_COLLECTION_NOT_FOUND` | environment | 2 if transient, else 1 | correct the export's `table:` (a dotted collection name is written whole), or create the collection |
 | `RIVET_SOURCE_TABLE_NOT_FOUND` | environment | 2 if transient, else 1 | correct the export's `table:` (or the relation its `query:` reads), or remove the export from `exports:` if the table was dropped on purpose |
 | `RIVET_DEST_CONTAINER_NOT_FOUND` | environment | 2 if transient, else 1 | create the bucket or container, or correct `destination.bucket` |
+| `RIVET_DEST_RELATIVE_PATH_MOVED` | refusal | 5 | move the export's files from the directory under the working directory to the one beside the config, or make `destination.path` absolute |
 | `RIVET_DEST_ALREADY_COMPLETE` | refusal | 5 | pass `--force` with `--resume` to continue an interrupted run or, with none, run as a plain run does (new parts beside the complete export); or use another destination prefix |
 | `RIVET_LOAD_VALUE_OUT_OF_TARGET_RANGE` | refusal | 5 | the warehouse type cannot hold this value; declare a wider type (e.g. String) for the column, or fix the source value |
 | `RIVET_LOAD_COUNT_MISMATCH` | integrity | 3 | compare the warehouse table with the run's manifest before re-running; the source is kept |

@@ -10,4 +10,4 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output/schema
+      path: ./output/schema

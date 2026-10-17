@@ -14,4 +14,4 @@ exports:
     format: csv
     destination:
       type: local
-      path: ./dev/output
+      path: ./output

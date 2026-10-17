@@ -91,7 +91,7 @@ Use a **small `chunk_size`** relative to your table if you want many steps on th
 
 ```bash
 # From repo root; Postgres up + seeded (e.g. docker compose + cargo run --bin seed ...)
-mkdir -p dev/output/bench
+mkdir -p dev/scenarios/output/bench
 rivet check --config dev/scenarios/chunked_postgres_bench.yaml
 rivet run --config dev/scenarios/chunked_postgres_bench.yaml --export bench_content_p4_safe
 # Optional: RUST_LOG=info for more log detail; RUST_LOG=warn to reduce log noise (bar unchanged in a TTY)

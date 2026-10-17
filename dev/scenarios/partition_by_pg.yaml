@@ -15,7 +15,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output/partition_by/ci_by_day/{partition}
+      path: ./output/partition_by/ci_by_day/{partition}
 
   # 2) Month granularity over the whole table — exercises the NULL bucket
   #    (content_items.published_at has 20,227 NULLs → col=__HIVE_DEFAULT_PARTITION__).
@@ -26,4 +26,4 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/output/partition_by/ci_by_month/{partition}
+      path: ./output/partition_by/ci_by_month/{partition}

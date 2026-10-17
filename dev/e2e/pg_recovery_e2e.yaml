@@ -11,7 +11,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
 
   - name: recovery_incremental
     query: "SELECT id, user_id, product, quantity, price, status, updated_at FROM orders"
@@ -20,7 +20,7 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       price: decimal(10,2)
 
@@ -34,6 +34,6 @@ exports:
     format: parquet
     destination:
       type: local
-      path: ./dev/e2e/output
+      path: ./output
     columns:
       price: decimal(10,2)
