@@ -220,7 +220,10 @@ impl StateStore {
     /// Run an INSERT/UPDATE/DELETE on the active backend; returns rows affected.
     pub(super) fn execute(&self, sql: &str, params: &[StateParam]) -> Result<usize> {
         match &self.conn {
-            StateConn::Sqlite(c) => Ok(c.execute(sql, rusqlite::params_from_iter(params.iter()))?),
+            StateConn::Sqlite(c) => {
+                let _turn = self.write_turn();
+                Ok(c.execute(sql, rusqlite::params_from_iter(params.iter()))?)
+            }
             StateConn::Postgres(client) => {
                 let mut c = client.borrow_mut();
                 Ok(c.execute(&pg_sql(sql), &pg_params(params))? as usize)
@@ -233,6 +236,7 @@ impl StateStore {
         if self.in_tx.get() {
             return work();
         }
+        let _turn = self.write_turn();
         self.batch(match &self.conn {
             StateConn::Sqlite(_) => "BEGIN IMMEDIATE",
             StateConn::Postgres(_) => "BEGIN",
@@ -244,6 +248,21 @@ impl StateStore {
         self.in_tx.set(false);
         drop(open);
         Ok(out)
+    }
+
+    /// This process's turn at the SQLite file's write lock (see [`super::write_turn`]); none on
+    /// PostgreSQL, inside an open transaction (which holds it), or for an in-memory store.
+    fn write_turn(&self) -> Option<super::write_turn::Turn> {
+        let super::StateRef::Sqlite(db) = &self.state_ref else {
+            return None;
+        };
+        if self.in_tx.get() {
+            return None;
+        }
+        super::write_turn::take(
+            db,
+            std::time::Duration::from_millis(super::SQLITE_BUSY_TIMEOUT_MS as u64),
+        )
     }
 
     /// Run a parameterless statement on the active backend.
