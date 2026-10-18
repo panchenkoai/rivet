@@ -894,6 +894,11 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
         assert!(slow.is_empty(), "starved: {slow:?}");
+        assert_eq!(
+            s.count_chunk_tasks_total("run_a").unwrap(),
+            3,
+            "every replan landed"
+        );
     }
     #[test]
     fn chunk_claim_complete_and_finalize() {

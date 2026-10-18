@@ -103,7 +103,7 @@ mod tests {
                 let (db, order) = (db.clone(), order.clone());
                 std::thread::sleep(Duration::from_millis(20));
                 std::thread::spawn(move || {
-                    let t = take(&db, Duration::from_secs(5)).expect("a turn");
+                    let t = take(&db, Duration::from_secs(2)).expect("a turn");
                     order.lock().unwrap().push(i);
                     drop(t);
                 })
