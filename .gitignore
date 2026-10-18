@@ -135,7 +135,7 @@ __pycache__/
 /docker-compose.override.yaml
 
 # downloaded previous-release binary — the release gate's regression baseline
-/.gate-baseline/
+/.gate-baseline
 
 # Cross-compilation target dirs. `cargo` only ever ignores `target/` itself, so
 # a build driven with `--target-dir target-linux` (e.g. `docker run ... cargo
