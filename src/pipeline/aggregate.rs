@@ -118,6 +118,7 @@ pub(super) fn entry_from_summary(s: &RunSummary) -> RunAggregateEntry {
             duration_ms: s.duration_ms,
             mode: s.mode.clone(),
             error_message: s.error_message.clone(),
+            skip_reason: s.skip_reason.clone(),
         },
         &s.snapshot_legs,
     )
@@ -189,6 +190,7 @@ pub(super) fn snapshot_leg_entry(
         duration_ms: *duration_ms,
         mode: "full".into(),
         error_message: error_message.clone(),
+        skip_reason: None,
     })
 }
 
@@ -716,6 +718,7 @@ pub(super) fn collect_child_entries(
                         duration_ms: m.duration_ms,
                         mode: m.mode.unwrap_or_default(),
                         error_message: m.error_message,
+                        skip_reason: m.skip_reason,
                     });
                 }
             }
@@ -748,6 +751,7 @@ pub(super) fn collect_child_entries(
                         .cloned()
                         .unwrap_or_else(|| "no metric recorded for this run".into()),
                 ),
+                skip_reason: None,
             }
         }));
     }
@@ -1208,6 +1212,7 @@ mod tests {
             } else {
                 None
             },
+            skip_reason: None,
         }
     }
 
@@ -1725,10 +1730,27 @@ mod tests {
         assert_eq!(t.chars().count(), 11); // 10 + ellipsis
     }
 
+    /// A skipped run's entry carries its reason into `per_export[]`; any other keeps `null`.
+    #[test]
+    fn a_skipped_entry_carries_the_reason_the_run_skipped() {
+        let mut s = RunSummary {
+            export_name: "e".into(),
+            status: "skipped".into(),
+            skip_reason: Some("no new rows since cursor 'updated_at'".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(entry_from_summary(&s)).unwrap();
+        assert_eq!(json["skip_reason"], "no new rows since cursor 'updated_at'");
+        s.status = "success".into();
+        s.skip_reason = None;
+        assert!(serde_json::to_value(entry_from_summary(&s)).unwrap()["skip_reason"].is_null());
+    }
+
     fn metric(name: &str, status: &str) -> ExportMetric {
         ExportMetric {
             bytes_read: 0,
             source_type: None,
+            skip_reason: None,
             export_name: name.into(),
             run_id: Some(format!("{name}_run")),
             run_at: "2026-06-09T12:00:00+00:00".into(),

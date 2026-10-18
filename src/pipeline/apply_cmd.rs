@@ -394,6 +394,7 @@ fn already_applied_entry(
         error_message: metric
             .is_none()
             .then(|| format!("metrics row of run {run_id} is not readable")),
+        skip_reason: None,
         snapshot_rows: 0,
     }
 }
@@ -852,6 +853,7 @@ mod tests {
             validated: None,
             schema_changed: None,
             source_type: None,
+            skip_reason: None,
         };
         let started = Utc::now();
         let replay = apply_document(

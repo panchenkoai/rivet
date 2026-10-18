@@ -328,7 +328,8 @@ The answer is machine-readable through the same channels a run uses: `--summary-
       "bytes_read": 1420,
       "duration_ms": 120,
       "mode": "full",
-      "error_message": null
+      "error_message": null,
+      "skip_reason": null
     }
   ]
 }

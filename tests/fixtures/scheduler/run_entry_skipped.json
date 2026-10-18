@@ -10,6 +10,7 @@
   "duration_ms": 310,
   "mode": "incremental",
   "error_message": null,
+  "skip_reason": "no new rows since cursor 'updated_at'",
   "error": null,
   "stop_reason": null,
   "tables": null

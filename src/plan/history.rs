@@ -97,6 +97,7 @@ mod tests {
         ExportMetric {
             bytes_read: 0,
             source_type: None,
+            skip_reason: None,
             export_name: "orders".into(),
             run_id: Some("r".into()),
             run_at: "2026-04-18T00:00:00Z".into(),

@@ -10,6 +10,7 @@
   "duration_ms": 4200,
   "mode": "full",
   "error_message": null,
+  "skip_reason": null,
   "error": null,
   "stop_reason": null,
   "tables": null
