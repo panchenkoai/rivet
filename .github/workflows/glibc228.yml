@@ -118,6 +118,18 @@ jobs:
       - name: Unpack
         run: tar xzf dist/*.tar.gz -C dist
 
+      # The other builds print `rivet <version> (<commit>)`; this one printed `(unknown)`.
+      - name: --version names the commit it was built from
+        run: |
+          set -euo pipefail
+          got="$(dist/rivet-*/rivet --version)"
+          want="($(git rev-parse --short=9 HEAD))"
+          echo "${got}"
+          case "${got}" in
+            *"${want}") ;;
+            *) echo "::error::rivet --version is '${got}', not built from ${want}"; exit 1 ;;
+          esac
+
       - name: Needs nothing newer than GLIBC_2.28
         run: python3 -m dev.pytools.glibc_floor --max 2.28 dist/rivet-*/rivet dist/rivet-*/rivet-mcp
 
