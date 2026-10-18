@@ -285,7 +285,7 @@ class Ledger:
             return
         try:
             from ..pytools import evidence
-            n = evidence.record_greens(sorted(GREEN_CELLS), by="gate")
+            n = evidence.record_greens(sorted(GREEN_CELLS), by="gate", path=evidence.LEDGER)
             print(f"  evidence: {n} green live cell(s) recorded in {evidence.LEDGER.relative_to(ROOT)}")
         except Exception as e:  # noqa: BLE001 — evidence must not fail the gate it describes
             print(f"  evidence: NOT recorded ({e})")
