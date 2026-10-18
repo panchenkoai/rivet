@@ -2887,7 +2887,8 @@ mod tests {
         );
         let pkeys: i64 = client
             .query_one(
-                "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'rivet_state_backup_v32' AND indexdef LIKE 'CREATE UNIQUE INDEX%'",
+                "SELECT COUNT(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid \
+                 WHERE c.relnamespace = 'rivet_state_backup_v32'::regnamespace AND i.indisunique",
                 &[],
             )
             .unwrap()
