@@ -28,8 +28,29 @@ rivet never deletes a copy. Delete it yourself once the upgrade is accepted.
 ## Rolling back an upgrade
 
 1. Stop every scheduler, cron entry and operator session that runs rivet against this state.
-2. Install the previous release.
-3. Put the copy back, then run the previous release once by hand.
+2. With the newer release still installed, write down the warehouse tables its loads know, for
+   every config that loads (step 5 needs it):
+
+   ```sh
+   rivet state loads -c <config> --last 1000000 | awk 'NR > 1 { print $NF }' | sort -u > targets-after.txt
+   ```
+
+3. Install the previous release.
+4. Put the copy back (below), then list the tables the restored ledger knows, the same way:
+
+   ```sh
+   rivet state loads -c <config> --last 1000000 | awk 'NR > 1 { print $NF }' | sort -u > targets-before.txt
+   comm -23 targets-after.txt targets-before.txt   # tables the newer release created
+   ```
+
+5. Each table `comm` prints was created by a load of the newer release, and the restored ledger
+   has no record of loading it: the previous release refuses it on every load ("no record of rivet
+   loading it", exit 1). Drop it (and its `__changes` log and view, when it has them). Its rows
+   come back: the runs it was loaded from are still under the export's prefix and the restored
+   ledger counts none of them as loaded, so the previous release's next load lands them again.
+   Under `load.cleanup_source: true` those parts were deleted after the load: rename the table
+   aside instead of dropping it, and copy into the new table the rows only the renamed one holds.
+6. Run the previous release once by hand: `rivet run`, then `rivet load`.
 
 ### SQLite
 
@@ -93,6 +114,7 @@ upgrade and the rollback are delivered again: at least once, never lost. Per mod
   PostgreSQL continues from the replication slot, whose position is the server's and does not move
   back: nothing is captured twice.
 - **`rivet load`**: the parts loaded after the upgrade are no longer in the load ledger, and the next
-  load loads them again. Into a table rivet appends to (an incremental or continued-key export)
+  load loads them again. A table the newer release created is unknown to the restored ledger and
+  is refused until step 5 drops it. Into a table rivet appends to (an incremental or continued-key export)
   the rows land a second time; a full export's load overwrites, and a `compact` merges by key, so
   nothing doubles there.
