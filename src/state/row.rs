@@ -259,10 +259,7 @@ impl StateStore {
         if self.in_tx.get() {
             return None;
         }
-        super::write_turn::take(
-            db,
-            std::time::Duration::from_millis(super::SQLITE_BUSY_TIMEOUT_MS as u64),
-        )
+        super::write_turn::take(db, super::write_turn::PATIENCE)
     }
 
     /// Run a parameterless statement on the active backend.

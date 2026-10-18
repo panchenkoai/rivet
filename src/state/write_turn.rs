@@ -14,6 +14,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+/// How long a writer waits for its turn before it goes on to SQLite's busy wait: the busy timeout.
+#[cfg(not(test))]
+pub(super) const PATIENCE: Duration = Duration::from_millis(super::SQLITE_BUSY_TIMEOUT_MS as u64);
+/// Fifty milliseconds in the unit tests, so a turn that is never handed back costs each write a
+/// moment there instead of the busy timeout.
+#[cfg(test)]
+pub(super) const PATIENCE: Duration = Duration::from_millis(50);
+
 /// One file's queue: the waiting tickets in order and whether a turn is taken.
 #[derive(Default)]
 struct Queue {
@@ -96,7 +104,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("state.db");
         std::fs::write(&db, b"").unwrap();
-        let first = take(&db, Duration::from_secs(1)).expect("a free lock is a turn");
+        let again = take(&db, Duration::ZERO).expect("a free lock is a turn at once");
+        drop(again);
+        let first = take(&db, Duration::ZERO).expect("a dropped turn is handed back at once");
         let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let waiters: Vec<_> = (0..3)
             .map(|i| {
