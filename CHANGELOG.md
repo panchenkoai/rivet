@@ -2,6 +2,474 @@
 
 ## Unreleased
 
+## 0.32.0 — 2026-10-18
+
+**Upgrading from 0.31.x or earlier — read these first:**
+
+- **Exit codes follow the code's class.** A coded refusal exits 5, an integrity stop 3, an internal
+  error 6, a usage error 1, an environment fault 2 when it is transient and 1 otherwise. Several
+  stops that exited 1 now exit 5; each is named in its entry below. A scheduler that retries on any
+  non-zero exit should stop retrying on 5.
+- **The state schema moves from v32 to v37 on the first run.** Before migrating, rivet now leaves a
+  copy of the old state (`.rivet_state.db.v32.<stamp>.bak` beside a SQLite state, schema
+  `rivet_state_backup_v32` in a PostgreSQL state) and the way back to the previous release is in
+  `docs/reference/state.md`, "Rolling back an upgrade". If the copy cannot be written, the
+  migration does not run (`RIVET_STATE_BACKUP_FAILED`).
+- **A relative `destination.path` is anchored to the config file's directory**, not the working
+  directory. A run started from another directory while the export's files still sit under the old
+  place is refused (`RIVET_DEST_RELATIVE_PATH_MOVED`) until the files are moved or the path is made
+  absolute.
+- **A dropped source table is refused `RIVET_SOURCE_TABLE_NOT_FOUND`** on every SQL engine; remove
+  the export from `exports:` if the table was dropped on purpose.
+
+- **A plan applied after UTC midnight wrote under the planning day.** `rivet plan` resolved
+  `{date}` in the destination into the sealed plan, so a plan made before midnight and applied
+  after it wrote under the planning day while the data and the part files were of the apply
+  (P-26, since `rivet plan` exists). **Now** the sealed plan keeps `{date}` as written and
+  `rivet apply` resolves it to the UTC day it runs on, through the same resolver `rivet run`
+  uses: a plan made before midnight UTC and applied after now writes under the apply date.
+  `rivet plan --date YYYY-MM-DD` freezes that day into the plan instead. A plan sealed by an
+  earlier release holds an already-resolved path and applies as it did. **What to do:**
+  nothing; pass `--date` to `rivet plan` when the planning day is the one wanted.
+
+- **`rivet apply` answers a replay of an applied plan in the summary document, and gains `--summary-output` / `--json`.**
+  A replay of a full, chunked or keyset plan that already applied to exit 0 (0.31.0, #616) answered
+  only in prose on stderr: no summary file, no JSON line, so a scheduler could not tell "already
+  applied by run X" from "succeeded, result missing" without parsing text. **Now** `rivet apply`
+  takes `--summary-output <PATH>` and `--json` like `rivet run` (in both plan-artifact and config
+  modes), and the replay writes the same document a run writes, built from the run that applied the
+  plan: its `run_id`, rows, files and bytes from its `export_metrics` row, `status: "already_applied"`
+  and `answered_by_run: "<run_id>"`. Every `per_export[]` entry now carries `answered_by_run`
+  (`null` unless the entry answers a replay); the stderr line is unchanged, the exit stays 0, and
+  the replay still writes no run, manifest or metrics row. ADR-0039 lists the new status word and
+  key. **What to do:** a scheduler reads `status` on the entry; a `status` table that treats an
+  unknown word as failed needs `already_applied` added.
+
+- **An upgrade could not be rolled back: the first run of a newer rivet migrated the state schema in
+  place, and the previous release then refused it (`RIVET_STATE_SCHEMA_NEWER`, exit 5) with no copy
+  of what it had written.** Release 0.31.0 knows schema v32; this release moves it to v37 (0.31.0
+  and earlier). **Now** a migration first writes a copy of the state as the previous release left it,
+  inside the migration lock and before its first statement: on SQLite the file
+  `<state>.v<old>.<UTC time>.bak` beside the state (`.rivet_state.db.v32.20261017T101530Z.bak`), on
+  PostgreSQL the schema `rivet_state_backup_v<old>` in the state database, every state table with its
+  rows, keys, indexes and defaults, in the migration's own transaction. One log line names the copy.
+  A copy that cannot be written (disk full, a read-only directory, a role without `CREATE` on the
+  database) stops the migration with `RIVET_STATE_BACKUP_FAILED` (exit 1); the state is untouched and
+  the previous release still opens it. **What to do:** nothing to upgrade. To roll back, follow
+  [Rolling back an upgrade](docs/reference/state.md#rolling-back-an-upgrade): stop the schedulers,
+  install the previous release, put the copy back (SQLite: replace the file; PostgreSQL: the SQL
+  block there) and run once. Progress written after the upgrade is lost, so the rows delivered since
+  are delivered again, at least once; what that means per mode and for `rivet load` is written there.
+
+- **Behaviour change: a replay of a sealed plan that already applied re-ran it, and an incremental plan could be applied only once.**
+  `rivet apply plan.json` run again after that plan's apply had exited 0 (a scheduler retry whose
+  task process died after rivet finished) extracted the whole table a second time for `mode: full`,
+  chunked and keyset plans. An incremental plan made after a run had stored a cursor was refused
+  `RIVET_PLAN_ARTIFACT_STALE` (exit 5, "cursor has drifted") on every apply after its first, by its
+  own cursor commit, and any plan older than 24 h was refused (0.31.0 and earlier). **Now** a
+  full, chunked or keyset plan is a point-in-time snapshot: the run that applies it to exit 0
+  records the plan's `plan_id` (state schema v37, `run_status.plan_id`), and a replay of it exits 0
+  without extracting, printing `apply: plan <plan_id> of export '<export>' was already applied by
+  run <run_id> (...)` with that run's rows, files and bytes; it writes no run, manifest or metrics
+  row. An incremental plan (`mode: incremental`, `keyset_incremental`) is a reusable description:
+  every apply of it, a retry included, reads the cursor from state and delivers what arrived since,
+  new rows or none; a cursor moved by an earlier apply of the same plan is not drift, and the 24 h
+  limit no longer applies to it. A cursor moved by another run is still refused
+  `RIVET_PLAN_ARTIFACT_STALE`, and a plan whose apply failed, was interrupted or died still
+  replays. **What to do:** nothing for a retry. To extract a full, chunked or keyset plan again,
+  make a new plan with `rivet plan`, or pass `--force`. Plans applied before the upgrade recorded no
+  `plan_id`, so a replay of one behaves as before.
+
+- **An export whose source table had been dropped failed with the raw driver error and no code.**
+  `rivet run` over a table dropped since the config was generated ended with the engine's own words
+  as its `Error:` line and no `RIVET_*` code on MySQL and PostgreSQL (`Error: MySqlError { ERROR
+  1146 (42S02): Table 'rivet.drop_probe_b' doesn't exist }`, exit 1), or `RIVET_SOURCE_QUERY_FAILED`
+  on SQL Server and Oracle; `rivet check` refused the same table as `RIVET_SOURCE_QUERY_FAILED`
+  (0.30.0 and 0.31.0). **Now** one function recognises each engine's own verdict (MySQL 1146,
+  PostgreSQL SQLSTATE 42P01, SQL Server 208, Oracle ORA-00942) on every path that reads the table
+  (the batch read, the parallel runners, the chunk planner's probe, the CDC snapshot leg, `check`
+  and `plan`), and the export stops as `Error: [RIVET_SOURCE_TABLE_NOT_FOUND] export 'drop_probe_b':
+  the table it reads does not exist (`drop_probe_b`, read by its `query:`). Correct the export's
+  `table:` or `query:`, or remove the export from `exports:` if the table was dropped on purpose:
+  MySqlError { ERROR 1146 (42S02): Table 'rivet.drop_probe_b' doesn't exist }` (exit 1). The exit
+  stays 1 and the other exports of the same run still deliver (`1 success · 1 failed`), so alerting
+  on the exit code sees no change; `rivet plan` keeps `RIVET_PLAN_SOURCE_UNREADABLE` as its outer
+  code, as it does for a missing MongoDB collection, with this refusal as the cause. **What to do:**
+  remove the export from `exports:` if the table was dropped on purpose, or correct its `table:`.
+
+- **A relative `destination.path` followed the working directory, not the config.** A local
+  export whose `path` is relative (`./output/orders`, what `rivet init` writes) was resolved
+  against the directory rivet was started from, while its cursor and state live beside the
+  config: the same config run from a cron entry and from a shell delivered ids 1..10 under one
+  directory and 11..13 under the other, each run green (P-27). **Now** a relative local `path`
+  is anchored to the config file's directory, resolved once at config load and used the same
+  way by `run`, `plan`/`apply`, `validate`, `reconcile`, `repair`, `state`, `doctor` and
+  `load`; a cursor stored under the old relative spelling continues under the anchored path.
+  **Transition guard:** a command started from another directory, whose working-directory
+  place still holds the export's files (its `manifest.json`) while the directory beside the
+  config holds none, is refused with `RIVET_DEST_RELATIVE_PATH_MOVED` (exit 5) naming both
+  directories, before anything is read or written; the check is one decision in the config
+  loader, so `run`, `load`, `reconcile`, `repair`, `validate` and every other command that
+  resolves the path meet it, and it costs local file reads only. **What to do:** nothing for
+  a run started from the config's directory, where the path resolves to the same place as
+  before. After the refusal, move the files to the named directory beside the config (the
+  stored cursor continues there), or make `destination.path` absolute to keep the old location.
+
+- **`reconcile` and `repair` read a stored chunk run on an edited `chunk_column`.** Neither
+  command compared the chunk plan the stored run was planned under with the config, so after a
+  `chunk_column` (or `query`, `chunk_size`, `chunk_count`, `chunk_by_days`) edit they re-read the
+  stored windows on the new column, and a `repair --execute` superseded parts: the manifest listed
+  39 rows for 40 source ids, exit 0 (P-21). **Now** both commands run the check `rivet run
+  --resume` already runs and refuse with `RIVET_STATE_CHUNK_PLAN_CHANGED` (exit 5) before any window
+  is read, naming the remedy. **What to do:** restore the chunk settings the run had to reconcile or
+  repair it, or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run
+  starts over. Exit codes: a `reconcile` or `repair` under a changed chunk plan exited 0 or 2 and
+  exits 5 now.
+
+- **Behaviour change: a Snowflake full load emptied its table before the COPY.** The load ran
+  `CREATE OR REPLACE TABLE` and then `COPY` as one script, so a COPY that failed (an unreadable
+  part, a lost client, a killed `snow`) left the table with 0 rows until a later load succeeded
+  (0.31.0 and earlier; measured: 20 rows before, 0 after a COPY of a corrupted part). **Now** the
+  parts land in a new table `<table>__rivet_load_<16 hex>`, the landed row count is checked against
+  the runs, and one `CREATE OR REPLACE TABLE <table> CLONE <staging> COPY GRANTS` puts it in place;
+  any failure before that statement leaves the table as it was and drops the staging table. A table
+  that existed before the upgrade is replaced like any other. Grants made on the table now survive a
+  full load (`COPY GRANTS`); before, every full load dropped them. **What to do:** nothing; a load
+  killed between the COPY and the clone can leave a `<table>__rivet_load_*` table, which no view or
+  load reads: drop it.
+
+- **A coded stop met by one chunk of a checkpointed export lost its code and its exit class.** A
+  range-chunked export with `chunk_checkpoint: true` (with or without `parallel:`) recorded a
+  failed chunk's cause as text in `chunk_task` only, so the run always ended as the incomplete run
+  `RIVET_RUN_UNITS_FAILED` with exit 1 and a `--resume` hint, and a `--resume` met the same stop and
+  ended the same way, so a scheduler resumed a refusal forever. Present through 0.31.0. **Now** the
+  run prints the code of the most stop-worthy coded chunk failure and exits by its class, as the
+  same export does without `chunk_checkpoint`; the message lists every failed chunk under the resume
+  remedy, and a `--resume` that meets the stop again refuses by the same code. The exits that
+  change: a refusal in a chunk (e.g. `RIVET_SOURCE_VALUE_UNREPRESENTABLE`) 1 → 5; an integrity
+  stop (e.g. `RIVET_DEST_PART_ROWS_MISMATCH`) 1 → 3; an internal one 1 → 6; a coded usage or
+  environment stop 1 or 2 → its own code's exit. A chunk whose stored window does not parse now
+  stops as `RIVET_STATE_CHUNK_WINDOWS_BROKEN` (exit 5) on the parallel checkpoint runner too. Chunk
+  failures that carry no code still exit as `RIVET_RUN_UNITS_FAILED`. The sequential runner's
+  message changed from `chunk checkpoint incomplete (N tasks not completed); fix errors and ...` to
+  `N chunk task(s) of export '...' not completed; fix the cause, then ... --resume, or inspect
+  rivet state chunks ...`, followed by each failed chunk's cause. **What to do:** a job that matched
+  `RIVET_RUN_UNITS_FAILED` or exit 1 for these stops matches the stop's own code and exit class
+  instead.
+
+- **A stop caused by another live rivet process exited 5, "a human decides", while its remedy was to wait and run again.** `RIVET_STATE_RUN_IN_PROGRESS` (a run, `apply`, a CDC drain, `rivet state reset*` or `rivet repair` beside a live run of the export), `RIVET_LOAD_TABLE_BUSY` and `RIVET_STATE_LEASE_LOST` (a `rivet load` or `rivet compact` beside another of the same table) exited 5, so a scheduler that does not retry a refusal (the Airflow provider, cron with retries keyed on the exit code) failed the task for good, although the same command succeeds once the other process ends (an overlapping trigger, an orphaned child of a killed parent). **Behaviour change:** these stops now have the kind `busy` and exit 2 (retryable); the codes and the texts are unchanged, the stop still writes nothing and never counts as ownership of the table (`RIVET_STATE_LEASE_LOST` is journaled `refused`; `RIVET_LOAD_TABLE_BUSY` stops before a load_run row exists and journals nothing). A `rivet run` of several exports where one is busy and another fails without a code now exits 2 (the busy stop ranks above an uncoded failure). A stop about what a dead run left behind keeps exit 5. **What to do:** a scheduler that branches on these codes needs no change; one that branches on exit 5 to catch an overlap matches exit 2 with the code instead.
+
+- **The `dest retries` line of a `--parallel-export-processes` run counted a CDC child's retries
+  more than once.** Each child sends its process's running total of destination retries with every
+  run it finishes, and a CDC child with `initial: snapshot` finishes one run per snapshot leg and then
+  its own; the parent added every one of those totals, so a run whose leg retried R times and whose
+  drain retried D times printed 2R + D, and more with more legs (0.31.0 and earlier with two or more
+  legs; with one leg since the snapshot-leg summary change in this release). **Now** the parent adds
+  only what each child's total grew by since that child's previous report. **What to do:** nothing.
+
+- **`rivet run` on a PostgreSQL source crashed when the process had no file descriptor left for the
+  driver's runtime.** Under a low `RLIMIT_NOFILE` the PostgreSQL client's own runtime build hit
+  `Too many open files` and the process ended with a panic (exit 101, no `Error:` line), while
+  MySQL, SQL Server, Oracle and MongoDB failed loudly under the same cap (0.31.0 and earlier).
+  **Now** every PostgreSQL dial (the source, CDC, the Postgres state, `init`, `doctor`, `check`, the
+  MCP server) first proves the process can start a runtime and is refused
+  `RIVET_SOURCE_RUNTIME_UNAVAILABLE` (an environment stop) when it cannot. **What to do:** raise the
+  open-files limit of the process that runs rivet.
+
+- **An Azure container removed while `rivet run` was writing into it was retried for minutes.** Each
+  chunk's upload was retried as a transient error (Azurite answers its 404 with a `keep-alive:
+  timeout=5` header, and the retry classifier read the word "timeout" in the store's answer as a
+  timeout), so a run of ten chunks took over nine minutes to fail; a bucket removed on S3 or GCS
+  failed in seconds (0.31.0 and earlier). **Now** a store's own final answer (not found, denied,
+  invalid, unsupported) is permanent by its type, whatever words its headers carry, and a container
+  that answered once but is gone by the time a write, listing or read fails is asked about again and
+  refused `RIVET_DEST_CONTAINER_NOT_FOUND`. **What to do:** nothing.
+
+- **The run summary of a CDC export's first run counted the stream only, not its snapshot.** A
+  `mode: cdc` export with `cdc.initial: snapshot` writes each table's baseline through a snapshot leg
+  (`<export>__snapshot_<table>`) and then drains the stream; its `per_export[]` entry in
+  `--summary-output`, `--json` and `run_aggregate` carried the drain's counts alone, so a run that wrote
+  the whole table read `rows: 0, files: 0` (and so did a scheduler task built on it), and a failed leg
+  showed up as an entry named after the leg instead of the CDC export (0.31.0 and earlier). **Now** the
+  CDC export's entry adds what its snapshot legs wrote in the same run to `rows`, `files`, `bytes` and
+  `bytes_read`, whether the exports run in one process or as `--parallel-export-processes` children,
+  and a failed leg fails the entry under the CDC export's name. The legs still have
+  their own `export_metrics` rows, so `rivet metrics` counts each write once, and `duration_ms` stays the
+  drain's. Under `--parallel-export-processes` the parent also took each export's entry as the newest
+  finished metric row of the export's NAME, so on a shared state database a failed run was reported as
+  another config's success of the same export name, with that run's id (0.31.0 and earlier); **now**
+  each child reports its own run id and the parent reads that run's row, and a child with none is
+  reported failed. **What to do:** nothing; summaries written by earlier runs are not rewritten.
+
+- **A coded stop met by one parallel worker lost its code and its exit class.** A keyset export
+  with `parallel:` (`chunk_by_key`), a range-chunked export with `parallel:` (`chunk_column`,
+  without `chunk_checkpoint`) and a MongoDB export with `parallel:` kept each worker's failure as
+  text only, so the run always printed `RIVET_RUN_UNITS_FAILED` and exited 1, or 2 when any
+  worker's text read as transient; a scheduler then retried a refusal it should have stopped on.
+  Present through 0.31.0. **Now** the run prints the code of the most stop-worthy coded worker
+  failure and exits by its class, as the same export does with one worker; the message still
+  lists every failed unit, the deciding one last. The exits that change: a refusal in a worker
+  (e.g. `RIVET_SOURCE_VALUE_UNREPRESENTABLE`) 1 or 2 → 5; an integrity stop (e.g.
+  `RIVET_DEST_PART_ROWS_MISMATCH`) → 3; an internal one → 6; a usage one (e.g.
+  `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH`, `RIVET_SOURCE_VALUE_TOO_LARGE`) 2 → 1 when a sibling's
+  text read as transient; an environment one keeps its own code and exits 2 only when its own
+  text is transient. Worker failures that carry no code still exit as `RIVET_RUN_UNITS_FAILED`.
+  **What to do:** a job that matched `RIVET_RUN_UNITS_FAILED` or exit 1/2 for these stops matches
+  the stop's own code and exit class instead.
+
+- **A stored incremental cursor moved past rows the export never delivered was continued from.**
+  With `last_cursor_value` edited above the last delivered value, the next run exported only the
+  rows past it and exited 0, while the destination's own `manifest.json` ended below it (every
+  version through 0.31.0). **Now** a run that continues from a stored cursor (incremental,
+  `keyset_incremental`) compares it with the `cursor_high` of the success manifest at its
+  destination and refuses a cursor past it with `RIVET_STATE_CURSOR_PAST_MANIFEST` (exit 5); a
+  cursor equal or below, a destination with no success manifest of this export, or one that keeps
+  no objects (a warehouse load) proceed as before. **What to do:** `rivet state reset -c <config>
+  --export <name>` starts the cursor over with a full pass.
+
+- **rivet could only be installed from a tarball, Homebrew or cargo, which a managed Airflow worker
+  (Cloud Composer, MWAA, Astronomer) does not allow.** **Now** a release can publish the same
+  binaries as `rivet-cli` wheels on PyPI (`manylinux_2_28` x86_64 / aarch64 and macOS arm64 /
+  x86_64; `rivet` and `rivet-mcp` land in the environment's `bin`, and `rivet_cli.path()` returns
+  the installed `rivet`). **What to do:** nothing; once a release is published there,
+  `pip install rivet-cli` installs the binary.
+
+- **The Linux release binaries did not start on Debian 12, RHEL 8/9 or the official Airflow images.**
+  They were built on Ubuntu 24.04 and needed GLIBC_2.38 / 2.39: `version 'GLIBC_2.39' not found`
+  (0.31.0 and earlier releases built the same way). **Now** every release also ships
+  `rivet-<version>-x86_64-unknown-linux-gnu-glibc2.28.tar.gz` and `…-aarch64-…-glibc2.28.tar.gz`,
+  built in manylinux_2_28, which run on any glibc 2.28 or newer; the release checks that they need
+  nothing newer and that they start on Rocky Linux 8 and 9, Amazon Linux 2023, Debian 12 and
+  Airflow 2.10 / 3.3 before it publishes. **What to do:** on an older distribution or in an Airflow
+  image, take the `-glibc2.28` asset.
+
+- **A `rivet load` stopped while selecting its runs left no ledger row, and a missing load spec hid a state-DB fault.** A stop raised before any warehouse write but outside the load's typed refusal seam (a `--pool --split` prefix holding two split generations, `RIVET_LOAD_SPLIT_GENERATIONS_MIXED`; a shared prefix; an unreadable loaded set) propagated untyped and unrecorded, so `rivet state loads` showed no attempt at all, and the one text under `RIVET_LOAD_SPEC_MISSING` covered both "no column types recorded" and "the state DB could not be read". Since 0.27.0. **Now** every stop out of run selection is journaled `refused` (never counted as rivet's own attempt) and the next cycle refuses again by the same code; a state DB that cannot answer for the load spec stops as `RIVET_STATE_BACKEND_FAILED`, and a missing spec stays `RIVET_LOAD_SPEC_MISSING`. **What to do:** nothing.
+
+- **The Airflow provider package moved to its own repository.** `integrations/airflow` (the
+  `airflow-provider-rivet` package: operators for `run`, `load` and `compact`, retry by error class,
+  CDC) left the rivet repository for
+  [`panchenkoai/airflow-provider-rivet`](https://github.com/panchenkoai/airflow-provider-rivet), with its
+  history, so the Rust repository does not publish to PyPI. **Now** the scheduler contract fixtures
+  (`tests/fixtures/scheduler/`) stay here and the provider's CI reads them from a pinned rivet
+  checkout. **What to do:** install the provider from its own repository; nothing changes in rivet.
+
+- **An empty table under `chunk_by_days` stopped the run instead of exporting zero rows.** The date
+  planner read the NULL `min` of a table with no row as an unreadable bound and stopped with
+  `min(<column>) returned NULL — table may be empty` (since date-native chunking in 0.2.0-beta.3, through
+  0.31.0; exit 5 `RIVET_SOURCE_PROBE_UNREADABLE` once the stop carried a code), while the same table
+  range-chunked on an integer key exported zero rows with exit 0. **Now** both planners read the key's
+  span through one function: a table with no row plans one empty window, so the run exits 0 and writes
+  `_SUCCESS` and a manifest of 0 rows, as the range run does; a bound absent over a table that has rows
+  is still refused `RIVET_SOURCE_PROBE_UNREADABLE`, and a NULL key is still refused
+  `RIVET_PLAN_CHUNK_KEY_NULL`. **What to do:** nothing.
+
+- **A keyset run stopped before its first part blocked the remedy its refusal named.** A resumed
+  MongoDB keyset run refused for an `_id` a `$gt` seek cannot page over (mixed BSON types, NaN) had
+  already claimed the export's resume anchor, so the full scan the refusal recommends was refused
+  `RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH` (exit 5) on every run, through 0.31.0. The same held
+  for any keyset export whose run failed before it recorded a part. **Now** a run that ends with a
+  resume anchor under which no part was recorded releases it, so the next run of any mode starts
+  fresh; an anchor with recorded parts is kept for the resume as before. The refusal
+  (`RIVET_SOURCE_KEYSET_KEY_UNORDERED`) now names every key to remove: `page_size`, `resume` and
+  `parallel` (`resume: true` without `page_size` is itself refused). **What to do:** nothing for a
+  new refusal. An export already stuck on an anchor a 0.31.0 run left: run the `rivet state reset`
+  command the `RIVET_STATE_INTERRUPTED_RUN_OWNER_MISMATCH` refusal prints (that run recorded no part).
+
+- **Every remaining error rivet raises outside its source readers carried no `RIVET_*` code.** The
+  CLI, destination, plan, init, state, preflight, format, manifest, MCP, type-override and TLS
+  stops (152 sites) printed prose only, so a scheduler could match on wording alone, since the
+  codes were introduced. **Now** every stop carries a registered code (`[CODE]` prefix on the text
+  line, `code` in `--json-errors`), with 28 new codes in `docs/reference/errors.md`; message text
+  is unchanged. A stop's exit follows its code's class, which moves these stops from exit 1 to the
+  class exit: `rivet init -o` over an existing config (`RIVET_INIT_CONFIG_EXISTS`, 5); an export
+  whose destination prefix holds a manifest of the other mode (`RIVET_DEST_PREFIX_MODE_MISMATCH`,
+  5); a Full load over a `--pool --split` prefix spanning two split generations
+  (`RIVET_LOAD_SPLIT_GENERATIONS_MIXED`, 5); `rivet load` for an export with no recorded column
+  types (`RIVET_LOAD_SPEC_MISSING`, 5); a state migration that did not reach the binary's schema
+  version, an empty state path, a run aggregate that does not serialise
+  (`RIVET_INTERNAL_STATE_INVARIANT`, 6); a destination backend method the backend does not
+  implement, a destination key with no file name, a CSV cell type the writer never rejected
+  (`RIVET_INTERNAL_DEST_INVARIANT`, 6); a `row_hash` column gone from the batch or read as the
+  wrong array kind, a worker panic, a `COUNT(*)` that is not a number, a committed cursor with no
+  column to record it under (`RIVET_INTERNAL_RUN_INVARIANT`, 6); an Oracle current schema the
+  server did not return, a MySQL MCP query with no result set (`RIVET_INTERNAL_SOURCE_INVARIANT`,
+  6). **What to do:** a script that keyed on exit 1 for one of these stops treats 5 as "a human
+  decides, do not retry unchanged" and 6 as "a bug, report it"; the text is unchanged, so a script
+  matching text keeps working. Other stops keep their exit: usage codes exit 1 and environment
+  codes exit 2 when transient, else 1, as before.
+
+- **Most errors raised while reading a source carried no `RIVET_*` code.** A malformed source
+  URL, a CDC `table:` that names no single base table, a value the column type cannot hold, a
+  SQL Server statement the server refused, a MySQL server with no binlog, a spill log that
+  would not flush, a pgoutput message in a shape the reader never produces, and the other stops
+  raised under `src/source/` (PostgreSQL, MySQL, SQL Server, Oracle, MongoDB and the shared CDC,
+  spill, checksum and validate modules) printed only their text, and most exited 1 whatever
+  their kind (0.31.0 and earlier). **Now** every error raised there carries a registered code,
+  with the message text unchanged: `RIVET_CONFIG_SOURCE_URL_INVALID`,
+  `RIVET_CONFIG_SOURCE_OPTION_UNSUPPORTED`, `RIVET_CONFIG_SOURCE_FEATURE_MISSING`,
+  `RIVET_SOURCE_CDC_TABLE_UNRESOLVED`, `RIVET_SOURCE_CDC_TABLE_UNSUPPORTED`,
+  `RIVET_SOURCE_CDC_TRANSACTION_TOO_LARGE`, `RIVET_SOURCE_QUERY_COLUMN_UNREFERENCEABLE` (usage,
+  exit 1); `RIVET_SOURCE_KEYSET_KEY_UNORDERED` (refusal, exit 5); `RIVET_SOURCE_RUNTIME_UNAVAILABLE`,
+  `RIVET_SOURCE_CONNECT_FAILED`, `RIVET_SOURCE_QUERY_FAILED`, `RIVET_SOURCE_CDC_SPILL_UNLOCKABLE`,
+  `RIVET_SOURCE_CDC_SPILL_UNWRITABLE` (environment, exit 2 when transient, else 1);
+  `RIVET_INTERNAL_SOURCE_INVARIANT` (internal, exit 6). Existing codes now also cover source
+  sites (`RIVET_TYPE_UNSAFE_MAPPING`, `RIVET_SOURCE_VALUE_UNREPRESENTABLE`,
+  `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH`, `RIVET_SOURCE_VALUE_TOO_LARGE`,
+  `RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ`, `RIVET_SOURCE_CDC_PREREQUISITE`,
+  `RIVET_SOURCE_CDC_CELL_UNSUPPORTED`, `RIVET_SOURCE_CDC_UNDECODABLE`, `RIVET_SOURCE_CDC_TRUNCATED`,
+  `RIVET_SOURCE_CDC_CHECKPOINT_INVALID`, `RIVET_CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH`,
+  `RIVET_CONFIG_MODE_SETTING_INVALID`, `RIVET_CONFIG_EXPORT_SOURCE_INVALID`,
+  `RIVET_CONFIG_VALUE_OUT_OF_RANGE`, `RIVET_LOAD_RESERVED_COLUMN`, `RIVET_STATE_CURSOR_INCOMPARABLE`,
+  `RIVET_DEST_CONTROL_ARTIFACT_INVALID`, `RIVET_VALIDATE_UNVERIFIED`, `RIVET_INTERNAL_SPILL`,
+  `RIVET_INTERNAL_TYPE_BUILDER`, `RIVET_INTERNAL_VALUE_CONVERTER`). An Oracle driver error is
+  coded by phase (connect against statement) with the server's words kept; a MySQL anchor refused
+  because the identity query failed keeps that query's own code; a pgoutput transaction poisoned
+  by a refusal re-raises the original cause with its code. See `docs/reference/errors.md`.
+  **What to do:** nothing; a script matching error text keeps working. A scheduler that keys on
+  the exit code sees 5 where these stops used to exit 1: a batch value the column's type cannot
+  hold (a PostgreSQL multi-dimensional array or an array of temporal/uuid/bytea elements, a
+  NUMERIC NaN or infinity under a decimal target, a DECIMAL that does not fit the declared
+  scale on PostgreSQL or MySQL, a SQL Server MONEY that is non-finite or past 2^53, a SQL Server
+  decimal that overflows on rescale, an Oracle date, time or NUMBER outside its column type); a
+  CDC cell the decoder has no faithful reading for (a deferred PostgreSQL infinity or
+  unchanged-TOAST cell, a pgoutput column type with no binary decoder or no known OID, an
+  Oracle value the miner cannot decode); a MySQL XA PREPARE or statement-logged DML on a
+  captured table, an Oracle row written without ALL COLUMNS supplemental logging, and a MongoDB
+  event past 16 MB (`RIVET_SOURCE_CDC_UNDECODABLE`); a MongoDB change stream invalidated
+  (`RIVET_SOURCE_CDC_TRUNCATED`); a malformed SQL Server resume LSN or an unrecognised MongoDB
+  resume-token checkpoint (`RIVET_SOURCE_CDC_CHECKPOINT_INVALID`); a MongoDB `_id` span a seek
+  cannot page over, and a stored MongoDB keyset cursor token that no longer decodes
+  (`RIVET_STATE_CURSOR_INCOMPARABLE`); a manifest column checksum that is not a number
+  (`RIVET_DEST_CONTROL_ARTIFACT_INVALID`, under `rivet validate`). It sees 6 where a source
+  reader invariant broke: a truncated or unexpected pgoutput message, a row before its Relation,
+  a row image whose arity differs from its relation, a text-form cell on a binary slot, a
+  spilled row that decodes to no change, a malformed slot LSN or position, a SQL Server open-time
+  LSN or `sys.databases` answer in a shape the server never gives, a MySQL query with no result
+  set, an Oracle SCN the server did not return or a mined row of an unexpected table, a MongoDB
+  resume token that is not a document or a non-row operation reaching the row decoder, a column
+  builder given a type it cannot build (`RIVET_INTERNAL_TYPE_BUILDER`), a value checksum that
+  changed between read and Arrow build or a MONEY render that did not parse
+  (`RIVET_INTERNAL_VALUE_CONVERTER`), and a spill frame that is truncated, oversized, nested too
+  deep, not UTF-8, not a date-time, not JSON or followed by trailing bytes
+  (`RIVET_INTERNAL_SPILL`). Environment stops keep their exit: 2 when the failure is transient,
+  else 1, as before.
+
+- **Most errors raised while running, planning, applying, reconciling, repairing and validating
+  an export carried no `RIVET_*` code.** An unknown `--export`, a stale plan artifact, a NULL
+  chunk key, an unfinished chunk checkpoint run, a committed part gone from the destination, a
+  damaged `manifest.json`, failed chunks or keyset ranges, and the other stops raised under
+  `src/pipeline/` printed only their text, and most exited 1 whatever their kind (0.31.0 and
+  earlier). **Now** every error raised there carries a registered code, with the message text
+  unchanged: `RIVET_CLI_EXPORT_UNKNOWN`, `RIVET_CLI_RUN_ID_EXPORT_MISMATCH`,
+  `RIVET_CLI_OPTION_UNSUPPORTED`, `RIVET_CLI_REPORT_INVALID`, `RIVET_PLAN_NOTHING_TO_PLAN`,
+  `RIVET_PLAN_ARTIFACT_NO_CREDENTIALS`, `RIVET_PLAN_PARTITION_TOKEN_UNEXPANDED`,
+  `RIVET_PLAN_REJECTED`, `RIVET_PLAN_CHUNK_KEY_SPARSE`, `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER`,
+  `RIVET_CONFIG_SETTLE_COLUMN_NOT_TEMPORAL`, `RIVET_CONFIG_SPLIT_PREFIX_UNSTABLE`,
+  `RIVET_CONFIG_EXPORT_NAME_RESERVED`, `RIVET_CONFIG_BATCH_MEMORY_EXCEEDED`,
+  `RIVET_CONFIG_CDC_CAPTURE_INSTANCE_MISMATCH`, `RIVET_SOURCE_VALUE_TOO_LARGE`,
+  `RIVET_STATE_CHUNK_RUN_MISSING`, `RIVET_DEST_MANIFEST_MISSING` (usage, exit 1);
+  `RIVET_PLAN_ARTIFACT_STALE`, `RIVET_PLAN_CHUNK_KEY_NULL`, `RIVET_SOURCE_KEYSET_KEY_COARSE`,
+  `RIVET_STATE_CHUNK_RUN_UNFINISHED`, `RIVET_DEST_COMMITTED_PART_GONE`,
+  `RIVET_DEST_CONTROL_ARTIFACT_INVALID` (refusals, exit 5); `RIVET_DEST_PART_ROWS_MISMATCH`
+  (integrity, exit 3); `RIVET_RUN_UNITS_FAILED`, `RIVET_RUN_RECONCILE_UNVERIFIED`,
+  `RIVET_DEST_MANIFEST_NOT_WRITTEN`, `RIVET_DEST_OBJECT_NOT_FOUND`, `RIVET_DEST_UPLOAD_CORRUPTED`,
+  `RIVET_DEST_PREFIX_UNLISTABLE`, `RIVET_CLI_OUTPUT_UNWRITABLE`, `RIVET_CLI_INPUT_UNREADABLE`,
+  `RIVET_CLI_EXECUTABLE_UNRESOLVED`, `RIVET_CLI_TEST_FAULT_INJECTED` (environment, exit 2 when
+  transient, else 1); `RIVET_INTERNAL_RUN_INVARIANT` (internal, exit 6). Some existing codes now
+  also cover pipeline sites (`RIVET_SOURCE_PROBE_UNREADABLE`, `RIVET_STATE_CHUNK_WINDOWS_BROKEN`,
+  `RIVET_SOURCE_CDC_PREREQUISITE`, `RIVET_CONFIG_MODE_SETTING_INVALID`,
+  `RIVET_CONFIG_CDC_SHAPE_INVALID`, `RIVET_LOAD_KEY_COLUMN_INVALID`, `RIVET_CONFIG_NO_EXPORTS`,
+  `RIVET_CONFIG_FILE_UNREADABLE`, `RIVET_VALIDATE_UNVERIFIED`, `RIVET_STATE_NOT_WRITABLE`). An
+  error rebuilt around another (the chunked planner's probe around `resolve_url`, a worker's
+  state-database open, `state reset` / `state accept` around the source) keeps the inner error's
+  code instead of dropping it. See `docs/reference/errors.md`. **What to do:** nothing; a script
+  matching error text keeps working. A scheduler that keys on the exit code sees 5 where these
+  stops used to exit 1: a plan artifact older than 24 h or with a drifted cursor applied without
+  `--force`; NULL values in a range, date or `--pool --split` chunk key; a keyset page that ends
+  on the key it started after; a plain run meeting an unfinished chunk checkpoint run; a
+  committed part gone from the destination on resume; a `manifest.json` that does not parse or
+  exceeds the read cap; a min/max/partition bound the planner cannot read, or a keyset key value
+  it cannot read from a page's last row (`RIVET_SOURCE_PROBE_UNREADABLE`); a stored chunk window
+  bound that is not an integer (`RIVET_STATE_CHUNK_WINDOWS_BROKEN`). It sees 3 where a part
+  written under `validate: true` holds fewer rows than counted, and 6 where a run invariant
+  broke (a `COUNT(*)` with no row, a chunk run recorded with no tasks, a reconcile over a
+  non-chunked plan, an encode worker that stopped or panicked, a retry loop with no error to
+  report).
+
+- **Range chunking refused an Oracle `NUMBER(19)` key.** A `NUMBER(19)` primary key (the type a
+  64-bit integer key usually has on Oracle) was read as not integer-family, so `mode: chunked` over it
+  exited 1 (0.31.0 and earlier). **Now** `NUMBER(p, 0)` up to precision 19 is an integer range key for
+  the planner and `rivet check`; a value past the 64-bit range is refused when the bounds are read,
+  with a message that says so. `rivet init` still proposes keyset for such a key, which takes any
+  value. **What to do:** nothing.
+
+- **Most `rivet load` and `rivet compact` errors carried no `RIVET_*` code.** A refused warehouse
+  object, an unsafe identifier, a missing key, an incomplete run under the prefix, a failed
+  BigQuery job and the other stops raised under `src/load/` printed only their text, and most exited
+  1 whatever their kind (0.31.0 and earlier). **Now** every error raised there carries a registered
+  code, with the message text unchanged: `RIVET_LOAD_IDENTIFIER_UNSAFE`,
+  `RIVET_LOAD_KEY_COLUMN_INVALID`, `RIVET_LOAD_PRIMARY_KEY_MISSING`, `RIVET_LOAD_RESERVED_COLUMN`,
+  `RIVET_LOAD_LOOKALIKE_COLUMN`, `RIVET_LOAD_TARGET_COLLISION`, `RIVET_LOAD_STAGING_PREFIX_INVALID`,
+  `RIVET_LOAD_DESTINATION_TYPE_UNSUPPORTED`, `RIVET_LOAD_PARTITION_BUDGET_EXCEEDED`,
+  `RIVET_LOAD_FILE_LIMIT_EXCEEDED`, `RIVET_LOAD_COLUMN_TYPE_UNSUPPORTED`, `RIVET_LOAD_TLS_CA_INVALID`
+  (exit 1); `RIVET_LOAD_EMPTY_RUN_UNSUPPORTED`, `RIVET_LOAD_RUN_NOT_LOADABLE`,
+  `RIVET_LOAD_STAGING_OBJECT_UNSAFE`, `RIVET_LOAD_SOURCES_SHARED`, `RIVET_LOAD_COLUMN_RESPELLED`,
+  `RIVET_LOAD_TARGET_OBJECT_CONFLICT`, `RIVET_LOAD_COMPACT_BASE_MISSING`,
+  `RIVET_LOAD_CHANGELOG_PARTITION_CHANGED`, `RIVET_LOAD_BUFFER_NOT_COMPACTED`,
+  `RIVET_LOAD_REBASELINE_OVER_CHANGES`, `RIVET_LOAD_TABLE_BUSY` (refusals, exit 5);
+  `RIVET_LOAD_MANIFEST_INCONSISTENT`, `RIVET_LOAD_SOURCE_FILE_MISMATCH`,
+  `RIVET_LOAD_COPY_COUNT_MISMATCH` (integrity, exit 3); `RIVET_LOAD_LEDGER_UNREADABLE`,
+  `RIVET_LOAD_RUN_LANDED_DURING_LOAD`, `RIVET_LOAD_WAREHOUSE_AUTH_FAILED`,
+  `RIVET_LOAD_WAREHOUSE_ACCESS_DENIED`, `RIVET_LOAD_WAREHOUSE_OBJECT_NOT_FOUND`,
+  `RIVET_LOAD_WAREHOUSE_REJECTED`, `RIVET_LOAD_WAREHOUSE_UNAVAILABLE` (environment, exit 2 when
+  transient, else 1); `RIVET_LOAD_WAREHOUSE_ANSWER_UNREADABLE` and `RIVET_INTERNAL_LOAD_INVARIANT`
+  (internal, exit 6). Some existing codes now also cover load sites (`RIVET_CONFIG_NO_EXPORTS`,
+  `RIVET_CONFIG_MODE_SETTING_INVALID`, `RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED`,
+  `RIVET_CONFIG_LOAD_PARTITION_UNSUPPORTED`, `RIVET_LOAD_TARGET_NOT_RIVETS`). A Snowflake or
+  ClickHouse stop before the first statement (an empty newest run, more than 1,000 files, an unsafe
+  `cluster_by`, a CDC log without a key) is now journaled `refused`, not `failed`, so it no longer
+  counts as rivet having loaded the table. See `docs/reference/errors.md`. **What to do:** nothing;
+  a script matching error text keeps working. A scheduler that keys on the exit code sees 5, 3 or 6
+  where these stops used to exit 1.
+
+- **A float `chunk_column` under `query:` lost its fractional keys with exit 0.** With `table:` the
+  planner refused a non-integer range key; with `query:` it could not read a catalog, only warned,
+  and integer `BETWEEN` windows skipped every key between two whole numbers (a `double precision` key
+  delivered 40 of 43 rows) (0.31.0 and earlier). **Now** the run reads the query's result type before
+  it plans the windows and refuses a float or scaled-decimal key with
+  `RIVET_CONFIG_CHUNK_COLUMN_NOT_INTEGER` (exit 1), the same code the `table:` refusal now carries.
+  **What to do:** use `chunk_by_key:` (keyset) or an integer column for such a key.
+
+- **Most config errors carried no `RIVET_*` code.** A missing config file, broken YAML, an
+  incomplete `source:` block, an unset `url_env`, a mode without its setting and the other
+  refusals raised while a config is read printed only their text, so a scheduler or a script could
+  match them by wording alone (0.31.0 and earlier). **Now** every error raised under `src/config/`
+  carries a registered code, with the message text unchanged: `RIVET_CONFIG_FILE_UNREADABLE`,
+  `RIVET_CONFIG_YAML_INVALID`, `RIVET_CONFIG_SOURCE_CONNECTION_INVALID`, `RIVET_CONFIG_SECRET_UNSET`,
+  `RIVET_CONFIG_EXPORT_SOURCE_INVALID`, `RIVET_CONFIG_MODE_SETTING_INVALID`,
+  `RIVET_CONFIG_DESTINATION_AUTH_INVALID`, `RIVET_CONFIG_DESTINATION_ENDPOINT_UNSAFE`,
+  `RIVET_CONFIG_VALUE_OUT_OF_RANGE`, `RIVET_CONFIG_CDC_SHAPE_INVALID`,
+  `RIVET_CONFIG_CSV_COMPRESSION_UNSUPPORTED`, `RIVET_CONFIG_TLS_VERIFICATION_DOWNGRADE`,
+  `RIVET_CONFIG_LOAD_BLOCK_INVALID`, `RIVET_CONFIG_PATH_UNSAFE`, `RIVET_CONFIG_ROW_HASH_INVALID` and
+  `RIVET_CONFIG_COLUMN_OVERRIDE_TABLE_UNKNOWN` (see `docs/reference/errors.md`). The exit code stays
+  1. **What to do:** nothing; a script matching config error text keeps working.
+
+- **`rivet run` into a bucket that does not exist failed with the store's raw error.** The upload
+  ended with `NotFound (persistent) at write, context: { uri: ... }` and no `RIVET_*` code (exit 1),
+  while `rivet validate` and every read already named the missing bucket (0.31.0 and earlier).
+  **Now** a write the store answers "not found" asks whether the bucket exists, and a missing one is
+  refused `RIVET_DEST_CONTAINER_NOT_FOUND` naming it, on S3, GCS and Azure. **What to do:** nothing.
+
+- **Two exports of one name on a shared state refused each other even when they read different
+  sources.** Since every run took the export's run lease (keyed by the export name), the
+  shared-state deployment the state docs describe (several configs, one export name, one PostgreSQL
+  state, different sources) ran one export at a time and refused the rest with
+  `RIVET_STATE_RUN_IN_PROGRESS`. **Now** the run lease is keyed by the export and its source, as the
+  cursor is: runs of one name on different sources run side by side, a second run on the same source
+  is still refused. A run under its lease closes only its own source's dead `running` rows; state
+  schema v36 records the source on each `run_status` row (rows from before v36 have none and are
+  closed by any run of the export). **What to do:** nothing.
+
 - **`rivet init` could not scaffold a Snowflake `load:` block.** It had flags for BigQuery and
   ClickHouse only, so a Snowflake config needed a hand-written `load:` block (0.31.0 and earlier).
   **Now** `--snowflake-connection`, `--snowflake-warehouse`, `--snowflake-database`,
