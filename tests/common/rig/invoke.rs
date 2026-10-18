@@ -61,7 +61,8 @@ impl Rig {
             );
             return None;
         };
-        let bin = PathBuf::from(bin);
+        // Absolute: a cell that runs in its own directory (`Rig::in_dir`) spawns by this path.
+        let bin = std::fs::canonicalize(&bin).unwrap_or_else(|_| PathBuf::from(&bin));
         assert!(
             bin.is_file() && bin != Path::new(crate::common::runner::rivet_bin()),
             "RIVET_PREV_RELEASE_BIN={} is not another rivet binary",

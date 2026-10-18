@@ -303,15 +303,12 @@ exclude_re = [
     # ceiling that stood in for them; the newly-visible survivors are recorded
     # in docs/mutants-baseline.txt with this date.
     "replace run_mongo_parallel ->",
-    # run_export_job_with_chunk_source is the plan-ARTIFACT apply orchestration
-    # (apply_cmd.rs:215 is its only caller) — a real StateStore + source per
-    # export, live-only. Its stub `(Ok(()), Default::default())` is proven
-    # live-killed by hand 2026-08-21: plan_and_apply_full_export_round_trip
-    # FAILS (no export happens). Honest scope note: the .yaml wave-apply live
-    # test (resume_skips_completed_exports) stays GREEN under this stub — that
-    # path goes through run_export_job, not this fn; the artifact round-trip
-    # test is the one that owns it.
-    "replace run_export_job_with_chunk_source ->",
+    # run_export_job_with_chunk_source: EXCLUSION LIFTED 2026-10-18. The plan-artifact
+    # apply orchestration was live-only until #623 gave apply_cmd.rs unit tests that drive
+    # it; the live-only coverage tool then measured 34% of its body offline, and its stub
+    # `(Ok(()), Default::default())` is CAUGHT under `--lib --bins` by
+    # a_reusable_plan_extracts_on_every_replay_from_the_stored_cursor and
+    # only_an_exit_zero_apply_of_the_same_plan_answers_a_replay.
     # introspect_all (init/mod.rs) is the whole-schema scan: every arm opens a
     # live engine connection, so its dispatch mutants (delete match arm
     # "postgres"/"mysql"/"mssql") are unkillable OFFLINE. The DECISION logic was

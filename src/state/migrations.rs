@@ -2887,7 +2887,8 @@ mod tests {
         );
         let pkeys: i64 = client
             .query_one(
-                "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'rivet_state_backup_v32' AND indexdef LIKE 'CREATE UNIQUE INDEX%'",
+                "SELECT COUNT(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid \
+                 WHERE c.relnamespace = 'rivet_state_backup_v32'::regnamespace AND i.indisunique",
                 &[],
             )
             .unwrap()
@@ -2963,15 +2964,22 @@ mod tests {
                 "RIVET_TEST_STATE_URL is not a superuser: cannot create the test role",
             );
         }
-        let reset = "DROP SCHEMA IF EXISTS rivet_wayback_nocreate CASCADE; \
-                     DROP SCHEMA IF EXISTS rivet_state_backup_v30 CASCADE; \
-                     DROP ROLE IF EXISTS rivet_wayback_nocreate;";
-        admin.batch_execute(reset).unwrap();
+        // Per process: a role is cluster-wide, and one left by a run on another database
+        // of this server cannot be dropped from here ("objects in database X depend on it").
+        let role_name = format!("rivet_wayback_nocreate_{}", std::process::id());
+        let reset = format!(
+            "DROP SCHEMA IF EXISTS {role_name} CASCADE; \
+             DROP SCHEMA IF EXISTS rivet_state_backup_v30 CASCADE; \
+             DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role_name}') \
+             THEN EXECUTE 'DROP OWNED BY {role_name}'; END IF; END $$; \
+             DROP ROLE IF EXISTS {role_name};"
+        );
+        admin.batch_execute(&reset).unwrap();
         admin
-            .batch_execute(
-                "CREATE SCHEMA rivet_wayback_nocreate; SET search_path TO rivet_wayback_nocreate; \
-                 CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);",
-            )
+            .batch_execute(&format!(
+                "CREATE SCHEMA {role_name}; SET search_path TO {role_name}; \
+                 CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);"
+            ))
             .unwrap();
         for &(ver, sql) in PG_MIGRATIONS {
             if ver <= 30 {
@@ -2983,13 +2991,13 @@ mod tests {
             }
         }
         admin
-            .batch_execute(
+            .batch_execute(&format!(
                 "INSERT INTO export_state (export_name, prefix, last_cursor_value) VALUES ('orders', 'pg/a', '42'); \
-                 CREATE ROLE rivet_wayback_nocreate LOGIN PASSWORD 'nocreate'; \
-                 GRANT USAGE, CREATE ON SCHEMA rivet_wayback_nocreate TO rivet_wayback_nocreate; \
-                 GRANT ALL ON ALL TABLES IN SCHEMA rivet_wayback_nocreate TO rivet_wayback_nocreate; \
-                 GRANT ALL ON ALL SEQUENCES IN SCHEMA rivet_wayback_nocreate TO rivet_wayback_nocreate;",
-            )
+                 CREATE ROLE {role_name} LOGIN PASSWORD 'nocreate'; \
+                 GRANT USAGE, CREATE ON SCHEMA {role_name} TO {role_name}; \
+                 GRANT ALL ON ALL TABLES IN SCHEMA {role_name} TO {role_name}; \
+                 GRANT ALL ON ALL SEQUENCES IN SCHEMA {role_name} TO {role_name};"
+            ))
             .unwrap();
         // The same server and database, as the role, reading the test schema.
         let host_db = url
@@ -2999,7 +3007,7 @@ mod tests {
             .next()
             .unwrap();
         let role_url = format!(
-            "postgresql://rivet_wayback_nocreate:nocreate@{host_db}?options=-c%20search_path%3Drivet_wayback_nocreate"
+            "postgresql://{role_name}:nocreate@{host_db}?options=-c%20search_path%3D{role_name}"
         );
         let mut role = connect_pg(&role_url).expect("connect as the role without CREATE");
 
@@ -3014,7 +3022,7 @@ mod tests {
         assert!(said.contains("Nothing was migrated"), "{said}");
         let ver: i64 = admin
             .query_one(
-                "SELECT MAX(version) FROM rivet_wayback_nocreate.rivet_schema_version",
+                &format!("SELECT MAX(version) FROM {role_name}.rivet_schema_version"),
                 &[],
             )
             .unwrap()
@@ -3022,8 +3030,10 @@ mod tests {
         assert_eq!(ver, 30, "the state is still v30");
         let stream_cols: i64 = admin
             .query_one(
-                "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = 'rivet_wayback_nocreate' \
-                 AND table_name = 'export_state' AND column_name = 'stream'",
+                &format!(
+                    "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = '{role_name}' \
+                     AND table_name = 'export_state' AND column_name = 'stream'"
+                ),
                 &[],
             )
             .unwrap()
@@ -3038,6 +3048,6 @@ mod tests {
             .get(0);
         assert_eq!(copies, 0, "no half-written copy is left behind");
         drop(role);
-        admin.batch_execute(reset).unwrap();
+        admin.batch_execute(&reset).unwrap();
     }
 }

@@ -42,6 +42,10 @@ UNTRIAGED = ("untriaged: green on v0.31.0 when first measured (2026-10-08); "
              "either a control of the fix or a vacuous fix cell, to be read")
 
 #: Controls: the neighbour of a fix that must stay as it was, so it is green on the release without the fix.
+REUSABLE_PLAN = ("control of 1146e47b: a replay of an incremental or keyset-incremental plan, or of a plan whose apply "
+                 "died, extracts again, which v0.31.0 did for every replay; the first draft of #616 answered every "
+                 "replay as already applied, and these cells are what caught it (the point-in-time replay cells are the "
+                 "red ones there)")
 KEYSET_GROWS = ("control of b6b15004: a keyset resume seeks past its checkpoint key, so it delivered a source that grew "
                 "before the fix; the range and parallel-keyset plans are the cells that are red there")
 COMPRESSION_EDIT = ("control of b6b15004: a `compression` edit under stored progress is not what the new destination "
@@ -79,6 +83,13 @@ MIXED_ID_ORACLE = ("edited by 1b7ffa1f, not written for it: the commit dropped t
 
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
     "a_crashed_keyset_incremental_run_is_resumed_not_reread_postgres": UNTRIAGED,
+    "a_replayed_first_incremental_plan_delivers_what_arrived_since_mysql": REUSABLE_PLAN,
+    "a_replayed_first_incremental_plan_delivers_what_arrived_since_postgres": REUSABLE_PLAN,
+    "a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql": REUSABLE_PLAN,
+    "a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres": REUSABLE_PLAN,
+    "a_replayed_plan_whose_apply_died_extracts_mysql": REUSABLE_PLAN,
+    "a_replayed_plan_whose_apply_died_extracts_postgres": REUSABLE_PLAN,
+    "incremental_keyset_apply_rotates_run_id_across_repeated_applies": REUSABLE_PLAN,
     "a_query_that_does_not_rename_the_chunk_column_delivers_its_rows_postgres": UNTRIAGED,
     "a_refused_chunked_checkpoint_run_keeps_refusing_a_duplicate_postgres": UNTRIAGED,
     "a_refused_keyset_checkpoint_run_keeps_refusing_a_duplicate_postgres": UNTRIAGED,
