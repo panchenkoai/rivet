@@ -22,6 +22,16 @@
 - **A dropped source table is refused `RIVET_SOURCE_TABLE_NOT_FOUND`** on every SQL engine; remove
   the export from `exports:` if the table was dropped on purpose.
 
+**Known issue in this release (fixed in 0.32.1):**
+
+- **`rivet load` of a batch export reads the manifests under its whole prefix, including another
+  export's nested under it.** `rivet init` on SQL Server writes a batch prefix `exports/<t>/` and a
+  CDC prefix `exports/<t>/cdc/`; with both in one bucket, `rivet load` of the batch export takes the
+  stream's snapshot and change parts as its own and applies their deletes to the batch table
+  (exit 0). Present since at least 0.31.0. **What to do:** never place one export's prefix inside
+  another's; in a config `rivet init` generated for SQL Server, move the CDC export's `prefix` to a
+  sibling (for example `cdc/<t>/`) before the first run.
+
 - **A plan applied after UTC midnight wrote under the planning day.** `rivet plan` resolved
   `{date}` in the destination into the sealed plan, so a plan made before midnight and applied
   after it wrote under the planning day while the data and the part files were of the apply
