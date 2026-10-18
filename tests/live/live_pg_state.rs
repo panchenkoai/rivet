@@ -627,6 +627,15 @@ fn a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out
     assert!(!stderr.contains("source.tls"), "{stderr}");
 
     let sep = if remote.contains('?') { '&' } else { '?' };
+    let loopback = format!("{url}{sep}sslmode=disable");
+    let ran = rig.run_args_env(&[], &[("RIVET_STATE_URL", loopback.as_str())]);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(ran.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("plaintext to a remote host"),
+        "a loopback state is not remote: {stderr}"
+    );
+
     let plaintext = format!("{remote}{sep}sslmode=disable");
     let ran = rig.run_args_env(&[], &[("RIVET_STATE_URL", plaintext.as_str())]);
     let stderr = String::from_utf8_lossy(&ran.stderr);

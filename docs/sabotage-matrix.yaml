@@ -70,6 +70,14 @@
 engines: [postgres, mysql, mssql, mongo, oracle]
 
 scenarios:
+  - id: refusal_state_url_tls_required
+    what: "RIVET_STATE_URL_TLS_REQUIRED: a PostgreSQL state URL for a remote host that names no `sslmode`"
+    postgres: { gap: "asserted by its code with its `?sslmode=disable` remedy run in live_pg_state::a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out; the walk needs refuse twice, `?sslmode=require` against a state server with TLS, and one wrong remedy (`source.tls`)" }
+    mysql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+    mssql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+    mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+    oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+
   - id: refusal_state_cursor_owner_mismatch
     what: "RIVET_STATE_CURSOR_OWNER_MISMATCH: `cursor_column` changed with no reset; both named remedies deliver, `state reset-chunks` (the sibling command) leaves the refusal"
     postgres: { test: a_changed_cursor_column_is_refused_and_walked_out_postgres }
