@@ -50,9 +50,21 @@ jobs:
             arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
+      # git before the checkout: without it in the container, actions/checkout downloads the tree
+      # with no `.git`, and build.rs stamps `--version` with `(unknown)`. The vendored OpenSSL's
+      # Configure needs Perl core modules (IPC::Cmd, Time::Piece, ...) that manylinux_2_28 does
+      # not ship; the `perl` package installs all of them.
+      - name: Install build tools
+        run: dnf -y -q install perl git
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      # The workspace belongs to the runner's user, not the container's root, so git refuses it
+      # ("dubious ownership") unless it is marked safe; build.rs reads the commit through git.
+      - name: Let build.rs read the commit
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -62,11 +74,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}-glibc228
-
-      # The vendored OpenSSL's Configure needs Perl core modules (IPC::Cmd, Time::Piece, ...) that
-      # manylinux_2_28 does not ship; the `perl` package installs all of them.
-      - name: Install build tools
-        run: dnf -y -q install perl
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
