@@ -600,7 +600,7 @@ fn check_doctor_and_init_refuse_a_state_that_does_not_answer() {
     ))
     .expect("seed");
     let _t = crate::common::PgTable::adopt(tbl.clone());
-    let rig = crate::common::Rig::pg_batch(&tbl).no_oracle("setup commands deliver nothing");
+    let rig = crate::common::Rig::pg_batch(&tbl);
     let text = |o: &std::process::Output| {
         format!(
             "{}{}",
@@ -613,7 +613,7 @@ fn check_doctor_and_init_refuse_a_state_that_does_not_answer() {
     assert!(!check.status.success(), "{}", text(&check));
     assert!(!text(&check).contains("Looks good"), "{}", text(&check));
     assert!(
-        text(&check).contains("RIVET_CHECK_REPORTED_ERRORS"),
+        text(&check).contains("RIVET_CLI_CHECK_REPORTED_ERRORS"),
         "{}",
         text(&check)
     );

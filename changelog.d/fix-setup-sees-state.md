@@ -4,6 +4,6 @@
   did not look at the state at all, so setup passed and every run after it failed (0.32.0 and
   earlier). **Now** `doctor` opens the state the config uses without migrating it and prints
   `[OK]  State (postgres …)` / `(sqlite …)` or fails; `check` exits non-zero
-  (`RIVET_CHECK_REPORTED_ERRORS`) when it logged an ERROR line, including a state that does not
+  (`RIVET_CLI_CHECK_REPORTED_ERRORS`) when it logged an ERROR line, including a state that does not
   answer; `init -o` with `RIVET_STATE_URL` set refuses before writing the config when that state
   does not answer. **What to do:** nothing; fix what the new failure names.

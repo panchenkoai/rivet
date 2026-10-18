@@ -274,6 +274,11 @@ impl StateStore {
         Self::open_sqlite(config_path)
     }
 
+    /// Whether `RIVET_STATE_URL` names a state server, so the state does not live beside the config.
+    pub fn names_a_server() -> bool {
+        std::env::var("RIVET_STATE_URL").is_ok_and(|u| !u.is_empty())
+    }
+
     /// Which state `config_path` uses and that it answers, without creating or migrating it: `postgres <redacted url>` or `sqlite <path>`.
     pub fn probe(config_path: &str) -> Result<String> {
         if let Ok(url) = std::env::var("RIVET_STATE_URL")

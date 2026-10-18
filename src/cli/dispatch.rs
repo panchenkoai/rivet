@@ -509,7 +509,7 @@ fn dispatch_check(
     let errors = crate::redact::errors_logged();
     if errors > 0 {
         crate::rivet_bail!(
-            crate::error::codes::CHECK_REPORTED_ERRORS,
+            crate::error::codes::CLI_CHECK_REPORTED_ERRORS,
             "`rivet check` logged {errors} ERROR line(s) above; the config is not ready to run"
         );
     }

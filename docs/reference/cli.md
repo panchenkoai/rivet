@@ -585,7 +585,7 @@ Fidelity levels:
 
 Output includes: table existence, estimated row count, index analysis, tuning recommendation.
 
-`check` also asks the state the config uses (`RIVET_STATE_URL`, or the SQLite file beside the config) whether it answers. When `check` logged any `ERROR` line, it does not print `Looks good.` and exits non-zero with `RIVET_CHECK_REPORTED_ERRORS`.
+`check` also asks the state the config uses (`RIVET_STATE_URL`, or the SQLite file beside the config) whether it answers. When `check` logged any `ERROR` line, it does not print `Looks good.` and exits non-zero with `RIVET_CLI_CHECK_REPORTED_ERRORS`.
 
 ---
 

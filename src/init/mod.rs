@@ -1562,7 +1562,7 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
 /// are what `rivet load` keys a `query:` export by. The SQLite default beside the config
 /// needs no such check, since writing the config proves the directory takes files.
 fn require_explicit_state(config_path: &str) -> Result<()> {
-    if std::env::var("RIVET_STATE_URL").is_ok_and(|u| !u.is_empty()) {
+    if crate::state::StateStore::names_a_server() {
         crate::state::StateStore::probe(config_path).map_err(|e| {
             e.context(format!(
                 "init: RIVET_STATE_URL does not answer, so `{config_path}` was not written"
