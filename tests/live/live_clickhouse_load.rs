@@ -2335,3 +2335,95 @@ fn an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_po
         &change,
     );
 }
+
+/// The warehouse tables in `rivet state loads` output (its last column), one per load row.
+fn loaded_targets(out: &std::process::Output) -> std::collections::BTreeSet<String> {
+    assert!(
+        out.status.success(),
+        "state loads: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().last().map(str::to_string))
+        .collect()
+}
+
+/// The rollback in docs/reference/state.md, end to end: the previous release loads export `a`,
+/// this release upgrades the SQLite state and creates `b`'s table with its first load, the copy
+/// is put back, and the previous release refuses `b`'s table as one it has no record of loading
+/// on every load. The doc's step lists the tables the newer release's ledger holds and the
+/// restored one does not, drops them, and the previous release's next load lands both tables
+/// equal to the source.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres + RIVET_PREV_RELEASE_BIN at a release with an older state schema"]
+fn a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_dropped() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (ta, _a, _c) = pg_batch_seeded("rivet_ch_rb_a", 5);
+    let (tb, _b, _d) = pg_batch_seeded("rivet_ch_rb_b", 3);
+    let db = Db::new("rivet_chtest");
+    let mut rig = batch_into_clickhouse(Rig::pg_batch(&ta).mode("full"), &db);
+    let Some(old) = rig.as_previous_release() else {
+        return;
+    };
+    // The rig renders the config first, so the twin writing the same text is not an outside edit.
+    let _ = rig.config_path();
+    old.run_ok();
+    old.load_ok(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+
+    rig.rebuilt(|r| r.also_batch_export(&tb, &tb, "full"));
+    rig.run_ok();
+    let dir = rig.config_path().parent().unwrap().to_path_buf();
+    let mut copies: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".rivet_state.db.v") && n.ends_with(".bak"))
+        .collect();
+    copies.sort();
+    let Some(copy) = copies.last().cloned() else {
+        crate::common::skip_live(
+            "RIVET_PREV_RELEASE_BIN writes this tree's state schema: no migration, nothing to roll back",
+        );
+        return;
+    };
+    load(&rig);
+    let after = loaded_targets(&rig.cli(&["state", "loads", "--last", "100000"]));
+
+    std::fs::copy(dir.join(&copy), dir.join(".rivet_state.db")).unwrap();
+    for side in [".rivet_state.db-wal", ".rivet_state.db-shm"] {
+        let _ = std::fs::remove_file(dir.join(side));
+    }
+    let old = rig.as_previous_release().expect("the previous release");
+    let refused = old.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    assert!(
+        !refused.status.success(),
+        "the restored ledger has no record of the table the newer release created: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let before = loaded_targets(&old.cli(&["state", "loads", "--last", "100000"]));
+    let created: Vec<&String> = after.difference(&before).collect();
+    assert_eq!(
+        created,
+        vec![&format!("{}.{tb}", db.0)],
+        "the newer release's ledger minus the restored one names the table it created"
+    );
+    for t in created {
+        ch(&format!("DROP TABLE {t}"));
+    }
+    old.run_ok();
+    old.load_ok(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    for t in [&ta, &tb] {
+        assert_eq!(
+            clickhouse_rows(&format!(
+                "SELECT id, v FROM {}.{t} ORDER BY id FORMAT TSV",
+                db.0
+            )),
+            pg_rows(&mut pg_connect(), t),
+            "{t}"
+        );
+    }
+}
