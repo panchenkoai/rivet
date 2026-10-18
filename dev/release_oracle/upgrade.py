@@ -57,6 +57,7 @@ from __future__ import annotations
 from contextlib import ExitStack, closing
 import glob
 import json
+import itertools
 import os
 import re
 import shutil
@@ -377,14 +378,18 @@ def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, st
         _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
 
 
+_ROLE_SEQ = itertools.count()
+
+
 def _role_without_create(state_url: str) -> str | None:
     """A URL to the state database as a login role with every right on `public` and its tables and no CREATE on the database (the copy's CREATE SCHEMA is denied); dropped at exit."""
     import atexit
     import urllib.parse
     u = urllib.parse.urlsplit(state_url)
-    role = f"rivet_nocreate_{os.getpid()}"
-    # One role per process, re-created per leg: the grants the previous leg gave it are dropped first,
-    # or `DROP ROLE` refuses ("objects depend on it") and every leg after the first has no role.
+    # One role per LEG: a role is cluster-wide and every leg runs on its own isolated database, so a
+    # role the previous leg granted rights in cannot be dropped from this one ("objects depend on it")
+    # and every leg after the first had no role. `drop` also clears a same-database leftover.
+    role = f"rivet_nocreate_{os.getpid()}_{next(_ROLE_SEQ)}"
     drop = (f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') "
             f"THEN EXECUTE 'DROP OWNED BY {role}'; END IF; END $$; DROP ROLE IF EXISTS {role};")
     grant = (f"{drop} CREATE ROLE {role} LOGIN PASSWORD 'nocreate'; "
