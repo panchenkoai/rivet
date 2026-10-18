@@ -1,0 +1,13 @@
+diff --git a/src/state/mod.rs b/src/state/mod.rs
+index 5fe4315e..1519635f 100644
+--- a/src/state/mod.rs
++++ b/src/state/mod.rs
+@@ -301,7 +301,7 @@ fn refuse_a_state_left_behind(beside: &std::path::Path, target: &std::path::Path
+                 .zip(std::fs::canonicalize(b).ok())
+                 .is_some_and(|(a, b)| a == b)
+     };
+-    if same(beside, target) || !holds_state(beside) || holds_state(target) {
++    if same(beside, target) || !holds_state(beside) || holds_state(target) || !target.as_os_str().is_empty() {
+         return Ok(());
+     }
+     crate::rivet_bail!(

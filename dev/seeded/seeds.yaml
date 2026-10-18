@@ -419,6 +419,20 @@ seeds:
       sqlite-state:
         na: "a SQLite state is a file beside the config; it has no connection and no TLS"
 
+  - name: sqlite-state-url-ignored-or-moved-blind
+    class: "`RIVET_STATE_URL=sqlite:<path>` is not honoured (refused as an unknown scheme, so init and run keep the state beside the config), or a move to an empty `sqlite:` file starts every export over and leaves the load journal behind"
+    history: "0.32.2 item 5, 2026-10-18: owner asked for a SQLite state outside the config directory (client sim); measured on main 8ef02e5f: `sqlite:/x/state.db` refused RIVET_STATE_URL_SCHEME_UNSUPPORTED, nothing written there"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-state-url-ignored-or-moved-blind/sqlite-state.patch
+        cells:
+          - a_sqlite_state_url_keeps_init_and_run_in_one_file_and_refuses_to_leave_state_behind
+          - a_sqlite_state_url_that_leaves_the_state_behind_is_refused_and_walked_out
+          - "lib:a_sqlite_url_that_leaves_the_state_beside_the_config_behind_is_refused"
+      postgres-state:
+        na: "a `sqlite:` state URL names a SQLite file; a PostgreSQL state is the server's"
+
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
     history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"
