@@ -321,6 +321,64 @@ impl StateStore {
         Self::open_sqlite(config_path)
     }
 
+    /// Whether `RIVET_STATE_URL` names a state server, so the state does not live beside the config.
+    pub fn names_a_server() -> bool {
+        Self::names_a_server_in(std::env::var("RIVET_STATE_URL").ok().as_deref())
+    }
+
+    /// [`StateStore::names_a_server`] over the variable's value: anything set and not a SQLite file.
+    pub fn names_a_server_in(url: Option<&str>) -> bool {
+        url.is_some_and(|u| !u.is_empty() && !u.starts_with("sqlite:"))
+    }
+
+    /// Which state `config_path` uses and that it answers, without creating or migrating it: `postgres <redacted url>` or `sqlite <path>`.
+    pub fn probe(config_path: &str) -> Result<String> {
+        if let Ok(url) = std::env::var("RIVET_STATE_URL")
+            && let Some(url) = postgres_state_url(&url)?
+        {
+            let mut client = connect_pg(url)?;
+            client.simple_query("SELECT 1").map_err(|e| {
+                crate::error::coded(
+                    crate::error::codes::STATE_BACKEND_FAILED,
+                    format!(
+                        "state(pg): '{}' took the connection and not `SELECT 1`: {}",
+                        redact_pg_url(url),
+                        pg_detail(&e)
+                    ),
+                )
+            })?;
+            return Ok(format!("postgres {}", redact_pg_url(url)));
+        }
+        let path = Self::state_db_path(config_path);
+        if path.exists() {
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .and_then(|c| {
+                        c.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .map(|_| c)
+                    });
+            if let Err(e) = conn {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_BACKEND_FAILED,
+                    "state(sqlite): `{}` cannot be read: {e}",
+                    path.display()
+                );
+            }
+        } else if !path
+            .parent()
+            .is_some_and(|d| d.as_os_str().is_empty() || d.is_dir())
+        {
+            crate::rivet_bail!(
+                crate::error::codes::STATE_BACKEND_FAILED,
+                "state(sqlite): the directory of `{}` does not exist, so no state can be kept there",
+                path.display()
+            );
+        }
+        Ok(format!("sqlite {}", path.display()))
+    }
+
     /// Reopen the store a [`StateRef`] points at.
     ///
     /// The reconnection seam for parallel chunk workers, which cannot share one
@@ -877,6 +935,51 @@ mod tests {
 }
 
 #[cfg(test)]
+mod probe_tests {
+    use super::StateStore;
+
+    /// `probe` names the SQLite file beside the config, and refuses one it cannot read or a directory that does not exist, creating nothing.
+    #[test]
+    fn a_sqlite_probe_names_the_file_and_refuses_what_it_cannot_read() {
+        if std::env::var("RIVET_STATE_URL").is_ok_and(|u| !u.is_empty()) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("c.yaml");
+        let cfg = cfg.to_str().unwrap();
+        let at = StateStore::probe(cfg).unwrap();
+        assert_eq!(
+            at,
+            format!("sqlite {}", dir.path().join(".rivet_state.db").display())
+        );
+        assert!(
+            !dir.path().join(".rivet_state.db").exists(),
+            "the probe creates nothing"
+        );
+
+        std::fs::write(
+            dir.path().join(".rivet_state.db"),
+            b"not a database at all, just text",
+        )
+        .unwrap();
+        let err = StateStore::probe(cfg).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_BACKEND_FAILED"),
+            "{err:#}"
+        );
+
+        let gone = dir.path().join("missing").join("c.yaml");
+        let err = StateStore::probe(gone.to_str().unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("does not exist"), "{err:#}");
+
+        std::fs::remove_file(dir.path().join(".rivet_state.db")).unwrap();
+        StateStore::open(cfg).unwrap();
+        assert!(StateStore::probe(cfg).unwrap().starts_with("sqlite "));
+    }
+}
+
+#[cfg(test)]
 mod state_url_tls_tests {
     use super::state_url_tls;
     use crate::config::TlsMode;
@@ -936,5 +1039,50 @@ mod state_url_tls_tests {
             .unwrap()
             .unwrap();
         assert_eq!(tls.mode, TlsMode::VerifyFull);
+    }
+}
+
+#[cfg(test)]
+mod names_a_server_tests {
+    use super::StateStore;
+
+    #[test]
+    fn a_server_is_named_by_any_set_url_but_a_sqlite_file() {
+        assert!(!StateStore::names_a_server_in(None));
+        assert!(!StateStore::names_a_server_in(Some("")));
+        assert!(!StateStore::names_a_server_in(Some(
+            "sqlite:/var/lib/rivet/state.db"
+        )));
+        assert!(StateStore::names_a_server_in(Some("postgresql://u@db/s")));
+    }
+
+    /// The wrapper reads `RIVET_STATE_URL`: checked here against the value this process has, and,
+    /// when it has none, once more in a child of this test binary that has a PostgreSQL URL.
+    #[test]
+    fn names_a_server_reads_rivet_state_url() {
+        let url = std::env::var("RIVET_STATE_URL").ok();
+        assert_eq!(
+            StateStore::names_a_server(),
+            StateStore::names_a_server_in(url.as_deref())
+        );
+        if url.is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "state::names_a_server_tests::names_a_server_reads_rivet_state_url",
+                    "--test-threads",
+                    "1",
+                ])
+                .env("RIVET_STATE_URL", "postgresql://u@db/s")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success()
+                    && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+                "{}{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
     }
 }

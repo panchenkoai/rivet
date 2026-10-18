@@ -328,6 +328,14 @@ pub fn install_logger(route: LogRoute) {
     let _ = log::set_boxed_logger(Box::new(UiRoutedLogger(stderr_logger, route)));
 }
 
+/// ERROR-level lines this process has logged.
+static ERRORS_LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many ERROR-level lines this process has logged, so a command that reports problems as log lines can refuse to call itself green.
+pub fn errors_logged() -> usize {
+    ERRORS_LOGGED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Takes a formatted, redacted log line; `false` leaves it to stderr.
 pub type LogRoute = fn(String) -> bool;
 
@@ -341,6 +349,9 @@ impl log::Log for UiRoutedLogger {
     fn log(&self, record: &log::Record) {
         if !self.0.matches(record) {
             return;
+        }
+        if record.level() == log::Level::Error {
+            ERRORS_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let line = redacted_log_line(
             &chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -381,6 +392,16 @@ mod logger_tests {
             .target(env_logger::Target::Pipe(Box::new(Sink(sink))))
             .build();
         UiRoutedLogger(inner, crate::cli::LOG_ROUTE)
+    }
+
+    /// Every ERROR line the logger writes is counted, a WARN line is not.
+    #[test]
+    fn the_logger_counts_its_error_lines() {
+        let l = logger(Arc::new(Mutex::new(Vec::new())));
+        let before = errors_logged();
+        l.log(&record(log::Level::Error, format_args!("one")));
+        l.log(&record(log::Level::Error, format_args!("two")));
+        assert!(errors_logged() >= before + 2, "two ERROR lines counted");
     }
 
     fn record<'a>(level: log::Level, args: std::fmt::Arguments<'a>) -> log::Record<'a> {
