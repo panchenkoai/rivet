@@ -713,7 +713,7 @@ fn a_generated_single_table_cdc_config_takes_its_baseline_then_only_later_change
     };
 
     run();
-    let out = dir.path().join("output").join(&table).join("cdc");
+    let out = dir.path().join("output").join(format!("{table}_cdc"));
     assert!(
         parts_in(&out).is_empty(),
         "nothing changed after the anchor, so the STREAM holds no part"
@@ -895,7 +895,11 @@ fn cdc_warehouse_chain(src: CdcSource, bq: &BqLive) {
     assert!(generated.contains("\nload:"), "{generated}");
     let export = scaffolded_export(&generated);
     let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
-    let export = src.bq_table.clone().unwrap_or(export);
+    // The CDC export is `<table>_cdc`; the warehouse table is named from the source table.
+    let export = src
+        .bq_table
+        .clone()
+        .unwrap_or_else(|| export.trim_end_matches("_cdc").to_string());
     let changes = format!("{export}__changes");
     let _bq_guard = bq.cleanup(&[&export, &changes]);
     let _slot = generated
@@ -1164,7 +1168,6 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
         .path()
         .join("output")
         .join(scaffolded_export(&generated))
-        .join("cdc")
         .join("snapshot");
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
 }

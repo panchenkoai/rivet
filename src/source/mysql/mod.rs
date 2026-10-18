@@ -476,7 +476,11 @@ mod session_time_zone_tests {
     fn a_session_off_utc_is_refused_by_code_and_a_utc_one_reads() {
         super::refuse_a_session_off_utc("+00:00", 0).unwrap();
         super::refuse_a_session_off_utc("SYSTEM", 0).unwrap();
-        for (zone, offset) in [("SYSTEM", 10_800), ("+03:00", 10_800), ("-05:30", -19_800)] {
+        for (zone, offset, hours) in [
+            ("SYSTEM", 10_800, "+3 h"),
+            ("+03:00", 10_800, "+3 h"),
+            ("-05:30", -19_800, "-5.5 h"),
+        ] {
             let err = super::refuse_a_session_off_utc(zone, offset).unwrap_err();
             assert_eq!(
                 crate::error::error_code(&err),
@@ -484,6 +488,7 @@ mod session_time_zone_tests {
             );
             assert_eq!(crate::error::classify_exit(&err), 5);
             let text = format!("{err:#}");
+            assert!(text.contains(hours), "{text}");
             assert!(
                 text.contains(zone) && text.contains("default_time_zone"),
                 "{text}"
