@@ -24,6 +24,7 @@ pub(super) fn record_after_run(
     }
     let recorded = match &summary.open_mappings {
         Some(mappings) => record_from_run(
+            &config.source.state_key(),
             export,
             state,
             mappings,
@@ -45,6 +46,7 @@ pub(super) fn record_after_run(
 
 /// The spec from what the run itself resolved — no second source connection.
 fn record_from_run(
+    config_source_key: &str,
     export: &ExportConfig,
     state: &StateStore,
     mappings: &[crate::types::TypeMapping],
@@ -52,7 +54,14 @@ fn record_from_run(
     run_id: &str,
 ) -> Result<()> {
     let columns: Vec<LoadSpecColumn> = mappings.iter().map(LoadSpecColumn::from_mapping).collect();
-    state.record_load_spec(&export.name, None, &columns, primary_key, run_id)
+    state.record_load_spec(
+        &export.name,
+        None,
+        config_source_key,
+        &columns,
+        primary_key,
+        run_id,
+    )
 }
 
 fn capture_and_record(
@@ -79,6 +88,7 @@ fn capture_and_record(
         state.record_load_spec(
             &export.name,
             unit.table.as_deref(),
+            &config.source.state_key(),
             &columns,
             unit.primary_key.as_deref(),
             run_id,

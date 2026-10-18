@@ -375,6 +375,7 @@ fn pg_load_spec_round_trips() {
     s.record_load_spec(
         export,
         None,
+        "",
         std::slice::from_ref(&col),
         Some(&pk),
         "run_pg_1",
@@ -382,7 +383,7 @@ fn pg_load_spec_round_trips() {
     .expect("recording a load spec must succeed on Postgres");
 
     let spec = s
-        .load_spec(export, None)
+        .load_spec(export, None, "")
         .unwrap()
         .expect("the spec must read back");
     assert_eq!(spec.columns, vec![col.clone()]);
@@ -392,10 +393,17 @@ fn pg_load_spec_round_trips() {
 
     // The UPDATE arms carry the same shape: a later capture with no key clears a key
     // a RUN recorded (the export stopped reading that relation).
-    s.record_load_spec(export, None, std::slice::from_ref(&col), None, "run_pg_2")
-        .expect("the keyless capture must also succeed");
+    s.record_load_spec(
+        export,
+        None,
+        "",
+        std::slice::from_ref(&col),
+        None,
+        "run_pg_2",
+    )
+    .expect("the keyless capture must also succeed");
     assert_eq!(
-        s.load_spec(export, None).unwrap().unwrap().primary_key,
+        s.load_spec(export, None, "").unwrap().unwrap().primary_key,
         None
     );
 }

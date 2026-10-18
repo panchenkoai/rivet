@@ -1637,12 +1637,13 @@ fn record_primary_keys(
             return;
         }
     };
+    let source_key = crate::config::source_state_key(kind, source_url);
     let mut failed: Vec<&str> = Vec::new();
     for s in snapshots {
         let relation = relation_for_key(&kind, s.source_schema.as_deref(), &s.source_table);
         match src.primary_key(&relation) {
             Ok(Some(pk)) => {
-                if let Err(e) = store.record_primary_key(&s.export_name, None, &pk) {
+                if let Err(e) = store.record_primary_key(&s.export_name, None, &source_key, &pk) {
                     log::debug!(
                         "init: primary key for '{}' not written: {e:#}",
                         s.export_name
