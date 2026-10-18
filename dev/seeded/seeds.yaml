@@ -1378,6 +1378,27 @@ seeds:
       lib:
         cells: ["lib:a_placeholder_value_is_not_part_of_the_progress_identity_and_the_query_text_is"]
 
+  - name: nested-cdc-runs-loaded-by-batch
+    class: "a batch `rivet load` (full or incremental) takes the runs of a CDC export of the same name nested inside its prefix (`exports/<t>/cdc/`, the `rivet init` layout): the batch table receives the stream's change rows and keeps a deleted key, exit 0"
+    history: "0.32.1 item 1, 2026-10-18: measured on main 8afde974 into ClickHouse: full load 7 rows for 5 source rows, incremental keeps deleted id 2 (SQL Server, MySQL), PostgreSQL lands unparseable change rows"
+    scope: source
+    patch: nested-cdc-runs-loaded-by-batch/shared.patch
+    engines:
+      postgres:
+        cells: [an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_postgres]
+      mysql:
+        cells: [an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mysql]
+      mssql:
+        cells:
+          - a_full_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mssql
+          - an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mssql
+      mongo:
+        cells: ["lib:a_batch_load_skips_the_runs_of_a_cdc_export_nested_in_its_prefix_and_says_so"]
+      oracle:
+        na: "an Oracle CDC export has no `rivet load` yet (ADR-0037), so no CDC run of it is ever loaded beside a batch one"
+      lib:
+        cells: ["lib:a_batch_load_skips_the_runs_of_a_cdc_export_nested_in_its_prefix_and_says_so"]
+
   - name: accepted-edit-not-recorded
     class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"
     history: "2026-10-08, owner decision on #493 - a refused edit that is meant had no way out that kept the cursor (`state accept` did not exist on the PR's head 3dd6ade4); seeded so the command cannot answer `Accepted` without re-binding the row"

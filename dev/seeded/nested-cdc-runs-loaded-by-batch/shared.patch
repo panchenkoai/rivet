@@ -1,0 +1,13 @@
+diff --git a/src/load/reconcile.rs b/src/load/reconcile.rs
+index 0ad15edd..d9d3b4dc 100644
+--- a/src/load/reconcile.rs
++++ b/src/load/reconcile.rs
+@@ -561,7 +561,7 @@ pub fn own_manifests(
+     export_name: &str,
+     mode: crate::load::plan::LoadMode,
+ ) -> Result<(Keyed, Option<String>)> {
+-    if mode == crate::load::plan::LoadMode::Cdc {
++    if mode == crate::load::plan::LoadMode::Cdc || !gcs_prefix.is_empty() {
+         return Ok((keyed, None));
+     }
+     let (_, base) = crate::load::split_object_uri(gcs_prefix)?;
