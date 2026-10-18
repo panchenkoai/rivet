@@ -1,0 +1,13 @@
+diff --git a/src/init/mssql.rs b/src/init/mssql.rs
+index ebbcfd72..15bd8e6d 100644
+--- a/src/init/mssql.rs
++++ b/src/init/mssql.rs
+@@ -50,7 +50,7 @@ pub(super) fn list_tables(conn: &mut MssqlSource, schema: &str) -> Result<Vec<St
+         "SELECT STRING_AGG(CONVERT(nvarchar(max), TABLE_NAME), CHAR(30)) WITHIN GROUP (ORDER BY TABLE_NAME) \
+          FROM information_schema.TABLES \
+          WHERE TABLE_SCHEMA = N'{}' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
+-         AND OBJECTPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA) + '.' + QUOTENAME(TABLE_NAME)), 'IsMSShipped') = 0",
++         AND OBJECTPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA) + '.' + QUOTENAME(TABLE_NAME)), 'IsMSShipped') >= 0",
+         schema.replace('\'', "''"),
+     );
+     let names = conn

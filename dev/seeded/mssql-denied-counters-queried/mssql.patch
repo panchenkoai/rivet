@@ -1,0 +1,13 @@
+diff --git a/src/source/mssql/mod.rs b/src/source/mssql/mod.rs
+index 76ab78b0..f09cf26f 100644
+--- a/src/source/mssql/mod.rs
++++ b/src/source/mssql/mod.rs
+@@ -981,7 +981,7 @@ impl MssqlSource {
+             .query_scalar(SERVER_COUNTERS_GRANTED)
+             .ok()
+             .flatten()
+-            .is_some_and(|v| v.trim() == "1");
++            .is_none_or(|v| v.trim() != "x");
+         self.server_counters = Some(readable);
+         readable
+     }

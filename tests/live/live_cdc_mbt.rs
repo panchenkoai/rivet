@@ -1873,7 +1873,7 @@ fn cdc_scaffold_gets_its_own_prefix_and_cross_shape_overwrite_is_refused() {
     assert!(out.status.success());
     let yaml = std::fs::read_to_string(d.path().join("cdc.yaml")).unwrap();
     assert!(
-        yaml.contains(&format!("./output/{}/cdc/", scn.table)),
+        yaml.contains(&format!("./output/{}_cdc/", scn.table)),
         "cdc scaffold must use its own sub-prefix: {yaml}"
     );
 

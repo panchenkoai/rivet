@@ -39,17 +39,21 @@ pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Resu
     MssqlSource::connect_with_tls(url, tls)
 }
 
-/// Base tables and views in a SQL Server schema (`information_schema.TABLES`).
+/// Base tables and views in a SQL Server schema (`information_schema.TABLES`), without the system objects SQL Server ships (`IsMSShipped`, e.g. `dbo.systranschemas` of a CDC database).
 ///
 /// `TABLE_CATALOG` is the connection's database (from the URL), so no catalog
 /// filter is needed; `schema` filters `TABLE_SCHEMA` (default `dbo`). Names are
 /// aggregated into one `RS`-delimited scalar because the source seam only hands
 /// back a single cell.
-pub(super) fn list_tables(conn: &mut MssqlSource, schema: &str) -> Result<Vec<String>> {
+pub(super) fn list_tables(
+    conn: &mut dyn crate::source::Source,
+    schema: &str,
+) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT STRING_AGG(CONVERT(nvarchar(max), TABLE_NAME), CHAR(30)) WITHIN GROUP (ORDER BY TABLE_NAME) \
          FROM information_schema.TABLES \
-         WHERE TABLE_SCHEMA = N'{}' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')",
+         WHERE TABLE_SCHEMA = N'{}' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
+         AND OBJECTPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA) + '.' + QUOTENAME(TABLE_NAME)), 'IsMSShipped') = 0",
         schema.replace('\'', "''"),
     );
     let names = conn
@@ -291,5 +295,46 @@ mod tests {
     #[test]
     fn parse_columns_agg_empty_is_empty() {
         assert!(parse_columns_agg("").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod list_tables_tests {
+    /// A source that answers the listing with `names` joined by `RS` and keeps the SQL it was asked.
+    struct Listing(Option<String>, Vec<String>);
+
+    impl crate::source::Source for Listing {
+        fn export(
+            &mut self,
+            _request: &crate::source::ExportRequest<'_>,
+            _sink: &mut dyn crate::source::BatchSink,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        fn query_scalar(&mut self, sql: &str) -> crate::error::Result<Option<String>> {
+            self.1.push(sql.to_string());
+            Ok(self.0.clone())
+        }
+        fn type_mappings(
+            &mut self,
+            _query: &str,
+            _column_overrides: &crate::types::ColumnOverrides,
+        ) -> crate::error::Result<Vec<crate::types::TypeMapping>> {
+            unreachable!()
+        }
+    }
+
+    /// The listing asks for the schema's tables and views without the shipped ones, and returns every name the server sent.
+    #[test]
+    fn the_listing_leaves_out_shipped_objects_and_returns_every_name() {
+        let rs = super::RS.to_string();
+        let mut src = Listing(Some(["orders", "o'brien", ""].join(&rs)), Vec::new());
+        let names = super::list_tables(&mut src, "sa'les").unwrap();
+        assert_eq!(names, vec!["orders".to_string(), "o'brien".to_string()]);
+        let sql = &src.1[0];
+        assert!(sql.contains("'IsMSShipped') = 0"), "{sql}");
+        assert!(sql.contains("TABLE_SCHEMA = N'sa''les'"), "{sql}");
+        let mut empty = Listing(None, Vec::new());
+        assert!(super::list_tables(&mut empty, "dbo").unwrap().is_empty());
     }
 }
