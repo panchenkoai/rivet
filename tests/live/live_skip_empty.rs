@@ -228,3 +228,53 @@ fn a_skipped_run_on_s3_leaves_no_live_running_marker() {
         "a skipped run left its running marker on the prefix — it reads as live for ever: {live:?}"
     );
 }
+
+/// An empty export under `skip_empty` through `rivet run --summary-output`, with `extra` run
+/// args and, when `side` is set, a second export beside it: the summary's entry is `skipped`
+/// and says why in `skip_reason`, as the metrics row does.
+fn the_summary_says_why_it_skipped(tag: &str, extra: &[&str], side: bool) {
+    require_alive(LiveService::Postgres);
+    let table = unique_name(tag);
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (k BIGINT PRIMARY KEY, v TEXT)"
+        ))
+        .unwrap();
+    let _guard = PgCleanup(table.clone());
+    let export = unique_name(&format!("{tag}_exp"));
+    let mut rig = Rig::pg_batch(&table)
+        .export_named(&export)
+        .export_line("skip_empty: true");
+    if side {
+        rig = rig.also_export(&unique_name(&format!("{tag}_side")), "SELECT 1 AS x");
+    }
+    let summary = tempfile::NamedTempFile::new().unwrap();
+    let mut args = vec!["--summary-output", summary.path().to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let r = rig.run_args(&args);
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(summary.path()).unwrap()).unwrap();
+    let entry = doc["per_export"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["export_name"] == export.as_str())
+        .unwrap_or_else(|| panic!("no entry for {export}: {doc}"));
+    assert_eq!(entry["status"], "skipped", "{entry}");
+    assert_eq!(entry["skip_reason"], "source returned 0 rows", "{entry}");
+}
+
+/// The sequential runner builds the entry from the run's summary.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_skipped_entry_of_the_run_summary_says_why() {
+    the_summary_says_why_it_skipped("skip_why", &[], false);
+}
+
+/// The process runner builds the entry from the child's metrics row, not from a summary.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_skipped_entry_of_the_run_summary_says_why_under_child_processes() {
+    the_summary_says_why_it_skipped("skip_why_pp", &["--parallel-export-processes"], true);
+}

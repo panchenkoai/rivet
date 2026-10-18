@@ -56,6 +56,9 @@ pub struct RunAggregateEntry {
     pub duration_ms: i64,
     pub mode: String,
     pub error_message: Option<String>,
+    /// Why a `skipped` entry wrote nothing (`skip_empty`: "no new rows since cursor 'c'", "source returned 0 rows"); `null` on every other entry and in entries older binaries wrote.
+    #[serde(default)]
+    pub skip_reason: Option<String>,
     /// Rows of the `initial: snapshot` legs folded into `rows`; never serialized, kept out of the throughput self-check.
     #[serde(skip)]
     pub snapshot_rows: i64,
@@ -170,6 +173,7 @@ mod tests {
                     duration_ms: 600_000,
                     mode: "chunked".into(),
                     error_message: None,
+                    skip_reason: None,
                 },
                 RunAggregateEntry {
                     snapshot_rows: 0,
@@ -184,6 +188,7 @@ mod tests {
                     duration_ms: 80_000,
                     mode: "full".into(),
                     error_message: Some("connection reset".into()),
+                    skip_reason: None,
                 },
             ],
         }
