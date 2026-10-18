@@ -129,9 +129,17 @@ fn the_ab_regression_harness_passes_its_own_self_test() {
 /// `_self_test` docstring in `dev/release_oracle/regression.py`).
 #[test]
 fn the_release_oracle_wrapper_passes_its_own_self_test() {
+    let ledger = format!("{}/docs/evidence/last-green.yaml", root());
+    let before = fs::read(&ledger).ok();
     self_test(
         "dev.release_oracle",
         "the child-harness signal, the grace period, the stand row and the banner",
+    );
+    assert_eq!(
+        fs::read(&ledger).ok(),
+        before,
+        "the self-test wrote its fixture cells into docs/evidence/last-green.yaml; a self-test \
+         records evidence only into a ledger of its own, or every test run dirties the tree"
     );
 }
 
