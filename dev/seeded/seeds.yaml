@@ -395,6 +395,18 @@ seeds:
       sqlite-state:
         cells: ["lib:a_migration_copies_the_old_state_beside_it_before_the_first_ddl"]
 
+  - name: setup-green-over-dead-state
+    class: "`rivet check` prints `Looks good.` and exits 0 (and `doctor` / `init` stay green) while the state the config uses does not answer, so setup passes and every run after it fails"
+    history: "client simulation on 0.32.0, 2026-10-18 (D2): init WARN + exit 0, check ERROR then `Looks good.` exit 0, doctor `All checks passed.` without a state check; measured on main 8afde974 with RIVET_STATE_URL at a closed port: check `Looks good.`, exit 0"
+    scope: state
+    engines:
+      postgres-state:
+        patch: setup-green-over-dead-state/postgres-state.patch
+        cells: [check_doctor_and_init_refuse_a_state_that_does_not_answer]
+      sqlite-state:
+        patch: setup-green-over-dead-state/sqlite-state.patch
+        cells: ["lib:a_sqlite_probe_names_the_file_and_refuses_what_it_cannot_read"]
+
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
     history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"

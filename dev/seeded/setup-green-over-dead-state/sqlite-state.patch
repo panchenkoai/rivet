@@ -1,0 +1,13 @@
+diff --git a/src/state/mod.rs b/src/state/mod.rs
+index 5d99639c..54f35d18 100644
+--- a/src/state/mod.rs
++++ b/src/state/mod.rs
+@@ -302,7 +302,7 @@ impl StateStore {
+                         })
+                         .map(|_| c)
+                     });
+-            if let Err(e) = conn {
++            if let (Err(e), true) = (conn, false) {
+                 crate::rivet_bail!(
+                     crate::error::codes::STATE_BACKEND_FAILED,
+                     "state(sqlite): `{}` cannot be read: {e}",
