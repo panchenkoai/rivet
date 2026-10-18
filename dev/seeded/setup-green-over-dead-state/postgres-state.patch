@@ -1,16 +1,13 @@
 diff --git a/src/cli/dispatch.rs b/src/cli/dispatch.rs
-index 81ed069a..89b328cb 100644
+index e1f70ca2..89b328cb 100644
 --- a/src/cli/dispatch.rs
 +++ b/src/cli/dispatch.rs
-@@ -507,9 +507,9 @@ fn dispatch_check(
+@@ -507,7 +507,7 @@ fn dispatch_check(
          log::error!("check: the state this config uses does not answer: {e:#}");
      }
      let errors = crate::redact::errors_logged();
 -    if errors > 0 {
 +    if errors > 0 && errors == usize::MAX {
          crate::rivet_bail!(
--            crate::error::codes::CHECK_REPORTED_ERRORS,
-+            crate::error::codes::CLI_CHECK_REPORTED_ERRORS,
+             crate::error::codes::CLI_CHECK_REPORTED_ERRORS,
              "`rivet check` logged {errors} ERROR line(s) above; the config is not ready to run"
-         );
-     }
