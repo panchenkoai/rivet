@@ -85,6 +85,13 @@ scenarios:
     mssql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+  - id: refusal_source_session_time_zone_not_applied
+    what: "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: a MySQL session still off UTC after rivet's `SET time_zone` (a proxy answered it without forwarding); a direct connection delivers, the same run again through the proxy refuses"
+    mysql:    { test: a_session_time_zone_the_proxy_dropped_is_refused_before_a_row_is_read }
+    postgres: { na: "the session-time-zone guard is MySQL's: PostgreSQL reads `timestamptz` as an instant and `timestamp` without a zone, never through a session SET" }
+    mssql:    { na: "the session-time-zone guard is MySQL's: SQL Server's datetime types carry no session time zone" }
+    mongo:    { na: "the session-time-zone guard is MySQL's: MongoDB dates are UTC instants" }
+    oracle:   { na: "the session-time-zone guard is MySQL's: Oracle's TIMESTAMP WITH TIME ZONE carries its zone and rivet sets no session zone there" }
 
   - id: refusal_state_cursor_owner_mismatch
     what: "RIVET_STATE_CURSOR_OWNER_MISMATCH: `cursor_column` changed with no reset; both named remedies deliver, `state reset-chunks` (the sibling command) leaves the refusal"
