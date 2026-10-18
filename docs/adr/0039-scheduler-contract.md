@@ -120,6 +120,7 @@ Fixtures, each one `per_export[]` entry of the run aggregate (`--json`, `--summa
 | `status` | string, closed set | `success`, `failed`, `skipped`, `already_applied` |
 | `answered_by_run` | string or `null` | on a `rivet apply` replay of a full, chunked or keyset plan that already applied to exit 0 (0.32.0): the `run_id` of the run that applied it, the same value as the entry's `run_id`, with `status: already_applied` and that run's counts from its `export_metrics` row; `null` on every other entry. The replay writes no run, manifest or metrics row |
 | `rows`, `files`, `bytes`, `bytes_read`, `duration_ms` | non-negative integer | as today; on a `mode: cdc` entry the four counts include the `initial: snapshot` legs the same invocation ran (`duration_ms` stays the drain's) |
+| `skip_reason` | string or `null` | why a `skipped` entry wrote nothing (`skip_empty`: "no new rows since cursor '<column>'", "source returned 0 rows"), the text of the metrics row and the console card (0.32.1); `null` on every other entry |
 | `error` | object or `null` | the D1 object for every `failed` entry on every path (sequential, threads, waves, pool, and process children through a defaulted member on `ChildEvent::Finished`, `src/pipeline/ipc.rs:104-127`); `null` otherwise |
 | `stop_reason` | string or `null`, closed set | D4 |
 | `tables` | array or `null` | D4 |

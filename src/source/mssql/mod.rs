@@ -48,6 +48,10 @@ type MssqlClient = Client<Compat<TcpStream>>;
 /// `pub` (not `pub(crate)`) so integration tests can reach `proxy_kind()` the
 /// same way they reach `MysqlSource::proxy_kind()`; the rest of the type
 /// carries the same "no external API contract" disclaimer as `MysqlSource`.
+/// `1` when the login holds a permission that reads the server DMVs; an unknown permission name (2019 has no `VIEW SERVER PERFORMANCE STATE`) answers NULL, not an error.
+const SERVER_COUNTERS_GRANTED: &str = "SELECT CAST(CASE WHEN HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER PERFORMANCE STATE') = 1 \
+     OR HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE') = 1 THEN 1 ELSE 0 END AS NVARCHAR(1))";
+
 pub struct MssqlSource {
     rt: Runtime,
     client: MssqlClient,
@@ -60,6 +64,8 @@ pub struct MssqlSource {
     snapshot_applied: bool,
     /// Whether the locking-read warning was already emitted on this connection.
     locking_read_warned: bool,
+    /// Whether this login may read the server's DMVs, asked once; see [`MssqlSource::server_counters_readable`].
+    server_counters: Option<bool>,
 }
 
 /// How an incremental read can see one transaction-consistent state on this database.
@@ -360,6 +366,7 @@ impl MssqlSource {
             lock_timeout_applied: false,
             snapshot_applied: false,
             locking_read_warned: false,
+            server_counters: None,
         };
         // Health round-trip — surfaces auth/permission errors at connect time
         // (doctor relies on this).
@@ -851,6 +858,9 @@ impl Source for MssqlSource {
     }
 
     fn sample_governor_pressure(&mut self) -> Option<u64> {
+        if !self.server_counters_readable() {
+            return None;
+        }
         let Self { rt, client, .. } = self;
         // FOREIGN-pressure proxy for the governor: cumulative `Log Flush
         // Waits/sec` (redo-WRITE pressure). A read-only export barely moves it
@@ -916,6 +926,9 @@ impl MssqlSource {
     /// the export. Cumulative since server start; the pipeline deltas it around
     /// the run.
     pub(crate) fn harm_counters(&mut self) -> Option<Vec<(String, i64)>> {
+        if !self.server_counters_readable() {
+            return None;
+        }
         let Self { rt, client, .. } = self;
         // Lock waits; logical reads of every completed query (dm_exec_query_stats, updated
         // as each query finishes); the buffer pool's page lookups/reads and the work
@@ -954,6 +967,23 @@ impl MssqlSource {
                     .collect(),
             )
         })
+    }
+
+    /// Whether this login may read `sys.dm_os_performance_counters` and the other server DMVs,
+    /// asked once per connection. The server answers a denied DMV read with an error the driver
+    /// logs at ERROR, once per sample, so a login without `VIEW SERVER PERFORMANCE STATE` (SQL
+    /// Server 2022) or `VIEW SERVER STATE` never sends one: the counters are skipped, quietly.
+    fn server_counters_readable(&mut self) -> bool {
+        if let Some(known) = self.server_counters {
+            return known;
+        }
+        let readable = self
+            .query_scalar(SERVER_COUNTERS_GRANTED)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v.trim() == "1");
+        self.server_counters = Some(readable);
+        readable
     }
 
     /// Does the current login hold `VIEW SERVER STATE` — the permission

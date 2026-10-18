@@ -10,6 +10,7 @@
   "duration_ms": 4200,
   "mode": "cdc",
   "error_message": "export 'orders_cdc': the checkpoint position is no longer in the source log",
+  "skip_reason": null,
   "error": {
     "code": "RIVET_SOURCE_CDC_LOG_GAP",
     "kind": "refusal",

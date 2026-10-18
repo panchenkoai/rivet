@@ -28,6 +28,8 @@ pub struct ExportMetric {
     pub bytes_read: i64,
     /// The engine the run read (`SourceType::ledger_label`); `None` on rows older than the column.
     pub source_type: Option<String>,
+    /// Why a `skipped` run wrote nothing; `None` for every other status.
+    pub skip_reason: Option<String>,
 }
 
 /// Every column written to one `export_metrics` row.
@@ -409,7 +411,7 @@ impl StateStore {
 /// The columns [`metric_from_row`] reads by POSITION — one list for every query it projects.
 const METRIC_COLUMNS: &str = "export_name, run_id, run_at, duration_ms, total_rows, peak_rss_mb, \
     status, error_message, tuning_profile, format, mode, files_produced, bytes_written, retries, \
-    validated, schema_changed, bytes_read, source_type";
+    validated, schema_changed, bytes_read, source_type, skip_reason";
 
 fn metric_from_row(r: &dyn super::row::StateRow) -> ExportMetric {
     ExportMetric {
@@ -431,6 +433,7 @@ fn metric_from_row(r: &dyn super::row::StateRow) -> ExportMetric {
         schema_changed: r.opt_bool(15),
         bytes_read: r.opt_i64(16).unwrap_or(0),
         source_type: r.opt_text(17),
+        skip_reason: r.opt_text(18),
     }
 }
 

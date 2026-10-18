@@ -3424,6 +3424,7 @@ pub(crate) mod run_tail_tests {
                 duration_ms: 5,
                 mode: "full".to_string(),
                 error_message: None,
+                skip_reason: None,
             })
             .collect();
         let now = chrono::Utc::now();
@@ -3633,6 +3634,7 @@ pub(crate) mod run_tail_tests {
             duration_ms: 20_000,
             mode: "full".to_string(),
             error_message: None,
+            skip_reason: None,
         }];
 
         // A re-exec'd child (`--parallel-export-processes`): its parent rebuilds
@@ -3730,6 +3732,7 @@ pub(crate) mod run_tail_tests {
                 duration_ms: 20_000,
                 mode: "full".to_string(),
                 error_message: None,
+                skip_reason: None,
             });
         }
         // The run reached a 3-wide batch, so its RUN-level label is the
@@ -3819,6 +3822,7 @@ pub(crate) mod run_tail_tests {
                 duration_ms: 20_000,
                 mode: "full".to_string(),
                 error_message: None,
+                skip_reason: None,
             });
         }
         // The measured windows: a `parallel_safe` export overlapping the first

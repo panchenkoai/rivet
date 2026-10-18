@@ -86,6 +86,7 @@ const RUN_ENTRY: &[Field] = &[
     ("duration_ms", Int, false),
     ("mode", Str, false),
     ("error_message", Str, true),
+    ("skip_reason", Str, true),
     ("error", Nested, true),
     ("stop_reason", Word(STOP_REASON), true),
     ("tables", Nested, true),
@@ -299,6 +300,10 @@ fn check_run_entry(v: &Value, at: &str) -> Check {
     require(
         (v["status"] == "already_applied") != v["answered_by_run"].is_null(),
         || format!("{at}: answered_by_run iff already_applied"),
+    )?;
+    require(
+        (v["status"] == "skipped") != v["skip_reason"].is_null(),
+        || format!("{at}: skip_reason iff skipped"),
     )?;
     require(
         v["status"] != "already_applied" || v["answered_by_run"] == v["run_id"],
@@ -975,6 +980,7 @@ fn the_run_entry_is_what_the_product_serializes_plus_the_pending_keys() {
         duration_ms: 1,
         mode: "cdc".into(),
         error_message: Some("e".into()),
+        skip_reason: None,
     };
     let emitted = serde_json::to_value(&entry).unwrap();
     let contract = fixture("run_entry_failed.json");

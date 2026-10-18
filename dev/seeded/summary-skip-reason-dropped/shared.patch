@@ -1,0 +1,13 @@
+diff --git a/src/pipeline/aggregate.rs b/src/pipeline/aggregate.rs
+index b5cbea0d..325bbe98 100644
+--- a/src/pipeline/aggregate.rs
++++ b/src/pipeline/aggregate.rs
+@@ -118,7 +118,7 @@ pub(super) fn entry_from_summary(s: &RunSummary) -> RunAggregateEntry {
+             duration_ms: s.duration_ms,
+             mode: s.mode.clone(),
+             error_message: s.error_message.clone(),
+-            skip_reason: s.skip_reason.clone(),
++            skip_reason: None,
+         },
+         &s.snapshot_legs,
+     )
