@@ -320,6 +320,21 @@ pub fn state_url_under_test() -> Option<String> {
         .filter(|u| u.starts_with("postgres"))
 }
 
+/// The SQLite file a rivet child spawned with `envs` uses when its `RIVET_STATE_URL` is `sqlite:<path>` (a relative path anchored to `config_dir`, as rivet anchors it).
+pub fn sqlite_state_for(
+    envs: &[(&str, &str)],
+    config_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let url = envs.iter().rev().find(|(k, _)| *k == "RIVET_STATE_URL")?.1;
+    let path = url.strip_prefix("sqlite:")?;
+    let path = std::path::Path::new(path.strip_prefix("//").unwrap_or(path));
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir.join(path)
+    })
+}
+
 /// The Postgres state a rivet child spawned with `envs` uses (the last `RIVET_STATE_URL` wins, as in the child's environment), else the backend under test; `None` is SQLite.
 pub fn state_url_for(envs: &[(&str, &str)]) -> Option<String> {
     envs.iter()

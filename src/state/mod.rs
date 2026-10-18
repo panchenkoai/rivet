@@ -253,9 +253,74 @@ pub(crate) fn open_connection(db_path: &std::path::Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// The SQLite file a `RIVET_STATE_URL` of the form `sqlite:<path>` names: an absolute path as
+/// written, a relative one anchored to the config's directory (where the default file lives, so
+/// the place does not move with the working directory); `None` for any other value.
+fn sqlite_state_path(url: &str, config_path: &str) -> Option<std::path::PathBuf> {
+    let path = url.strip_prefix("sqlite:")?;
+    let path = path.strip_prefix("//").unwrap_or(path);
+    let path = std::path::Path::new(path);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_dir_of(config_path).join(path)
+    })
+}
+
+/// The directory a config path's state is anchored to.
+fn config_dir_of(config_path: &str) -> &std::path::Path {
+    std::path::Path::new(config_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+}
+
+/// Whether the SQLite file at `path` holds state a run wrote: an export cursor or a run.
+fn holds_state(path: &std::path::Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .and_then(|c| {
+            c.query_row(
+                "SELECT (SELECT COUNT(*) FROM export_state) + (SELECT COUNT(*) FROM run_status)",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .is_ok_and(|n| n > 0)
+}
+
+/// Refuse a `sqlite:` target that holds nothing while the file beside the config holds this
+/// config's state: the cursors, runs and load journal would be left behind and the next run would
+/// start over (a full re-read, a load that finds its own tables foreign).
+fn refuse_a_state_left_behind(beside: &std::path::Path, target: &std::path::Path) -> Result<()> {
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b
+            || std::fs::canonicalize(a)
+                .ok()
+                .zip(std::fs::canonicalize(b).ok())
+                .is_some_and(|(a, b)| a == b)
+    };
+    if same(beside, target) || !holds_state(beside) || holds_state(target) {
+        return Ok(());
+    }
+    crate::rivet_bail!(
+        crate::error::codes::STATE_URL_LEAVES_STATE_BEHIND,
+        "RIVET_STATE_URL names `{}`, which holds no state, while `{}` beside the config holds this \
+         config's cursors and runs: opening the new file would start every export over and leave \
+         the load journal behind. Nothing was opened. Copy the state to the new place with every \
+         run stopped (`sqlite3 {} \".backup {}\"`, which takes the `-wal` file with it), or unset \
+         RIVET_STATE_URL to keep using the file beside the config.",
+        target.display(),
+        beside.display(),
+        beside.display(),
+        target.display()
+    )
+}
+
 /// The PostgreSQL URL a `RIVET_STATE_URL` value names, `None` for an empty one (SQLite); any other value is refused, never replaced by SQLite.
 fn postgres_state_url(url: &str) -> Result<Option<&str>> {
-    if url.is_empty() {
+    if url.is_empty() || url.starts_with("sqlite:") {
         return Ok(None);
     }
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
@@ -272,10 +337,10 @@ fn postgres_state_url(url: &str) -> Result<Option<&str>> {
     };
     crate::rivet_bail!(
         crate::error::codes::STATE_URL_SCHEME_UNSUPPORTED,
-        "RIVET_STATE_URL {what}; the state backends are PostgreSQL and the SQLite file \
-         beside the config, and a URL rivet cannot use is not replaced by that file. No \
-         state was opened and nothing was read or written. Set RIVET_STATE_URL to a \
-         `postgres://` or `postgresql://` URL, or unset it to keep the state in \
+        "RIVET_STATE_URL {what}; the state backends are PostgreSQL and a SQLite file, and a \
+         URL rivet cannot use is not replaced by the file beside the config. No state was \
+         opened and nothing was read or written. Set RIVET_STATE_URL to a `postgres://` or \
+         `postgresql://` URL or to `sqlite:<path>`, or unset it to keep the state in \
          `{STATE_DB_NAME}` beside the config."
     )
 }
@@ -313,10 +378,14 @@ impl StateStore {
     ///
     /// `RIVET_STATE_URL` when it is set, else SQLite next to `config_path`.
     pub fn open(config_path: &str) -> Result<Self> {
-        if let Ok(url) = std::env::var("RIVET_STATE_URL")
-            && let Some(url) = postgres_state_url(&url)?
-        {
-            return Self::open_postgres(url);
+        if let Ok(url) = std::env::var("RIVET_STATE_URL") {
+            if let Some(path) = sqlite_state_path(&url, config_path) {
+                refuse_a_state_left_behind(&config_dir_of(config_path).join(STATE_DB_NAME), &path)?;
+                return Self::open_at_path(&path);
+            }
+            if let Some(url) = postgres_state_url(&url)? {
+                return Self::open_postgres(url);
+            }
         }
         Self::open_sqlite(config_path)
     }
@@ -350,6 +419,7 @@ impl StateStore {
             return Ok(format!("postgres {}", redact_pg_url(url)));
         }
         let path = Self::state_db_path(config_path);
+        refuse_a_state_left_behind(&config_dir_of(config_path).join(STATE_DB_NAME), &path)?;
         if path.exists() {
             let conn =
                 Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -466,10 +536,10 @@ impl StateStore {
     /// directory path for Postgres (not meaningful for connection, only used
     /// by legacy callers — prefer `state_ref()` for new code).
     pub fn state_db_path(config_path: &str) -> std::path::PathBuf {
-        let config_dir = std::path::Path::new(config_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        config_dir.join(STATE_DB_NAME)
+        std::env::var("RIVET_STATE_URL")
+            .ok()
+            .and_then(|url| sqlite_state_path(&url, config_path))
+            .unwrap_or_else(|| config_dir_of(config_path).join(STATE_DB_NAME))
     }
 
     /// Serialisable connection reference for parallel chunk workers.
@@ -621,11 +691,12 @@ mod state_url_guard {
             assert_eq!(
                 said,
                 format!(
-                    "RIVET_STATE_URL {what}; the state backends are PostgreSQL and the SQLite \
-                     file beside the config, and a URL rivet cannot use is not replaced by that \
-                     file. No state was opened and nothing was read or written. Set \
-                     RIVET_STATE_URL to a `postgres://` or `postgresql://` URL, or unset it to \
-                     keep the state in `.rivet_state.db` beside the config."
+                    "RIVET_STATE_URL {what}; the state backends are PostgreSQL and a SQLite \
+                     file, and a URL rivet cannot use is not replaced by the file beside the \
+                     config. No state was opened and nothing was read or written. Set \
+                     RIVET_STATE_URL to a `postgres://` or `postgresql://` URL or to \
+                     `sqlite:<path>`, or unset it to keep the state in `.rivet_state.db` beside \
+                     the config."
                 ),
                 "{url}"
             );
@@ -1084,5 +1155,52 @@ mod names_a_server_tests {
                 String::from_utf8_lossy(&child.stderr)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sqlite_state_url_tests {
+    use super::*;
+
+    #[test]
+    fn a_sqlite_url_names_its_file_and_a_relative_one_is_anchored_to_the_config() {
+        let cfg = "/etc/rivet/app.yaml";
+        let p = |u: &str| sqlite_state_path(u, cfg);
+        assert_eq!(
+            p("sqlite:/var/lib/rivet/state.db"),
+            Some("/var/lib/rivet/state.db".into())
+        );
+        assert_eq!(
+            p("sqlite:///var/lib/rivet/state.db"),
+            Some("/var/lib/rivet/state.db".into())
+        );
+        assert_eq!(
+            p("sqlite:state/app.db"),
+            Some("/etc/rivet/state/app.db".into())
+        );
+        assert_eq!(p("postgresql://u@h/s"), None);
+        assert_eq!(p(""), None);
+        assert_eq!(postgres_state_url("sqlite:/x.db").unwrap(), None);
+    }
+
+    #[test]
+    fn a_sqlite_url_that_leaves_the_state_beside_the_config_behind_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let beside = dir.path().join(".rivet_state.db");
+        let target = dir.path().join("other").join("state.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        refuse_a_state_left_behind(&beside, &target).unwrap();
+        let s = StateStore::open_at_path(&beside).unwrap();
+        s.update_legacy("orders", "42").unwrap();
+        drop(s);
+        let err = refuse_a_state_left_behind(&beside, &target).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_URL_LEAVES_STATE_BEHIND")
+        );
+        assert_eq!(crate::error::classify_exit(&err), 5);
+        refuse_a_state_left_behind(&beside, &beside).unwrap();
+        std::fs::copy(&beside, &target).unwrap();
+        refuse_a_state_left_behind(&beside, &target).unwrap();
     }
 }
