@@ -1412,6 +1412,23 @@ seeds:
       lib:
         cells: ["lib:a_batch_load_skips_the_runs_of_a_cdc_export_nested_in_its_prefix_and_says_so"]
 
+  - name: summary-skip-reason-dropped
+    class: "the run summary's `per_export[]` entry of a `skip_empty` run says `skipped` without the reason the metrics row and the console card carry"
+    history: "0.32.1 item 6, 2026-10-18: measured on main 935064e8: `--summary-output` entry `\"status\":\"skipped\"`, `skip_reason` absent (read as null) on the sequential and the process runner"
+    scope: source
+    patch: summary-skip-reason-dropped/shared.patch
+    engines:
+      postgres:
+        cells: [a_skipped_entry_of_the_run_summary_says_why, "lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      mysql:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      mssql:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      mongo:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      oracle:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+
   - name: accepted-edit-not-recorded
     class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"
     history: "2026-10-08, owner decision on #493 - a refused edit that is meant had no way out that kept the cursor (`state accept` did not exist on the PR's head 3dd6ade4); seeded so the command cannot answer `Accepted` without re-binding the row"
