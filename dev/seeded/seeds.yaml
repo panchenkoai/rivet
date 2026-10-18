@@ -1439,6 +1439,56 @@ seeds:
         cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
       oracle:
         cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+  - name: init-cdc-shares-batch-name
+    class: "`rivet init` names a table's CDC export like its batch export and nests the CDC prefix (`exports/<t>/cdc/`) inside the batch one, so the two share a load spec and a batch load lists the stream's runs"
+    history: "0.32.1 item 2, 2026-10-18: measured on main 935064e8 with SQL Server init (batch, then --mode cdc): `name: ab2_mssql_cdc_new` twice, `exports/ab2_mssql_cdc_new/` and `exports/ab2_mssql_cdc_new/cdc/`"
+    scope: source
+    patch: init-cdc-shares-batch-name/shared.patch
+    engines:
+      postgres:
+        cells: ["lib:a_batch_and_a_cdc_scaffold_of_one_table_share_no_name_and_nest_no_prefix"]
+      mysql:
+        cells: ["lib:a_batch_and_a_cdc_scaffold_of_one_table_share_no_name_and_nest_no_prefix"]
+      mssql:
+        cells: ["lib:a_batch_and_a_cdc_scaffold_of_one_table_share_no_name_and_nest_no_prefix"]
+      mongo:
+        cells: ["lib:a_batch_and_a_cdc_scaffold_of_one_table_share_no_name_and_nest_no_prefix"]
+      oracle:
+        cells: ["lib:a_batch_and_a_cdc_scaffold_of_one_table_share_no_name_and_nest_no_prefix"]
+
+  - name: mssql-shipped-tables-scaffolded
+    class: "a schema-wide SQL Server `rivet init` scaffolds the system tables SQL Server ships (`dbo.systranschemas` of a CDC database) as exports"
+    history: "0.32.1 item 2, 2026-10-18: measured on main 935064e8 against the mssql-cdc stand: `- name: systranschemas` in the scaffold"
+    scope: source
+    patch: mssql-shipped-tables-scaffolded/mssql.patch
+    engines:
+      mssql:
+        cells: [init_mssql_schema_wide_leaves_out_the_tables_sql_server_ships]
+      postgres:
+        na: "the `IsMSShipped` filter is SQL Server's table listing; PostgreSQL's lists `information_schema` of one schema without system catalogs"
+      mysql:
+        na: "the `IsMSShipped` filter is SQL Server's table listing; MySQL's lists one database without the system schemas"
+      mongo:
+        na: "the `IsMSShipped` filter is SQL Server's table listing; MongoDB's lists collections"
+      oracle:
+        na: "the `IsMSShipped` filter is SQL Server's table listing; Oracle's lists one owner's tables"
+
+  - name: mssql-denied-counters-queried
+    class: "a SQL Server run as a login without `VIEW SERVER PERFORMANCE STATE` / `VIEW SERVER STATE` queries the server counters anyway, and the driver logs the denial at ERROR on every sample"
+    history: "0.32.1 item 2, 2026-10-18: measured on main 935064e8 with a db_datareader login on the mssql-cdc stand: two `VIEW SERVER PERFORMANCE STATE permission was denied` ERROR lines per `rivet run`"
+    scope: source
+    patch: mssql-denied-counters-queried/mssql.patch
+    engines:
+      mssql:
+        cells: [a_sql_server_reader_without_server_grants_runs_without_permission_errors]
+      postgres:
+        na: "the permission gate is SQL Server's DMV read; PostgreSQL's counters read `pg_stat_*`, which every role may read"
+      mysql:
+        na: "the permission gate is SQL Server's DMV read; MySQL's counters read session and global status, which every user may read"
+      mongo:
+        na: "the permission gate is SQL Server's DMV read; MongoDB samples no server counters"
+      oracle:
+        na: "the permission gate is SQL Server's DMV read; Oracle samples no server counters"
 
   - name: accepted-edit-not-recorded
     class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"

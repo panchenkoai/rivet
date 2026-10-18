@@ -1,0 +1,13 @@
+diff --git a/src/init/yaml_scaffold.rs b/src/init/yaml_scaffold.rs
+index d34df564..4dab08e7 100644
+--- a/src/init/yaml_scaffold.rs
++++ b/src/init/yaml_scaffold.rs
+@@ -473,7 +473,7 @@ fn mode_segment(info: &TableInfo, source_type: &str, mode: &str) -> String {
+ /// What a CDC scaffold appends to the table's export name and path segment, so a batch and a
+ /// CDC export of one table never share a name (the state keys a load spec by export name) or
+ /// nest one prefix inside the other.
+-const CDC_NAME_SUFFIX: &str = "_cdc";
++const CDC_NAME_SUFFIX: &str = "";
+ 
+ /// Emit a YAML scalar that is unambiguous for any plain-text value the user
+ /// could pass via `--gcs-bucket` / `--s3-region` / `--gcs-credentials-file`.
