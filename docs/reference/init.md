@@ -119,6 +119,18 @@ If the column is declared as plain `NUMERIC` (no precision / scale in the DDL), 
 
 ---
 
+### CDC stream objects (`--mode cdc`)
+
+A CDC scaffold written with `-o <file>` names its stream objects after the file, so two configs
+on one cluster never read each other's stream: the PostgreSQL slot is `rivet_<stem>_<table>`
+(`rivet_<stem>_<schema>_cdc` for a whole-schema stream), the stem being the file name in
+lowercase letters, digits and `_` (`-o staging.yaml` -> `rivet_staging_public_cdc`), cut to
+PostgreSQL's 63 bytes; the MySQL `server_id` is 1000000 plus a stable hash of the stem below
+1000000, plus the export's position among the config's CDC exports. A scaffold printed to stdout
+keeps `rivet_<table>` and `server_id: 4271` and says beside each that it is one per cluster. A
+CDC export of a table is named `<table>_cdc` and writes to `exports/<table>_cdc/`, beside the
+batch export of the table, never inside it.
+
 ## Flags (summary)
 
 | Flag | Required | Description |

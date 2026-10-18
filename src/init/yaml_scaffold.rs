@@ -1243,14 +1243,16 @@ omitting differ per engine — see cdc.md)",
         // One id per export: two exports sharing a replica id evict each other's
         // binlog connection, so the per-table scaffold counts up from the first.
         "mysql" => lines.push(format!(
-            "      server_id: {}  # unique replica id; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants",
-            4271 + ordinal
+            "      server_id: {}  # unique replica id{}; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants",
+            server_id(dest.cdc_name_stem.as_deref(), ordinal),
+            per_cluster_note(dest)
         )),
         // PostgreSQL accepts only lowercase letters, digits and `_` in a slot name:
         // `rivet_Orders` is refused by the server the moment the stream opens.
         "postgres" => lines.push(format!(
-            "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
-            ident.to_lowercase()
+            "      slot: {}  # logical slot (auto-created){}; source needs wal_level=logical + a REPLICATION role",
+            slot_name(dest.cdc_name_stem.as_deref(), ident),
+            per_cluster_note(dest)
         )),
         "mssql" => lines.push(match &info.cdc_capture_instance {
             Some(ci) => format!(
@@ -1340,14 +1342,16 @@ fn cdc_multiplex_export_lines(
             lines.push(format!(
                 "      checkpoint: ./cdc/{name}.ckpt  # one resume position for the whole stream"
             ));
-            lines.push(
-                "      server_id: 4271  # ONE replica id for the stream; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants"
-                    .to_string(),
-            );
+            lines.push(format!(
+                "      server_id: {}  # ONE replica id for the stream{}; source needs binlog_format=ROW + REPLICATION SLAVE and REPLICATION CLIENT grants",
+                server_id(dest.cdc_name_stem.as_deref(), 0),
+                per_cluster_note(dest)
+            ));
         }
         "postgres" => lines.push(format!(
-            "      slot: rivet_{}  # ONE logical slot for the whole stream; source needs wal_level=logical + a REPLICATION role",
-            cdc_ident(&name).to_lowercase()
+            "      slot: {}  # ONE logical slot for the whole stream{}; source needs wal_level=logical + a REPLICATION role",
+            slot_name(dest.cdc_name_stem.as_deref(), &name),
+            per_cluster_note(dest)
         )),
         // Like MySQL, the anchor is client-side: the checkpoint is the resume position.
         "oracle" => lines.push(format!(
@@ -1479,6 +1483,68 @@ fn unique_cdc_idents(names: &[&str]) -> Vec<String> {
         })
         .collect()
 }
+
+/// The longest name PostgreSQL keeps for a replication slot.
+const SLOT_NAME_MAX: usize = 63;
+
+/// The first `server_id` a scaffold named from an `-o` stem can take; ids run from here
+/// across [`SERVER_ID_SPAN`] values, the stem's hash choosing one and each further table
+/// export of the config the next.
+const SERVER_ID_BASE: u32 = 1_000_000;
+
+/// How many `server_id` values a stem can hash to.
+const SERVER_ID_SPAN: u32 = 1_000_000;
+
+/// The default `server_id` of a scaffold without an `-o` stem (stdout).
+const SERVER_ID_DEFAULT: u32 = 4271;
+
+/// The `[a-z0-9_]` stem of an output file name (`-o staging.yaml` -> `staging`); `None` when nothing is left.
+pub(super) fn output_stem(path: &str) -> Option<String> {
+    let file = std::path::Path::new(path).file_stem()?.to_str()?;
+    let stem: String = file
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let stem = stem.trim_matches('_').to_string();
+    (!stem.is_empty()).then_some(stem)
+}
+
+/// The PostgreSQL slot for `ident`: `rivet_<stem>_<ident>`, or `rivet_<ident>` without a stem,
+/// lowercase and cut to [`SLOT_NAME_MAX`] bytes (every byte is ASCII after sanitising).
+fn slot_name(stem: Option<&str>, ident: &str) -> String {
+    let ident = cdc_ident(ident).to_lowercase();
+    let name = match stem {
+        Some(s) => format!("rivet_{s}_{ident}"),
+        None => format!("rivet_{ident}"),
+    };
+    name.chars().take(SLOT_NAME_MAX).collect()
+}
+
+/// The MySQL `server_id` of the `ordinal`-th CDC export: [`SERVER_ID_DEFAULT`] + ordinal without
+/// a stem, else [`SERVER_ID_BASE`] + a stable hash of the stem into [`SERVER_ID_SPAN`] + ordinal.
+fn server_id(stem: Option<&str>, ordinal: usize) -> u32 {
+    let first = match stem {
+        Some(s) => {
+            SERVER_ID_BASE
+                + (xxhash_rust::xxh3::xxh3_64(s.as_bytes()) % u64::from(SERVER_ID_SPAN)) as u32
+        }
+        None => SERVER_ID_DEFAULT,
+    };
+    first + ordinal as u32
+}
+
+/// `, <ONE_PER_CLUSTER>` for a scaffold without an `-o` stem, else nothing.
+fn per_cluster_note(dest: &InitYamlDestination) -> String {
+    if dest.cdc_name_stem.is_some() {
+        String::new()
+    } else {
+        format!(", {ONE_PER_CLUSTER}")
+    }
+}
+
+/// The comment beside a slot or `server_id` the scaffold wrote without an `-o` stem.
+const ONE_PER_CLUSTER: &str = "one per cluster: a second config on this server needs its own";
 
 /// Sanitise a table name into a plain identifier for a checkpoint filename /
 /// PostgreSQL slot name (`[A-Za-z0-9_]`).
@@ -2675,6 +2741,92 @@ mod tests {
     }
 
     #[test]
+    fn the_output_stem_is_the_file_name_in_lowercase_letters_digits_and_underscores() {
+        assert_eq!(output_stem("staging.yaml").as_deref(), Some("staging"));
+        assert_eq!(
+            output_stem("/etc/rivet/Prod-EU.v2.yaml").as_deref(),
+            Some("prod_eu_v2")
+        );
+        assert_eq!(output_stem("./--.yaml"), None);
+        assert_eq!(output_stem("Café.yaml").as_deref(), Some("caf"));
+    }
+
+    #[test]
+    fn a_slot_named_from_the_stem_fits_postgres_and_keeps_the_default_without_one() {
+        assert_eq!(
+            slot_name(Some("staging"), "public_cdc"),
+            "rivet_staging_public_cdc"
+        );
+        assert_eq!(slot_name(None, "public_cdc"), "rivet_public_cdc");
+        assert_eq!(slot_name(None, "Orders"), "rivet_orders");
+        let long = slot_name(Some(&"s".repeat(80)), "t");
+        assert_eq!(long.len(), SLOT_NAME_MAX);
+        assert!(
+            long.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        );
+    }
+
+    #[test]
+    fn a_server_id_from_the_stem_is_stable_inside_its_range_and_counts_up_per_export() {
+        assert_eq!(server_id(None, 0), SERVER_ID_DEFAULT);
+        assert_eq!(server_id(None, 2), SERVER_ID_DEFAULT + 2);
+        let a = server_id(Some("staging"), 0);
+        assert_eq!(a, server_id(Some("staging"), 0), "stable");
+        assert!(
+            (SERVER_ID_BASE..SERVER_ID_BASE + SERVER_ID_SPAN).contains(&a),
+            "{a}"
+        );
+        assert_eq!(server_id(Some("staging"), 1), a + 1);
+        assert_ne!(a, server_id(Some("prod"), 0));
+    }
+
+    /// `-o staging.yaml` names the stream objects after the file; stdout keeps the default names
+    /// and says each is one per cluster.
+    #[test]
+    fn a_cdc_scaffold_names_its_slot_and_server_id_from_the_output_file() {
+        let info = make_table(vec![col("id", "bigint")]);
+        let named = InitYamlDestination {
+            cdc_name_stem: Some("staging".into()),
+            ..Default::default()
+        };
+        let render = |url: &str, dest: &InitYamlDestination| {
+            generate_config(
+                &info,
+                url,
+                &crate::init::SourceProvenance::Inline,
+                dest,
+                Some("cdc"),
+                None,
+            )
+            .unwrap()
+        };
+        let pg = render("postgresql://u@localhost/db", &named);
+        assert!(
+            pg.contains(&format!(
+                "slot: {}",
+                slot_name(Some("staging"), &info.table)
+            )),
+            "{pg}"
+        );
+        assert!(!pg.contains("one per cluster"), "{pg}");
+        let my = render("mysql://u@localhost/db", &named);
+        assert!(
+            my.contains(&format!("server_id: {}", server_id(Some("staging"), 0))),
+            "{my}"
+        );
+        let stdout = render(
+            "postgresql://u@localhost/db",
+            &InitYamlDestination::default(),
+        );
+        assert!(
+            stdout.contains(&format!("slot: {}", slot_name(None, &info.table))),
+            "{stdout}"
+        );
+        assert!(stdout.contains("one per cluster"), "{stdout}");
+    }
+
+    #[test]
     fn cdc_mode_scaffolds_cdc_block_not_batch() {
         let info = make_table(vec![col("id", "bigint"), decimal_col("amount", 18, 2)]);
         let dest = InitYamlDestination::default();
@@ -3677,6 +3829,7 @@ mod load_block_tests {
             clickhouse_database: None,
             clickhouse_user: None,
             snowflake: None,
+            cdc_name_stem: None,
         };
         assert!(
             load_block_lines(&bare, true, None, &mut ScaffoldDecisions::default()).is_empty(),
