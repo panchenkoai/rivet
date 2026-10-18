@@ -545,6 +545,62 @@ fn is_run_unique_manifest(base: &str) -> bool {
     crate::manifest::is_run_unique_manifest_name(base)
 }
 
+/// The manifests under a load's prefix without the runs of a CDC export nested inside it,
+/// and a one-line note naming the directories skipped (`None` when nothing was skipped).
+///
+/// The listing is recursive, and `rivet init` nests a table's CDC export inside its batch
+/// export (`exports/<t>/` and `exports/<t>/cdc/`) under the same export name, so a batch
+/// load summed the stream's runs with its own and landed the stream's deleted rows (exit 0).
+/// A batch (full or incremental) load skips a CDC-shaped run of its family (a drain run or
+/// a baseline leg) that sits in a sub-directory of `base` where none of its batch runs
+/// lives; a run at the prefix itself, or beside a batch run, is the same export that changed
+/// mode and stays. A CDC load owns its legs and baseline, so it skips nothing.
+pub fn own_manifests(
+    keyed: Vec<(String, RunManifest)>,
+    gcs_prefix: &str,
+    export_name: &str,
+    mode: crate::load::plan::LoadMode,
+) -> Result<(Keyed, Option<String>)> {
+    if mode == crate::load::plan::LoadMode::Cdc {
+        return Ok((keyed, None));
+    }
+    let (_, base) = crate::load::split_object_uri(gcs_prefix)?;
+    let base = base.trim_end_matches('/');
+    let dir = |k: &str| k.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+    let cdc_shaped: Vec<bool> = keyed
+        .iter()
+        .map(|(_, m)| {
+            let family = crate::manifest::identity_family(m, &keyed);
+            let leg_prefix = format!("{family}{}", crate::manifest::SNAPSHOT_LEG_INFIX);
+            family == export_name && (m.mode == "cdc" || m.export_name.starts_with(&leg_prefix))
+        })
+        .collect();
+    let batch_dirs: std::collections::BTreeSet<String> = keyed
+        .iter()
+        .zip(&cdc_shaped)
+        .filter(|(_, cdc)| !**cdc)
+        .map(|((k, _), _)| dir(k))
+        .collect();
+    let mut skipped: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut own = Vec::new();
+    for ((key, m), cdc) in keyed.into_iter().zip(cdc_shaped) {
+        let d = dir(&key);
+        if cdc && d != base && !batch_dirs.contains(&d) {
+            skipped.insert(format!("{d}/"));
+        } else {
+            own.push((key, m));
+        }
+    }
+    let note = (!skipped.is_empty()).then(|| {
+        format!(
+            "  load [{export_name}]: skipped the CDC runs under {} — a CDC export nested in \
+             this batch export's prefix; its own `rivet load` loads them",
+            skipped.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    });
+    Ok((own, note))
+}
+
 /// Refuse a load whose prefix holds MORE THAN ONE export's manifests. The load
 /// sums EVERY manifest under `gcs_prefix` (fetched recursively) and cleanup
 /// removes the prefix recursively, so a shared base prefix — two `partition_by`
@@ -2273,6 +2329,124 @@ mod tests {
     /// Build an fs-backed [`GcsStore`] over a fresh tempdir seeded with
     /// `(bucket-relative-key, bytes)` objects. Returns the store and the guard —
     /// hold the `TempDir` for the store's lifetime.
+    /// A manifest of export family `family` with `name`, `mode`, keyed at `key`.
+    fn shaped(key: &str, run: &str, name: &str, family: &str, mode: &str) -> (String, RunManifest) {
+        let mut m = manifest(run, 1, None);
+        m.export_name = name.into();
+        m.export_family = family.into();
+        m.mode = mode.into();
+        (key.to_string(), m)
+    }
+
+    /// The `init` layout: a batch export at `exports/t/` and a CDC export of the same name
+    /// nested at `exports/t/cdc/t/`, with its baseline leg under `snapshot/`.
+    fn nested_layout() -> Vec<(String, RunManifest)> {
+        vec![
+            shaped("exports/t/manifest-b1.json", "b1", "t", "t", "batch"),
+            shaped(
+                "exports/t/cdc/t/manifest-c1.json",
+                "c1",
+                "dbo.t",
+                "t",
+                "cdc",
+            ),
+            shaped(
+                "exports/t/cdc/t/snapshot/manifest-s1.json",
+                "s1",
+                "t__snapshot_dbo_t",
+                "t",
+                "batch",
+            ),
+        ]
+    }
+
+    fn run_ids(keyed: &[(String, RunManifest)]) -> Vec<&str> {
+        keyed.iter().map(|(_, m)| m.run_id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_batch_load_skips_the_runs_of_a_cdc_export_nested_in_its_prefix_and_says_so() {
+        for mode in [
+            crate::load::plan::LoadMode::Full,
+            crate::load::plan::LoadMode::Incremental,
+        ] {
+            let (own, note) =
+                own_manifests(nested_layout(), "gs://b/exports/t/", "t", mode).unwrap();
+            assert_eq!(run_ids(&own), vec!["b1"], "{mode:?}");
+            let note = note.expect("the skipped runs are named");
+            assert!(
+                note.contains("exports/t/cdc/t/, exports/t/cdc/t/snapshot/"),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cdc_load_keeps_its_stream_and_its_baseline_leg() {
+        let (own, note) = own_manifests(
+            nested_layout()[1..].to_vec(),
+            "gs://b/exports/t/cdc/t/",
+            "t",
+            crate::load::plan::LoadMode::Cdc,
+        )
+        .unwrap();
+        assert_eq!(run_ids(&own), vec!["c1", "s1"]);
+        assert!(note.is_none(), "{note:?}");
+    }
+
+    /// A batch export switched to CDC (or back) writes both shapes into ONE directory: the
+    /// same export, so nothing is skipped and the load's own guards decide.
+    #[test]
+    fn a_cdc_run_at_the_prefix_or_beside_a_batch_run_is_the_same_export() {
+        for keyed in [
+            vec![shaped(
+                "exports/t/manifest-c1.json",
+                "c1",
+                "dbo.t",
+                "t",
+                "cdc",
+            )],
+            vec![
+                shaped("exports/t/p=1/manifest-b1.json", "b1", "t", "t", "batch"),
+                shaped("exports/t/p=1/manifest-c1.json", "c1", "dbo.t", "t", "cdc"),
+            ],
+        ] {
+            let n = keyed.len();
+            let (own, note) = own_manifests(
+                keyed,
+                "gs://b/exports/t",
+                "t",
+                crate::load::plan::LoadMode::Full,
+            )
+            .unwrap();
+            assert_eq!(own.len(), n);
+            assert!(note.is_none(), "{note:?}");
+        }
+    }
+
+    /// Another export's runs are not skipped: the shared-prefix guard refuses them.
+    #[test]
+    fn a_nested_run_of_another_export_is_left_for_the_shared_prefix_guard() {
+        let keyed = vec![
+            shaped("exports/t/manifest-b1.json", "b1", "t", "t", "batch"),
+            shaped("exports/t/u/manifest-c1.json", "c1", "dbo.u", "u", "cdc"),
+        ];
+        let (own, note) = own_manifests(
+            keyed,
+            "gs://b/exports/t/",
+            "t",
+            crate::load::plan::LoadMode::Full,
+        )
+        .unwrap();
+        assert_eq!(run_ids(&own), vec!["b1", "c1"]);
+        assert!(note.is_none());
+        let err = ensure_single_export(&own).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_SOURCES_SHARED")
+        );
+    }
+
     fn fs_store(files: &[(&str, Vec<u8>)]) -> (GcsStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         for (rel, bytes) in files {
