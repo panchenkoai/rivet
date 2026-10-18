@@ -383,12 +383,16 @@ def _role_without_create(state_url: str) -> str | None:
     import urllib.parse
     u = urllib.parse.urlsplit(state_url)
     role = f"rivet_nocreate_{os.getpid()}"
-    grant = (f"DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'nocreate'; "
+    # One role per process, re-created per leg: the grants the previous leg gave it are dropped first,
+    # or `DROP ROLE` refuses ("objects depend on it") and every leg after the first has no role.
+    drop = (f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') "
+            f"THEN EXECUTE 'DROP OWNED BY {role}'; END IF; END $$; DROP ROLE IF EXISTS {role};")
+    grant = (f"{drop} CREATE ROLE {role} LOGIN PASSWORD 'nocreate'; "
              f"GRANT USAGE, CREATE ON SCHEMA public TO {role}; "
              f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}; GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role};")
     if not _state_psql(state_url, grant).ok:
         return None
-    atexit.register(lambda: _state_psql(state_url, f"DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"))
+    atexit.register(lambda: _state_psql(state_url, drop))
     return urllib.parse.urlunsplit((u.scheme, f"{role}:nocreate@{u.hostname}:{u.port or 5432}", u.path, u.query, u.fragment))
 
 

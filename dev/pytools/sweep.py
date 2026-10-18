@@ -342,8 +342,9 @@ def _pg_slots(source: str, container: str, db: str | None = "rivet") -> None:
     q = lambda sql: shell.docker_exec(container, *cdc_stand.psql_argv(sql, db=db), timeout=300)  # noqa: E731
     slots = q("SELECT slot_name FROM pg_replication_slots WHERE NOT active")
     dropped, failed = [], []
+    legacy = set(registry.load().get("legacy_slot_names", []))
     for slot in _lines(slots) if slots.ok else []:
-        if registry.orphaned(slot):
+        if registry.orphaned(slot) or slot in legacy:
             lit = slot.replace("'", "''")
             (dropped if q(f"SELECT pg_drop_replication_slot('{lit}')").ok else failed).append(slot)
     if dropped or failed:
