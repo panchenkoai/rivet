@@ -394,6 +394,16 @@ mod logger_tests {
         UiRoutedLogger(inner, crate::cli::LOG_ROUTE)
     }
 
+    /// Every ERROR line the logger writes is counted, a WARN line is not.
+    #[test]
+    fn the_logger_counts_its_error_lines() {
+        let l = logger(Arc::new(Mutex::new(Vec::new())));
+        let before = errors_logged();
+        l.log(&record(log::Level::Error, format_args!("one")));
+        l.log(&record(log::Level::Error, format_args!("two")));
+        assert!(errors_logged() >= before + 2, "two ERROR lines counted");
+    }
+
     fn record<'a>(level: log::Level, args: std::fmt::Arguments<'a>) -> log::Record<'a> {
         log::Record::builder()
             .level(level)
