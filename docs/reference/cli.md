@@ -913,10 +913,16 @@ rivet run --config pilot.yaml
 ### Security
 
 - Passwords are **redacted** from all log and error messages: `postgresql://user:***@host/db`.
-- A `WARN` is emitted when connecting to a non-localhost host **without TLS**. For production use a `sslmode=require` URL:
+- A state URL for a non-loopback host must say how to connect. `?sslmode=require` (or
+  `verify-ca` / `verify-full`) negotiates TLS and needs TLS enabled on the state server;
+  `?sslmode=disable` connects in plaintext, the operator's choice for a private network, with
+  one `WARN` line. A remote URL with neither (or with `prefer` / `allow`, which rivet cannot
+  negotiate) is refused `RIVET_STATE_URL_TLS_REQUIRED`, exit 5, before any connection:
 
 ```bash
 export RIVET_STATE_URL="postgresql://rivet:secret@db.internal/rivet_state?sslmode=require"
+# a private network without TLS on the state server:
+export RIVET_STATE_URL="postgresql://rivet:secret@10.0.0.5/rivet_state?sslmode=disable"
 ```
 
 - The `RIVET_STATE_URL` value is **not** embedded in plan artifacts or config files. It is resolved from the environment at runtime.

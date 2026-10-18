@@ -65,6 +65,35 @@ fn emit_check(checks: &mut Vec<DoctorCheck>, json: bool, mut check: DoctorCheck)
     checks.push(check);
 }
 
+/// Keep the first transient failure's text in `slot`, so the doctor's exit stays retryable.
+fn keep_first_transient(slot: &mut Option<String>, e: &anyhow::Error) {
+    if slot.is_none() && crate::error::retry::classify_error(e).is_transient() {
+        *slot = Some(format!("{e:#}"));
+    }
+}
+
+#[cfg(test)]
+mod transient_tests {
+    #[test]
+    fn the_first_transient_failure_is_kept_and_a_permanent_one_is_not() {
+        let transient = anyhow::anyhow!("connection refused (os error 111)");
+        let permanent = anyhow::anyhow!("permission denied for table orders");
+        let mut slot = None;
+        super::keep_first_transient(&mut slot, &permanent);
+        assert_eq!(slot, None);
+        super::keep_first_transient(&mut slot, &transient);
+        assert!(slot.as_deref().is_some_and(|s| s.contains("refused")));
+        super::keep_first_transient(
+            &mut slot,
+            &anyhow::anyhow!("timed out, then connection reset"),
+        );
+        assert!(
+            slot.as_deref().is_some_and(|s| s.contains("refused")),
+            "the first is kept"
+        );
+    }
+}
+
 pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     if !json {
         println!("rivet doctor: verifying auth for config '{}'", config_path);
@@ -132,10 +161,7 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
         ),
         Err(e) => {
             all_ok = false;
-            if transient_detail.is_none() && crate::error::retry::classify_error(&e).is_transient()
-            {
-                transient_detail = Some(format!("{e:#}"));
-            }
+            keep_first_transient(&mut transient_detail, &e);
             emit_check(
                 &mut checks,
                 json,

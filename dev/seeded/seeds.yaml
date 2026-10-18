@@ -406,6 +406,18 @@ seeds:
       sqlite-state:
         patch: setup-green-over-dead-state/sqlite-state.patch
         cells: ["lib:a_sqlite_probe_names_the_file_and_refuses_what_it_cannot_read"]
+  - name: remote-pg-state-plaintext-refused
+    class: "a PostgreSQL state on a non-loopback host without TLS cannot be used: `?sslmode=disable` in RIVET_STATE_URL is ignored and every command is refused through the source TLS gate (`source.tls`, RIVET_STATE_BACKEND_FAILED, exit 1)"
+    history: "client simulation on 0.32.0, 2026-10-18 (D1): postgres:16 without ssl as the shared state; measured on main 8afde974: both URLs refused RIVET_STATE_BACKEND_FAILED exit 1"
+    scope: state
+    engines:
+      postgres-state:
+        patch: remote-pg-state-plaintext-refused/postgres-state.patch
+        cells:
+          - a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out
+          - "lib:sslmode_disable_is_the_operators_opt_out_on_any_host"
+      sqlite-state:
+        na: "a SQLite state is a file beside the config; it has no connection and no TLS"
 
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape

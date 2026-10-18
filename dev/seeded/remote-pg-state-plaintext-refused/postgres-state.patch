@@ -1,0 +1,13 @@
+diff --git a/src/state/mod.rs b/src/state/mod.rs
+index 75544634..07a8bd48 100644
+--- a/src/state/mod.rs
++++ b/src/state/mod.rs
+@@ -112,7 +112,7 @@ fn url_sslmode(url: &str) -> Option<&str> {
+ 
+ /// Whether the state URL opts out of TLS itself with `sslmode=disable`.
+ fn opts_out_of_tls(url: &str) -> bool {
+-    url_sslmode(url) == Some("disable")
++    url_sslmode(url) == Some("disable") && url.is_empty()
+ }
+ 
+ /// The TLS a state URL asks for: its `sslmode`, an explicit plaintext for `sslmode=disable`,
