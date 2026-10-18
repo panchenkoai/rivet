@@ -397,6 +397,10 @@ mod logger_tests {
     /// Every ERROR line the logger writes is counted, a WARN line is not.
     #[test]
     fn the_logger_counts_its_error_lines() {
+        // Logs through the routed logger, so it must not run while another test owns the in-process tx.
+        let _serial = crate::pipeline::parent_ui::retry_counter_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let l = logger(Arc::new(Mutex::new(Vec::new())));
         let before = errors_logged();
         l.log(&record(log::Level::Error, format_args!("one")));
