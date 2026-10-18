@@ -614,19 +614,37 @@ fn a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out
     ))
     .expect("seed");
     let _t = crate::common::PgTable::adopt(tbl.clone());
-    let rig = crate::common::Rig::pg_batch(&tbl);
-
-    let refused = rig.run_args_env(&[], &[("RIVET_STATE_URL", remote.as_str())]);
-    let stderr = String::from_utf8_lossy(&refused.stderr);
-    assert_eq!(refused.status.code(), Some(5), "{stderr}");
-    assert!(stderr.contains("RIVET_STATE_URL_TLS_REQUIRED"), "{stderr}");
-    assert!(
-        stderr.contains("?sslmode=require") && stderr.contains("?sslmode=disable"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("source.tls"), "{stderr}");
+    let mut rig = crate::common::Rig::pg_batch(&tbl);
 
     let sep = if remote.contains('?') { '&' } else { '?' };
+    let plaintext = format!("{remote}{sep}sslmode=disable");
+    let prefer = format!("{remote}{sep}sslmode=prefer");
+    let want = crate::common::Refused::by_code("RIVET_STATE_URL_TLS_REQUIRED", 5);
+    let text = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[("RIVET_STATE_URL", remote.as_str())],
+        want,
+        vec![
+            crate::common::Remedy::wrong(
+                "adds `?sslmode=prefer`, which rivet cannot negotiate",
+                crate::common::Then::Refuses(want),
+                |_| {},
+            )
+            .rerun_env(&[("RIVET_STATE_URL", prefer.as_str())]),
+            crate::common::Remedy::new(
+                "`?sslmode=disable` to accept plaintext on a private network",
+                crate::common::Then::DeliversTheSource,
+                |_| {},
+            )
+            .rerun_env(&[("RIVET_STATE_URL", plaintext.as_str())]),
+        ],
+    );
+    assert!(
+        text.contains("?sslmode=require") && text.contains("?sslmode=disable"),
+        "{text}"
+    );
+    assert!(!text.contains("source.tls"), "{text}");
+
     let loopback = format!("{url}{sep}sslmode=disable");
     let ran = rig.run_args_env(&[], &[("RIVET_STATE_URL", loopback.as_str())]);
     let stderr = String::from_utf8_lossy(&ran.stderr);
@@ -636,7 +654,6 @@ fn a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out
         "a loopback state is not remote: {stderr}"
     );
 
-    let plaintext = format!("{remote}{sep}sslmode=disable");
     let ran = rig.run_args_env(&[], &[("RIVET_STATE_URL", plaintext.as_str())]);
     let stderr = String::from_utf8_lossy(&ran.stderr);
     assert!(ran.status.success(), "{stderr}");
