@@ -630,13 +630,15 @@ fn a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out
                 crate::common::Then::Refuses(want),
                 |_| {},
             )
-            .rerun_env(&[("RIVET_STATE_URL", prefer.as_str())]),
+            .rerun_env(&[("RIVET_STATE_URL", prefer.as_str())])
+            .in_place(),
             crate::common::Remedy::new(
-                "`?sslmode=disable` to accept plaintext on a private network",
+                "to accept plaintext on a private network",
                 crate::common::Then::DeliversTheSource,
                 |_| {},
             )
-            .rerun_env(&[("RIVET_STATE_URL", plaintext.as_str())]),
+            .rerun_env(&[("RIVET_STATE_URL", plaintext.as_str())])
+            .in_place(),
         ],
     );
     assert!(
