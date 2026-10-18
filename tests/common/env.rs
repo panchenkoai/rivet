@@ -96,6 +96,12 @@ pub const MSSQL_GOVERNOR_URL: &str = "sqlserver://sa:Rivet_Passw0rd!@127.0.0.1:1
 /// Backend forwards to the same `mysql` service used by `MYSQL_URL`.
 pub const PROXYSQL_URL: &str = "mysql://rivet:rivet@127.0.0.1:6033/rivet";
 
+/// MySQL whose server time zone is `+03:00` (`mysql-tz`, :3397). Opt in: `docker compose --profile tz up -d proxysql-tz`.
+pub const MYSQL_TZ_URL: &str = "mysql://rivet:rivet@127.0.0.1:3397/rivet";
+
+/// ProxySQL in front of `mysql-tz` that answers every `SET time_zone` with OK and never forwards it (`proxysql-tz`, :6097).
+pub const PROXYSQL_TZ_URL: &str = "mysql://rivet:rivet@127.0.0.1:6097/rivet";
+
 /// Standalone Mongo (`mongo` service :27017) routed through Toxiproxy on :27019 —
 /// for retry / fault-injection tests. Seed via the direct :27017 driver
 /// (`MongoTest::connect(27017, …)`); point rivet at this URL so its reads cross
@@ -379,6 +385,10 @@ pub enum LiveService {
     Toxiproxy,
     PgBouncer,
     ProxySql,
+    /// MySQL at server time zone `+03:00`. TCP :3397.
+    MysqlTz,
+    /// ProxySQL dropping `SET time_zone` in front of `mysql-tz`. TCP :6097.
+    ProxySqlTz,
     /// ADR-0014 Parquet validator: `python:3.12-slim + duckdb`. No TCP port —
     /// probed via `docker inspect` health.
     DuckDb,
@@ -453,6 +463,16 @@ impl LiveService {
                 "127.0.0.1",
                 6033,
                 "service `proxysql` — run: docker compose --profile pool up -d proxysql",
+            ),
+            LiveService::MysqlTz => (
+                "127.0.0.1",
+                3397,
+                "service `mysql-tz` — run: docker compose --profile tz up -d mysql-tz",
+            ),
+            LiveService::ProxySqlTz => (
+                "127.0.0.1",
+                6097,
+                "service `proxysql-tz` — run: docker compose --profile tz up -d proxysql-tz",
             ),
             LiveService::ClickHouse => (
                 "127.0.0.1",

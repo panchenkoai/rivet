@@ -784,6 +784,11 @@ pub mod codes {
         "RIVET_STATE_URL_TLS_REQUIRED",
         "add `?sslmode=require` (or `verify-ca` / `verify-full`) to `RIVET_STATE_URL` with TLS enabled on the state server, or `?sslmode=disable` to accept plaintext on a private network",
     );
+    /// A MySQL session that is not at UTC after rivet set it, so every TIMESTAMP would land shifted.
+    pub const SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: Code = refusal(
+        "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED",
+        "set `default_time_zone = '+00:00'` on the MySQL server, keep rivet's session variables on one backend in the proxy (ProxySQL: session-variable tracking, no multiplexing for rivet's user), or connect directly",
+    );
     /// `RIVET_STATE_URL` set to something that is not a PostgreSQL URL.
     pub const STATE_URL_SCHEME_UNSUPPORTED: Code = usage(
         "RIVET_STATE_URL_SCHEME_UNSUPPORTED",
@@ -1626,6 +1631,7 @@ pub mod codes {
         SOURCE_COLUMNS_CHANGED_UNDER_READ,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_URL_SCHEME_UNSUPPORTED,
+        SOURCE_SESSION_TIME_ZONE_NOT_APPLIED,
         CLI_CHECK_REPORTED_ERRORS,
         STATE_URL_TLS_REQUIRED,
         STATE_NOT_WRITABLE,
