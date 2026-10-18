@@ -1598,7 +1598,11 @@ def _snowflake_env() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
-        return _self_test()
+        import tempfile
+        from ..pytools import evidence
+        with tempfile.TemporaryDirectory() as d:
+            evidence.LEDGER = Path(d, "last-green.yaml")  # fixture cells never reach the real ledger
+            return _self_test()
     ns = parse_args(argv)
     from .core import scrub_inherited_rivet_env
     dropped = scrub_inherited_rivet_env()
