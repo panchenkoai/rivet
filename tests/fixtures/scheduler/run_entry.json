@@ -10,6 +10,7 @@
   "duration_ms": 4200,
   "mode": "cdc",
   "error_message": null,
+  "skip_reason": null,
   "error": null,
   "stop_reason": "max_events",
   "tables": [

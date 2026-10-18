@@ -1441,6 +1441,22 @@ seeds:
         na: "the session-time-zone guard is MySQL's; MongoDB dates are UTC instants"
       oracle:
         na: "the session-time-zone guard is MySQL's; rivet sets no session zone on Oracle"
+  - name: summary-skip-reason-dropped
+    class: "the run summary's `per_export[]` entry of a `skip_empty` run says `skipped` without the reason the metrics row and the console card carry"
+    history: "0.32.1 item 6, 2026-10-18: measured on main 935064e8: `--summary-output` entry `\"status\":\"skipped\"`, `skip_reason` absent (read as null) on the sequential and the process runner"
+    scope: source
+    patch: summary-skip-reason-dropped/shared.patch
+    engines:
+      postgres:
+        cells: [a_skipped_entry_of_the_run_summary_says_why, "lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      mysql:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      mssql:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      mongo:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
+      oracle:
+        cells: ["lib:a_skipped_entry_carries_the_reason_the_run_skipped"]
   - name: init-cdc-shares-batch-name
     class: "`rivet init` names a table's CDC export like its batch export and nests the CDC prefix (`exports/<t>/cdc/`) inside the batch one, so the two share a load spec and a batch load lists the stream's runs"
     history: "0.32.1 item 2, 2026-10-18: measured on main 935064e8 with SQL Server init (batch, then --mode cdc): `name: ab2_mssql_cdc_new` twice, `exports/ab2_mssql_cdc_new/` and `exports/ab2_mssql_cdc_new/cdc/`"
