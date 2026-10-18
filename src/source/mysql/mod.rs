@@ -443,6 +443,60 @@ fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
 /// so that SET errors — and `time_zone`, already set, would leak). Arming the
 /// reset on `Drop` closes both: whatever exit path the export takes, the
 /// connection is clean before it returns to the pool.
+/// The session's `time_zone` and its offset from UTC in seconds, read on the connection that reads the rows.
+const SESSION_UTC_OFFSET: &str =
+    "SELECT @@session.time_zone, TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6))";
+
+/// Refuse a session whose clock is not UTC after rivet set `time_zone = '+00:00'`.
+///
+/// Every TIMESTAMP is read in the session time zone and written as UTC, so a SET that did not
+/// reach the backend that reads (a proxy that answered it without forwarding, or routed the read
+/// elsewhere) shifts every value by the server's offset with exit 0. Only the offset decides: a
+/// server already in UTC reads right whatever the session says.
+fn refuse_a_session_off_utc(zone: &str, offset_s: i64) -> Result<()> {
+    if offset_s == 0 {
+        return Ok(());
+    }
+    let hours = offset_s as f64 / 3600.0;
+    crate::rivet_bail!(
+        crate::error::codes::SOURCE_SESSION_TIME_ZONE_NOT_APPLIED,
+        "mysql: after `SET time_zone = '+00:00'` the session that reads is at `{zone}`, \
+         {hours:+} h from UTC: the SET did not reach the backend connection (a proxy such as \
+         ProxySQL answered it without forwarding it, or sent the read to another backend), so \
+         every TIMESTAMP would be written {hours:+} h off as UTC. Nothing was read. Set \
+         `default_time_zone = '+00:00'` on the server, let the proxy keep rivet's session \
+         variables on one backend (ProxySQL: session-variable tracking, no multiplexing for \
+         rivet's user), or connect rivet to MySQL directly."
+    )
+}
+
+#[cfg(test)]
+mod session_time_zone_tests {
+    #[test]
+    fn a_session_off_utc_is_refused_by_code_and_a_utc_one_reads() {
+        super::refuse_a_session_off_utc("+00:00", 0).unwrap();
+        super::refuse_a_session_off_utc("SYSTEM", 0).unwrap();
+        for (zone, offset, hours) in [
+            ("SYSTEM", 10_800, "+3 h"),
+            ("+03:00", 10_800, "+3 h"),
+            ("-05:30", -19_800, "-5.5 h"),
+        ] {
+            let err = super::refuse_a_session_off_utc(zone, offset).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED")
+            );
+            assert_eq!(crate::error::classify_exit(&err), 5);
+            let text = format!("{err:#}");
+            assert!(text.contains(hours), "{text}");
+            assert!(
+                text.contains(zone) && text.contains("default_time_zone"),
+                "{text}"
+            );
+        }
+    }
+}
+
 struct MysqlSessionGuard<'a> {
     conn: &'a mut mysql::PooledConn,
     reset_max_exec: bool,
@@ -475,6 +529,11 @@ impl<'a> MysqlSessionGuard<'a> {
                 .query_drop(format!("SET SESSION max_execution_time = {ms}"))?;
             guard.reset_max_exec = true;
         }
+        let (zone, offset_s): (String, i64) = guard
+            .conn
+            .query_first(SESSION_UTC_OFFSET)?
+            .unwrap_or_else(|| (String::new(), 0));
+        refuse_a_session_off_utc(&zone, offset_s)?;
         Ok(guard)
     }
 

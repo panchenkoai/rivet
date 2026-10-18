@@ -1495,7 +1495,7 @@ jobs:
           # quiet-window lock. On the shared instance the two canaries failed in
           # OPPOSITE directions and both blamed the product for the schedule; they were
           # the dominant E2E flake through 2026-08-16/17.
-          ( docker compose --profile pool --profile cdc --profile replica --profile governor up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer pgbouncer-state proxysql postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
+          ( docker compose --profile pool --profile cdc --profile replica --profile governor --profile tz up -d postgres postgres-state mysql mssql mssql-governor minio fake-gcs azurite toxiproxy pgbouncer pgbouncer-state proxysql mysql-tz proxysql-tz postgres-cdc mysql-cdc mssql-cdc mysql-primary mysql-replica mysql-replica-nolog duckdb clickhouse oracle > "$RUNNER_TEMP/compose.log" 2>&1; echo $? > "$RUNNER_TEMP/compose.rc" ) &
 
       - uses: dtolnay/rust-toolchain@master
         if: ${{ matrix.leg == 'pre' }}
@@ -1567,6 +1567,8 @@ jobs:
           # 6033 is the client-facing MySQL protocol port; 6032 admin comes
           # up first but we wait for 6033 so backend wiring is in place.
           for i in $(seq 1 30); do (exec 3<>/dev/tcp/127.0.0.1/6033) 2>/dev/null && break || sleep 1; done
+          echo "Waiting for ProxySQL in front of the +03:00 MySQL (mysql-tz, D5)..."
+          for i in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/6097) 2>/dev/null && break || sleep 1; done
           echo "Waiting for Azurite..."
           # Blob emulator on :10000 — the live_azure_multipart suite lists/reads
           # blobs over HTTP and creates its container via the (preinstalled) az CLI.

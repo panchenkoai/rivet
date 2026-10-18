@@ -527,3 +527,99 @@ fn mysql_proxysql_session_vars_clean_after_failed_export() {
         "max_execution_time leaked through ProxySQL after failed export: got {timeout}"
     );
 }
+
+// ─── D5: a session time zone the proxy dropped is refused, never shifted ─────────
+
+/// A fresh `(id, t TIMESTAMP(6))` table on `mysql-tz` holding one row written at the server's
+/// `+03:00`: `2026-01-01 12:00:00` there is `2026-01-01T09:00:00Z`.
+fn tz_table(prefix: &str) -> (String, TzTable) {
+    let mut c = mysql::Pool::new(MYSQL_TZ_URL)
+        .expect("mysql-tz pool")
+        .get_conn()
+        .expect("mysql-tz conn");
+    let tbl = unique_name(prefix);
+    mysql::prelude::Queryable::query_drop(&mut c, format!(
+        "DROP TABLE IF EXISTS {tbl}; CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, t TIMESTAMP(6)); \
+         INSERT INTO {tbl} VALUES (1, '2026-01-01 12:00:00')"
+    ))
+    .expect("seed");
+    (tbl.clone(), TzTable(tbl))
+}
+
+/// Drops a `mysql-tz` table.
+struct TzTable(String);
+impl Drop for TzTable {
+    fn drop(&mut self) {
+        if let Ok(mut c) = mysql::Pool::new(MYSQL_TZ_URL).and_then(|p| p.get_conn()) {
+            let _ = mysql::prelude::Queryable::query_drop(
+                &mut c,
+                format!("DROP TABLE IF EXISTS {}", self.0),
+            );
+        }
+    }
+}
+
+/// The one value of the exported CSV's `t` column.
+fn exported_t(rig: &Rig) -> String {
+    let csv = files_under(&rig.out_dir())
+        .into_iter()
+        .find(|p| p.extension().is_some_and(|e| e == "csv"))
+        .expect("a CSV part");
+    let text = std::fs::read_to_string(csv).unwrap();
+    text.lines()
+        .nth(1)
+        .expect("one row")
+        .split(',')
+        .nth(1)
+        .unwrap()
+        .to_string()
+}
+
+/// Through a proxy that answers `SET time_zone` without forwarding it, the read session stays at
+/// the server's `+03:00`: the run is refused by code, exit 5, before a row is read. Before the
+/// fix it exported `12:00:00Z` for `09:00:00Z`, exit 0.
+#[test]
+#[ignore = "live: requires docker compose --profile tz proxysql-tz"]
+fn a_session_time_zone_the_proxy_dropped_is_refused_before_a_row_is_read() {
+    require_alive(LiveService::ProxySqlTz);
+    let (tbl, _t) = tz_table("rivet_tz_proxy");
+    let mut rig = Rig::mysql_batch(&tbl)
+        .source_url(PROXYSQL_TZ_URL)
+        .with_format("csv");
+    let want = Refused::by_code("RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED", 5);
+    let text = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        want,
+        vec![
+            Remedy::wrong(
+                "runs the export again through the same proxy",
+                Then::Refuses(want),
+                |_| {},
+            ),
+            Remedy::new(
+                "connect rivet to MySQL directly",
+                Then::DeliversTheSource,
+                |r| r.rebuilt(|b| b.source_url(MYSQL_TZ_URL)),
+            ),
+        ],
+    );
+    assert!(
+        text.contains("+3 h"),
+        "the refusal names the offset: {text}"
+    );
+}
+
+/// Straight to the `+03:00` server the SET is honoured: the guard passes and the value is the
+/// source's instant in UTC.
+#[test]
+#[ignore = "live: requires docker compose --profile tz mysql-tz"]
+fn a_server_in_another_time_zone_reads_its_timestamps_as_utc_when_the_set_is_honoured() {
+    require_alive(LiveService::MysqlTz);
+    let (tbl, _t) = tz_table("rivet_tz_direct");
+    let rig = Rig::mysql_batch(&tbl)
+        .source_url(MYSQL_TZ_URL)
+        .with_format("csv");
+    rig.run_ok();
+    assert_eq!(exported_t(&rig), "2026-01-01T09:00:00.000000Z");
+}

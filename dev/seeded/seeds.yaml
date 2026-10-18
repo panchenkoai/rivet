@@ -1434,6 +1434,24 @@ seeds:
       lib:
         cells: ["lib:a_batch_load_skips_the_runs_of_a_cdc_export_nested_in_its_prefix_and_says_so"]
 
+  - name: mysql-session-off-utc-read
+    class: "a MySQL read whose session is still at the server's time zone after rivet's `SET time_zone = '+00:00'` (a proxy dropped or rerouted the SET) writes every TIMESTAMP shifted by the offset, exit 0"
+    history: "0.32.1 D5, 2026-10-18: a pilot's ProxySQL in front of a Europe/Moscow MySQL; measured on main 51a1b69c through proxysql-tz (a rule answering `SET time_zone` with OK): `2026-01-01T12:00:00Z` exported for `09:00:00Z`, exit 0. ProxySQL 2.5.5 with no rule forwards the SET and logs `Unable to parse unknown SET query ... Setting lock_hostgroup` for rivet's reset `SET time_zone = @@global.time_zone`"
+    scope: source
+    patch: mysql-session-off-utc-read/mysql.patch
+    engines:
+      mysql:
+        cells:
+          - a_session_time_zone_the_proxy_dropped_is_refused_before_a_row_is_read
+          - "lib:a_session_off_utc_is_refused_by_code_and_a_utc_one_reads"
+      postgres:
+        na: "the session-time-zone guard is MySQL's; PostgreSQL reads no TIMESTAMP through a session SET"
+      mssql:
+        na: "the session-time-zone guard is MySQL's; SQL Server's datetime types carry no session time zone"
+      mongo:
+        na: "the session-time-zone guard is MySQL's; MongoDB dates are UTC instants"
+      oracle:
+        na: "the session-time-zone guard is MySQL's; rivet sets no session zone on Oracle"
   - name: summary-skip-reason-dropped
     class: "the run summary's `per_export[]` entry of a `skip_empty` run says `skipped` without the reason the metrics row and the console card carry"
     history: "0.32.1 item 6, 2026-10-18: measured on main 935064e8: `--summary-output` entry `\"status\":\"skipped\"`, `skip_reason` absent (read as null) on the sequential and the process runner"
