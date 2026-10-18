@@ -2226,7 +2226,6 @@ fn mssql_nested_cell(shape: impl Fn(Rig) -> Rig) {
     require_alive(LiveService::ClickHouse);
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
-    let _serial = cross_process_serial("mssql_cdc");
     let (table, ci, _guard) = mssql_nested_table("rivet_ch_nest");
     let source = || {
         pairs(
@@ -2254,12 +2253,14 @@ fn mssql_nested_cell(shape: impl Fn(Rig) -> Rig) {
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + mssql-cdc with SQL Server Agent"]
 fn a_full_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
     mssql_nested_cell(|r| r.mode("full"));
 }
 
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + mssql-cdc with SQL Server Agent"]
 fn an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
     mssql_nested_cell(|r| r.mode("incremental").export_line("cursor_column: id"));
 }
 
