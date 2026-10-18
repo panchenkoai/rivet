@@ -2150,3 +2150,187 @@ fn a_range_refusal_claims_nothing_so_a_table_made_after_it_stays_foreign() {
         "the foreign table keeps its row"
     );
 }
+
+/// A batch export and a CDC export of one table under one export name, the CDC prefix nested
+/// inside the batch one (the layout `rivet init` writes). The stream's run is the newest
+/// manifest under the batch prefix when the batch load runs: each load lands only its own
+/// rows, and the batch load names the CDC runs it skipped. `change` deletes id 2 and inserts
+/// id 6 and returns once the stream can read them.
+fn nested_cdc_prefix_cell(
+    table: &str,
+    batch: Rig,
+    cdc: Rig,
+    source: &dyn Fn() -> Vec<(i64, i64)>,
+    change: &dyn Fn(),
+) {
+    let prefix = unique_name("chnest");
+    let batch_db = Db::new("rivet_chtest");
+    let cdc_db = Db::new("rivet_chtest");
+    let batch = batch_into_clickhouse(batch.export_named(table), &batch_db).dest_gcs(
+        BUCKET,
+        &format!("{prefix}/"),
+        FAKE_GCS_ENDPOINT,
+    );
+    let cdc = into_clickhouse(cdc.export_named(table), &cdc_db).dest_gcs(
+        BUCKET,
+        &format!("{prefix}/{table}/cdc/"),
+        FAKE_GCS_ENDPOINT,
+    );
+
+    cdc.run_ok();
+    change();
+    batch.run_ok();
+    let snapshot = source();
+    cdc.run_ok();
+
+    let out = batch.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "batch load: {stderr}");
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{table} ORDER BY id FORMAT TSV",
+            batch_db.0
+        )),
+        snapshot,
+        "the batch table holds the batch run, not the CDC stream"
+    );
+    assert!(
+        stderr.contains("skipped the CDC runs under") && stderr.contains("/cdc/"),
+        "the batch load names the CDC runs it skipped: {stderr}"
+    );
+    load(&cdc);
+    clickhouse_rows_match_source(&format!("{}.{table}", cdc_db.0), source(), "2");
+}
+
+/// A SQL Server table on the CDC stand, CDC-enabled, holding ids `1..=5`.
+fn mssql_nested_table(prefix: &str) -> (String, String, MssqlCdcTable) {
+    let table = unique_name(prefix);
+    let ci = format!("dbo_{table}");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v BIGINT)"
+    ));
+    enable_cdc(&table, &ci);
+    let guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    mssql_cdc_exec(&format!(
+        "INSERT INTO dbo.{table} VALUES (1,1),(2,2),(3,3),(4,4),(5,5)"
+    ));
+    wait_for_capture(&ci, 5);
+    (table, ci, guard)
+}
+
+fn mssql_nested_cell(shape: impl Fn(Rig) -> Rig) {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let _serial = cross_process_serial("mssql_cdc");
+    let (table, ci, _guard) = mssql_nested_table("rivet_ch_nest");
+    let source = || {
+        pairs(
+            &mssql_cdc_query_strings(&format!(
+                "SELECT CONCAT(id, CHAR(9), v) FROM dbo.{table} ORDER BY id"
+            ))
+            .join("\n"),
+        )
+    };
+    let change = || {
+        mssql_cdc_exec(&format!(
+            "DELETE FROM dbo.{table} WHERE id = 2; INSERT INTO dbo.{table} VALUES (6,6)"
+        ));
+        wait_for_capture(&ci, 7);
+    };
+    nested_cdc_prefix_cell(
+        &table,
+        shape(Rig::mssql_batch(&table).source_url(MSSQL_CDC_URL)),
+        Rig::mssql_cdc(&table, &ci),
+        &source,
+        &change,
+    );
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mssql-cdc with SQL Server Agent"]
+fn a_full_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mssql() {
+    mssql_nested_cell(|r| r.mode("full"));
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mssql-cdc with SQL Server Agent"]
+fn an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mssql() {
+    mssql_nested_cell(|r| r.mode("incremental").export_line("cursor_column: id"));
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_mysql() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _guard) = seeded("rivet_ch_nest", 5);
+    let change = || {
+        conn()
+            .query_drop(format!(
+                "DELETE FROM {tbl} WHERE id = 2; INSERT INTO {tbl} (id, v) VALUES (6, 6)"
+            ))
+            .expect("changes");
+    };
+    nested_cdc_prefix_cell(
+        &tbl,
+        Rig::mysql_batch(&tbl)
+            .source_url(MYSQL_CDC_URL)
+            .mode("incremental")
+            .export_line("cursor_column: id"),
+        Rig::mysql_cdc(&tbl),
+        &|| source_rows(&tbl),
+        &change,
+    );
+}
+
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres-cdc"]
+fn an_incremental_load_under_a_nested_cdc_prefix_takes_only_its_own_manifests_postgres() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let tbl = unique_name("rivet_ch_nest");
+    let slot = unique_name("rivet_ch_slot");
+    let _slot = Slot::new(slot.clone());
+    let c = std::cell::RefCell::new(
+        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg"),
+    );
+    c.borrow_mut()
+        .batch_execute(&format!(
+            "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT); \
+             INSERT INTO {tbl} SELECT g, g FROM generate_series(1, 5) g"
+        ))
+        .expect("seed");
+    let _tbl = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let source = || -> Vec<(i64, i64)> {
+        c.borrow_mut()
+            .query(&format!("SELECT id, v FROM {tbl} ORDER BY id"), &[])
+            .expect("read source")
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect()
+    };
+    let change = || {
+        c.borrow_mut()
+            .batch_execute(&format!(
+                "DELETE FROM {tbl} WHERE id = 2; INSERT INTO {tbl} VALUES (6, 6)"
+            ))
+            .expect("changes");
+    };
+    nested_cdc_prefix_cell(
+        &tbl,
+        Rig::pg_batch(&tbl)
+            .source_url(POSTGRES_CDC_URL)
+            .mode("incremental")
+            .export_line("cursor_column: id"),
+        Rig::pg_cdc(&tbl, &slot),
+        &source,
+        &change,
+    );
+}
