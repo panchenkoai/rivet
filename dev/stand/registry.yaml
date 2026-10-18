@@ -5,6 +5,9 @@
 # Objects a test creates carry this suffix (tests/common::unique_name): `<prefix>_<pid>_<n>`.
 # The sweep drops one only when <pid> is no longer a running process.
 test_object_suffix: '_([0-9]+)_[0-9]+$'
+# Replication slots older trees named without a pid (v0.31.0's tests/harness/mod.rs): no owner to check,
+# so the sweep drops them when inactive. One pinned 1.7 GB of WAL on the CDC stand (2026-10-17).
+legacy_slot_names: [rivet_matrix_soak]
 
 sources:
   postgres:     {container: rivet-postgres-1,     url: "postgresql://rivet:rivet@127.0.0.1:5432/rivet"}

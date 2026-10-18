@@ -269,6 +269,11 @@ def _flags_for(cell_ix: int, pipeline: str, lifecycle: str, store: str) -> dict[
             f["apply:second"] = ["--force"]
         if store == "local" and _rot(seed + "pep", 4) == 0:
             f["apply"] = f["apply"] + ["--parallel-export-processes"]
+        # apply's run summary (#623): written to the cell's work dir on every cell (the
+        # executor fills SUMMARY in, as for run) and printed on a third of them.
+        f["apply"] = f["apply"] + ["--summary-output", "SUMMARY"]
+        if _rot(seed + "ajson", 3) == 0:
+            f["apply"] += ["--json"]
         # The reconcile leg is a `rivet run`, so it is where the batch chain
         # carries the rest of run's surface. `--force` and `--resume` are
         # mutually exclusive in meaning (redo everything vs continue), so they
@@ -912,9 +917,11 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
                 return
             crash_note = f"crashed at {hook} (exit={c.returncode}, {len(left)} part(s) left) → "
 
-        p = rivet("apply", str(plan), *cell.flags.get("apply", []),
+        summary = work / "apply-summary.json"
+        p = rivet("apply", str(plan),
+                  *[str(summary) if a == "SUMMARY" else a for a in cell.flags.get("apply", [])],
                   env=env, timeout=scenarios.NO_TIMEOUT)
-        applied = p.ok
+        applied = p.ok and summary.is_file()
         wave_only = SEALED_PLAN_IGNORES & set(cell.flags.get("apply", []))
         if applied and wave_only and SEALED_PLAN_WARNING not in p.out:
             _stage(led, cell, tag, "apply", False,
@@ -931,7 +938,8 @@ def _run_chain(led: Ledger, cell: Cell, url: str, state_url: str, work: Path,
             p2 = rivet("apply", str(plan), *cell.flags.get("apply:second", []),
                        env=env, timeout=scenarios.NO_TIMEOUT)
             applied = p2.ok
-        if not _stage(led, cell, tag, "apply", applied, f"{crash_note}exit={p.returncode} {_why(p) if not applied else ''}"):
+        if not _stage(led, cell, tag, "apply", applied,
+                      f"{crash_note}exit={p.returncode} summary={summary.is_file()} {_why(p) if not applied else ''}"):
             _unreached(led, cell, tag, "apply")
             return
         # Console-surface: the run summary's read/write byte lines (batch apply).

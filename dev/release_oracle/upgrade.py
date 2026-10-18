@@ -57,6 +57,7 @@ from __future__ import annotations
 from contextlib import ExitStack, closing
 import glob
 import json
+import itertools
 import os
 import re
 import shutil
@@ -377,18 +378,26 @@ def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, st
         _sql(engine, url, f"DROP TABLE IF EXISTS {table};")
 
 
+_ROLE_SEQ = itertools.count()
+
+
 def _role_without_create(state_url: str) -> str | None:
     """A URL to the state database as a login role with every right on `public` and its tables and no CREATE on the database (the copy's CREATE SCHEMA is denied); dropped at exit."""
     import atexit
     import urllib.parse
     u = urllib.parse.urlsplit(state_url)
-    role = f"rivet_nocreate_{os.getpid()}"
-    grant = (f"DROP ROLE IF EXISTS {role}; CREATE ROLE {role} LOGIN PASSWORD 'nocreate'; "
+    # One role per LEG: a role is cluster-wide and every leg runs on its own isolated database, so a
+    # role the previous leg granted rights in cannot be dropped from this one ("objects depend on it")
+    # and every leg after the first had no role. `drop` also clears a same-database leftover.
+    role = f"rivet_nocreate_{os.getpid()}_{next(_ROLE_SEQ)}"
+    drop = (f"DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') "
+            f"THEN EXECUTE 'DROP OWNED BY {role}'; END IF; END $$; DROP ROLE IF EXISTS {role};")
+    grant = (f"{drop} CREATE ROLE {role} LOGIN PASSWORD 'nocreate'; "
              f"GRANT USAGE, CREATE ON SCHEMA public TO {role}; "
              f"GRANT ALL ON ALL TABLES IN SCHEMA public TO {role}; GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO {role};")
     if not _state_psql(state_url, grant).ok:
         return None
-    atexit.register(lambda: _state_psql(state_url, f"DROP OWNED BY {role}; DROP ROLE IF EXISTS {role};"))
+    atexit.register(lambda: _state_psql(state_url, drop))
     return urllib.parse.urlunsplit((u.scheme, f"{role}:nocreate@{u.hostname}:{u.port or 5432}", u.path, u.query, u.fragment))
 
 
