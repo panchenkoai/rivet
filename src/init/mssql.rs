@@ -39,7 +39,7 @@ pub(super) fn connect(url: &str, tls: Option<&crate::config::TlsConfig>) -> Resu
     MssqlSource::connect_with_tls(url, tls)
 }
 
-/// Base tables and views in a SQL Server schema (`information_schema.TABLES`).
+/// Base tables and views in a SQL Server schema (`information_schema.TABLES`), without the system objects SQL Server ships (`IsMSShipped`, e.g. `dbo.systranschemas` of a CDC database).
 ///
 /// `TABLE_CATALOG` is the connection's database (from the URL), so no catalog
 /// filter is needed; `schema` filters `TABLE_SCHEMA` (default `dbo`). Names are
@@ -49,7 +49,8 @@ pub(super) fn list_tables(conn: &mut MssqlSource, schema: &str) -> Result<Vec<St
     let sql = format!(
         "SELECT STRING_AGG(CONVERT(nvarchar(max), TABLE_NAME), CHAR(30)) WITHIN GROUP (ORDER BY TABLE_NAME) \
          FROM information_schema.TABLES \
-         WHERE TABLE_SCHEMA = N'{}' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW')",
+         WHERE TABLE_SCHEMA = N'{}' AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
+         AND OBJECTPROPERTY(OBJECT_ID(QUOTENAME(TABLE_SCHEMA) + '.' + QUOTENAME(TABLE_NAME)), 'IsMSShipped') = 0",
         schema.replace('\'', "''"),
     );
     let names = conn

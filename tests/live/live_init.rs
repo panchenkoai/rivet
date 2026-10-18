@@ -414,3 +414,69 @@ fn init_mongo_refuses_a_forced_mode_mongo_cannot_run() {
     let yaml = std::fs::read_to_string(&path).unwrap();
     assert!(yaml.contains("    mode: full\n"), "{yaml}");
 }
+
+// ─── I10: SQL Server init leaves the system tables out; a reader without server grants runs quietly ──
+
+/// A database with CDC enabled holds `dbo.systranschemas`, a system table SQL Server ships and marks
+/// `is_ms_shipped`; a schema-wide init scaffolded it as an export (0.32.0 and earlier).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn init_mssql_schema_wide_leaves_out_the_tables_sql_server_ships() {
+    mssql_cdc_exec(
+        "IF NOT EXISTS(SELECT 1 FROM sys.databases WHERE name='rivet' AND is_cdc_enabled=1) \
+         EXEC sys.sp_cdc_enable_db;",
+    );
+    assert_eq!(
+        mssql_cdc_query_i64(
+            "SELECT COUNT(*) FROM sys.tables WHERE name = 'systranschemas' AND is_ms_shipped = 1"
+        ),
+        1,
+        "fixture: the CDC database holds the shipped dbo.systranschemas"
+    );
+    let out = run_rivet(&["init", "--source", MSSQL_CDC_URL]);
+    let yaml = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(yaml.contains("  - name: "), "{yaml}");
+    assert!(
+        !yaml.contains("systranschemas"),
+        "a shipped system table became an export:\n{yaml}"
+    );
+}
+
+/// A login without `VIEW SERVER PERFORMANCE STATE` / `VIEW SERVER STATE` reads its table; the run
+/// skips the server counters without sending the query the server denies, so the driver logs no
+/// `permission was denied` ERROR line per sample (0.32.0 and earlier logged two per run).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn a_sql_server_reader_without_server_grants_runs_without_permission_errors() {
+    mssql_cdc_exec(
+        "IF NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE name = N'rivet_lowpriv') \
+           CREATE LOGIN rivet_lowpriv WITH PASSWORD = N'Low_Passw0rd!', CHECK_POLICY = OFF; \
+         IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'rivet_lowpriv') \
+           CREATE USER rivet_lowpriv FOR LOGIN rivet_lowpriv; \
+         ALTER ROLE db_datareader ADD MEMBER rivet_lowpriv;",
+    );
+    let table = unique_name("rivet_lowpriv_read");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY, v BIGINT); \
+         INSERT INTO dbo.{table} VALUES (1,1),(2,2),(3,3)"
+    ));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: String::new(),
+    };
+    let rig = Rig::mssql_batch(&table)
+        .source_url("sqlserver://rivet_lowpriv:Low_Passw0rd!@127.0.0.1:1434/rivet");
+    let out = rig.run_args(&[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("permission was denied"),
+        "a denied server counter was queried: {stderr}"
+    );
+}

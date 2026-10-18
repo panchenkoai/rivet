@@ -452,19 +452,28 @@ fn export_segment(info: &TableInfo, source_type: &str) -> String {
 }
 
 /// `exports/<table>/` in the bucket, or `exports/<schema>__<table>/` for
-/// non-`public` PostgreSQL. CDC scaffolds get `exports/<table>/cdc/` — a batch
-/// and a CDC export of the SAME table would otherwise share a prefix and
-/// clobber each other's `manifest.json`/`_SUCCESS` (finding #44: the batch
-/// manifest silently vanished under the CDC run's, orphaning its parts from
-/// `rivet validate`).
+/// non-`public` PostgreSQL. CDC scaffolds get the sibling `exports/<table>_cdc/`:
+/// sharing the batch prefix clobbers its `manifest.json`/`_SUCCESS` (finding
+/// #44), and nesting inside it (`exports/<table>/cdc/`, through 0.32.0) put the
+/// stream's runs under every recursive read of the batch prefix.
 fn table_export_prefix(info: &TableInfo, source_type: &str, mode: &str) -> String {
+    format!("exports/{}/", mode_segment(info, source_type, mode))
+}
+
+/// The per-export path segment of `mode`: [`export_segment`], with `_cdc` for a CDC export.
+fn mode_segment(info: &TableInfo, source_type: &str, mode: &str) -> String {
     let seg = export_segment(info, source_type);
     if mode == "cdc" {
-        format!("exports/{seg}/cdc/")
+        format!("{seg}{CDC_NAME_SUFFIX}")
     } else {
-        format!("exports/{seg}/")
+        seg
     }
 }
+
+/// What a CDC scaffold appends to the table's export name and path segment, so a batch and a
+/// CDC export of one table never share a name (the state keys a load spec by export name) or
+/// nest one prefix inside the other.
+const CDC_NAME_SUFFIX: &str = "_cdc";
 
 /// Emit a YAML scalar that is unambiguous for any plain-text value the user
 /// could pass via `--gcs-bucket` / `--s3-region` / `--gcs-credentials-file`.
@@ -1200,7 +1209,10 @@ fn cdc_export_lines(
 ) -> Vec<String> {
     d.has_delta = true;
     let mut lines = vec![
-        format!("  - name: {}", yaml_quote_if_needed(&info.table)),
+        format!(
+            "  - name: {}",
+            yaml_quote_if_needed(&format!("{}{CDC_NAME_SUFFIX}", info.table))
+        ),
         "    # change data capture — reads the transaction log (grants: docs/reference/cdc.md)"
             .to_string(),
         format!("    table: {}", yaml_quote_if_needed(qualified_table)),
@@ -1521,12 +1533,10 @@ fn destination_scaffold(
         // a schema-wide init's exports don't all share ./output — that collides
         // their manifest.json / _SUCCESS and makes a second run read a sibling's
         // parts (the scary double-count WARN).
-        let seg = export_segment(info, source_type);
-        let path = if mode == "cdc" {
-            yaml_quote_if_needed(&format!("./output/{seg}/cdc/"))
-        } else {
-            yaml_quote_if_needed(&format!("./output/{seg}/"))
-        };
+        let path = yaml_quote_if_needed(&format!(
+            "./output/{}/",
+            mode_segment(info, source_type, mode)
+        ));
         vec![
             "    destination:".to_string(),
             "      type: local".to_string(),
@@ -2588,6 +2598,80 @@ mod tests {
 
     fn unbounded_col(name: &str) -> ColumnInfo {
         col(name, "numeric")
+    }
+
+    /// The `name:` and the destination location of every export a scaffold writes.
+    fn names_and_places(yaml: &str) -> Vec<(String, String)> {
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(yaml).expect("the scaffold parses");
+        doc["exports"]
+            .as_sequence()
+            .expect("exports")
+            .iter()
+            .map(|e| {
+                let d = &e["destination"];
+                let place = d["prefix"]
+                    .as_str()
+                    .or(d["path"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (e["name"].as_str().unwrap().to_string(), place)
+            })
+            .collect()
+    }
+
+    /// A batch and a CDC scaffold of one table, on every engine and destination, never share an
+    /// export name (the state keys a load spec by it) and never put one prefix inside the other
+    /// (a load lists its prefix recursively): `rivet init` wrote `name: t` twice and
+    /// `exports/t/` around `exports/t/cdc/` through 0.32.0.
+    #[test]
+    fn a_batch_and_a_cdc_scaffold_of_one_table_share_no_name_and_nest_no_prefix() {
+        let info = make_table(vec![col("id", "bigint")]);
+        let dests = [
+            InitYamlDestination::default(),
+            InitYamlDestination {
+                gcs_bucket: Some("b".into()),
+                ..Default::default()
+            },
+            InitYamlDestination {
+                s3_bucket: Some("b".into()),
+                ..Default::default()
+            },
+        ];
+        for url in [
+            "postgresql://u@localhost/db",
+            "mysql://u@localhost/db",
+            "sqlserver://u@localhost/db",
+            "mongodb://u@localhost/db",
+            "oracle://u@localhost:1521/FREEPDB1",
+        ] {
+            for dest in &dests {
+                let render = |mode: Option<&str>| {
+                    names_and_places(
+                        &generate_config(
+                            &info,
+                            url,
+                            &crate::init::SourceProvenance::Inline,
+                            dest,
+                            mode,
+                            None,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let batch = render(None);
+                let cdc = render(Some("cdc"));
+                for (bn, bp) in &batch {
+                    for (cn, cp) in &cdc {
+                        assert_ne!(bn, cn, "{url}: one name for batch and cdc");
+                        let nested = |a: &str, b: &str| {
+                            let (a, b) = (a.trim_start_matches("./"), b.trim_start_matches("./"));
+                            a.starts_with(b) || b.starts_with(a)
+                        };
+                        assert!(!nested(bp, cp), "{url}: {bp} and {cp} nest");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
