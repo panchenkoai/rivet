@@ -433,6 +433,14 @@ fn init_mssql_schema_wide_leaves_out_the_tables_sql_server_ships() {
         1,
         "fixture: the CDC database holds the shipped dbo.systranschemas"
     );
+    // A user table of the cell's own, so the schema holds one whatever ran before on the stand.
+    let table = unique_name("rivet_init_user");
+    mssql_cdc_drop_table(&format!("dbo.{table}"));
+    mssql_cdc_exec(&format!("CREATE TABLE dbo.{table}(id BIGINT PRIMARY KEY)"));
+    let _guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: String::new(),
+    };
     let out = run_rivet(&["init", "--source", MSSQL_CDC_URL]);
     let yaml = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -440,7 +448,10 @@ fn init_mssql_schema_wide_leaves_out_the_tables_sql_server_ships() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(yaml.contains("  - name: "), "{yaml}");
+    assert!(
+        yaml.contains(&format!("  - name: {table}")),
+        "the user table is scaffolded:\n{yaml}"
+    );
     assert!(
         !yaml.contains("systranschemas"),
         "a shipped system table became an export:\n{yaml}"
