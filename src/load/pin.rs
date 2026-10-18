@@ -46,6 +46,10 @@ pub(super) fn pin_plan_to_its_run(
     let runs = match load::open_store(&plan.destination)
         .and_then(|store| load::reconcile::fetch_manifests_keyed(&store, &plan.gcs_prefix))
         .and_then(|keyed| {
+            load::reconcile::own_manifests(keyed, &plan.gcs_prefix, &plan.export_name, plan.mode)
+        })
+        .map(|(keyed, _)| keyed)
+        .and_then(|keyed| {
             load::reconcile::select_runs(keyed, &std::collections::HashSet::new(), plan.mode)
         }) {
         Ok(runs) => runs,
