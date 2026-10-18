@@ -585,11 +585,13 @@ Fidelity levels:
 
 Output includes: table existence, estimated row count, index analysis, tuning recommendation.
 
+`check` also asks the state the config uses (`RIVET_STATE_URL`, or the SQLite file beside the config) whether it answers. When `check` logged any `ERROR` line, it does not print `Looks good.` and exits non-zero with `RIVET_CLI_CHECK_REPORTED_ERRORS`.
+
 ---
 
 ## `rivet doctor`
 
-Verify source and destination connectivity/auth before running exports.
+Verify source, state and destination connectivity/auth before running exports. The State check opens the state the config uses without creating or migrating it, and names the backend.
 
 ```bash
 rivet doctor --config <PATH>
@@ -611,6 +613,7 @@ Output:
 rivet doctor: verifying auth for config 'my_export.yaml'
 
 [OK]  Config parsed successfully
+[OK]  State (sqlite /etc/rivet/.rivet_state.db)
 [OK]  Source auth (Postgres)
 [OK]  Destination Local(./output)
 
@@ -631,6 +634,8 @@ rivet init (--source <URL> | --source-env <ENV_VAR> | --source-file <PATH>)
 ```
 
 Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enforced by the argument group).
+
+With `-o` and `RIVET_STATE_URL` set, `init` first asks that state whether it answers and writes no config when it does not: every run of the config opens that state, and the primary keys `init` records there are what `rivet load` keys a `query:` export by.
 
 | Flag | Short | Type | Description |
 |------|-------|------|-------------|
