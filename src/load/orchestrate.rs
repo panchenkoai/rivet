@@ -736,7 +736,15 @@ fn prepare_load(
             None
         }
     });
-    let keyed = load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?;
+    let (keyed, foreign) = load::reconcile::own_manifests(
+        load::reconcile::fetch_manifests_keyed(store, &plan.gcs_prefix)?,
+        &plan.gcs_prefix,
+        &plan.export_name,
+        plan.mode,
+    )?;
+    if let Some(note) = foreign {
+        eprintln!("{note}");
+    }
     // The bucket's own liveness markers, at run-id granularity. The ledger sample
     // above fails SAFE on `Err` — it consumes nothing — but it cannot fail safe on
     // `Ok({})`, and an EMPTY answer is what a load on a FOREIGN HOST gets: `StateStore
