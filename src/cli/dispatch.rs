@@ -503,6 +503,16 @@ fn dispatch_check(
     // This BAILS on a rejection, so the "Looks good" epilogue below only prints
     // when BOTH gates pass — never alongside a "Rejected: …" line (dogfood MED).
     report_plan_compatibility(plans, json)?;
+    if let Err(e) = StateStore::probe(&config) {
+        log::error!("check: the state this config uses does not answer: {e:#}");
+    }
+    let errors = crate::redact::errors_logged();
+    if errors > 0 {
+        crate::rivet_bail!(
+            crate::error::codes::CHECK_REPORTED_ERRORS,
+            "`rivet check` logged {errors} ERROR line(s) above; the config is not ready to run"
+        );
+    }
     if type_clean && !json {
         println!(
             "Looks good. Next: rivet run -c {config} --validate   # export, then verify row counts"

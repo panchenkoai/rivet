@@ -117,6 +117,38 @@ pub fn doctor(config_path: &str, json: bool) -> Result<()> {
     // transient message so the final bail stays classifiable.
     let mut transient_detail: Option<String> = None;
 
+    // The state every run of this config opens: a run that cannot open it fails before
+    // reading a row, so a doctor that skipped it was green over a config no run could use.
+    match crate::state::StateStore::probe(config_path) {
+        Ok(at) => emit_check(
+            &mut checks,
+            json,
+            DoctorCheck {
+                name: format!("State ({at})"),
+                ok: true,
+                detail: None,
+                hint: None,
+            },
+        ),
+        Err(e) => {
+            all_ok = false;
+            if transient_detail.is_none() && crate::error::retry::classify_error(&e).is_transient()
+            {
+                transient_detail = Some(format!("{e:#}"));
+            }
+            emit_check(
+                &mut checks,
+                json,
+                DoctorCheck {
+                    name: "State".into(),
+                    ok: false,
+                    detail: Some(trim_probe_error(&e)),
+                    hint: None,
+                },
+            );
+        }
+    }
+
     match check_source_auth(&config) {
         Ok(()) => {
             emit_check(

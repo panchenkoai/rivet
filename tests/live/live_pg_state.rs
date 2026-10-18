@@ -580,3 +580,74 @@ fn pg_a_chunk_run_whose_task_insert_fails_is_not_left_open() {
         .unwrap();
     assert_eq!(s.count_chunk_tasks_total("run-2").unwrap(), 2);
 }
+
+/// Setup sees a state that does not answer: with `RIVET_STATE_URL` pointing at a closed port,
+/// `rivet check` exits non-zero instead of printing `Looks good.`, `rivet doctor` fails its
+/// State check, and `rivet init -o` writes no config; with the stand's state all three are
+/// green and doctor names the backend. Before the fix init and check exited 0 and doctor did
+/// not look at the state (client simulation on 0.32.0, D2).
+#[test]
+#[ignore]
+fn check_doctor_and_init_refuse_a_state_that_does_not_answer() {
+    let Some(good) = crate::common::pg_state_url() else {
+        return;
+    };
+    let dead = "postgresql://rivet:rivet@127.0.0.1:1/rivet_state";
+    let mut c = crate::common::pg_connect();
+    let tbl = crate::common::unique_name("rivet_setup_state");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY); INSERT INTO {tbl} VALUES (1)"
+    ))
+    .expect("seed");
+    let _t = crate::common::PgTable::adopt(tbl.clone());
+    let rig = crate::common::Rig::pg_batch(&tbl).no_oracle("setup commands deliver nothing");
+    let text = |o: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
+
+    let check = rig.cli_env(&["check"], &[("RIVET_STATE_URL", dead)]);
+    assert!(!check.status.success(), "{}", text(&check));
+    assert!(!text(&check).contains("Looks good"), "{}", text(&check));
+    assert!(
+        text(&check).contains("RIVET_CHECK_REPORTED_ERRORS"),
+        "{}",
+        text(&check)
+    );
+    let doctor = rig.cli_env(&["doctor"], &[("RIVET_STATE_URL", dead)]);
+    assert!(!doctor.status.success(), "{}", text(&doctor));
+    assert!(text(&doctor).contains("[FAIL] State"), "{}", text(&doctor));
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("init.yaml");
+    let init = crate::common::run_rivet_env(
+        &[
+            "init",
+            "--source",
+            crate::common::POSTGRES_URL,
+            "--table",
+            &tbl,
+            "-o",
+            out.to_str().unwrap(),
+        ],
+        &[("RIVET_STATE_URL", dead)],
+    );
+    assert!(!init.status.success(), "{}", text(&init));
+    assert!(
+        !out.exists(),
+        "init wrote a config for a state that does not answer"
+    );
+
+    let check = rig.cli_env(&["check"], &[("RIVET_STATE_URL", good.as_str())]);
+    assert!(check.status.success(), "{}", text(&check));
+    assert!(text(&check).contains("Looks good"), "{}", text(&check));
+    let doctor = rig.cli_env(&["doctor"], &[("RIVET_STATE_URL", good.as_str())]);
+    assert!(doctor.status.success(), "{}", text(&doctor));
+    assert!(
+        text(&doctor).contains("[OK]  State (postgres "),
+        "{}",
+        text(&doctor)
+    );
+}

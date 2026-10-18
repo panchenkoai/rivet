@@ -808,6 +808,7 @@ pub fn init(
 
     match output {
         Some(path) => {
+            require_explicit_state(path)?;
             write_config_output(path, &text)?;
             record_strategy_snapshots(path, &snapshots);
             record_primary_keys(path, source_url, tls, &snapshots);
@@ -1554,6 +1555,21 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
         }
         _ => unreachable!(),
     })
+}
+
+/// A `RIVET_STATE_URL` the operator set must answer before `init` writes a config for it:
+/// every run of that config opens that state, and the primary keys `init` records there
+/// are what `rivet load` keys a `query:` export by. The SQLite default beside the config
+/// needs no such check, since writing the config proves the directory takes files.
+fn require_explicit_state(config_path: &str) -> Result<()> {
+    if std::env::var("RIVET_STATE_URL").is_ok_and(|u| !u.is_empty()) {
+        crate::state::StateStore::probe(config_path).map_err(|e| {
+            e.context(format!(
+                "init: RIVET_STATE_URL does not answer, so `{config_path}` was not written"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Persist the shape each strategy was chosen from, into the state store the
