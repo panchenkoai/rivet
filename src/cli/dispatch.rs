@@ -503,12 +503,40 @@ fn dispatch_check(
     // This BAILS on a rejection, so the "Looks good" epilogue below only prints
     // when BOTH gates pass — never alongside a "Rejected: …" line (dogfood MED).
     report_plan_compatibility(plans, json)?;
+    if let Err(e) = StateStore::probe(&config) {
+        log::error!("check: the state this config uses does not answer: {e:#}");
+    }
+    refuse_after_errors(crate::redact::errors_logged())?;
     if type_clean && !json {
         println!(
             "Looks good. Next: rivet run -c {config} --validate   # export, then verify row counts"
         );
     }
     Ok(())
+}
+
+/// `check`'s refusal to call a config ready after it logged `errors` ERROR lines.
+fn refuse_after_errors(errors: usize) -> Result<()> {
+    if errors > 0 {
+        crate::rivet_bail!(
+            crate::error::codes::CLI_CHECK_REPORTED_ERRORS,
+            "`rivet check` logged {errors} ERROR line(s) above; the config is not ready to run"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod check_error_tests {
+    #[test]
+    fn check_refuses_after_one_error_line_and_not_before() {
+        super::refuse_after_errors(0).unwrap();
+        let err = super::refuse_after_errors(1).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_CLI_CHECK_REPORTED_ERRORS")
+        );
+    }
 }
 
 /// One selected batch export's plan as `rivet run` builds it, or why it did not build.

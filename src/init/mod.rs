@@ -808,6 +808,7 @@ pub fn init(
 
     match output {
         Some(path) => {
+            require_explicit_state(path, crate::state::StateStore::names_a_server())?;
             write_config_output(path, &text)?;
             record_strategy_snapshots(path, &snapshots);
             record_primary_keys(path, source_url, tls, &snapshots);
@@ -1554,6 +1555,21 @@ fn schema_scope_label(source_url: &str, schema: Option<&str>, n: usize) -> Resul
         }
         _ => unreachable!(),
     })
+}
+
+/// A `RIVET_STATE_URL` the operator set must answer before `init` writes a config for it:
+/// every run of that config opens that state, and the primary keys `init` records there
+/// are what `rivet load` keys a `query:` export by. The SQLite default beside the config
+/// needs no such check, since writing the config proves the directory takes files.
+fn require_explicit_state(config_path: &str, server_named: bool) -> Result<()> {
+    if server_named {
+        crate::state::StateStore::probe(config_path).map_err(|e| {
+            e.context(format!(
+                "init: RIVET_STATE_URL does not answer, so `{config_path}` was not written"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Persist the shape each strategy was chosen from, into the state store the
@@ -3576,5 +3592,18 @@ mod tests {
             "expected coalesce hint, got: {:?}",
             td.notes
         );
+    }
+}
+
+#[cfg(test)]
+mod explicit_state_tests {
+    /// A named state that does not answer stops `init` before the config is written; without one nothing is asked.
+    #[test]
+    fn init_asks_a_named_state_only() {
+        let gone = "/nonexistent-rivet-init-dir/c.yaml";
+        if !crate::state::StateStore::names_a_server() {
+            assert!(super::require_explicit_state(gone, true).is_err());
+        }
+        super::require_explicit_state(gone, false).unwrap();
     }
 }

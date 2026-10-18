@@ -774,6 +774,11 @@ pub mod codes {
         }
     }
 
+    /// `rivet check` logged an ERROR line, so it does not call the config ready.
+    pub const CLI_CHECK_REPORTED_ERRORS: Code = environment(
+        "RIVET_CLI_CHECK_REPORTED_ERRORS",
+        "fix what the ERROR lines above name (the source, the state, the destination), then run `rivet check` again",
+    );
     /// `RIVET_STATE_URL` names a remote host and does not say whether to encrypt the connection.
     pub const STATE_URL_TLS_REQUIRED: Code = refusal(
         "RIVET_STATE_URL_TLS_REQUIRED",
@@ -1621,6 +1626,7 @@ pub mod codes {
         SOURCE_COLUMNS_CHANGED_UNDER_READ,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_URL_SCHEME_UNSUPPORTED,
+        CLI_CHECK_REPORTED_ERRORS,
         STATE_URL_TLS_REQUIRED,
         STATE_NOT_WRITABLE,
         STATE_CURSOR_NOT_STORED,
