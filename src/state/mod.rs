@@ -81,21 +81,68 @@ pub(super) fn pg_sql(sql: &str) -> String {
 /// [`crate::connect::postgres::connect_client`] path so the state backend and
 /// source connections apply identical TLS rules.
 ///
-/// - missing / `disable` / `prefer` / `allow` / unrecognized → `NoTls`
-///   (plaintext), keeping local and dev setups working unchanged.
 /// - `require` / `verify-ca` / `verify-full` → negotiate TLS.
+/// - `disable` → plaintext, the operator's explicit opt-out, on any host.
+/// - anything else → plaintext to a loopback host; a remote host is refused
+///   `RIVET_STATE_URL_TLS_REQUIRED` by [`state_url_tls`].
 ///
 /// Used by both [`StateStore::open_postgres`] and the parallel chunk-worker
 /// reconnection paths in `checkpoint.rs`, so every PG state connection is
 /// TLS-aware.
 pub(super) fn connect_pg(url: &str) -> Result<postgres::Client> {
-    let tls = crate::config::url::url_tls(url).1;
+    let tls = state_url_tls(url)?;
     crate::connect::postgres::connect_client(url, tls.as_ref()).map_err(|e| {
         crate::error::coded(
             crate::error::codes::STATE_BACKEND_FAILED,
             format!("state(pg): connect to '{}': {:#}", redact_pg_url(url), e),
         )
     })
+}
+
+/// The last `sslmode` value of a state URL, if it names one.
+fn url_sslmode(url: &str) -> Option<&str> {
+    let query = url.split_once('?').map_or("", |(_, q)| q);
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('=').or(Some((pair, ""))))
+        .filter(|(key, _)| *key == "sslmode")
+        .map(|(_, value)| value)
+        .next_back()
+}
+
+/// Whether the state URL opts out of TLS itself with `sslmode=disable`.
+fn opts_out_of_tls(url: &str) -> bool {
+    url_sslmode(url) == Some("disable")
+}
+
+/// The TLS a state URL asks for: its `sslmode`, an explicit plaintext for `sslmode=disable`,
+/// and a coded refusal for a remote host whose URL says neither (the source's `tls:` block,
+/// which the shared dial names, does not exist for the state).
+fn state_url_tls(url: &str) -> Result<Option<crate::config::TlsConfig>> {
+    if let Some(tls) = crate::config::url::url_tls(url).1 {
+        return Ok(Some(tls));
+    }
+    if opts_out_of_tls(url) {
+        return Ok(Some(crate::config::TlsConfig {
+            mode: crate::config::TlsMode::Disable,
+            ..Default::default()
+        }));
+    }
+    if !crate::config::url::host_is_loopback(url) {
+        let asked = url_sslmode(url).map_or_else(
+            || "names no `sslmode`".to_string(),
+            |m| format!("says `sslmode={m}`, which rivet cannot negotiate"),
+        );
+        crate::rivet_bail!(
+            crate::error::codes::STATE_URL_TLS_REQUIRED,
+            "state(pg): `RIVET_STATE_URL` ('{}') points at a remote host and {asked}, so the \
+             state's credentials and cursors would cross the network unencrypted. Add \
+             `?sslmode=require` (or `verify-ca` / `verify-full`) with TLS enabled on the state \
+             server, or `?sslmode=disable` to accept plaintext on a private network.",
+            redact_pg_url(url)
+        );
+    }
+    Ok(None)
 }
 
 // ─── Backend connection ────────────────────────────────────────────────────────
@@ -339,12 +386,14 @@ impl StateStore {
     }
 
     fn open_postgres(url: &str) -> Result<Self> {
-        if is_plaintext_remote(url) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        if is_plaintext_remote(url) && opts_out_of_tls(url) {
+            WARNED.call_once(|| {
             log::warn!(
-                "state(pg): connecting to a remote host without TLS; \
-                 add sslmode=require (or verify-ca / verify-full) to RIVET_STATE_URL \
-                 to negotiate TLS for production use"
+                "state(pg): plaintext to a remote host, as `sslmode=disable` in RIVET_STATE_URL \
+                 asks; use `sslmode=require` (or verify-ca / verify-full) outside a private network"
             );
+            });
         }
         let mut client = connect_pg(url)?;
         migrate_pg(&mut client)?;
@@ -824,5 +873,68 @@ mod tests {
                 redact_pg_url(u)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod state_url_tls_tests {
+    use super::state_url_tls;
+    use crate::config::TlsMode;
+
+    #[test]
+    fn a_remote_state_url_without_sslmode_is_refused_with_the_state_remedies() {
+        for url in [
+            "postgresql://u:p@10.0.0.5:5432/s",
+            "postgresql://u:p@db.internal/s?sslmode=prefer",
+            "postgresql://u:p@db.internal/s?sslmode=disable&sslmode=allow",
+        ] {
+            let err = state_url_tls(url).unwrap_err();
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_STATE_URL_TLS_REQUIRED"),
+                "{url}: {err:#}"
+            );
+            assert_eq!(crate::error::classify_exit(&err), 5, "{url}");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("?sslmode=require") && text.contains("?sslmode=disable"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("source.tls") && !text.contains(":p@"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn sslmode_disable_is_the_operators_opt_out_on_any_host() {
+        for url in [
+            "postgresql://u:p@10.0.0.5:5432/s?sslmode=disable",
+            "postgresql://u:p@db.internal/s?connect_timeout=5&sslmode=disable",
+            "postgresql://u:p@db.internal/s?sslmode=require&sslmode=disable",
+        ] {
+            let tls = state_url_tls(url).unwrap().expect("an explicit plaintext");
+            assert_eq!(tls.mode, TlsMode::Disable, "{url}");
+            crate::connect::require_tls_or_loopback(url, Some(&tls)).unwrap();
+        }
+    }
+
+    #[test]
+    fn loopback_stays_plaintext_and_an_enforced_sslmode_negotiates() {
+        assert!(
+            state_url_tls("postgresql://u:p@127.0.0.1:5433/s")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state_url_tls("postgresql://u:p@localhost/s")
+                .unwrap()
+                .is_none()
+        );
+        let tls = state_url_tls("postgresql://u:p@db.internal/s?sslmode=verify-full")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tls.mode, TlsMode::VerifyFull);
     }
 }

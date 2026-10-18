@@ -580,3 +580,60 @@ fn pg_a_chunk_run_whose_task_insert_fails_is_not_left_open() {
         .unwrap();
     assert_eq!(s.count_chunk_tasks_total("run-2").unwrap(), 2);
 }
+
+/// This host's address on its outbound interface, which other hosts reach it at; the PG
+/// state stand publishes its port on every interface. A UDP `connect` sends nothing.
+fn non_loopback_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+}
+
+/// A PostgreSQL state on a non-loopback address of a server without TLS: a URL that names no
+/// `sslmode` is refused `RIVET_STATE_URL_TLS_REQUIRED` (exit 5) with the state's remedies,
+/// and `?sslmode=disable` is the operator's opt-out, honoured with one warning line. Before
+/// the fix both URLs were refused `RIVET_STATE_BACKEND_FAILED` (exit 1), naming `source.tls`.
+#[test]
+#[ignore]
+fn a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out() {
+    let Some(url) = crate::common::pg_state_url() else {
+        return;
+    };
+    let ip = non_loopback_ip().expect("this host has a non-loopback address");
+    let remote = url.replacen("@127.0.0.1:", &format!("@{ip}:"), 1).replacen(
+        "@localhost:",
+        &format!("@{ip}:"),
+        1,
+    );
+    assert_ne!(remote, url, "the state URL names a loopback host: {url}");
+    let mut c = crate::common::pg_connect();
+    let tbl = crate::common::unique_name("rivet_state_tls");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY); INSERT INTO {tbl} VALUES (1), (2)"
+    ))
+    .expect("seed");
+    let _t = crate::common::PgTable::adopt(tbl.clone());
+    let rig = crate::common::Rig::pg_batch(&tbl);
+
+    let refused = rig.run_args_env(&[], &[("RIVET_STATE_URL", remote.as_str())]);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(refused.status.code(), Some(5), "{stderr}");
+    assert!(stderr.contains("RIVET_STATE_URL_TLS_REQUIRED"), "{stderr}");
+    assert!(
+        stderr.contains("?sslmode=require") && stderr.contains("?sslmode=disable"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("source.tls"), "{stderr}");
+
+    let sep = if remote.contains('?') { '&' } else { '?' };
+    let plaintext = format!("{remote}{sep}sslmode=disable");
+    let ran = rig.run_args_env(&[], &[("RIVET_STATE_URL", plaintext.as_str())]);
+    let stderr = String::from_utf8_lossy(&ran.stderr);
+    assert!(ran.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("plaintext to a remote host").count(),
+        1,
+        "one warning line: {stderr}"
+    );
+}
