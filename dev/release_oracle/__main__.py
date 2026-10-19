@@ -890,6 +890,7 @@ def _self_test() -> int:
     from . import upgrade_matrix
 
     upgrade_matrix._self_test()
+    upgrade._self_test()
     _lanes_self_test()
     skip_census._self_test()
     fix_cells._self_test()

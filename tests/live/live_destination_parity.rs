@@ -336,7 +336,7 @@ fn a_relative_destination_path_follows_the_config() {
     );
 }
 
-/// Upgrade: the previous release, started from directory A with `path: ./out`, wrote under A; this build started from A refuses by code, twice and through `validate` alike, with nothing written in either place; the printed remedy, moving the files beside the config, lets the next run continue the cursor there, every source row once (P-27).
+/// Upgrade: the previous release, started from directory A with `path: ./out`, wrote under A; this build started from A refuses by code, twice and through `validate` alike, with nothing written in either place; the printed remedy, moving the files beside the config, lets the next run continue the cursor there, every source row once (P-27). A previous release that already anchors the path (0.32.0 on) leaves nothing to refuse, and the cell skips.
 #[test]
 #[ignore = "live: requires docker compose postgres and RIVET_PREV_RELEASE_BIN"]
 fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow() {
@@ -369,6 +369,13 @@ fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_f
         "the previous release: {}",
         String::from_utf8_lossy(&run.stderr)
     );
+    if !under_cwd.exists() && beside.exists() {
+        crate::common::skip_live(
+            "RIVET_PREV_RELEASE_BIN anchors a relative destination.path beside its config (0.32.0 on): \
+             it leaves nothing under the working directory for this build to refuse",
+        );
+        return;
+    }
     let first = (1..=10).collect::<Vec<_>>();
     assert_eq!(
         read_ids(&under_cwd),

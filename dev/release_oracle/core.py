@@ -751,6 +751,12 @@ SKIP_ALLOWED: dict[str, str] = {
         "needs a mounted tiny filesystem (RIVET_TINYFS_DIR) the stand does not provision",
     "live_keyset_parallel::parallel_keyset_incremental_survives_no_backslash_escapes_mysql":
         "sets @@global.sql_mode, which needs SUPER; the stand's test user has none",
+    "live_clickhouse_load::a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_dropped":
+        "skips only when the previous release writes this tree's state schema: nothing migrates, so no copy is left "
+        "to roll back to; it runs again with the next migration",
+    "live_destination_parity::a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow":
+        "skips only when the previous release already anchors a relative destination.path beside its config "
+        "(0.32.0 on): the move it refuses arises from a release before 0.32 only",
 }
 
 
