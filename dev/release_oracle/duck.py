@@ -35,6 +35,9 @@ READ_TRIES, READ_BUDGET_S = 3, 180.0
 #: libcurl codes a BigQuery read dies of without a verdict: couldn't connect (7), timeout (28),
 #: SSL connect (35), send/recv failure (55/56), and an empty reply (52).
 TRANSIENT_CURL = re.compile(r"CURL error \[(7|28|35|52|55|56)\]")
+#: The token service the BigQuery extension's credentials come from answered 5xx (gcloud logs
+#: `oauth2_credentials.cc ... error 500 [{"error": "internal_failure"}]`): no read reached BigQuery.
+TRANSIENT_TOKEN = re.compile(r'"error":\s*"internal_failure"')
 
 
 #: Where the DuckDB `snowflake` extension looks for its ADBC driver before its own extension directory.
@@ -70,9 +73,9 @@ class OracleUnavailable(Exception):
 
 
 def transient(e: BaseException) -> bool:
-    """Whether a DuckDB error is the reader's transport (curl, a dropped BigQuery Storage read session), not the data."""
+    """Whether a DuckDB error is the reader's transport (curl, its token service, a dropped BigQuery Storage read session), not the data."""
     s = str(e)
-    return bool(TRANSIENT_CURL.search(s)) or bool(
+    return bool(TRANSIENT_CURL.search(s)) or bool(TRANSIENT_TOKEN.search(s)) or bool(
         "read session" in s and re.search(r"\b(CANCELLED|UNAVAILABLE|DEADLINE_EXCEEDED|ABORTED)\b", s))
 
 
