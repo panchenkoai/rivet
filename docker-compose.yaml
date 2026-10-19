@@ -736,7 +736,7 @@ services:
     volumes:
       - ./dev/proxysql/proxysql-tz.cnf:/etc/proxysql.cnf:ro
     healthcheck:
-      test: ["CMD-SHELL", "(echo > /dev/tcp/127.0.0.1/6033) >/dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL", "bash -c '(echo > /dev/tcp/127.0.0.1/6033)' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 20

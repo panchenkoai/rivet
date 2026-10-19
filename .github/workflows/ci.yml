@@ -1846,6 +1846,7 @@ jobs:
             RIVET_TEST_EXCLUSIVE
             pg18-batch (:5518)
             RIVET_PREV_RELEASE_BIN
+            RIVET_MIGRATION_CARRIER_BIN
             macOS `hdiutil`
             RIVET_GATE_STATE_URL
           # BIGQUERY_TEST_PROJECT / SNOWFLAKE_TEST_CONNECTION: no warehouse credentials here (same as
@@ -1855,6 +1856,7 @@ jobs:
           # RIVET_TEST_EXCLUSIVE: the suite runs in parallel on a shared stand; the gate runs those alone.
           # pg18-batch: a service this job's compose line does not start.
           # RIVET_PREV_RELEASE_BIN: no downloaded previous release here; the `versions_*` sabotage cells run in the gate.
+          # RIVET_MIGRATION_CARRIER_BIN: nor the pinned older-schema release; the cells that migrate from it run in the gate.
           # macOS `hdiutil`: the volume-full sabotage cells mount a disk image; a Linux tmpfs needs root.
           # RIVET_GATE_STATE_URL: unset here by design (see the job env); the cells that need the Rig itself on a
           #   Postgres state (a run lease held as a row) run in the gate's Postgres-state pass.

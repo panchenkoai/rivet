@@ -340,6 +340,18 @@ fn a_relative_destination_path_follows_the_config() {
 #[test]
 #[ignore = "live: requires docker compose postgres and RIVET_PREV_RELEASE_BIN"]
 fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow() {
+    relative_path_moved_from(Rig::as_previous_release, false);
+}
+
+/// The same upgrade from the pinned release before 0.32 (`RIVET_MIGRATION_CARRIER_BIN`), so the move and its refusal are graded every gate.
+#[test]
+#[ignore = "live: requires docker compose postgres and RIVET_MIGRATION_CARRIER_BIN"]
+fn a_relative_path_moved_by_upgrading_the_pinned_release_is_refused_until_the_files_follow() {
+    relative_path_moved_from(Rig::as_migration_carrier, true);
+}
+
+/// The P-27 walk from the release `as_old` resolves; one that already anchors the path skips, or fails when it is the `pinned` carrier.
+fn relative_path_moved_from(as_old: fn(&Rig) -> Option<Rig>, pinned: bool) {
     let e = SqlEngine::Pg;
     e.alive();
     let (table, _guard) = e.table("dest_rel_upgrade");
@@ -353,7 +365,7 @@ fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_f
     let a = tempfile::tempdir_in(beside.parent().unwrap()).unwrap();
     let under_cwd = a.path().join("out");
     let mut rig = rig.in_dir(a.path());
-    let Some(old) = rig.as_previous_release() else {
+    let Some(old) = as_old(&rig) else {
         return;
     };
     // A state database of the cell's own when the pass grades the shared Postgres state, which the previous release must not meet migrated past it.
@@ -370,6 +382,10 @@ fn a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_f
         String::from_utf8_lossy(&run.stderr)
     );
     if !under_cwd.exists() && beside.exists() {
+        assert!(
+            !pinned,
+            "the pinned release anchors a relative destination.path beside its config: pin a release before 0.32"
+        );
         crate::common::skip_live(
             "RIVET_PREV_RELEASE_BIN anchors a relative destination.path beside its config (0.32.0 on): \
              it leaves nothing under the working directory for this build to refuse",
