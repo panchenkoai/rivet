@@ -432,6 +432,16 @@ seeds:
           - "lib:a_sqlite_url_that_leaves_the_state_beside_the_config_behind_is_refused"
       postgres-state:
         na: "a `sqlite:` state URL names a SQLite file; a PostgreSQL state is the server's"
+  - name: sqlite-writer-starved-by-a-sibling
+    class: "a state write on the SQLite file is refused `database is locked` after the busy timeout because a sibling writer in the same process takes the write lock in every gap (SQLite's busy wait has no queue)"
+    history: "0.32.1 D6, 2026-10-18: CI flake of a_replan_beside_another_writer_of_the_state_waits_for_it on #634 (`1 of 1000 replans failed beside 94629 writes`); measured on devbox: BEGIN IMMEDIATE refused after 15.4 s beside 530 000 writes; the forced cell is red 3/3 on main 51a1b69c"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-writer-starved-by-a-sibling/sqlite-state.patch
+        cells: ["lib:a_replan_beside_a_writer_that_never_lets_go_gets_its_turn"]
+      postgres-state:
+        na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
 
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
@@ -2962,6 +2972,7 @@ seeds:
         cells:
           - "lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"
           - a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow
+          - a_relative_path_moved_by_upgrading_the_pinned_release_is_refused_until_the_files_follow
       mysql:
         cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
       mssql:

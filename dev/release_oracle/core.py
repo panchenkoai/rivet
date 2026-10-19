@@ -573,7 +573,7 @@ HARNESS_ENV: frozenset[str] = frozenset((
     "RIVET_CDC_STATE_URL", "RIVET_CONC_SRC_CONTAINER", "RIVET_CONC_SRC_URL", "RIVET_CONC_STATE_URL",
     "RIVET_FAILURE_MONGO_URL", "RIVET_FIELD_LOCK", "RIVET_FIELD_MYSQL_CONTAINER", "RIVET_FIELD_REPLAY_BIN",
     "RIVET_FLOW_VERDICTS", "RIVET_GATE_SHARED_STATE", "RIVET_GATE_STATE_URL",
-    "RIVET_HARM_SLACK", "RIVET_HARM_TOL",
+    "RIVET_HARM_SLACK", "RIVET_HARM_TOL", "RIVET_MIGRATION_CARRIER_BIN",
     "RIVET_ORACLE_DOCKER", "RIVET_ORACLE_LATEST_ONLY", "RIVET_ORACLE_LOG", "RIVET_ORACLE_SELFTEST_FLAG",
     "RIVET_ORACLE_VERSIONS", "RIVET_ORACLE_WITHOUT_PREV_RELEASE", "RIVET_ORACLE_WORK",
     "RIVET_PERF_BQ_WALL_TOL", "RIVET_PERF_CPU_TOL", "RIVET_PERF_RSS_TOL", "RIVET_PERF_WALL_TOL",
@@ -751,6 +751,12 @@ SKIP_ALLOWED: dict[str, str] = {
         "needs a mounted tiny filesystem (RIVET_TINYFS_DIR) the stand does not provision",
     "live_keyset_parallel::parallel_keyset_incremental_survives_no_backslash_escapes_mysql":
         "sets @@global.sql_mode, which needs SUPER; the stand's test user has none",
+    "live_clickhouse_load::a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_dropped":
+        "skips only when the previous release writes this tree's state schema: nothing migrates, so no copy is left "
+        "to roll back to; it runs again with the next migration",
+    "live_destination_parity::a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow":
+        "skips only when the previous release already anchors a relative destination.path beside its config "
+        "(0.32.0 on): the move it refuses arises from a release before 0.32 only",
 }
 
 

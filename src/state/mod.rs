@@ -25,6 +25,7 @@ mod run_aggregate;
 mod run_status_store;
 mod schema;
 mod shape;
+mod write_turn;
 
 // Re-export domain types so callers use `rivet::state::*` unchanged.
 // Items below may not be explicitly named by all internal callers (often used
@@ -294,13 +295,9 @@ fn holds_state(path: &std::path::Path) -> bool {
 /// config's state: the cursors, runs and load journal would be left behind and the next run would
 /// start over (a full re-read, a load that finds its own tables foreign).
 fn refuse_a_state_left_behind(beside: &std::path::Path, target: &std::path::Path) -> Result<()> {
-    let same = |a: &std::path::Path, b: &std::path::Path| {
-        a == b
-            || std::fs::canonicalize(a)
-                .ok()
-                .zip(std::fs::canonicalize(b).ok())
-                .is_some_and(|(a, b)| a == b)
-    };
+    let resolved =
+        |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let same = |a: &std::path::Path, b: &std::path::Path| resolved(a) == resolved(b);
     if same(beside, target) || !holds_state(beside) || holds_state(target) {
         return Ok(());
     }
@@ -1202,5 +1199,53 @@ mod sqlite_state_url_tests {
         refuse_a_state_left_behind(&beside, &beside).unwrap();
         std::fs::copy(&beside, &target).unwrap();
         refuse_a_state_left_behind(&beside, &target).unwrap();
+    }
+
+    /// `holds_state` at its threshold: a migrated state with no row holds nothing, one cursor row is state.
+    #[test]
+    fn a_state_holds_something_from_its_first_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("s.db");
+        assert!(!holds_state(&db), "no file");
+        let s = StateStore::open_at_path(&db).unwrap();
+        assert!(!holds_state(&db), "a migrated state with no row");
+        s.update_legacy("orders", "1").unwrap();
+        assert!(holds_state(&db), "one cursor row");
+    }
+
+    /// Each condition that lets a `sqlite:` target open, alone: the same file under another
+    /// spelling; nothing beside the config; state already in the target. Only state beside the
+    /// config and none in the target refuses.
+    #[test]
+    fn each_reason_to_open_a_sqlite_target_is_enough_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let beside = dir.path().join(".rivet_state.db");
+        let s = StateStore::open_at_path(&beside).unwrap();
+        s.update_legacy("orders", "1").unwrap();
+        drop(s);
+        // The same file, spelled through `..`: equal only once resolved.
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let respelled = sub.join("..").join(".rivet_state.db");
+        refuse_a_state_left_behind(&beside, &respelled).unwrap();
+        // Nothing beside the config, nothing in the target.
+        let empty_dir = tempfile::tempdir().unwrap();
+        refuse_a_state_left_behind(
+            &empty_dir.path().join(".rivet_state.db"),
+            &empty_dir.path().join("t.db"),
+        )
+        .unwrap();
+        // State in both.
+        let both = dir.path().join("both.db");
+        let t = StateStore::open_at_path(&both).unwrap();
+        t.update_legacy("orders", "2").unwrap();
+        drop(t);
+        refuse_a_state_left_behind(&beside, &both).unwrap();
+        // State beside, none in the target.
+        let err = refuse_a_state_left_behind(&beside, &dir.path().join("new.db")).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_STATE_URL_LEAVES_STATE_BEHIND")
+        );
     }
 }

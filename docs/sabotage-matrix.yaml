@@ -438,7 +438,7 @@ scenarios:
 
   - id: refusal_dest_relative_path_moved
     what: "RIVET_DEST_RELATIVE_PATH_MOVED: a relative local `destination.path` whose place under the working directory (where a release before 0.32 wrote) alone holds the export's files; moving them beside the config delivers, and `validate` meets the same refusal"
-    postgres: { test: a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow }
+    postgres: { test: a_relative_path_moved_by_upgrading_the_pinned_release_is_refused_until_the_files_follow }
     mysql:    { na: "the decision is one shared seam, the config loader (`Config::anchor_paths`), made before any source is opened; graded on postgres" }
     mssql:    { na: "the decision is one shared seam, the config loader (`Config::anchor_paths`), made before any source is opened; graded on postgres" }
     mongo:    { na: "the decision is one shared seam, the config loader (`Config::anchor_paths`), made before any source is opened; graded on postgres" }

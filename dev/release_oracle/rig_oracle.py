@@ -1770,6 +1770,17 @@ def _self_test() -> None:
         return "rows"
 
     assert duck.retry(dropped_once, sleep=slept.append) == "rows" and len(calls) == 2, calls
+    token = duckdb.BinderException('Query execution failed: Error in non-idempotent operation: {\n  "error": "internal_failure"\n}')
+    calls.clear()
+
+    def token_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise token
+        return "rows"
+
+    assert duck.retry(token_once, sleep=slept.append) == "rows" and len(calls) == 2, \
+        "a 5xx from the oracle's token service is its transport: the read is tried again"
     now = iter([0.0, 176.0])
     calls.clear()
     try:

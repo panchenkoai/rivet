@@ -14,11 +14,17 @@ Per SQL engine, on the downloaded previous binary and this one:
              once, every latest value right (the cursor in state is the artifact).
   way-back   previous incremental run twice → a later delta → this binary's run (it migrates the
              state and leaves the pre-migration copy) → the restore in docs/reference/state.md,
-             run AS WRITTEN there (its sh / sql block) → the previous release runs again: exit 0,
-             from its own cursor; every id delivered, the overlap exactly this binary's delta.
+             run AS WRITTEN there (the sh block under its SQLite heading, the sql block under its
+             PostgreSQL one) → the previous release runs again: exit 0, from its own cursor; every
+             id delivered, the overlap exactly this binary's delta.
   no-way-back the copy cannot be written (SQLite: a read-only state directory; Postgres: a role
              without CREATE on the database): this binary stops RIVET_STATE_BACKUP_FAILED, exit 1,
              writes no part; the previous release still opens the state and delivers the delta.
+             Both are SKIP when the previous release writes this binary's state schema: nothing
+             migrates, so there is no copy to leave or restore. Both run again from the pinned
+             release of an older state schema (`RIVET_MIGRATION_CARRIER_BIN`, the Makefile's
+             MIGRATION_CARRIER_TAG), so a real migration and its restore are graded every gate;
+             a carrier that is missing, or that writes this binary's schema, is a FAIL.
   crash      the previous binary crashes mid keyset run → this binary resumes it: every
              id exactly once, and no part the crashed run left is written again (the crash
              checkpoint is the artifact; a restart from scratch rewrites the same part names).
@@ -69,6 +75,7 @@ from pathlib import Path
 from .core import (ROOT, Ledger, Proc, container_for_port, docker_exec, first_error, isolate_state_db, rivet_bin, run,
                    run_lanes, server_of)
 from .engines import sql as _sql
+from .fix_cells import prev_tag
 from .regression import _require_prev_binary
 from .upgrade_cdc_load import cdc_load_lane_cells
 from .upgrade_matrix import matrix_lane_cells
@@ -308,16 +315,21 @@ def _fresh_leg(led: Ledger, e: _Env, engine: str, want: int) -> None:
 
 RESTORE_DOC = ROOT / "docs/reference/state.md"
 RESTORE_SECTION = "## Rolling back an upgrade"
+#: Per state store, the heading under RESTORE_SECTION that holds its restore and the language of its block.
+RESTORE_BLOCKS = {"sqlite": ("### SQLite", "sh"), "pg-state": ("### PostgreSQL", "sql")}
 
 
-def restore_block(lang: str, text: str | None = None) -> str:
-    """The fenced ```<lang> block under "Rolling back an upgrade" in docs/reference/state.md: the cell runs the doc as written."""
+def restore_block(store: str, text: str | None = None) -> str:
+    """The fenced block under `store`'s heading of "Rolling back an upgrade" in docs/reference/state.md: the cell runs the doc as written."""
     text = RESTORE_DOC.read_text() if text is None else text
+    heading, lang = RESTORE_BLOCKS[store]
     if RESTORE_SECTION not in text:
         raise RuntimeError(f"{RESTORE_DOC.name}: no section {RESTORE_SECTION!r}")
-    m = re.search(rf"```{re.escape(lang)}\n(.*?)```", text.split(RESTORE_SECTION, 1)[1], re.S)
+    section = re.split(r"^## ", text.split(RESTORE_SECTION, 1)[1], maxsplit=1, flags=re.M)[0]
+    sub = next((s for s in re.split(r"^(?=### )", section, flags=re.M) if s.startswith(f"{heading}\n")), "")
+    m = re.search(rf"```{re.escape(lang)}\n(.*?)```", sub, re.S)
     if m is None:
-        raise RuntimeError(f"{RESTORE_DOC.name}: no ```{lang} block under {RESTORE_SECTION!r}")
+        raise RuntimeError(f"{RESTORE_DOC.name}: no ```{lang} block under {heading!r} of {RESTORE_SECTION!r}")
     return m.group(1)
 
 
@@ -343,19 +355,62 @@ def _copies(e: _Env, state_url: str) -> list[str]:
 def _restore(e: _Env, state_url: str) -> Proc:
     """The restore doc, run as written: its sh block in the config dir (SQLite), its sql block on the state database (Postgres)."""
     if not state_url:
-        return run(["bash", "-euo", "pipefail", "-c", restore_block("sh")], cwd=e.dir)
-    return _state_psql(state_url, restore_block("sql"))
+        return run(["bash", "-euo", "pipefail", "-c", restore_block("sqlite")], cwd=e.dir)
+    return _state_psql(state_url, restore_block("pg-state"))
 
 
-def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
-    """The previous release runs twice, this binary once (migrates, leaves the copy), the doc's restore runs as written, the previous release runs again from its own cursor: every id delivered, the overlap exactly this binary's delta."""
+_SCHEMAS: dict[Path, int | None] = {}
+
+
+def _schema_of(binary: Path, e: _Env) -> int | None:
+    """The state schema `binary` writes: its own `state show` over an empty SQLite state beside a copy of `e`'s config."""
+    if binary not in _SCHEMAS:
+        d = Path(tempfile.mkdtemp(prefix="schema-", dir=e.dir.parent))
+        shutil.copy(e.dir / "c.yaml", d / "c.yaml")
+        run([str(binary), "state", "show", "-c", "c.yaml"], env={**e.env, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""},
+            cwd=d)
+        _SCHEMAS[binary] = None
+        if (d / ".rivet_state.db").is_file():
+            with closing(sqlite3.connect(d / ".rivet_state.db")) as con:
+                _SCHEMAS[binary] = con.execute("SELECT max(version) FROM schema_version").fetchone()[0]
+    return _SCHEMAS[binary]
+
+
+def _nothing_migrates(led: Ledger, engine: str, store: str, tag: str, prev: Path, e: _Env, pinned: str) -> bool:
+    """True, with the row recorded, when `prev` writes this binary's state schema: SKIP for the previous release, FAIL for the pinned carrier, which exists to migrate."""
+    was, now = _schema_of(prev, e), _schema_of(rivet_bin(), e)
+    if was is None or was != now:
+        return False
+    if pinned:
+        led.failed(engine, "-", SCEN, store, f"{tag}: the pinned {pinned} writes state schema v{now}, this binary's own: "
+                   "nothing migrates; pin a release from before the last migration (MIGRATION_CARRIER_TAG)", "stale carrier")
+    else:
+        led.skipped(engine, "-", SCEN, store, f"{tag}: the previous release and this binary both write state schema "
+                    f"v{now}: nothing migrates, so no copy is left to restore", "same schema")
+    return True
+
+
+def _migration_carrier(led: Ledger) -> Path | None:
+    """The pinned release of an older state schema the way-back legs also run from (`RIVET_MIGRATION_CARRIER_BIN`); missing is a FAIL."""
+    raw = os.environ.get("RIVET_MIGRATION_CARRIER_BIN", "").strip()
+    if raw and Path(raw).is_file() and os.access(raw, os.X_OK):
+        return Path(raw).resolve()
+    led.failed("all", "-", SCEN, "carrier", f"upgrade[way-back]: RIVET_MIGRATION_CARRIER_BIN={raw!r} is not an executable "
+               "file, so no way-back leg grades a real migration (`make release-oracle-prev-bin` fetches it)", "no carrier")
+    return None
+
+
+def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str, pinned: str = "") -> None:
+    """The previous release (or the `pinned` carrier) runs twice, this binary once (migrates, leaves the copy), the doc's restore runs as written, the older release runs again from its own cursor: every id delivered, the overlap exactly this binary's delta."""
     store = "pg-state" if state_url else "sqlite"
-    tag = f"upgrade[{engine}/way-back/{store}]"
-    table = _case(engine, f"upg_back_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}")
+    tag = f"upgrade[{engine}/way-back/{store}{f'/from={pinned}' if pinned else ''}]"
+    table = _case(engine, f"upg_back_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}{'_p' if pinned else ''}")
     if not _seed(engine, url, table, ROWS, with_cursor=True):
         return led.failed(engine, "-", SCEN, store, f"{tag}: seed failed", "seed")
     e = _Env(prev, root, engine, url, table, "incremental", state_url)
     try:
+        if e.init.ok and _nothing_migrates(led, engine, store, tag, prev, e, pinned):
+            return
         r1 = e.rivet(prev, "run", "-c", "c.yaml")
         ok = e.init.ok and r1.ok and _mutate(engine, url, table)
         r2 = e.rivet(prev, "run", "-c", "c.yaml")
@@ -401,15 +456,17 @@ def _role_without_create(state_url: str) -> str | None:
     return urllib.parse.urlunsplit((u.scheme, f"{role}:nocreate@{u.hostname}:{u.port or 5432}", u.path, u.query, u.fragment))
 
 
-def _no_way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
-    """The copy cannot be written: this binary stops by code and migrates nothing; the previous release still opens the state and delivers the delta."""
+def _no_way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str, pinned: str = "") -> None:
+    """The copy cannot be written: this binary stops by code and migrates nothing; the previous release (or the `pinned` carrier) still opens the state and delivers the delta."""
     store = "pg-state" if state_url else "sqlite"
-    tag = f"upgrade[{engine}/no-way-back/{store}]"
-    table = _case(engine, f"upg_noback_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}")
+    tag = f"upgrade[{engine}/no-way-back/{store}{f'/from={pinned}' if pinned else ''}]"
+    table = _case(engine, f"upg_noback_{engine[:2]}_{os.getpid()}_{store.replace('-', '')}{'_p' if pinned else ''}")
     if not _seed(engine, url, table, ROWS, with_cursor=True):
         return led.failed(engine, "-", SCEN, store, f"{tag}: seed failed", "seed")
     e = _Env(prev, root, engine, url, table, "incremental", state_url)
     try:
+        if e.init.ok and _nothing_migrates(led, engine, store, tag, prev, e, pinned):
+            return
         r1 = e.rivet(prev, "run", "-c", "c.yaml")
         ok = e.init.ok and r1.ok and _mutate(engine, url, table)
         before = e.parquet_count()
@@ -831,24 +888,7 @@ def verify_upgrade_continuity(led: Ledger) -> None:
         return
     led.phase("Upgrade continuity — the previous release's config, cursor and crash, carried on")
     root = Path(tempfile.mkdtemp(prefix="rivet-oracle-upgrade-"))
-    states = [""] + ([os.environ["RIVET_GATE_STATE_URL"]] if os.environ.get("RIVET_GATE_STATE_URL") else [])
-    for engine in ENGINES:
-        uvar = f"RIVET_ORACLE_{engine.upper()}_URL"
-        url = os.environ.get(uvar, "")
-        if not url:
-            led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}]: no {uvar}", "no url")
-            continue
-        for state_url in states:
-            for leg in (_cursor_leg, _crash_leg, _way_back_leg, _no_way_back_leg):
-                # Each Postgres-state leg gets a DB the PREVIOUS release creates: the gate's own
-                # DB is already migrated by this binary, which the previous one rightly refuses.
-                fresh = isolate_state_db(state_url, f"{os.getpid()}_{engine}_{leg.__name__}") \
-                    if state_url else ""
-                if state_url and not fresh:
-                    led.failed(engine, "-", SCEN, "pg-state", f"upgrade[{engine}]: could not create "
-                               "a fresh Postgres state DB for the previous release", "no state db")
-                    continue
-                leg(led, prev, root, engine, url, fresh)
+    engine_legs(led, prev, _migration_carrier(led), root)
     if os.environ.get("RIVET_ORACLE_POSTGRES_URL"):
         _load_leg(led, prev, root, os.environ["RIVET_ORACLE_POSTGRES_URL"])
     else:
@@ -861,6 +901,39 @@ def verify_upgrade_continuity(led: Ledger) -> None:
             led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: no {cvar}", "no url")
             continue
         _cdc_leg(led, prev, engine, curl)
+
+
+def engine_legs(led: Ledger, prev: Path, carrier: Path | None, root: Path) -> None:
+    """Per SQL engine and state store, the previous release's legs, then the way-back legs from the pinned `carrier`."""
+    states = [""] + ([os.environ["RIVET_GATE_STATE_URL"]] if os.environ.get("RIVET_GATE_STATE_URL") else [])
+    pinned = prev_tag(carrier) if carrier else ""
+    for engine in ENGINES:
+        uvar = f"RIVET_ORACLE_{engine.upper()}_URL"
+        url = os.environ.get(uvar, "")
+        if not url:
+            led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}]: no {uvar}", "no url")
+            continue
+        for state_url in states:
+            runs = [(leg, prev, "") for leg in (_cursor_leg, _crash_leg, _way_back_leg, _no_way_back_leg)]
+            runs += [(leg, carrier, pinned) for leg in (_way_back_leg, _no_way_back_leg) if carrier]
+            for leg, old, pin in runs:
+                # Each Postgres-state leg gets a DB the OLDER release creates: the gate's own
+                # DB is already migrated by this binary, which the older one rightly refuses.
+                fresh = isolate_state_db(state_url, f"{os.getpid()}_{engine}_{leg.__name__}{'_p' if pin else ''}") \
+                    if state_url else ""
+                if state_url and not fresh:
+                    led.failed(engine, "-", SCEN, "pg-state", f"upgrade[{engine}]: could not create "
+                               "a fresh Postgres state DB for the older release", "no state db")
+                    continue
+                leg(led, old, root, engine, url, fresh, **({"pinned": pin} if pin else {}))
+
+
+def _self_test() -> None:
+    """The way-back legs run the doc's own restore blocks, not the first fenced block of its section."""
+    sh, sql = restore_block("sqlite"), restore_block("pg-state")
+    assert ".rivet_state.db.v" in sh and "cp -p" in sh, f"the SQLite restore the way-back leg runs:\n{sh}"
+    assert "rivet_state_backup_v" in sql and "SET SCHEMA" in sql, f"the PostgreSQL restore the way-back leg runs:\n{sql}"
+    print("self-test ok: the way-back legs run the restore blocks under the doc's SQLite and PostgreSQL headings")
 
 
 if __name__ == "__main__":
