@@ -786,16 +786,28 @@ fn contend(
 #[test]
 #[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds + RIVET_PREV_RELEASE_BIN"]
 fn the_previous_release_and_this_tree_never_hold_one_lease_together() {
-    let Some(bq) = BqLive::from_env("lease_compat") else {
+    one_lease_between("lease_compat", "lk_compat", Rig::as_previous_release, false);
+}
+
+/// The pinned release of an older state schema (`RIVET_MIGRATION_CARRIER_BIN`) and this tree contend in both orders: the state this tree migrated stops the older release at the schema, before it reaches the lease.
+#[test]
+#[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds + RIVET_MIGRATION_CARRIER_BIN"]
+fn the_pinned_older_schema_release_is_stopped_at_the_schema_before_this_trees_lease() {
+    one_lease_between("lease_mig", "lk_mig", Rig::as_migration_carrier, true);
+}
+
+/// One table's lease between the release `as_old` resolves and this tree, in both orders; with `older`, that release must write an older state schema.
+fn one_lease_between(dataset: &str, label: &str, as_old: fn(&Rig) -> Option<Rig>, older: bool) {
+    let Some(bq) = BqLive::from_env(dataset) else {
         return;
     };
     let mut old_schema = 0;
     for old_holds in [true, false] {
-        let Some(state) = ScratchState::create("lk_compat") else {
+        let Some(state) = ScratchState::create(label) else {
             return;
         };
-        let (t, new, _guard) = loadable(&bq, "lk_compat");
-        let Some(old) = new.as_previous_release() else {
+        let (t, new, _guard) = loadable(&bq, label);
+        let Some(old) = as_old(&new) else {
             return;
         };
         let _cleanup = bq.cleanup(&[&t]);
@@ -814,6 +826,10 @@ fn the_previous_release_and_this_tree_never_hold_one_lease_together() {
         } else if state.schema() > old_schema {
             "[RIVET_STATE_SCHEMA_NEWER]"
         } else {
+            assert!(
+                !older,
+                "the pinned release writes state schema v{old_schema}, this tree's own: pin a release from before the last migration"
+            );
             "is writing `"
         };
         contend(&state, &bq, &t, holder, contender, refusal);

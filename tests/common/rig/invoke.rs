@@ -55,17 +55,31 @@ impl Rig {
 
     /// A second handle on this rig's export whose invocations run the previous release (`RIVET_PREV_RELEASE_BIN`); `None`, with the skip recorded, when it is unset.
     pub fn as_previous_release(&self) -> Option<Rig> {
-        let Ok(bin) = std::env::var("RIVET_PREV_RELEASE_BIN") else {
-            crate::common::skip_live(
-                "RIVET_PREV_RELEASE_BIN unset: no previous-release binary to run beside this tree's",
-            );
+        self.as_release(
+            "RIVET_PREV_RELEASE_BIN",
+            "no previous-release binary to run beside this tree's",
+        )
+    }
+
+    /// The same handle on the pinned release of an older state schema (`RIVET_MIGRATION_CARRIER_BIN`), so a migration lies between it and this tree.
+    pub fn as_migration_carrier(&self) -> Option<Rig> {
+        self.as_release(
+            "RIVET_MIGRATION_CARRIER_BIN",
+            "no pinned older-schema release to migrate from",
+        )
+    }
+
+    /// A twin that runs the binary `var` names; `None`, with the skip recorded, when it is unset.
+    fn as_release(&self, var: &str, what: &str) -> Option<Rig> {
+        let Ok(bin) = std::env::var(var) else {
+            crate::common::skip_live(&format!("{var} unset: {what}"));
             return None;
         };
         // Absolute: a cell that runs in its own directory (`Rig::in_dir`) spawns by this path.
         let bin = std::fs::canonicalize(&bin).unwrap_or_else(|_| PathBuf::from(&bin));
         assert!(
             bin.is_file() && bin != Path::new(crate::common::runner::rivet_bin()),
-            "RIVET_PREV_RELEASE_BIN={} is not another rivet binary",
+            "{var}={} is not another rivet binary",
             bin.display()
         );
         let mut old = self.twin();
