@@ -8,9 +8,10 @@ buffer is left. The source epoch is computed by the source engine itself, never 
 session-rendered text. Every SQL engine runs a second time with a non-UTC zone (see `Src.tz_note`).
 Every engine runs once more as `/init=this`: THIS binary's init config, five cycles by this binary, so
 a fix in init is graded before the previous release carries it.
-MySQL and PostgreSQL run once more as `/empty-baseline`: the last table holds no row at the baseline, the
-previous release's compact must refuse it once its first rows are buffered (0.31.0 built no base for it),
-and this binary's first cycle must leave it equal to the source with no manual step.
+MySQL and PostgreSQL run once more as `/empty-baseline`: the last table holds no row at the baseline. A
+previous release before #501 (0.31.0 built no base for it) must refuse its compact on both cycles after its
+first rows are buffered, and this binary's first cycle must leave it equal to the source with no manual step;
+a previous release with #501 must refuse none, and its own compacts must leave it equal to the source.
 """
 
 from __future__ import annotations
@@ -359,6 +360,7 @@ def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, 
     """Oracle CDC does not load yet (ADR-0037; the GA work): init writes no `load:` block, says why,
     and `run` writes every table's baseline to Parquet whose `id:v:epoch` equals the source's."""
     import duckdb
+    import yaml
 
     from . import gcp
     from .scenarios import _declared_read
@@ -369,10 +371,14 @@ def _oracle_no_load(led: Ledger, name: str, fail, step, body: str, bucket: str, 
     if not r.ok:
         return fail("run", f"this {r.why}")
     names = gcp.gcs_list(bucket, f"{pfx}/")
+    # Each table's prefix as init wrote it, not a layout the harness guesses (#634 moved it to `<t>_cdc/`).
+    prefix = {str(x.get("table", "")).rsplit(".", 1)[-1].strip('"').upper(): x["destination"]["prefix"]
+              for x in yaml.safe_load(body)["exports"]}
     bad = []
     for t in tables:
         # The snapshot leg's objects, then only the parts its manifest DECLARES (what a consumer reads).
-        objs = [n for n in names if f"/{t}/cdc/snapshot/" in n and "/" not in n.split("/snapshot/", 1)[1]]
+        snap = f"{prefix.get(t.upper(), f'<no export of {t}>/')}snapshot/"
+        objs = [n for n in names if n.startswith(snap) and "/" not in n[len(snap):]]
         local = d / "baseline" / t
         local.mkdir(parents=True)
         for n in objs:
@@ -409,7 +415,8 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                  init_this: bool = False, empty: bool = False) -> None:
     """One cdc-load cell: the previous release's init config, three cycles by it and two by this binary;
     with `init_this`, this binary's init config and five cycles by this binary; with `empty`, the last
-    table is empty at the baseline and the previous release's compact must refuse it (`NO_BASE`)."""
+    table is empty at the baseline and the previous release's compact refuses it (`NO_BASE`) on both of its
+    cycles after the rows arrive, or on none."""
     import duckdb
 
     from . import gcp
@@ -505,14 +512,15 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                         continue
                     if not p.ok:
                         return fail(f"cycle{n}/{s}", f"{who} {p.why}")
-                if empty and who == "this" and refused != 2:
-                    # The positive control: the state this cell heals must have been produced.
-                    return fail(f"cycle{n}", f"the previous release's compact refused {refused} time(s), "
-                                             f"not twice, with `{NO_BASE}`")
+                if empty and who == "this" and refused not in (0, 2):
+                    # A release before #501 refuses both compacts after the rows arrive, one with it none.
+                    return fail(f"cycle{n}", f"the previous release's compact refused {refused} time(s) with "
+                                             f"`{NO_BASE}`: neither on both of its cycles after the rows arrived "
+                                             "(a release before #501) nor on none (a release with it)")
                 def grade() -> tuple[list[str], str]:
                     bad = []
                     with Duck(bigquery=True, bq_dataset=dset, **src.attach) as o:
-                        for t in (seeded if who == "prev" else tables):
+                        for t in (seeded if who == "prev" and (refused or n == 1) else tables):
                             want, live, gone, dup, buf = _state(o, src, dset, t)
                             ids = {int(x.split(":")[0]) for x in want.split(",") if x}
                             seen[t] |= ids
@@ -531,9 +539,12 @@ def cdc_load_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, tz:
                                              + "; ".join(bad)[:600])
             how = ("five cycles by this binary on its own init config" if init_this else
                    "three cycles by the previous release, two by this binary on its init config")
-            if empty:
+            if empty and refused:
                 how += (f"; the last table was empty at the baseline, the previous release's compact refused it "
                         f"{refused} time(s) and this binary's first cycle built its base")
+            elif empty:
+                how += ("; the last table was empty at the baseline, and the previous release's own compacts "
+                        "built its base once rows arrived")
             led.passed(engine, "-", SCEN, "cdc-load", f"{name}: {how}; after every compact each of {CDC_TABLES} bases "
                        f"equals the source instant by value, deletes flagged, no duplicate key, no buffer left "
                        f"(partition column: {part or 'none'}{f'; zone: {src.tz_note}' if tz else ''})", "cdc-load")

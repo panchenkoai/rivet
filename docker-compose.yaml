@@ -700,6 +700,47 @@ services:
       timeout: 3s
       retries: 20
 
+  # ---- MySQL in another time zone, alone and behind a proxy that drops a SET ----
+  # `mysql-tz` runs with `default_time_zone = '+03:00'` (a server in Europe/Moscow);
+  # `proxysql-tz` stands in front of it with one query rule that answers every
+  # `SET time_zone ...` with OK and never forwards it — what a pilot's ProxySQL did
+  # (0.32.1, D5): rivet's UTC session never reached the backend that read, and every
+  # TIMESTAMP landed 3 h off as UTC. Opt in: `docker compose --profile tz up -d proxysql-tz`.
+  mysql-tz:
+    image: mysql:8.0
+    profiles: ["tz"]
+    command:
+      - "--default-authentication-plugin=mysql_native_password"
+      - "--default-time-zone=+03:00"
+    environment:
+      MYSQL_ROOT_PASSWORD: rivet
+      MYSQL_USER: rivet
+      MYSQL_PASSWORD: rivet
+      MYSQL_DATABASE: rivet
+    ports:
+      - "3397:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-privet"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  proxysql-tz:
+    image: proxysql/proxysql:2.5.5
+    profiles: ["tz"]
+    ports:
+      - "6097:6033"
+    depends_on:
+      mysql-tz:
+        condition: service_healthy
+    volumes:
+      - ./dev/proxysql/proxysql-tz.cnf:/etc/proxysql.cnf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '(echo > /dev/tcp/127.0.0.1/6033)' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:latest
     ports:

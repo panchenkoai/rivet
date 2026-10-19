@@ -25,6 +25,7 @@ mod run_aggregate;
 mod run_status_store;
 mod schema;
 mod shape;
+mod write_turn;
 
 // Re-export domain types so callers use `rivet::state::*` unchanged.
 // Items below may not be explicitly named by all internal callers (often used
