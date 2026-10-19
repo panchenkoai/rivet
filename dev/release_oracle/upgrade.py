@@ -14,11 +14,14 @@ Per SQL engine, on the downloaded previous binary and this one:
              once, every latest value right (the cursor in state is the artifact).
   way-back   previous incremental run twice → a later delta → this binary's run (it migrates the
              state and leaves the pre-migration copy) → the restore in docs/reference/state.md,
-             run AS WRITTEN there (its sh / sql block) → the previous release runs again: exit 0,
-             from its own cursor; every id delivered, the overlap exactly this binary's delta.
+             run AS WRITTEN there (the sh block under its SQLite heading, the sql block under its
+             PostgreSQL one) → the previous release runs again: exit 0, from its own cursor; every
+             id delivered, the overlap exactly this binary's delta.
   no-way-back the copy cannot be written (SQLite: a read-only state directory; Postgres: a role
              without CREATE on the database): this binary stops RIVET_STATE_BACKUP_FAILED, exit 1,
              writes no part; the previous release still opens the state and delivers the delta.
+             Both are SKIP when the previous release writes this binary's state schema: nothing
+             migrates, so there is no copy to leave or restore.
   crash      the previous binary crashes mid keyset run → this binary resumes it: every
              id exactly once, and no part the crashed run left is written again (the crash
              checkpoint is the artifact; a restart from scratch rewrites the same part names).
@@ -308,16 +311,21 @@ def _fresh_leg(led: Ledger, e: _Env, engine: str, want: int) -> None:
 
 RESTORE_DOC = ROOT / "docs/reference/state.md"
 RESTORE_SECTION = "## Rolling back an upgrade"
+#: Per state store, the heading under RESTORE_SECTION that holds its restore and the language of its block.
+RESTORE_BLOCKS = {"sqlite": ("### SQLite", "sh"), "pg-state": ("### PostgreSQL", "sql")}
 
 
-def restore_block(lang: str, text: str | None = None) -> str:
-    """The fenced ```<lang> block under "Rolling back an upgrade" in docs/reference/state.md: the cell runs the doc as written."""
+def restore_block(store: str, text: str | None = None) -> str:
+    """The fenced block under `store`'s heading of "Rolling back an upgrade" in docs/reference/state.md: the cell runs the doc as written."""
     text = RESTORE_DOC.read_text() if text is None else text
+    heading, lang = RESTORE_BLOCKS[store]
     if RESTORE_SECTION not in text:
         raise RuntimeError(f"{RESTORE_DOC.name}: no section {RESTORE_SECTION!r}")
-    m = re.search(rf"```{re.escape(lang)}\n(.*?)```", text.split(RESTORE_SECTION, 1)[1], re.S)
+    section = re.split(r"^## ", text.split(RESTORE_SECTION, 1)[1], maxsplit=1, flags=re.M)[0]
+    sub = next((s for s in re.split(r"^(?=### )", section, flags=re.M) if s.startswith(f"{heading}\n")), "")
+    m = re.search(rf"```{re.escape(lang)}\n(.*?)```", sub, re.S)
     if m is None:
-        raise RuntimeError(f"{RESTORE_DOC.name}: no ```{lang} block under {RESTORE_SECTION!r}")
+        raise RuntimeError(f"{RESTORE_DOC.name}: no ```{lang} block under {heading!r} of {RESTORE_SECTION!r}")
     return m.group(1)
 
 
@@ -343,8 +351,33 @@ def _copies(e: _Env, state_url: str) -> list[str]:
 def _restore(e: _Env, state_url: str) -> Proc:
     """The restore doc, run as written: its sh block in the config dir (SQLite), its sql block on the state database (Postgres)."""
     if not state_url:
-        return run(["bash", "-euo", "pipefail", "-c", restore_block("sh")], cwd=e.dir)
-    return _state_psql(state_url, restore_block("sql"))
+        return run(["bash", "-euo", "pipefail", "-c", restore_block("sqlite")], cwd=e.dir)
+    return _state_psql(state_url, restore_block("pg-state"))
+
+
+_SCHEMAS: dict[Path, int | None] = {}
+
+
+def _schema_of(binary: Path, e: _Env) -> int | None:
+    """The state schema `binary` writes: its own `state show` over an empty SQLite state beside a copy of `e`'s config."""
+    if binary not in _SCHEMAS:
+        d = Path(tempfile.mkdtemp(prefix="schema-", dir=e.dir.parent))
+        shutil.copy(e.dir / "c.yaml", d / "c.yaml")
+        run([str(binary), "state", "show", "-c", "c.yaml"], env={**e.env, "RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": ""},
+            cwd=d)
+        _SCHEMAS[binary] = None
+        if (d / ".rivet_state.db").is_file():
+            with closing(sqlite3.connect(d / ".rivet_state.db")) as con:
+                _SCHEMAS[binary] = con.execute("SELECT max(version) FROM schema_version").fetchone()[0]
+    return _SCHEMAS[binary]
+
+
+def _no_migration(prev: Path, e: _Env) -> str | None:
+    """Why a way-back leg has nothing to grade: the previous release writes this binary's state schema; None when this binary migrates it."""
+    was, now = _schema_of(prev, e), _schema_of(rivet_bin(), e)
+    if was is None or was != now:
+        return None
+    return f"the previous release and this binary both write state schema v{now}: nothing migrates, so no copy is left to restore"
 
 
 def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, state_url: str) -> None:
@@ -356,6 +389,8 @@ def _way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str, st
         return led.failed(engine, "-", SCEN, store, f"{tag}: seed failed", "seed")
     e = _Env(prev, root, engine, url, table, "incremental", state_url)
     try:
+        if e.init.ok and (same := _no_migration(prev, e)):
+            return led.skipped(engine, "-", SCEN, store, f"{tag}: {same}", "same schema")
         r1 = e.rivet(prev, "run", "-c", "c.yaml")
         ok = e.init.ok and r1.ok and _mutate(engine, url, table)
         r2 = e.rivet(prev, "run", "-c", "c.yaml")
@@ -410,6 +445,8 @@ def _no_way_back_leg(led: Ledger, prev: Path, root: Path, engine: str, url: str,
         return led.failed(engine, "-", SCEN, store, f"{tag}: seed failed", "seed")
     e = _Env(prev, root, engine, url, table, "incremental", state_url)
     try:
+        if e.init.ok and (same := _no_migration(prev, e)):
+            return led.skipped(engine, "-", SCEN, store, f"{tag}: {same}", "same schema")
         r1 = e.rivet(prev, "run", "-c", "c.yaml")
         ok = e.init.ok and r1.ok and _mutate(engine, url, table)
         before = e.parquet_count()
@@ -861,6 +898,14 @@ def verify_upgrade_continuity(led: Ledger) -> None:
             led.skipped(engine, "-", SCEN, "local", f"upgrade[{engine}/cdc]: no {cvar}", "no url")
             continue
         _cdc_leg(led, prev, engine, curl)
+
+
+def _self_test() -> None:
+    """The way-back legs run the doc's own restore blocks, not the first fenced block of its section."""
+    sh, sql = restore_block("sqlite"), restore_block("pg-state")
+    assert ".rivet_state.db.v" in sh and "cp -p" in sh, f"the SQLite restore the way-back leg runs:\n{sh}"
+    assert "rivet_state_backup_v" in sql and "SET SCHEMA" in sql, f"the PostgreSQL restore the way-back leg runs:\n{sql}"
+    print("self-test ok: the way-back legs run the restore blocks under the doc's SQLite and PostgreSQL headings")
 
 
 if __name__ == "__main__":
