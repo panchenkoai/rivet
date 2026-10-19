@@ -2,6 +2,107 @@
 
 ## Unreleased
 
+## 0.32.1 — 2026-10-19
+
+**Upgrading from 0.32.0 — read these first:**
+
+- **No state migration.** The state schema stays v37; 0.32.0 and 0.32.1 open each other's state.
+- **New refusals (exit 5) where 0.32.0 went on or failed generically:**
+  - a MySQL session still off UTC after rivet's `SET time_zone` (a proxy dropped it):
+    `RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED`, before any row is read;
+  - a remote PostgreSQL `RIVET_STATE_URL` without `sslmode`: `RIVET_STATE_URL_TLS_REQUIRED`
+    (add `?sslmode=require`, or `?sslmode=disable` on a private network);
+  - `rivet check` that logged an ERROR: `RIVET_CLI_CHECK_REPORTED_ERRORS` instead of `Looks good.`;
+  - `rivet init` with a `RIVET_STATE_URL` that does not answer writes no config.
+- **`rivet init` names a CDC export `<table>_cdc` with a sibling prefix** (new configs only; an
+  existing config is read as before).
+
+- **A state write beside a sibling writer in the same process could fail `database is locked`.**
+  SQLite's busy wait has no queue: a writer that committed back to back (chunk workers, the lease
+  keeper, a run's own store on one SQLite state file) took the lock in every gap, and the other
+  store's `BEGIN IMMEDIATE` was refused after 15 s, past the 10 s busy timeout (0.32.0 and
+  earlier; seen as a 1-in-1000 CI failure of a replan beside a writer). **Now** writers of one
+  state file in one process take turns at its write lock, first come first served; another
+  process still meets SQLite's busy wait. **What to do:** nothing.
+
+- **A MySQL source behind a proxy that dropped `SET time_zone` delivered every TIMESTAMP shifted
+  by the server's offset, exit 0.** rivet reads MySQL in a UTC session; a ProxySQL that answered
+  the SET without forwarding it left the read at the server's zone (a pilot's Europe/Moscow:
+  `12:00:00Z` written for `09:00:00Z`) (0.32.0 and earlier). **Now** rivet checks on the
+  connection that reads, before the first row, that the session is at UTC, and refuses
+  `RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED`, exit 5, naming the offset otherwise. **What to
+  do:** set `default_time_zone = '+00:00'` on the server, keep rivet's session variables on one
+  backend in the proxy, or connect directly; re-export what a proxied run delivered before.
+
+- **A `skipped` entry of the run summary did not say why it was skipped.** `--summary-output`
+  and `--json` of `rivet run` / `rivet apply` wrote `status: "skipped"` for a `skip_empty` run
+  with no reason, while the console card and the metrics row had it (0.32.0 and earlier).
+  **Now** every `per_export[]` entry carries `skip_reason`: the reason for a `skipped` entry ("no
+  new rows since cursor 'updated_at'", "source returned 0 rows"), `null` for every other, on the
+  sequential, thread and process runners. **What to do:** nothing; a scheduler may read it.
+
+- **`rivet init` gave a table's batch and CDC exports one name and nested the CDC prefix in the
+  batch one.** Both scaffolds named the export after the table, and the CDC one wrote
+  `exports/<t>/cdc/` inside `exports/<t>/` (`./output/<t>/cdc/` locally), so the two exports shared
+  a load spec in a shared state and a load of the batch prefix listed the stream's runs (0.32.0
+  and earlier). **Now** a CDC scaffold names its export `<t>_cdc` and writes to the sibling
+  `exports/<t>_cdc/` (`./output/<t>_cdc/`). **What to do:** nothing for new scaffolds; a config
+  generated earlier keeps working, and `rivet load` already skips a nested CDC export's runs.
+- **A schema-wide `rivet init` on SQL Server scaffolded the system tables SQL Server ships.** On a
+  database with CDC enabled `dbo.systranschemas` became an export (0.32.0 and earlier). **Now**
+  tables and views marked `IsMSShipped` are left out. **What to do:** delete such an export from a
+  config generated earlier.
+- **A SQL Server login without `VIEW SERVER PERFORMANCE STATE` filled the log with permission
+  errors.** Each run sampled the server counters (`sys.dm_os_performance_counters` and the wait
+  and query statistics) and the driver logged the server's refusal at ERROR, twice per run, on a
+  run that otherwise succeeded (0.32.0 and earlier). **Now** rivet asks once per connection
+  whether the login may read them and skips them quietly when it may not. **What to do:**
+  nothing; grant `VIEW SERVER PERFORMANCE STATE` (2022) or `VIEW SERVER STATE` to keep the
+  harm counters and the governor's pressure signal.
+
+- **The rollback steps left the previous release refusing every table the newer release
+  created.** After putting the state copy back, a warehouse table first loaded after the upgrade
+  has no row in the restored load ledger, so the previous release's `rivet load` refused it on
+  every cycle ("no record of rivet loading it", exit 1), and `docs/reference/state.md` did not say
+  so (0.32.0). **Now** the rollback steps list those tables (`rivet state loads` before and after
+  the restore) and drop them, and the previous release's next load lands them again from the runs
+  still staged. **What to do:** when rolling back, follow steps 2, 4 and 5 of "Rolling back an
+  upgrade".
+
+- **`rivet init`, `rivet check` and `rivet doctor` were green over a state no run could open.**
+  With `RIVET_STATE_URL` pointing at a state that does not answer, `init` warned "primary keys
+  not recorded" and wrote the config, exit 0; `check` printed `Looks good.`, exit 0; `doctor`
+  did not look at the state at all, so setup passed and every run after it failed (0.32.0 and
+  earlier). **Now** `doctor` opens the state the config uses without migrating it and prints
+  `[OK]  State (postgres …)` / `(sqlite …)` or fails; `check` exits non-zero
+  (`RIVET_CLI_CHECK_REPORTED_ERRORS`) when it logged an ERROR line, including a state that does not
+  answer; `init -o` with `RIVET_STATE_URL` set refuses before writing the config when that state
+  does not answer. **What to do:** nothing; fix what the new failure names.
+
+- **`rivet --version` printed `(unknown)` instead of the commit on the glibc 2.28 Linux assets.**
+  The container that builds them checked the tree out without `.git`, so the build could not read
+  the commit (0.32.0). **Now** they print `rivet <version> (<commit>)` like every other asset, and
+  the release refuses to publish one that does not. **What to do:** nothing.
+
+- **A PostgreSQL state on a remote host without TLS could not be used at all.** Every command
+  with `RIVET_STATE_URL` naming a non-loopback host was refused `RIVET_STATE_BACKEND_FAILED`,
+  exit 1, with a text that told the operator to add `source.tls`, a key the state does not
+  have, and even `?sslmode=disable` was refused (0.32.0 and earlier). **Now** `?sslmode=disable`
+  is honoured as the operator's opt-out with one warning line, and a remote URL that names no
+  `sslmode` is refused `RIVET_STATE_URL_TLS_REQUIRED`, exit 5, naming the two state remedies.
+  **What to do:** add `?sslmode=require` to `RIVET_STATE_URL` with TLS on the state server, or
+  `?sslmode=disable` on a private network.
+
+- **A batch `rivet load` read the runs of a CDC export nested inside its prefix.** `rivet init`
+  puts a table's CDC export at `exports/<t>/cdc/` inside its batch export `exports/<t>/`, under
+  the same export name, and the load lists its prefix recursively: the batch table received the
+  stream's change rows, so a row deleted at the source stayed in it (a full load landed 7 rows
+  for 5, an incremental one kept the deleted key), exit 0 (0.32.0 and earlier). **Now** a full or
+  incremental load skips the CDC runs of its export that sit in a sub-directory holding none of
+  its batch runs, and says in one line which directories it skipped; the CDC export's own load
+  still loads them. **What to do:** nothing; reload a batch table that was loaded from such a
+  prefix (`mode: full` replaces it on the next load).
+
 ## 0.32.0 — 2026-10-18
 
 **Upgrading from 0.31.x or earlier — read these first:**
