@@ -2891,6 +2891,42 @@ mod tests {
         );
     }
 
+    /// The whole-schema PostgreSQL stream names its one slot after the `-o` stem, and keeps the
+    /// default `rivet_public_cdc` (marked one per cluster) without one.
+    #[test]
+    fn a_whole_schema_postgres_stream_names_its_slot_from_the_output_file() {
+        let t = |name: &str| TableInfo {
+            cdc_capture_instance: None,
+            density: None,
+            schema: "public".into(),
+            table: name.into(),
+            row_estimate: 100,
+            total_bytes: None,
+            columns: vec![pk("id", "bigint")],
+        };
+        let render = |dest: &InitYamlDestination| {
+            generate_schema_config(
+                &[t("orders"), t("invoices")],
+                "postgresql://rivet:rivet@localhost/app",
+                &crate::init::SourceProvenance::Inline,
+                "PostgreSQL schema \"public\"",
+                dest,
+                Some("cdc"),
+                None,
+            )
+            .unwrap()
+        };
+        let named = render(&InitYamlDestination {
+            cdc_name_stem: Some("staging".into()),
+            ..Default::default()
+        });
+        assert!(named.contains("slot: rivet_staging_public_cdc "), "{named}");
+        assert!(!named.contains("one per cluster"), "{named}");
+        let stdout = render(&InitYamlDestination::default());
+        assert!(stdout.contains("slot: rivet_public_cdc "), "{stdout}");
+        assert!(stdout.contains("one per cluster"), "{stdout}");
+    }
+
     #[test]
     fn whole_db_cdc_consolidates_into_one_tables_stream() {
         // Multiple tables + `--mode cdc` + MySQL ⇒ ONE `tables:` export (one
