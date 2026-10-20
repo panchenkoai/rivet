@@ -1505,3 +1505,62 @@ fn two_cdc_configs_of_one_cluster_name_their_own_stream_objects() {
         "two configs of one server get two replica ids"
     );
 }
+
+/// A copy into a PostgreSQL state that already holds state rows (the same SQLite state copied a
+/// second time) is refused by code, on every attempt, before a row is written; a schema of its
+/// own, the refusal's remedy, takes the copy.
+#[test]
+#[ignore = "live: requires postgres + postgres-state"]
+fn a_state_copy_into_a_state_with_rows_is_refused_and_walked_out() {
+    let tbl = unique_name("rivet_copy_src");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v TEXT); \
+             INSERT INTO {tbl} SELECT g, 'v' || g FROM generate_series(1, 20) g"
+        ))
+        .unwrap();
+    let _t = PgTable::adopt(tbl.clone());
+    let mut rig = Rig::pg_batch(&tbl);
+    rig.run_ok();
+    let filled = ScratchStateSchema::new("rivet_copy_filled");
+    let fresh = ScratchStateSchema::new("rivet_copy_fresh");
+    let (filled_url, fresh_url) = (filled.url(), fresh.url());
+    let first = rig.cli(&["state", "copy", "--to", &filled_url]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let want = Refused::by_code("RIVET_STATE_COPY_TARGET_NOT_EMPTY", 5);
+    rig.refuses_twice_and_walks_out(
+        &["state", "copy", "--to", &filled_url],
+        &[],
+        want,
+        vec![
+            Remedy::wrong(
+                "copies again into the same state",
+                Then::Refuses(want),
+                |_| {},
+            ),
+            Remedy::new(
+                "Copy into a database (or schema) of its own",
+                Then::DeliversTheSource,
+                |_| {},
+            )
+            .rerun_as(&["state", "copy", "--to", &fresh_url]),
+        ],
+    );
+    let runs = |state: &ScratchStateSchema| -> i64 {
+        state
+            .client()
+            .query_one("SELECT COUNT(*) FROM run_status", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(
+        runs(&fresh),
+        runs(&filled),
+        "the remedy copied the same state"
+    );
+    assert!(runs(&fresh) > 0, "the copied state holds the run");
+}

@@ -22,7 +22,7 @@ pub struct CopyReport {
 /// The SQLite file `config` keeps its state in and the PostgreSQL state to copy it into:
 /// `--to`, else a PostgreSQL `RIVET_STATE_URL`.
 pub fn endpoints(config: &str, to: Option<String>) -> Result<(std::path::PathBuf, String)> {
-    endpoints_in(config, to, std::env::var("RIVET_STATE_URL").ok())
+    endpoints_in(config, to, super::state_url_var())
 }
 
 /// [`endpoints`] over the value of `RIVET_STATE_URL`.
