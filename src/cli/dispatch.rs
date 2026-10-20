@@ -62,6 +62,14 @@ fn check_export_selection(config: &Config, export: Option<&str>) -> Result<()> {
     );
 }
 
+/// Where a `rivet load` / `rivet compact` sends its result document.
+fn load_report(json: bool, summary_output: Option<String>) -> load::result::Report {
+    load::result::Report {
+        json,
+        summary_output: summary_output.map(std::path::PathBuf::from),
+    }
+}
+
 /// Validate and execute the parsed CLI. Returns `Err` with a formatted message
 /// on validation failure or any subcommand error; `main.rs` decides whether to
 /// render it as plain text or JSON via the `--json-errors` global flag.
@@ -113,20 +121,32 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             run_id,
             rebuild_changelog,
             pool,
+            export,
+            table,
+            json,
+            summary_output,
         } => load::orchestrate::run_loads(load::orchestrate::LoadArgs {
             config,
             run_id,
             rebuild_changelog,
             pool,
+            selection: load::plan::Selection { export, table },
+            report: load_report(json, summary_output),
         }),
         Commands::Compact {
             config,
             run_id,
             pool,
+            export,
+            table,
+            json,
+            summary_output,
         } => load::compact::run_compacts(load::compact::CompactArgs {
             config,
             run_id,
             pool,
+            selection: load::plan::Selection { export, table },
+            report: load_report(json, summary_output),
         }),
         Commands::Init {
             source,

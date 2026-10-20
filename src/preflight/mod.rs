@@ -712,6 +712,7 @@ pub fn load_type_reports(
     config: &Config,
     state: &crate::state::StateStore,
     target: ExportTarget,
+    keep: &dyn Fn(&crate::config::ExportConfig, Option<&str>) -> bool,
 ) -> Result<(
     Vec<type_report::ExportTypeReport>,
     crate::plan::load_settings::RecordedKeys,
@@ -734,7 +735,7 @@ pub fn load_type_reports(
             Some(tables) => tables.iter().cloned().map(Some).collect(),
             None => vec![None],
         };
-        for unit in units {
+        for unit in units.into_iter().filter(|u| keep(export, u.as_deref())) {
             match state.load_spec(&export.name, unit.as_deref()) {
                 Ok(Some(spec)) if !spec.columns.is_empty() => {
                     let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
@@ -1272,7 +1273,7 @@ mod tests {
         let cfg = crate::config::Config::from_yaml(yaml).expect("the config parses");
         let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
         let target = crate::types::target::ExportTarget::parse("bigquery").expect("bigquery");
-        let err = load_type_reports(&cfg, &state, target)
+        let err = load_type_reports(&cfg, &state, target, &|_, _| true)
             .err()
             .expect("no spec is recorded for the export");
         crate::error::assert_coded(&err, "RIVET_LOAD_SPEC_MISSING", 5);
@@ -1290,7 +1291,7 @@ mod tests {
         let state = crate::state::StateStore::open_in_memory().expect("in-memory state");
         let target = crate::types::target::ExportTarget::parse("bigquery").expect("bigquery");
 
-        let missing = load_type_reports(&cfg, &state, target)
+        let missing = load_type_reports(&cfg, &state, target, &|_, _| true)
             .err()
             .expect("no spec recorded");
         crate::error::assert_coded(&missing, "RIVET_LOAD_SPEC_MISSING", 5);
@@ -1300,7 +1301,7 @@ mod tests {
         );
 
         state.exec_for_test("DROP TABLE export_load_spec");
-        let fault = load_type_reports(&cfg, &state, target)
+        let fault = load_type_reports(&cfg, &state, target, &|_, _| true)
             .err()
             .expect("the spec table is gone");
         crate::error::assert_coded(&fault, "RIVET_STATE_BACKEND_FAILED", 1);
@@ -1343,7 +1344,7 @@ mod tests {
             .expect("record the cdc export's own spec");
 
         let target = crate::types::target::ExportTarget::parse("bigquery").expect("bigquery");
-        let (reports, _keys) = load_type_reports(&cfg, &state, target)
+        let (reports, _keys) = load_type_reports(&cfg, &state, target, &|_, _| true)
             .expect("the recipe must not be asked for a load spec it can never have");
         let named: Vec<&str> = reports.iter().map(|r| r.export.as_str()).collect();
         assert_eq!(
