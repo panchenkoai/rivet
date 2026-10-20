@@ -83,7 +83,12 @@ pub(super) fn pin_plan_to_its_run(
     for (_, run_id) in &newest_first {
         // With the init-recorded key when the run recorded none (a `query:` export
         // has no key to read) — never with a key another run wrote by name.
-        match s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), run_id) {
+        match s.load_spec_of_run_with_init_key(
+            &plan.export_name,
+            plan.unit.as_deref(),
+            &plan.source_key,
+            run_id,
+        ) {
             Ok(Some(spec)) => {
                 pinned = Some((run_id.clone(), spec));
                 break;
@@ -125,9 +130,12 @@ pub(super) fn pin_plan_to_its_run(
     };
     let mut respelled: Vec<(String, String, String)> = Vec::new();
     for older in runs_loaded_with_the_pin(op, plan.mode, &newest_first, &run_id, &loaded) {
-        if let Ok(Some(o)) =
-            s.load_spec_of_run_with_init_key(&plan.export_name, plan.unit.as_deref(), older)
-        {
+        if let Ok(Some(o)) = s.load_spec_of_run_with_init_key(
+            &plan.export_name,
+            plan.unit.as_deref(),
+            &plan.source_key,
+            older,
+        ) {
             let names: Vec<&str> = o.columns.iter().map(|c| c.name.as_str()).collect();
             for (was, now) in load::plan::lookalike_spelling_changes(&pinned_names, &names) {
                 respelled.push((older.to_string(), was, now));

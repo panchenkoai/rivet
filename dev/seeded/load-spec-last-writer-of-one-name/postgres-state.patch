@@ -1,0 +1,13 @@
+diff --git a/src/state/load_spec_store.rs b/src/state/load_spec_store.rs
+index d8f5ac73..9225232a 100644
+--- a/src/state/load_spec_store.rs
++++ b/src/state/load_spec_store.rs
+@@ -259,7 +259,7 @@ impl StateStore {
+                 unit.unwrap_or("").into(),
+                 serde_json::to_string(primary_key)?.into(),
+                 now.into(),
+-                source.into(),
++                source.get(..0).unwrap_or(source).into(),
+             ],
+         )?;
+         Ok(())

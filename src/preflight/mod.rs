@@ -736,7 +736,7 @@ pub fn load_type_reports(
             None => vec![None],
         };
         for unit in units.into_iter().filter(|u| keep(export, u.as_deref())) {
-            match state.load_spec(&export.name, unit.as_deref()) {
+            match state.load_spec(&export.name, unit.as_deref(), &config.source.state_key()) {
                 Ok(Some(spec)) if !spec.columns.is_empty() => {
                     let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
                     if let Some(pk) = spec.primary_key {
@@ -1330,6 +1330,7 @@ mod tests {
             .record_load_spec(
                 "stream",
                 Some("orders"),
+                "",
                 &[crate::state::LoadSpecColumn {
                     name: "id".into(),
                     source_type: "bigint".into(),

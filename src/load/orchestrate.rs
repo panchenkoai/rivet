@@ -2537,6 +2537,7 @@ mod load_ledger_tests {
             clustering: load::plan::Clustering::Auto(vec![]),
             pinned_run: None,
             layout: CdcLayout::LogAndView,
+            source_key: String::new(),
         };
         let err = require_pk(&plan, "cdc").unwrap_err().to_string();
         assert!(err.contains("export `c1`"), "must name the export: {err}");
@@ -2745,6 +2746,7 @@ mod load_ledger_tests {
     fn cdc_plan(dir: &tempfile::TempDir, table: &str) -> load::plan::LoadPlan {
         use load::plan::{CdcLayout, LoadMode, LoadPlan, LoadSection, LoadTarget};
         LoadPlan {
+            source_key: String::new(),
             deleted_flag: false,
             renames: Vec::new(),
             rename_warnings: Vec::new(),
