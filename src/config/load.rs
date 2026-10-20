@@ -1069,6 +1069,11 @@ mod partition_form_tests {
             [true, false, false]
         );
         assert_eq!(
+            [bq.names_jobs(), sf.names_jobs(), ch.names_jobs()],
+            [true, false, true],
+            "the snow CLI prints no query id"
+        );
+        assert_eq!(
             [
                 bq.renames_lookalikes(),
                 sf.renames_lookalikes(),
