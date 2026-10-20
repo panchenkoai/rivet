@@ -5909,4 +5909,23 @@ mod overwritten_delta_tests {
         assert_eq!(warn(true, &[load("full", "failed")]), None);
         assert_eq!(warn(true, &[]), None);
     }
+
+    /// An incremental report counts the rows of whichever load it was.
+    #[test]
+    fn an_incremental_report_counts_the_rows_its_load_landed() {
+        let table = crate::load::orchestrate::IncrementalReport::Table(crate::load::LoadReport {
+            rows_loaded: 7,
+            target_table: "p.d.t".into(),
+            source_cleaned: false,
+        });
+        let log =
+            crate::load::orchestrate::IncrementalReport::Changelog(crate::load::CdcLoadReport {
+                rows_appended: 40,
+                changes_table: "p.d.t__changes".into(),
+                target: "p.d.t".into(),
+                target_kind: crate::load::ChangelogTarget::View,
+                source_cleaned: false,
+            });
+        assert_eq!((table.rows(), log.rows()), (7, 40));
+    }
 }

@@ -69,11 +69,16 @@ pub struct Report {
 impl Report {
     /// A human result line: stdout, unless stdout carries the document.
     pub(crate) fn say(&self, line: &str) {
-        if self.json {
+        if self.says_on_stderr() {
             eprintln!("{line}");
         } else {
             println!("{line}");
         }
+    }
+
+    /// Whether the human lines go to stderr: they do when stdout carries the document.
+    pub(crate) fn says_on_stderr(&self) -> bool {
+        self.json
     }
 
     /// Write and print `result` as asked; a file that cannot be written is the command's failure.
@@ -130,6 +135,21 @@ pub(crate) fn exit_of(tables: Result<()>, document: Result<()>) -> Result<()> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn the_human_lines_leave_stdout_only_when_stdout_carries_the_document() {
+        let json = Report {
+            json: true,
+            summary_output: None,
+        };
+        let file = Report {
+            json: false,
+            summary_output: Some("s.json".into()),
+        };
+        assert!(json.says_on_stderr());
+        assert!(!file.says_on_stderr());
+        assert!(!Report::default().says_on_stderr());
+    }
 
     #[test]
     fn each_outcome_fills_the_keys_its_status_owns() {

@@ -3594,4 +3594,102 @@ load: { target: bigquery, project: p, dataset: d }
             Some("RIVET_LOAD_DESTINATION_TYPE_UNSUPPORTED")
         );
     }
+
+    /// `--export` / `--table` take what they name and refuse a name the config does not load,
+    /// listing what it does load; a backfill recipe is not a loaded export.
+    #[test]
+    fn a_selection_takes_what_it_names_and_refuses_what_the_config_does_not_load() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: alpha
+    table: public.alpha
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: alpha/ }
+  - name: orders_base
+    table: orders
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: base/ }
+  - name: customers_base
+    table: customers
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: cust/ }
+  - name: stream
+    tables: [orders, customers]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      backfill: [orders_base, customers_base]
+    destination: { type: gcs, bucket: b, prefix: cdc/ }
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .unwrap();
+        let sel = |export: Option<&str>, table: Option<&str>| Selection {
+            export: export.map(str::to_string),
+            table: table.map(str::to_string),
+        };
+        let refusal = |s: Selection| {
+            let err = s.check(&cfg).expect_err("must refuse");
+            (crate::error::error_code(&err), format!("{err:#}"))
+        };
+
+        assert!(sel(None, None).keeps("alpha", "public_alpha"));
+        assert!(sel(Some("alpha"), None).keeps("alpha", "x"));
+        assert!(!sel(Some("alpha"), None).keeps("stream", "x"));
+        assert!(sel(None, Some("orders")).keeps("stream", "orders"));
+        assert!(!sel(None, Some("orders")).keeps("stream", "customers"));
+        assert!(!sel(Some("alpha"), Some("orders")).keeps("stream", "orders"));
+        assert!(!sel(Some("stream"), Some("orders")).keeps("stream", "customers"));
+        assert!(sel(Some("stream"), Some("orders")).keeps("stream", "orders"));
+
+        sel(None, None).check(&cfg).unwrap();
+        sel(Some("stream"), None).check(&cfg).unwrap();
+        sel(None, Some("public_alpha")).check(&cfg).unwrap();
+        sel(Some("stream"), Some("customers")).check(&cfg).unwrap();
+
+        assert_eq!(
+            refusal(sel(Some("orders_base"), None)),
+            (
+                Some("RIVET_CLI_EXPORT_UNKNOWN"),
+                "export 'orders_base' is not loaded by this config.\n  Loaded exports: alpha, stream"
+                    .to_string()
+            ),
+            "a backfill recipe runs inside its CDC export and is not loaded by name"
+        );
+        assert_eq!(
+            refusal(sel(Some("alpha"), Some("customers"))),
+            (
+                Some("RIVET_CLI_TABLE_UNKNOWN"),
+                "table 'customers' is not loaded by export 'alpha'.\n  Loaded tables: public_alpha"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            refusal(sel(None, Some("nope"))),
+            (
+                Some("RIVET_CLI_TABLE_UNKNOWN"),
+                "table 'nope' is not loaded by this config.\n  Loaded tables: customers, orders, public_alpha"
+                    .to_string()
+            )
+        );
+        assert_eq!(list_or_none(&[]), "(none)");
+        assert_eq!(list_or_none(&["a", "b"]), "a, b");
+        let stream = cfg.exports.iter().find(|e| e.name == "stream").unwrap();
+        assert_eq!(
+            units_of(stream),
+            vec![Some("orders".to_string()), Some("customers".to_string())]
+        );
+        assert_eq!(units_of(&cfg.exports[0]), vec![None]);
+    }
 }

@@ -1502,3 +1502,19 @@ mod init_snowflake_flags_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod load_report_tests {
+    /// `--json` and `--summary-output` reach the report as written.
+    #[test]
+    fn the_load_report_carries_both_flags() {
+        let r = super::load_report(true, Some("out/s.json".into()));
+        assert!(r.json);
+        assert_eq!(
+            r.summary_output,
+            Some(std::path::PathBuf::from("out/s.json"))
+        );
+        let r = super::load_report(false, None);
+        assert!(!r.json && r.summary_output.is_none());
+    }
+}
