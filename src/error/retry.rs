@@ -103,6 +103,21 @@ pub fn should_retry(a: Attempt<'_>) -> bool {
     a.attempt < a.max_retries && classify_error(a.error).is_transient()
 }
 
+/// The retry class an `io::ErrorKind` proves: a dropped or refused connection is transient, a
+/// file the operator must fix is permanent; any other kind (`Other`, a driver's wrapped error)
+/// leaves the decision to the text.
+fn classify_io_kind(kind: std::io::ErrorKind) -> Option<RetryClass> {
+    use std::io::ErrorKind::*;
+    match kind {
+        ConnectionReset | ConnectionAborted | ConnectionRefused | NotConnected | BrokenPipe
+        | TimedOut | UnexpectedEof | Interrupted | WouldBlock => Some(TRANSIENT_RECONNECT),
+        NotFound | PermissionDenied | AlreadyExists | NotADirectory | IsADirectory
+        | DirectoryNotEmpty | ReadOnlyFilesystem | StorageFull | FileTooLarge | InvalidInput
+        | InvalidData | InvalidFilename | Unsupported => Some(PERMANENT),
+        _ => None,
+    }
+}
+
 pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // A typed stop (drift, integrity, a non-environment code) is permanent, whatever its text says.
     if crate::error::stop_class(err).is_some() {
@@ -161,6 +176,17 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
     // The store's answer is final by TYPE: a 404 whose response headers happen to
     // carry `keep-alive: timeout=5` (Azurite) must not read as a timeout.
     if let Some(class) = err.chain().find_map(opendal_error).map(classify_opendal) {
+        return class;
+    }
+
+    // --- A filesystem or socket error: its kind decides, before a path in the text can ---
+    // The text names paths and tables an operator chose; a temp dir named `.tmprDnsA7` read
+    // as a `dns` failure and turned a missing directory into a retry (exit 2 for 1).
+    if let Some(class) = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<std::io::Error>())
+        .and_then(|io| classify_io_kind(io.kind()))
+    {
         return class;
     }
 

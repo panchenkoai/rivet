@@ -619,10 +619,8 @@ pub(super) fn write_json(path: &Path, agg: &RunAggregate) -> Result<()> {
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent).map_err(|e| {
-            crate::error::coded(
-                crate::error::codes::CLI_OUTPUT_UNWRITABLE,
-                format!("create_dir_all({}): {:#}", parent.display(), e),
-            )
+            let what = format!("create_dir_all({})", parent.display());
+            crate::error::coded_io(crate::error::codes::CLI_OUTPUT_UNWRITABLE, what, e)
         })?;
     }
     let json = serde_json::to_string_pretty(agg).map_err(|e| {
@@ -632,10 +630,8 @@ pub(super) fn write_json(path: &Path, agg: &RunAggregate) -> Result<()> {
         )
     })?;
     std::fs::write(path, json).map_err(|e| {
-        crate::error::coded(
-            crate::error::codes::CLI_OUTPUT_UNWRITABLE,
-            format!("write({}): {:#}", path.display(), e),
-        )
+        let what = format!("write({})", path.display());
+        crate::error::coded_io(crate::error::codes::CLI_OUTPUT_UNWRITABLE, what, e)
     })?;
     Ok(())
 }
@@ -1869,5 +1865,20 @@ mod tests {
         let agg = build(Vec::new(), Utc::now(), Utc::now(), None, "sequential");
         let err = write_json(&file.join("sub").join("agg.json"), &agg).unwrap_err();
         crate::error::assert_coded(&err, "RIVET_CLI_OUTPUT_UNWRITABLE", 1);
+    }
+
+    /// A path whose text reads like a network word (`dns`, `reset`) is still a file error: the
+    /// `io::Error` kind decides, so the stop exits 1, never as a transient 2 (CI saw a temp dir
+    /// named `.tmprDnsA7` turn this refusal into exit 2).
+    #[test]
+    fn an_unwritable_path_named_like_a_network_failure_is_not_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["dns", "connection reset", "broken pipe"] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, b"x").unwrap();
+            let agg = build(Vec::new(), Utc::now(), Utc::now(), None, "sequential");
+            let err = write_json(&file.join("sub").join("agg.json"), &agg).unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_CLI_OUTPUT_UNWRITABLE", 1);
+        }
     }
 }
