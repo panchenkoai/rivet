@@ -160,7 +160,7 @@ Check:
   it with `FINAL`. The cycle is `rivet run` + `rivet load`; see
   [the ClickHouse recipe](recipes/clickhouse-load.md).
 
-A load never merges: the baseline `OVERWRITE`s the base, changes `LOAD DATA INTO`
+A load never merges: the first baseline creates the base, later baselines and changes `LOAD DATA INTO`
 the buffer (or the changelog); only `rivet compact` rewrites base rows.
 
 ## 5. An interruption ON THE CDC LEG → run 3 → load 3

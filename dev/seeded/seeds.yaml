@@ -3098,6 +3098,31 @@ seeds:
       mongo:
         cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
 
+  - name: whole-pass-replaces-the-base
+    class: "a whole-table pass (an incremental run with no cursor, a CDC re-baseline) lands over an existing base-and-buffer base instead of joining its buffer, so every row only the base held (rows the source deleted, tombstones, copied history) is lost with exit 0"
+    history: "2026-10-20 - D1/D2 of the client cut-over simulation (Airflow + BigQuery, 0.32.1): `rivet state reset` then a cycle took a base from 3334 to 2178 rows, the printed CDC re-baseline from 16681 (5801 flagged) to 10772 (0 flagged); fixed by routing both through `whole_table_run_joins_the_log(base_and_buffer, ..)` and buffering the rows a re-baseline no longer holds as deletes"
+    scope: source
+    patch: whole-pass-replaces-the-base/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_whole_table_pass_over_an_existing_base_is_buffered_and_never_replaces_it"]
+      postgres:
+        cells:
+          - a_generated_config_drives_run_load_compact_into_the_warehouse_postgres
+          - a_generated_cdc_config_drives_run_load_compact_postgres
+      mysql:
+        cells:
+          - a_generated_config_drives_run_load_compact_into_the_warehouse_mysql
+          - a_generated_cdc_config_drives_run_load_compact_mysql
+      mssql:
+        cells:
+          - a_generated_config_drives_run_load_compact_into_the_warehouse_mssql
+          - a_generated_cdc_config_drives_run_load_compact_mssql
+      mongo:
+        cells: ["lib:a_whole_table_pass_over_an_existing_base_is_buffered_and_never_replaces_it"]
+      oracle:
+        cells: ["lib:a_whole_table_pass_over_an_existing_base_is_buffered_and_never_replaces_it"]
+
   - name: load-spec-read-under-an-unresolved-source
     class: "`rivet load` reads the source-keyed load spec under the key the config resolves on the load host, so a host without the source variable finds no spec and refuses every table"
     history: "2026-10-20, a regression of #650 (state v38) caught on main f5ba44a3 by the generated CDC chains: `rivet load` without DATABASE_URL refused with RIVET_LOAD_SPEC_MISSING; fixed by `StateStore::spec_source`"

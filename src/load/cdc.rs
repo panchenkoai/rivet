@@ -309,6 +309,35 @@ fn key_join(pk: &[&str]) -> String {
         .join(" AND ")
 }
 
+/// The tombstones a re-baseline buffers (BigQuery): every live base row whose key the
+/// buffer holds no row for, with the base's last values and `__op = 'delete'`. `rivet
+/// compact` then flags each one `__is_deleted` in the base.
+pub fn absent_as_deleted_sql(
+    base_fqtn: &str,
+    changes_fqtn: &str,
+    columns: &[&str],
+    pk: &[&str],
+) -> String {
+    let cols = columns
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let picked = columns
+        .iter()
+        .map(|c| format!("__rivet_t.`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "INSERT INTO `{changes_fqtn}` ({cols}, `__op`)\n\
+         SELECT {picked}, 'delete'\n\
+         FROM `{base_fqtn}` AS __rivet_t\n\
+         WHERE NOT IFNULL(__rivet_t.`{DELETE_FLAG_COLUMN}`, FALSE)\n\
+         \x20 AND NOT EXISTS (SELECT 1 FROM `{changes_fqtn}` AS __rivet_s WHERE {join})",
+        join = key_join(pk)
+    )
+}
+
 /// The partition column over every row a compaction can touch, as one column `v`:
 /// the buffer's rows and the base rows of the buffer's keys. The buffer alone names
 /// only a key's NEW value; the base holds the row under its old one.
@@ -889,6 +918,20 @@ fn unreadable_range(base: &str, col: &str, lo: &str, hi: &str) -> anyhow::Error 
 }
 #[cfg(test)]
 mod tests {
+    /// The re-baseline's tombstones: each live base row with no buffer row for its key, under its last values.
+    #[test]
+    fn the_rebaseline_tombstones_are_the_live_base_rows_the_buffer_does_not_hold() {
+        let sql = super::absent_as_deleted_sql("p.d.t", "p.d.t__changes", &["id", "v"], &["id"]);
+        assert_eq!(
+            sql,
+            "INSERT INTO `p.d.t__changes` (`id`, `v`, `__op`)\n\
+             SELECT __rivet_t.`id`, __rivet_t.`v`, 'delete'\n\
+             FROM `p.d.t` AS __rivet_t\n\
+             WHERE NOT IFNULL(__rivet_t.`__is_deleted`, FALSE)\n\
+             \x20 AND NOT EXISTS (SELECT 1 FROM `p.d.t__changes` AS __rivet_s WHERE __rivet_t.`id` = __rivet_s.`id`)"
+        );
+    }
+
     use super::*;
 
     const WAREHOUSES: [Warehouse; 2] = [Warehouse::BigQuery, Warehouse::Snowflake];
