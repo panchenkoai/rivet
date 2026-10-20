@@ -2135,6 +2135,8 @@ fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
         "strict",
         // global (clap-derived):
         "json-errors",
+        // global, ADR-0039 D9: notifications off for a scheduler that alerts itself:
+        "no-notify",
         "help",
         "version",
     ]
