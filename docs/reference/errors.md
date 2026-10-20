@@ -138,6 +138,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_INTERNAL_TYPE_BUILDER` | internal | 6 | a column builder got a type it cannot build — a bug; report it with the column's type |
 | `RIVET_LOAD_SPEC_SOURCE_UNRESOLVED` | usage | 1 | set the source's variable (`url_env:` / `password_env:`) for `rivet load` as for `rivet run` |
 | `RIVET_CLI_EXPORT_UNKNOWN` | usage | 1 | pass `--export` a name declared under `exports:` in this config |
+| `RIVET_CLI_TABLE_UNKNOWN` | usage | 1 | pass `--table` a warehouse table this config loads, as the message lists |
 | `RIVET_CLI_RUN_ID_EXPORT_MISMATCH` | usage | 1 | pass the `--export` the run id belongs to, or omit `--run-id` |
 | `RIVET_CLI_OPTION_UNSUPPORTED` | usage | 1 | drop the option, or give the command the config, export or mode it takes, as the message names |
 | `RIVET_CLI_REPORT_INVALID` | usage | 1 | pass the report `rivet reconcile --report` wrote for this export |

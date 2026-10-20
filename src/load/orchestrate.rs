@@ -19,6 +19,7 @@ use crate::load::ledger::ledger_status;
 use crate::load::ledger::{closing_status, ledger_load_id, ownership_of};
 use crate::load::partition_budget::{budgeted_uris, partition_budget_ok, partition_label};
 use crate::load::pin::{late_runs_stop, pin_plan_to_its_run};
+use crate::load::result::TableDone;
 use crate::load::staging::{cleanup_target_leased, ledger_writers, maybe_gc_orphans};
 use crate::state::LoadStatus;
 use crate::state::{LoadRecord, StateRef, StateStore};
@@ -32,6 +33,10 @@ pub struct LoadArgs {
     /// Worker threads to load the config's tables on; `None` takes the default
     /// pool (16, capped at the table count), not a sequential pass.
     pub pool: Option<usize>,
+    /// The tables `--export` / `--table` name; every table when both are absent.
+    pub selection: load::plan::Selection,
+    /// Where the human lines and the `--json` / `--summary-output` document go.
+    pub report: load::result::Report,
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
@@ -39,7 +44,7 @@ pub struct LoadArgs {
 /// config loads its exports into the shared target on a pool of up to 16
 /// workers, capped at the table count; `--pool 1` is the sequential pass.
 pub fn run_loads(args: LoadArgs) -> Result<()> {
-    let plans = load::plan::plan_loads(&args.config)?;
+    let plans = load::plan::plan_loads(&args.config, &args.selection)?;
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
     let run_id = resolve_run_id(args.run_id.clone());
@@ -138,7 +143,8 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
             }
             let load_id = ledger_load_id(&run_id, "load", &plan.table);
             let drift = plan.load.allow_source_drift;
-            let outcome = (|| -> Result<()> {
+            let say = |line: String| args.report.say(&line);
+            let outcome = (|| -> Result<TableDone> {
                 // Typed from the spec of the run this load consumes, not the by-name
                 // row. Inside the per-table closure: a spec the config does not fit is
                 // THIS table's failure, and the others still load.
@@ -160,9 +166,19 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             &load_id,
                         )? {
                             Some(report) => {
-                                println!("CDC LOAD OK [{}]: {}", plan.table, cdc_ok_line(&report))
+                                say(format!(
+                                    "CDC LOAD OK [{}]: {}",
+                                    plan.table,
+                                    cdc_ok_line(&report)
+                                ));
+                                Ok(TableDone::Work {
+                                    rows: report.rows_appended,
+                                })
                             }
-                            None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+                            None => {
+                                say(format!("CDC LOAD SKIP [{}]: up to date", plan.table));
+                                Ok(TableDone::Skipped(load::result::UP_TO_DATE))
+                            }
                         }
                     }
                     // Incremental: APPEND the delta + a cursor-ordered current-state view.
@@ -179,13 +195,22 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             &args.config,
                         )? {
                             Some(report) => {
-                                println!(
+                                say(format!(
                                     "INCREMENTAL LOAD OK [{}]: {}",
                                     plan.table,
                                     report.summary()
-                                )
+                                ));
+                                Ok(TableDone::Work {
+                                    rows: report.rows(),
+                                })
                             }
-                            None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                            None => {
+                                say(format!(
+                                    "INCREMENTAL LOAD SKIP [{}]: up to date",
+                                    plan.table
+                                ));
+                                Ok(TableDone::Skipped(load::result::UP_TO_DATE))
+                            }
                         }
                     }
                     // Full/chunked: ledger-driven latest-run OVERWRITE.
@@ -199,18 +224,25 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     // has to be routed deliberately instead of inheriting this one.
                     load::plan::LoadMode::Full => {
                         match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
-                            Some(report) => println!(
-                                "LOAD OK [{}]: {} row(s) in `{}`{}",
-                                plan.table,
-                                report.rows_loaded,
-                                report.target_table,
-                                cleaned_suffix(report.source_cleaned)
-                            ),
-                            None => println!("LOAD SKIP [{}]: up to date", plan.table),
+                            Some(report) => {
+                                say(format!(
+                                    "LOAD OK [{}]: {} row(s) in `{}`{}",
+                                    plan.table,
+                                    report.rows_loaded,
+                                    report.target_table,
+                                    cleaned_suffix(report.source_cleaned)
+                                ));
+                                Ok(TableDone::Work {
+                                    rows: report.rows_loaded,
+                                })
+                            }
+                            None => {
+                                say(format!("LOAD SKIP [{}]: up to date", plan.table));
+                                Ok(TableDone::Skipped(load::result::UP_TO_DATE))
+                            }
                         }
                     }
                 }
-                Ok(())
             })();
             if let Err(e) = &outcome {
                 // Name the table on the way out: the aggregate must say WHICH load
@@ -232,7 +264,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     crate::redact::redact_secrets(&format!("{e:#}"))
                 );
             }
-            outcome.map_err(|e| e.context(format!("load '{}'", plan.table)))?;
+            let done = outcome.map_err(|e| e.context(format!("load '{}'", plan.table)))?;
             if plan.load.gc_orphans {
                 // The store is opened HERE rather than inside `maybe_gc_orphans` so
                 // the GC body itself takes a store and is offline-testable against a
@@ -247,7 +279,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     ),
                 }
             }
-            Ok(())
+            Ok(done)
         },
         // A panic becomes THIS table's failure, not the run's silent end. Named as
         // a bug on the way out: catching it must not disguise an abort as an
@@ -261,10 +293,30 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
     // the table, whatever order the workers finished in — so the representative
     // `aggregate_load_failures` picks out of a tie is the same on every run.
-    let failures = failures_of(outcomes);
-    match aggregate_load_failures(failures) {
+    let result = command_result(&run_id, &plans, &outcomes, "loaded");
+    let tables = match aggregate_load_failures(failures_of(outcomes)) {
         Some(e) => Err(e),
         None => Ok(()),
+    };
+    load::result::exit_of(tables, args.report.finish(&result))
+}
+
+/// The document of one load or compact: each plan's entry, in config order.
+pub(super) fn command_result(
+    run_id: &str,
+    plans: &[load::plan::LoadPlan],
+    outcomes: &[Result<TableDone>],
+    done: &'static str,
+) -> load::result::CommandResult {
+    load::result::CommandResult {
+        run_id: run_id.to_string(),
+        per_table: plans
+            .iter()
+            .zip(outcomes)
+            .map(|(plan, outcome)| {
+                load::result::table_result(&plan.export_name, &plan.table, done, outcome)
+            })
+            .collect(),
     }
 }
 
@@ -521,7 +573,7 @@ pub(super) fn no_outcome_error(op: &str, table: &str) -> anyhow::Error {
 }
 
 /// The failed outcomes, in the order the pool returned them.
-pub(super) fn failures_of(outcomes: Vec<Result<()>>) -> Vec<anyhow::Error> {
+pub(super) fn failures_of<T>(outcomes: Vec<Result<T>>) -> Vec<anyhow::Error> {
     outcomes.into_iter().filter_map(Result::err).collect()
 }
 
@@ -889,7 +941,7 @@ fn prepare_load(
         // handed back as inputs with no URIs, so the caller records them consumed:
         // left unrecorded, every empty cycle was re-evaluated by every later load
         // (a pilot read 50 manifests per idle table per cycle, growing by one each).
-        println!(
+        eprintln!(
             "  {} → {}: {} run(s) produced no files — nothing to load",
             plan.table,
             plan.load.target.name(),
@@ -1876,6 +1928,14 @@ pub enum IncrementalReport {
 }
 
 impl IncrementalReport {
+    /// The rows this load landed.
+    pub fn rows(&self) -> u64 {
+        match self {
+            IncrementalReport::Table(r) => r.rows_loaded,
+            IncrementalReport::Changelog(r) => r.rows_appended,
+        }
+    }
+
     /// One line saying what landed where.
     pub fn summary(&self) -> String {
         match self {
@@ -5850,5 +5910,24 @@ mod overwritten_delta_tests {
         assert_eq!(warn(false, &[load("full", "success")]), None);
         assert_eq!(warn(true, &[load("full", "failed")]), None);
         assert_eq!(warn(true, &[]), None);
+    }
+
+    /// An incremental report counts the rows of whichever load it was.
+    #[test]
+    fn an_incremental_report_counts_the_rows_its_load_landed() {
+        let table = crate::load::orchestrate::IncrementalReport::Table(crate::load::LoadReport {
+            rows_loaded: 7,
+            target_table: "p.d.t".into(),
+            source_cleaned: false,
+        });
+        let log =
+            crate::load::orchestrate::IncrementalReport::Changelog(crate::load::CdcLoadReport {
+                rows_appended: 40,
+                changes_table: "p.d.t__changes".into(),
+                target: "p.d.t".into(),
+                target_kind: crate::load::ChangelogTarget::View,
+                source_cleaned: false,
+            });
+        assert_eq!((table.rows(), log.rows()), (7, 40));
     }
 }
