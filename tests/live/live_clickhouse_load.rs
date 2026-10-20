@@ -2484,8 +2484,8 @@ fn load_and_compact_report_each_selected_table_as_the_warehouse_holds_it() {
     require_alive(LiveService::ClickHouse);
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
-    let (one, _t1, _c1) = pg_batch_seeded("rivet_ch_doc_a", 3);
-    let (two, _t2, _c2) = pg_batch_seeded("rivet_ch_doc_b", 5);
+    let (one, _t1, mut c1) = pg_batch_seeded("rivet_ch_doc_a", 3);
+    let (two, _t2, mut c2) = pg_batch_seeded("rivet_ch_doc_b", 5);
     let db = Db::new("rivet_chtest");
     let second = unique_name("doc_b");
     let rig = batch_into_clickhouse(
@@ -2529,7 +2529,17 @@ fn load_and_compact_report_each_selected_table_as_the_warehouse_holds_it() {
         entries(&doc),
         vec![(one.clone(), "loaded".into(), None, count(&one))]
     );
-    assert_eq!(count(&one), 3);
+    let loaded = |t: &str| {
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{t} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+    };
+    assert_eq!(
+        loaded(&one),
+        pg_rows(&mut c1, &one),
+        "the table holds the source's values"
+    );
     assert_eq!(doc["per_table"][0]["export"], first.as_str());
     assert!(!exists(&two), "--export loaded only its own table");
     let written: serde_json::Value =
@@ -2560,7 +2570,11 @@ fn load_and_compact_report_each_selected_table_as_the_warehouse_holds_it() {
         ],
         "{err}"
     );
-    assert_eq!(count(&two), 5);
+    assert_eq!(
+        loaded(&two),
+        pg_rows(&mut c2, &two),
+        "the table holds the source's values"
+    );
 
     // 4. A full load has nothing to compact, and says which word of the closed set.
     let (doc, code, err) = result_document(&rig, &["compact", "--json"], CLICKHOUSE_PASSWORD);
