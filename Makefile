@@ -285,6 +285,12 @@ PREV_RELEASE_DIR          ?= .gate-baseline
 # stage stops going permanently red now that the fix has shipped in 0.24.5+.
 FIELD_REPLAY_CARRIER_TAG  ?= v0.24.4
 FIELD_REPLAY_CARRIER_BIN  ?= $(PREV_RELEASE_DIR)/carrier/rivet-$(FIELD_REPLAY_CARRIER_TAG)-$(shell uname -m | sed 's/arm64/aarch64/')-apple-darwin/rivet
+# The MIGRATION carrier: a release from before the last state-schema migration, PINNED like the
+# field-replay carrier, so every cell whose premise is an older release (the way-back legs, the
+# relative-path move, the lease met at the schema, the doc's rollback) grades a real migration even
+# when the previous release writes this tree's schema. Missing is a FAIL in each of them.
+MIGRATION_CARRIER_TAG     ?= v0.31.0
+MIGRATION_CARRIER_BIN     ?= $(PREV_RELEASE_DIR)/field/rivet-$(MIGRATION_CARRIER_TAG)-$(shell uname -m | sed 's/arm64/aarch64/')-apple-darwin/rivet
 
 GATE_ENV = \
   PYTHONUNBUFFERED=1 \
@@ -303,6 +309,7 @@ GATE_ENV = \
   RIVET_CONC_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_GATE_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_FIELD_REPLAY_BIN='$(FIELD_REPLAY_CARRIER_BIN)' \
+  RIVET_MIGRATION_CARRIER_BIN='$(MIGRATION_CARRIER_BIN)' \
   RIVET_TEST_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_SWEEP_STATE_CONTAINER='$(RIVET_SWEEP_STATE_CONTAINER)' \
   RIVET_CONC_SRC_CONTAINER='$(RIVET_CONC_SRC_CONTAINER)' \
@@ -333,6 +340,13 @@ release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regressio
 	fi
 	@# The releases a client still runs (dev/release_oracle/field_state.py FIELD_VERSIONS), beside the baseline.
 	@$(PY) -m dev.release_oracle.field_state --fetch $(PREV_RELEASE_DIR)/field
+	@# The MIGRATION carrier, PINNED: fetched by tag even once the compatibility floor passes it.
+	@if [ ! -x "$(MIGRATION_CARRIER_BIN)" ]; then \
+	 mkdir -p $(PREV_RELEASE_DIR)/field; \
+	 gh release download $(MIGRATION_CARRIER_TAG) --pattern "*aarch64-apple-darwin*" -D $(PREV_RELEASE_DIR)/field --clobber; \
+	 tar xzf $(PREV_RELEASE_DIR)/field/rivet-$(MIGRATION_CARRIER_TAG)-aarch64-apple-darwin.tar.gz -C $(PREV_RELEASE_DIR)/field; \
+	fi
+	@echo "  migration carrier: $$($(MIGRATION_CARRIER_BIN) --version)"
 
 release-oracle-full: release-oracle-prev-bin sweep-test-db sweep-test-cloud  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
 	@# The gate grades `target/release/rivet`. A stale one grades yesterday's

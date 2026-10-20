@@ -38,128 +38,14 @@ SCEN = "fix_cells"
 GIT = "/usr/bin/git" if Path("/usr/bin/git").exists() else "git"
 FIX = re.compile(r"fix[(:!]")
 TEST = re.compile(r"^#\[test\]\n(?:#\[[^\n]*\n)*(?:pub )?fn (\w+)\(\) \{\n(.*?)^\}", re.M | re.S)
-UNTRIAGED = ("untriaged: green on v0.31.0 when first measured (2026-10-08); "
-             "either a control of the fix or a vacuous fix cell, to be read")
-
 #: Controls: the neighbour of a fix that must stay as it was, so it is green on the release without the fix.
-REUSABLE_PLAN = ("control of 1146e47b: a replay of an incremental or keyset-incremental plan, or of a plan whose apply "
-                 "died, extracts again, which v0.31.0 did for every replay; the first draft of #616 answered every "
-                 "replay as already applied, and these cells are what caught it (the point-in-time replay cells are the "
-                 "red ones there)")
-KEYSET_GROWS = ("control of b6b15004: a keyset resume seeks past its checkpoint key, so it delivered a source that grew "
-                "before the fix; the range and parallel-keyset plans are the cells that are red there")
-COMPRESSION_EDIT = ("control of b6b15004: a `compression` edit under stored progress is not what the new destination "
-                    "guard refuses, and the run continues as it did")
-MOVED_UNFINISHED = ("control of b6b15004: a destination moved under an UNFINISHED range run delivers the source whole "
-                    "where the config points, as it did; the guard refuses a moved cursor and another format")
-ONE_DESTINATION = ("edited by b6b15004, not written for it: its stages now share one destination so the new guard "
-                   "does not refuse them; the golden math it asserts is unchanged")
-AFTER_A_PART = ("control of 3f073dd0: a run that fails AFTER a part still withdraws the marker; the fix is the run "
-                "that fails before its first write")
-MONGO_FORCED = ("control of 3f073dd0: `--resume --force` over a complete continued-key Mongo export is the empty "
-                "delta run it was; the checkpointed SQL shapes are the cells that are red there")
-MSSQL_NO_GAP = ("control of f7086105: no log gap exists here, so the refusal the fix adds from the first run after "
-                "the baseline must not fire, and it did not before")
-DIRECT_WIDE = ("control of 3132830a: the first version of that fix hung on a non-builtin column type beside "
-               "wide rows; the previous release never sent the unnamed statement, so it reads or refuses as before")
-WIRE_SAMPLE = ("control of 3132830a: a unit sample of the cell's own wire counter (executions, not statement "
-               "texts); it runs no product binary")
-EMPTY_PREFIX = ("control of 52f26e45: an empty prefix of an EXISTING bucket still reads `legacy`; the fix fails "
-                "`validate` on a missing bucket")
-SQLITE_AS_BEFORE = ("edited by 17747ef2, not written for it: the commit lifted the cell's restriction to the SQLite "
-                    "state; this stage runs the SQLite state only, where the cell is the test it was before the fix")
-
-SESSION_PIN_CDC = ("edited by 801df12f, not written for it: only its comment changed; v0.31.0's CDC reader pinned the "
-                   "same formats with a session SET (READER_SESSION_PIN), and the defect #525 fixed is graded by the "
-                   "two pooler cells, red on v0.31.0")
-SESSION_PIN_CHUNKS = ("control of 801df12f: v0.31.0 pinned TimeZone with a session SET on every direct connection; the "
-                      "fix moves the pin into each read transaction and this cell holds the planner probe to it, so a "
-                      "direct connection reads alike on both")
+SESSION_ZONE_HONOURED = ("control of 4cd95bab: straight to a `+03:00` MySQL server the `SET time_zone` rivet sends is "
+                         "honoured, so the new guard lets the read through and the value is the source's instant in UTC, "
+                         "as v0.32.0 read it; the proxy that drops the SET is the cell that is red there")
 
 #: Fix cells allowed to pass on the previous release, each with its reason. Shrink-only.
-MIXED_ID_ORACLE = ("edited by 1b7ffa1f, not written for it: the commit dropped the cell's `.no_oracle` once the rig "
-                   "oracle could read a mixed-type `_id`; the heterogeneous-_id refusal and the whole full scan it "
-                   "asserts predate v0.31.0")
-
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
-    "a_crashed_keyset_incremental_run_is_resumed_not_reread_postgres": UNTRIAGED,
-    "a_replayed_first_incremental_plan_delivers_what_arrived_since_mysql": REUSABLE_PLAN,
-    "a_replayed_first_incremental_plan_delivers_what_arrived_since_postgres": REUSABLE_PLAN,
-    "a_replayed_keyset_incremental_plan_delivers_what_arrived_since_mysql": REUSABLE_PLAN,
-    "a_replayed_keyset_incremental_plan_delivers_what_arrived_since_postgres": REUSABLE_PLAN,
-    "a_replayed_plan_whose_apply_died_extracts_mysql": REUSABLE_PLAN,
-    "a_replayed_plan_whose_apply_died_extracts_postgres": REUSABLE_PLAN,
-    "incremental_keyset_apply_rotates_run_id_across_repeated_applies": REUSABLE_PLAN,
-    "a_query_that_does_not_rename_the_chunk_column_delivers_its_rows_postgres": UNTRIAGED,
-    "a_refused_chunked_checkpoint_run_keeps_refusing_a_duplicate_postgres": UNTRIAGED,
-    "a_refused_keyset_checkpoint_run_keeps_refusing_a_duplicate_postgres": UNTRIAGED,
-    "a_refused_keyset_checkpoint_run_keeps_refusing_schema_drift_postgres": UNTRIAGED,
-    "a_refused_parallel_chunked_checkpoint_run_keeps_refusing_a_duplicate_postgres": UNTRIAGED,
-    "a_sql_server_cdc_stream_loads_into_clickhouse_and_the_view_matches_the_source": UNTRIAGED,
-    "an_update_of_a_replica_identity_index_reaches_the_base_as_one_update_postgres": UNTRIAGED,
-    "apply_child_processes_partitions_like_run_postgres": UNTRIAGED,
-    "full_then_resume_mongo": UNTRIAGED,
-    "keyset_then_resume_mongo": UNTRIAGED,
-    "mongo_keyset_on_heterogeneous_id_errors_loudly_full_scan_still_works": MIXED_ID_ORACLE,
-    "mongo_resume_crash_after_keyset_page_recovers_manifest_driven": UNTRIAGED,
-    "parallel_keyset_incremental_on_a_float_key_delivers_the_source_rows_mysql": UNTRIAGED,
-    "parallel_keyset_incremental_on_a_number5_key_delivers_the_source_rows_oracle": UNTRIAGED,
-    "parallel_keyset_incremental_on_a_real_key_delivers_the_source_rows_mssql": UNTRIAGED,
-    "parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_mssql": UNTRIAGED,
-    "parallel_keyset_incremental_on_a_smallint_key_delivers_the_source_rows_mysql": UNTRIAGED,
-    "parallel_keyset_incremental_on_the_other_key_types_delivers_the_source_rows_postgres": UNTRIAGED,
-    "parallel_keyset_on_a_smallint_key_delivers_the_source_rows_postgres": UNTRIAGED,
-    "parallel_keyset_then_resume_mongo": UNTRIAGED,
-    "pg_cdc_a_declared_key_absent_from_the_old_key_does_not_split": UNTRIAGED,
-    "pg_cdc_an_undecodable_old_cell_beside_an_unchanged_key_is_delivered": UNTRIAGED,
-    "pg_cdc_an_update_of_a_replica_identity_index_that_is_not_the_key_stays_one_update": UNTRIAGED,
-    "pg_table_added_to_tables_mid_stream_is_baselined": UNTRIAGED,
-    "roast_nan_id_refused_for_keyset_and_parallel_full_scan_complete": MIXED_ID_ORACLE,
-    "roast_null_and_object_id_must_not_slip_past_the_bracket_guard": MIXED_ID_ORACLE,
-    "run_child_processes_flag_keeps_its_partition_fallback_postgres": UNTRIAGED,
-    "run_partitions_the_fixture_postgres": UNTRIAGED,
-    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mssql": KEYSET_GROWS,
-    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_mysql": KEYSET_GROWS,
-    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_oracle": KEYSET_GROWS,
-    "a_keyset_checkpoint_run_killed_before_the_source_grows_delivers_the_source_postgres": KEYSET_GROWS,
-    "an_incremental_export_whose_compression_is_edited_delivers_the_source_mssql": COMPRESSION_EDIT,
-    "an_incremental_export_whose_compression_is_edited_delivers_the_source_mysql": COMPRESSION_EDIT,
-    "an_incremental_export_whose_compression_is_edited_delivers_the_source_oracle": COMPRESSION_EDIT,
-    "an_incremental_export_whose_compression_is_edited_delivers_the_source_postgres": COMPRESSION_EDIT,
-    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_mssql": COMPRESSION_EDIT,
-    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_mysql": COMPRESSION_EDIT,
-    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_oracle": COMPRESSION_EDIT,
-    "an_unfinished_run_whose_compression_is_edited_delivers_the_source_postgres": COMPRESSION_EDIT,
-    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mssql": MOVED_UNFINISHED,
-    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_mysql": MOVED_UNFINISHED,
-    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_oracle": MOVED_UNFINISHED,
-    "an_unfinished_run_whose_destination_path_is_edited_delivers_the_source_postgres": MOVED_UNFINISHED,
-    "batch_full_to_incremental_switch_golden_math": ONE_DESTINATION,
-    "batch_incremental_datetime_cursor_captures_updates_golden_math": ONE_DESTINATION,
-    "a_run_that_failed_after_a_part_withdraws_the_marker_mssql": AFTER_A_PART,
-    "a_run_that_failed_after_a_part_withdraws_the_marker_mysql": AFTER_A_PART,
-    "a_run_that_failed_after_a_part_withdraws_the_marker_oracle": AFTER_A_PART,
-    "a_run_that_failed_after_a_part_withdraws_the_marker_postgres": AFTER_A_PART,
-    "a_forced_resume_over_a_complete_prefix_lands_beside_it_mongo": MONGO_FORCED,
-    "mssql_a_never_changed_table_is_not_refused_after_cleanup_passes_its_anchor": MSSQL_NO_GAP,
-    "mssql_an_anchor_below_a_just_enabled_instance_still_delivers_every_later_change": MSSQL_NO_GAP,
-    "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_azure": EMPTY_PREFIX,
-    "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_gcs": EMPTY_PREFIX,
-    "validate_reads_an_empty_prefix_of_an_existing_bucket_as_legacy_s3": EMPTY_PREFIX,
-    "a_composite_column_with_wide_rows_is_refused_within_the_bound_direct_postgres": DIRECT_WIDE,
-    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_full_direct_postgres": DIRECT_WIDE,
-    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_incremental_direct_postgres": DIRECT_WIDE,
-    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_keyset_direct_postgres": DIRECT_WIDE,
-    "a_table_of_an_enum_and_a_domain_with_wide_rows_is_delivered_range_direct_postgres": DIRECT_WIDE,
-    "an_array_of_an_enum_with_wide_rows_is_refused_within_the_bound_direct_postgres": DIRECT_WIDE,
-    "an_answer_ends_at_the_next_request_and_two_pages_are_not_one": WIRE_SAMPLE,
-    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mongo": SQLITE_AS_BEFORE,
-    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mssql": SQLITE_AS_BEFORE,
-    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_mysql": SQLITE_AS_BEFORE,
-    "a_run_out_of_file_descriptors_fails_loudly_and_the_next_delivers_oracle": SQLITE_AS_BEFORE,
-    "pg_cdc_lmt_timestamptz_under_a_named_zone_matches_batch": SESSION_PIN_CDC,
-    "pg_cdc_non_iso_datestyle_and_escape_bytea_match_batch": SESSION_PIN_CDC,
-    "pg_chunks_on_a_day_the_query_computes_read_each_row_once_in_an_odd_session": SESSION_PIN_CHUNKS,
+    "a_server_in_another_time_zone_reads_its_timestamps_as_utc_when_the_set_is_honoured": SESSION_ZONE_HONOURED,
 }  # ratchet-pin: end
 
 

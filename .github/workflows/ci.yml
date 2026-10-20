@@ -282,7 +282,7 @@ jobs:
           key: mutants-outcomes-v2-${{ hashFiles('src/**/*.rs', 'tests/**/*.rs', 'Cargo.lock', '.cargo/mutants.toml') }}
       # Prebuilt binaries: `cargo install` compiled cargo-mutants from source
       # on every cold cache (68s on PR #314).
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         if: steps.scope.outputs.code == 'true'
         with:
           tool: cargo-mutants,cargo-llvm-cov
@@ -547,7 +547,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: mutants
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         with:
           tool: cargo-mutants
       - uses: actions/download-artifact@v8
@@ -844,7 +844,7 @@ jobs:
         if: steps.scope.outputs.code == 'true'
         with:
           key: mutants
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         if: steps.scope.outputs.code == 'true'
         with:
           tool: cargo-mutants
@@ -1304,7 +1304,7 @@ jobs:
       - name: The release oracle's env-flag grammar is one grammar
         run: python3 -m dev.release_oracle --self-test
       # uv: the rig oracle's self-test writes and reads parquet through the pinned duckdb/pyarrow.
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         with:
           tool: uv
       - name: The value canon and the rig oracle's graders self-test
@@ -1427,7 +1427,7 @@ jobs:
         with:
           # One cache for this job and the `pre` leg below, saved here only.
           shared-key: e2e-debug
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         with:
           tool: cargo-nextest
       - name: Build rivet and every test binary (debug), once
@@ -1507,7 +1507,7 @@ jobs:
           shared-key: e2e-debug
           save-if: false
       # uv runs the rig's default oracle (dev/release_oracle/rig_oracle.py, pinned by uv.lock).
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         with:
           tool: cargo-nextest,uv
 
@@ -1846,6 +1846,7 @@ jobs:
             RIVET_TEST_EXCLUSIVE
             pg18-batch (:5518)
             RIVET_PREV_RELEASE_BIN
+            RIVET_MIGRATION_CARRIER_BIN
             macOS `hdiutil`
             RIVET_GATE_STATE_URL
           # BIGQUERY_TEST_PROJECT / SNOWFLAKE_TEST_CONNECTION: no warehouse credentials here (same as
@@ -1855,6 +1856,7 @@ jobs:
           # RIVET_TEST_EXCLUSIVE: the suite runs in parallel on a shared stand; the gate runs those alone.
           # pg18-batch: a service this job's compose line does not start.
           # RIVET_PREV_RELEASE_BIN: no downloaded previous release here; the `versions_*` sabotage cells run in the gate.
+          # RIVET_MIGRATION_CARRIER_BIN: nor the pinned older-schema release; the cells that migrate from it run in the gate.
           # macOS `hdiutil`: the volume-full sabotage cells mount a disk image; a Linux tmpfs needs root.
           # RIVET_GATE_STATE_URL: unset here by design (see the job env); the cells that need the Rig itself on a
           #   Postgres state (a run lease held as a row) run in the gate's Postgres-state pass.
@@ -1885,7 +1887,7 @@ jobs:
       # MSSQL driver's unavoidable tiberius→rustls-0.21 advisories failed the
       # gate; documenting + tracking them in one place keeps the gate green
       # while still catching every *fixable* future advisory.
-      - uses: taiki-e/install-action@v2.87.22
+      - uses: taiki-e/install-action@v2.87.25
         with:
           tool: cargo-audit
       - run: cargo audit

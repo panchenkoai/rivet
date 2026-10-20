@@ -2359,6 +2359,18 @@ fn loaded_targets(out: &std::process::Output) -> std::collections::BTreeSet<Stri
 #[test]
 #[ignore = "live: requires clickhouse + fake-gcs + postgres + RIVET_PREV_RELEASE_BIN at a release with an older state schema"]
 fn a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_dropped() {
+    rolled_back_to(Rig::as_previous_release, false);
+}
+
+/// The same rollback to the pinned release of an older state schema (`RIVET_MIGRATION_CARRIER_BIN`), so a migration and its copy happen every gate.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres + RIVET_MIGRATION_CARRIER_BIN"]
+fn a_rollback_to_the_pinned_release_loads_the_tables_this_tree_created_once_dropped() {
+    rolled_back_to(Rig::as_migration_carrier, true);
+}
+
+/// The doc's rollback from this tree to the release `as_old` resolves; with no copy (nothing migrated) it skips, or fails when `must_migrate`.
+fn rolled_back_to(as_old: fn(&Rig) -> Option<Rig>, must_migrate: bool) {
     require_alive(LiveService::ClickHouse);
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
@@ -2366,7 +2378,7 @@ fn a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_
     let (tb, _b, _d) = pg_batch_seeded("rivet_ch_rb_b", 3);
     let db = Db::new("rivet_chtest");
     let mut rig = batch_into_clickhouse(Rig::pg_batch(&ta).mode("full"), &db);
-    let Some(old) = rig.as_previous_release() else {
+    let Some(old) = as_old(&rig) else {
         return;
     };
     // The rig renders the config first, so the twin writing the same text is not an outside edit.
@@ -2385,6 +2397,10 @@ fn a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_
         .collect();
     copies.sort();
     let Some(copy) = copies.last().cloned() else {
+        assert!(
+            !must_migrate,
+            "the pinned release writes this tree's state schema: nothing migrated; pin a release from before the last migration"
+        );
         crate::common::skip_live(
             "RIVET_PREV_RELEASE_BIN writes this tree's state schema: no migration, nothing to roll back",
         );
@@ -2397,7 +2413,7 @@ fn a_rolled_back_state_loads_the_tables_the_newer_release_created_once_they_are_
     for side in [".rivet_state.db-wal", ".rivet_state.db-shm"] {
         let _ = std::fs::remove_file(dir.join(side));
     }
-    let old = rig.as_previous_release().expect("the previous release");
+    let old = as_old(&rig).expect("the older release");
     let refused = old.load_args_env(&[], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
     assert!(
         !refused.status.success(),

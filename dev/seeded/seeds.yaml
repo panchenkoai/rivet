@@ -419,6 +419,30 @@ seeds:
       sqlite-state:
         na: "a SQLite state is a file beside the config; it has no connection and no TLS"
 
+  - name: sqlite-state-url-ignored-or-moved-blind
+    class: "`RIVET_STATE_URL=sqlite:<path>` is not honoured (refused as an unknown scheme, so init and run keep the state beside the config), or a move to an empty `sqlite:` file starts every export over and leaves the load journal behind"
+    history: "0.32.2 item 5, 2026-10-18: owner asked for a SQLite state outside the config directory (client sim); measured on main 8ef02e5f: `sqlite:/x/state.db` refused RIVET_STATE_URL_SCHEME_UNSUPPORTED, nothing written there"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-state-url-ignored-or-moved-blind/sqlite-state.patch
+        cells:
+          - a_sqlite_state_url_keeps_init_and_run_in_one_file_and_refuses_to_leave_state_behind
+          - a_sqlite_state_url_that_leaves_the_state_behind_is_refused_and_walked_out
+          - "lib:a_sqlite_url_that_leaves_the_state_beside_the_config_behind_is_refused"
+      postgres-state:
+        na: "a `sqlite:` state URL names a SQLite file; a PostgreSQL state is the server's"
+  - name: sqlite-writer-starved-by-a-sibling
+    class: "a state write on the SQLite file is refused `database is locked` after the busy timeout because a sibling writer in the same process takes the write lock in every gap (SQLite's busy wait has no queue)"
+    history: "0.32.1 D6, 2026-10-18: CI flake of a_replan_beside_another_writer_of_the_state_waits_for_it on #634 (`1 of 1000 replans failed beside 94629 writes`); measured on devbox: BEGIN IMMEDIATE refused after 15.4 s beside 530 000 writes; the forced cell is red 3/3 on main 51a1b69c"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-writer-starved-by-a-sibling/sqlite-state.patch
+        cells: ["lib:a_replan_beside_a_writer_that_never_lets_go_gets_its_turn"]
+      postgres-state:
+        na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
+
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
     history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"
@@ -2948,6 +2972,7 @@ seeds:
         cells:
           - "lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"
           - a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow
+          - a_relative_path_moved_by_upgrading_the_pinned_release_is_refused_until_the_files_follow
       mysql:
         cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
       mssql:

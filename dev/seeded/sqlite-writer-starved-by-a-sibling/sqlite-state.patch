@@ -1,0 +1,13 @@
+diff --git a/src/state/write_turn.rs b/src/state/write_turn.rs
+index 008995b1..448dfea1 100644
+--- a/src/state/write_turn.rs
++++ b/src/state/write_turn.rs
+@@ -55,7 +55,7 @@ fn turns_of(db: &Path) -> Arc<Turns> {
+ /// Wait for this process's turn at `db`'s write lock, at most `patience`; `None` past it (or for
+ /// an in-memory store), when the caller goes on to SQLite's own busy wait and its verdict.
+ pub(super) fn take(db: &Path, patience: Duration) -> Option<Turn> {
+-    if db.as_os_str() == ":memory:" {
++    if db.as_os_str() == ":memory:" || !db.as_os_str().is_empty() {
+         return None;
+     }
+     let turns = turns_of(db);

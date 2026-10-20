@@ -341,7 +341,7 @@ def _lanes_self_test() -> None:
     assert [c.detail for c in led.cells] == ["a1", "a2"], "rows recorded beside a raising cell were dropped"
 
     # The gate's own URLs (Makefile GATE_ENV): nine servers; Oracle's batch, resume-load and CDC cells share one.
-    from . import upgrade, upgrade_matrix
+    from . import upgrade_matrix
     urls = {"RIVET_ORACLE_POSTGRES_URL": "postgresql://rivet:rivet@127.0.0.1:5432/rivet",
             "RIVET_ORACLE_MYSQL_URL": "mysql://rivet:rivet@127.0.0.1:3306/rivet",
             "RIVET_ORACLE_MSSQL_URL": "mssql://sa:Rivet_Passw0rd!@127.0.0.1:1433/rivet",
@@ -488,12 +488,32 @@ def _stages_self_test() -> None:
     print(f"self-test ok: {len(want)} matrix `test` rows resolve to recorded stages; a stage that never ran or graded nothing fails the run")
 
 
+def _imports_shadowed_by_a_local() -> list[str]:
+    """`fn:name` where a function re-imports, or binds and also calls, a module-level import (#625 broke `main` so)."""
+    import ast
+
+    tree = ast.parse(Path(__file__).read_text())
+    imported = {a.asname or a.name.split(".")[0] for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+    out = []
+    for fn in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        nodes = list(ast.walk(fn))
+        reimported = {a.asname or a.name.split(".")[0] for n in nodes if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+        stored = {n.id for n in nodes if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+        called = {n.func.id for n in nodes if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        out += [f"{fn.name}:{v}" for v in sorted(imported & (reimported | (stored & called)))]
+    return out
+
+
 def _self_test() -> int:
     """Grade this module's env-flag grammar against `regression`'s.
 
     RED-provable: restore `default=bool(os.environ.get(...))` in `parse_args`
     and the `--without-prev-release-comparison` case below fails on `"0"`.
     """
+    shadowed = _imports_shadowed_by_a_local()
+    if shadowed:
+        print(f"FAIL: a function binds a module import as a local, so its other paths raise UnboundLocalError: {shadowed}")
+        return 1
     for raw, expect in _ENV_FLAG_TABLE.items():
         os.environ["RIVET_ORACLE_SELFTEST_FLAG"] = raw
         got = env_flag("RIVET_ORACLE_SELFTEST_FLAG")
@@ -870,6 +890,7 @@ def _self_test() -> int:
     from . import upgrade_matrix
 
     upgrade_matrix._self_test()
+    upgrade._self_test()
     _lanes_self_test()
     skip_census._self_test()
     fix_cells._self_test()
@@ -1598,7 +1619,6 @@ def _snowflake_env() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     if (argv if argv is not None else sys.argv[1:]) == ["--self-test"]:
-        import tempfile
         from ..pytools import evidence
         with tempfile.TemporaryDirectory() as d:
             evidence.LEDGER = Path(d, "last-green.yaml")  # fixture cells never reach the real ledger

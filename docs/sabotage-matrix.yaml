@@ -78,6 +78,13 @@ scenarios:
     mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
 
+  - id: refusal_state_url_leaves_state_behind
+    what: "RIVET_STATE_URL_LEAVES_STATE_BEHIND: `RIVET_STATE_URL=sqlite:<path>` naming an empty file while the file beside the config holds the state; unsetting the variable delivers, another empty file refuses"
+    postgres: { test: a_sqlite_state_url_that_leaves_the_state_behind_is_refused_and_walked_out }
+    mysql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+    mssql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+    mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+    oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
   - id: refusal_source_session_time_zone_not_applied
     what: "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: a MySQL session still off UTC after rivet's `SET time_zone` (a proxy answered it without forwarding); a direct connection delivers, the same run again through the proxy refuses"
     mysql:    { test: a_session_time_zone_the_proxy_dropped_is_refused_before_a_row_is_read }
@@ -431,7 +438,7 @@ scenarios:
 
   - id: refusal_dest_relative_path_moved
     what: "RIVET_DEST_RELATIVE_PATH_MOVED: a relative local `destination.path` whose place under the working directory (where a release before 0.32 wrote) alone holds the export's files; moving them beside the config delivers, and `validate` meets the same refusal"
-    postgres: { test: a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow }
+    postgres: { test: a_relative_path_moved_by_upgrading_the_pinned_release_is_refused_until_the_files_follow }
     mysql:    { na: "the decision is one shared seam, the config loader (`Config::anchor_paths`), made before any source is opened; graded on postgres" }
     mssql:    { na: "the decision is one shared seam, the config loader (`Config::anchor_paths`), made before any source is opened; graded on postgres" }
     mongo:    { na: "the decision is one shared seam, the config loader (`Config::anchor_paths`), made before any source is opened; graded on postgres" }

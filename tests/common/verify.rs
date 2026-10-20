@@ -529,6 +529,9 @@ impl Case {
         if self.cli.is_some() {
             return None;
         }
+        if let Some(file) = super::state::sqlite_state_for(envs, &self.config_dir) {
+            return Some(refusal::StateAt::Sqlite(file));
+        }
         Some(super::state::state_url_for(envs).map_or_else(
             || refusal::StateAt::Sqlite(self.config_dir.join(".rivet_state.db")),
             refusal::StateAt::Postgres,
