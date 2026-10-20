@@ -3141,3 +3141,20 @@ seeds:
         cells: [a_generated_cdc_config_drives_run_load_compact_mongo]
       oracle:
         cells: ["lib:a_load_without_the_source_variable_reads_the_only_spec_and_refuses_two"]
+
+  - name: mysql-session-set-per-chunk
+    class: "the MySQL session settings are sent again on every checkout of a pooled connection (per chunk), so through ProxySQL each read repeats its SETs"
+    history: "0.32.2 item 10, 2026-10-20: a pilot behind ProxySQL saw SETs on every chunk; measured on main through a default-config ProxySQL: 38 x each SET for 2 runs of 20 chunks, two of them expressions (REPLACE(@@sql_mode, ..), @@global.*) ProxySQL cannot parse"
+    scope: source
+    engines:
+      mysql:
+        patch: mysql-session-set-per-chunk/mysql.patch
+        cells: [through_a_multiplexing_proxysql_the_session_is_set_once_per_connection_by_literals]
+      postgres:
+        na: "the session SETs are MySQL's: PostgreSQL sets nothing per session for a read"
+      mssql:
+        na: "the session SETs are MySQL's: SQL Server reads set no session variable"
+      mongo:
+        na: "the session SETs are MySQL's: MongoDB has no session variables"
+      oracle:
+        na: "the session SETs are MySQL source code; an Oracle read goes through another source and sends none of them"
