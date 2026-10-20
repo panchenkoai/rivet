@@ -136,6 +136,8 @@ pub struct BigQueryLoader {
     api: Arc<OnceLock<BigQueryApi>>,
     /// Columns loaded under their Parquet name and renamed after, as (file name, warehouse name).
     renames: Vec<crate::load::plan::Rename>,
+    /// Where the client records every job it finishes.
+    journal: crate::load::result::JobJournal,
 }
 
 impl BigQueryLoader {
@@ -150,7 +152,14 @@ impl BigQueryLoader {
             footer_source: None,
             api: Arc::new(OnceLock::new()),
             renames: Vec::new(),
+            journal: Default::default(),
         }
+    }
+
+    /// Record every job this loader runs in `journal`.
+    pub fn journaled(mut self, journal: crate::load::result::JobJournal) -> Self {
+        self.journal = journal;
+        self
     }
 
     /// Partition the table the load creates.
@@ -267,7 +276,8 @@ impl BigQueryLoader {
         if let Some(api) = self.api.get() {
             return Ok(api);
         }
-        let built = BigQueryApi::for_dataset(&self.project, &self.dataset)?;
+        let built =
+            BigQueryApi::for_dataset(&self.project, &self.dataset)?.journaled(self.journal.clone());
         let _ = self.api.set(built);
         Ok(self.api.get().expect("the client was just set"))
     }

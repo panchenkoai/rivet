@@ -814,7 +814,7 @@ exclude_re = [
     # recipe's TLS limit and engine-maturity.md say so).
     "replace ClickhouseLoader::query_once -> Result<String>",
     "replace ClickhouseLoader::client -> Result<&reqwest::blocking::Client>",
-    # `await_job`'s poll deadline, `started.elapsed() > budget`: EQUIVALENT against
+    # `await_terminal`'s poll deadline (the loop `await_job` and `settle` share), `started.elapsed() > budget`: EQUIVALENT against
     # `>=`, and the reason is the clock, not the coverage. The two differ on exactly
     # one input — elapsed EQUAL to the budget to the nanosecond — which no caller can
     # construct through `Instant::elapsed()`. Searched for a witness before claiming
@@ -824,7 +824,7 @@ exclude_re = [
     # TIMEOUTS (`guard` forced `false`, `>` flipped to `==`) because a deadline that
     # never fires hangs against a stub answering RUNNING for ever — a detection, in a
     # different column. Only `>=` has no distinguishing input at all.
-    "replace > with >= in BigQueryApi::await_job",
+    "replace > with >= in BigQueryApi::await_terminal",
     # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
     # filtering and the redacting line are graded (`redact::logger_tests`).
     "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",
