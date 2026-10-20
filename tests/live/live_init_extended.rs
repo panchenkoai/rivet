@@ -504,24 +504,21 @@ fn an_azure_scaffold_runs_as_written_into_azurite() {
     ensure_azure_container(&container);
     let dir = tempfile::tempdir().expect("a config dir");
     let config = dir.path().join("rivet.yaml");
-    let init = std::process::Command::new(RIVET_BIN)
-        .args([
-            "init",
-            "--source",
-            POSTGRES_URL,
-            "--table",
-            table.name(),
-            "--azure-container",
-            &container,
-            "--azure-account",
-            AZURITE_ACCOUNT,
-            "--azure-endpoint",
-            AZURITE_ENDPOINT,
-            "-o",
-            config.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn rivet init");
+    let init = run_rivet(&[
+        "init",
+        "--source",
+        POSTGRES_URL,
+        "--table",
+        table.name(),
+        "--azure-container",
+        &container,
+        "--azure-account",
+        AZURITE_ACCOUNT,
+        "--azure-endpoint",
+        AZURITE_ENDPOINT,
+        "-o",
+        config.to_str().unwrap(),
+    ]);
     assert!(
         init.status.success(),
         "{}",
