@@ -533,3 +533,100 @@ fn a_lone_export_is_pointed_at_its_run_report_and_a_multi_export_run_is_not() {
         "one line per export would double the output"
     );
 }
+
+/// A webhook on loopback that counts the requests it gets, for as long as the test holds it.
+struct Hook {
+    url: String,
+    hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Hook {
+    fn start() -> Self {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok");
+            }
+        });
+        Hook { url, hits }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `--no-notify` sends no notification from the process or from the process children it starts;
+/// without it the same failing run notifies, in both runners.
+#[test]
+fn no_notify_silences_the_run_and_every_process_child() {
+    let hook = Hook::start();
+    let dir = tempfile::tempdir().unwrap();
+    let export = |name: &str| {
+        format!(
+            "  - name: {name}\n    query: \"SELECT 1 AS x\"\n    mode: full\n    format: csv\n    \
+             destination: {{ type: local, path: ./out_{name} }}\n"
+        )
+    };
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "source:\n  type: postgres\n  url: \"postgresql://u:p@127.0.0.1:1/db\"\nexports:\n{}{}\
+             notifications:\n  slack:\n    webhook_url: \"{}\"\n    on: [failure]\n",
+            export("a"),
+            export("b"),
+            hook.url
+        ),
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let mut seen = Vec::new();
+    for (case, args) in [
+        ("in process", vec!["run", "-c", cfg]),
+        (
+            "in process, --no-notify",
+            vec!["--no-notify", "run", "-c", cfg],
+        ),
+        (
+            "children",
+            vec!["run", "-c", cfg, "--parallel-export-processes"],
+        ),
+        (
+            "children, --no-notify",
+            vec![
+                "run",
+                "-c",
+                cfg,
+                "--parallel-export-processes",
+                "--no-notify",
+            ],
+        ),
+    ] {
+        let before = hook.hits();
+        let (code, _, err) = run(&args);
+        assert_ne!(code, 0, "{case}: the source is unreachable: {err}");
+        assert!(
+            err.contains("cannot reach the source"),
+            "{case}: the run itself failed: {err}"
+        );
+        seen.push((case, hook.hits() - before > 0));
+    }
+    assert_eq!(
+        seen,
+        [
+            ("in process", true),
+            ("in process, --no-notify", false),
+            ("children", true),
+            ("children, --no-notify", false),
+        ]
+    );
+}

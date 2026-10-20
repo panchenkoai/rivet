@@ -31,7 +31,7 @@ mod load_spec;
 mod manifest_reconcile;
 pub(crate) mod manifest_writer;
 mod mongo_parallel;
-mod parallel_children;
+pub(crate) mod parallel_children;
 pub(crate) mod parent_ui;
 mod partition_expand;
 mod plan_cmd;
