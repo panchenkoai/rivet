@@ -67,6 +67,7 @@ impl StateStore {
         &self,
         export_name: &str,
         unit: Option<&str>,
+        source: &str,
         columns: &[LoadSpecColumn],
         primary_key: Option<&[String]>,
         run_id: &str,
@@ -80,9 +81,9 @@ impl StateStore {
             self.execute(
                 "INSERT INTO export_load_spec
                      (export_name, unit, columns_json, primary_key_json, key_origin,
-                      run_id, origin, captured_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'run', ?7)
-                 ON CONFLICT (export_name, unit) DO UPDATE SET
+                      run_id, origin, captured_at, source)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'run', ?7, ?8)
+                 ON CONFLICT (export_name, unit, source) DO UPDATE SET
                      columns_json     = excluded.columns_json,
                      primary_key_json = CASE
                          WHEN excluded.primary_key_json IS NOT NULL THEN excluded.primary_key_json
@@ -103,6 +104,7 @@ impl StateStore {
                     key_origin.into(),
                     run_id.into(),
                     now.clone().into(),
+                    source.into(),
                 ],
             )?;
             // The same spec under ITS run: what `rivet load` pins a plan to, so a
@@ -197,25 +199,41 @@ impl StateStore {
         &self,
         export_name: &str,
         unit: Option<&str>,
+        source: &str,
         run_id: &str,
     ) -> Result<Option<LoadSpec>> {
         let Some(mut spec) = self.load_spec_of_run(export_name, unit, run_id)? else {
             return Ok(None);
         };
         if spec.primary_key.is_none() {
-            let init_key = self.query_opt(
-                "SELECT primary_key_json FROM export_load_spec
-                 WHERE export_name = ?1 AND unit = ?2 AND key_origin = 'init'",
-                &[export_name.into(), unit.unwrap_or("").into()],
-                |r| r.opt_text(0),
-            )?;
-            if let Some(Some(json)) = init_key {
-                spec.primary_key = Some(serde_json::from_str(&json).with_context(|| {
-                    format!("export '{export_name}': unreadable init-recorded primary key")
-                })?);
-            }
+            spec.primary_key = self.init_key(export_name, unit, source)?;
         }
         Ok(Some(spec))
+    }
+
+    /// The key `rivet init` recorded for `export_name` reading `source`: its own row, else the
+    /// one a state written before v38 holds under no source (`''`).
+    fn init_key(
+        &self,
+        export_name: &str,
+        unit: Option<&str>,
+        source: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let init_key = self.query_opt(
+            "SELECT primary_key_json FROM export_load_spec
+             WHERE export_name = ?1 AND unit = ?2 AND key_origin = 'init' AND source IN (?3, '')
+             ORDER BY CASE WHEN source = ?3 THEN 0 ELSE 1 END LIMIT 1",
+            &[export_name.into(), unit.unwrap_or("").into(), source.into()],
+            |r| r.opt_text(0),
+        )?;
+        init_key
+            .flatten()
+            .map(|json| {
+                serde_json::from_str(&json).with_context(|| {
+                    format!("export '{export_name}': unreadable init-recorded primary key")
+                })
+            })
+            .transpose()
     }
 
     /// Record the source primary key `rivet init` read for an export it scaffolded,
@@ -224,15 +242,16 @@ impl StateStore {
         &self,
         export_name: &str,
         unit: Option<&str>,
+        source: &str,
         primary_key: &[String],
     ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.execute(
             "INSERT INTO export_load_spec
                  (export_name, unit, columns_json, primary_key_json, key_origin,
-                  run_id, origin, captured_at)
-             VALUES (?1, ?2, NULL, ?3, 'init', NULL, 'init', ?4)
-             ON CONFLICT (export_name, unit) DO UPDATE SET
+                  run_id, origin, captured_at, source)
+             VALUES (?1, ?2, NULL, ?3, 'init', NULL, 'init', ?4, ?5)
+             ON CONFLICT (export_name, unit, source) DO UPDATE SET
                  primary_key_json = excluded.primary_key_json,
                  key_origin       = 'init'",
             &[
@@ -240,17 +259,24 @@ impl StateStore {
                 unit.unwrap_or("").into(),
                 serde_json::to_string(primary_key)?.into(),
                 now.into(),
+                source.into(),
             ],
         )?;
         Ok(())
     }
 
     /// The recorded spec for one unit of `export_name`, or `None` when nothing recorded one.
-    pub fn load_spec(&self, export_name: &str, unit: Option<&str>) -> Result<Option<LoadSpec>> {
+    pub fn load_spec(
+        &self,
+        export_name: &str,
+        unit: Option<&str>,
+        source: &str,
+    ) -> Result<Option<LoadSpec>> {
         let row = self.query_opt(
             "SELECT columns_json, primary_key_json, run_id, origin, captured_at
-             FROM export_load_spec WHERE export_name = ?1 AND unit = ?2",
-            &[export_name.into(), unit.unwrap_or("").into()],
+             FROM export_load_spec WHERE export_name = ?1 AND unit = ?2 AND source IN (?3, '')
+             ORDER BY CASE WHEN source = ?3 THEN 0 ELSE 1 END LIMIT 1",
+            &[export_name.into(), unit.unwrap_or("").into(), source.into()],
             |r| {
                 (
                     r.opt_text(0),
@@ -269,10 +295,14 @@ impl StateStore {
                 .with_context(|| format!("export '{export_name}': unreadable load spec columns"))?,
             None => Vec::new(),
         };
-        let primary_key = primary_key_json
+        let primary_key: Option<Vec<String>> = primary_key_json
             .map(|p| serde_json::from_str(&p))
             .transpose()
             .with_context(|| format!("export '{export_name}': unreadable load spec primary key"))?;
+        let primary_key = match primary_key {
+            Some(k) => Some(k),
+            None => self.init_key(export_name, unit, source)?,
+        };
         Ok(Some(LoadSpec {
             export_name: export_name.to_string(),
             unit: unit.map(str::to_string),
@@ -311,12 +341,13 @@ mod tests {
         s.record_load_spec(
             "orders",
             None,
+            "",
             &[col("id", RivetType::Int64)],
             None,
             "run_1",
         )
         .unwrap_err();
-        assert!(s.load_spec("orders", None).unwrap().is_none());
+        assert!(s.load_spec("orders", None, "").unwrap().is_none());
     }
 
     #[test]
@@ -349,10 +380,10 @@ mod tests {
             ),
         ];
         let pk = vec!["tenant".to_string(), "id".to_string()];
-        s.record_load_spec("orders", None, &columns, Some(&pk), "run_1")
+        s.record_load_spec("orders", None, "", &columns, Some(&pk), "run_1")
             .unwrap();
 
-        let spec = s.load_spec("orders", None).unwrap().unwrap();
+        let spec = s.load_spec("orders", None, "").unwrap().unwrap();
         assert_eq!(spec.columns, columns);
         assert_eq!(spec.primary_key, Some(pk));
         assert_eq!(spec.run_id.as_deref(), Some("run_1"));
@@ -374,13 +405,14 @@ mod tests {
                 .unwrap()
         };
         for run in ["r1", "r2", "r3"] {
-            s.record_load_spec("t", None, &cols, Some(&key), run)
+            s.record_load_spec("t", None, "", &cols, Some(&key), run)
                 .unwrap();
         }
         assert_eq!(versions(), 1, "an unchanged spec is stored once");
-        s.record_load_spec("t", None, &cols, None, "r4").unwrap();
+        s.record_load_spec("t", None, "", &cols, None, "r4")
+            .unwrap();
         assert_eq!(versions(), 2, "a keyless spec is a new version");
-        s.record_load_spec("t", None, &cols, Some(&key), "r5")
+        s.record_load_spec("t", None, "", &cols, Some(&key), "r5")
             .unwrap();
         assert_eq!(versions(), 2, "a returning spec reuses its version");
         let r4 = s.load_spec_of_run("t", None, "r4").unwrap().unwrap();
@@ -394,18 +426,26 @@ mod tests {
         let s = StateStore::open_in_memory().unwrap();
         let mine = vec![col("id", RivetType::Int64), col("v", RivetType::Int64)];
         let theirs = vec![col("_id", RivetType::Int32)];
-        s.record_load_spec("users", None, &mine, Some(&["id".to_string()]), "run_pg")
-            .unwrap();
         s.record_load_spec(
             "users",
             None,
+            "",
+            &mine,
+            Some(&["id".to_string()]),
+            "run_pg",
+        )
+        .unwrap();
+        s.record_load_spec(
+            "users",
+            None,
+            "",
             &theirs,
             Some(&["_id".to_string()]),
             "run_mongo",
         )
         .unwrap();
 
-        let by_name = s.load_spec("users", None).unwrap().unwrap();
+        let by_name = s.load_spec("users", None, "").unwrap().unwrap();
         assert_eq!(by_name.run_id.as_deref(), Some("run_mongo"), "last writer");
 
         let pg = s
@@ -426,7 +466,7 @@ mod tests {
             "a run that recorded nothing pins nothing"
         );
         // A keyless re-record of the SAME run replaces that run's row only.
-        s.record_load_spec("users", None, &mine, None, "run_pg")
+        s.record_load_spec("users", None, "", &mine, None, "run_pg")
             .unwrap();
         assert_eq!(
             s.load_spec_of_run("users", None, "run_pg")
@@ -453,9 +493,10 @@ mod tests {
     fn the_run_spec_borrows_an_init_recorded_key_but_never_another_runs() {
         let s = StateStore::open_in_memory().unwrap();
         let cols = vec![col("id", RivetType::Int64), col("v", RivetType::Int64)];
-        s.record_primary_key("q", None, &["id".to_string()])
+        s.record_primary_key("q", None, "", &["id".to_string()])
             .unwrap();
-        s.record_load_spec("q", None, &cols, None, "run_1").unwrap();
+        s.record_load_spec("q", None, "", &cols, None, "run_1")
+            .unwrap();
         assert_eq!(
             s.load_spec_of_run("q", None, "run_1")
                 .unwrap()
@@ -465,7 +506,7 @@ mod tests {
             "the run itself recorded none"
         );
         let pinned = s
-            .load_spec_of_run_with_init_key("q", None, "run_1")
+            .load_spec_of_run_with_init_key("q", None, "", "run_1")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -476,11 +517,19 @@ mod tests {
         assert_eq!(pinned.columns, cols, "the run's columns stay the run's");
 
         // A keyless run of `t` after another RUN wrote a key by name: NOT borrowed.
-        s.record_load_spec("t", None, &cols, Some(&["_id".to_string()]), "other_run")
+        s.record_load_spec(
+            "t",
+            None,
+            "",
+            &cols,
+            Some(&["_id".to_string()]),
+            "other_run",
+        )
+        .unwrap();
+        s.record_load_spec("t", None, "", &cols, None, "mine")
             .unwrap();
-        s.record_load_spec("t", None, &cols, None, "mine").unwrap();
         assert_eq!(
-            s.load_spec_of_run_with_init_key("t", None, "mine")
+            s.load_spec_of_run_with_init_key("t", None, "", "mine")
                 .unwrap()
                 .unwrap()
                 .primary_key,
@@ -490,11 +539,12 @@ mod tests {
         // The race in the order it happens: MY keyless run first, then a same-named
         // export of another config writes `_id` by name. Without the `key_origin =
         // 'init'` filter the by-name key is borrowed — the exact pin escape.
-        s.record_load_spec("u", None, &cols, None, "mine").unwrap();
-        s.record_load_spec("u", None, &cols, Some(&["_id".to_string()]), "theirs")
+        s.record_load_spec("u", None, "", &cols, None, "mine")
+            .unwrap();
+        s.record_load_spec("u", None, "", &cols, Some(&["_id".to_string()]), "theirs")
             .unwrap();
         assert_eq!(
-            s.load_spec_of_run_with_init_key("u", None, "mine")
+            s.load_spec_of_run_with_init_key("u", None, "", "mine")
                 .unwrap()
                 .unwrap()
                 .primary_key,
@@ -514,6 +564,7 @@ mod tests {
         s.record_load_spec(
             "q",
             None,
+            "",
             &[col("id", RivetType::Int64)],
             Some(&pk),
             "run_1",
@@ -522,13 +573,14 @@ mod tests {
         s.record_load_spec(
             "q",
             None,
+            "",
             &[col("id", RivetType::Int64), col("v", RivetType::String)],
             None,
             "run_2",
         )
         .unwrap();
 
-        let spec = s.load_spec("q", None).unwrap().unwrap();
+        let spec = s.load_spec("q", None, "").unwrap().unwrap();
         assert_eq!(
             spec.primary_key, None,
             "the key belonged to a relation no longer read"
@@ -541,26 +593,29 @@ mod tests {
     fn a_key_init_recorded_survives_the_run_that_records_the_columns() {
         let s = StateStore::open_in_memory().unwrap();
         let pk = vec!["b".to_string(), "a".to_string()];
-        s.record_primary_key("q", None, &pk).unwrap();
-        let init_only = s.load_spec("q", None).unwrap().unwrap();
+        s.record_primary_key("q", None, "", &pk).unwrap();
+        let init_only = s.load_spec("q", None, "").unwrap().unwrap();
         assert!(init_only.columns.is_empty());
         assert_eq!(init_only.origin, "init");
 
-        s.record_load_spec("q", None, &[col("a", RivetType::Int32)], None, "run_1")
+        s.record_load_spec("q", None, "", &[col("a", RivetType::Int32)], None, "run_1")
             .unwrap();
-        let spec = s.load_spec("q", None).unwrap().unwrap();
+        let spec = s.load_spec("q", None, "").unwrap().unwrap();
         assert_eq!(spec.primary_key, Some(pk.clone()));
         assert_eq!(spec.columns.len(), 1);
-        s.record_load_spec("q", None, &[col("a", RivetType::Int32)], None, "run_2")
+        s.record_load_spec("q", None, "", &[col("a", RivetType::Int32)], None, "run_2")
             .unwrap();
         assert_eq!(
-            s.load_spec("q", None).unwrap().unwrap().primary_key,
+            s.load_spec("q", None, "").unwrap().unwrap().primary_key,
             Some(pk.clone()),
             "init's key outlives every keyless capture"
         );
 
-        s.record_primary_key("q", None, &pk).unwrap();
-        assert_eq!(s.load_spec("q", None).unwrap().unwrap().columns.len(), 1);
+        s.record_primary_key("q", None, "", &pk).unwrap();
+        assert_eq!(
+            s.load_spec("q", None, "").unwrap().unwrap().columns.len(),
+            1
+        );
 
         // Once a run records a key of its own, that key is a run's: the next keyless
         // capture clears it.
@@ -568,38 +623,56 @@ mod tests {
         s.record_load_spec(
             "q",
             None,
+            "",
             &[col("a", RivetType::Int32)],
             Some(&seen),
             "run_3",
         )
         .unwrap();
         assert_eq!(
-            s.load_spec("q", None).unwrap().unwrap().primary_key,
+            s.load_spec("q", None, "").unwrap().unwrap().primary_key,
             Some(seen)
         );
-        s.record_load_spec("q", None, &[col("a", RivetType::Int32)], None, "run_4")
+        s.record_load_spec("q", None, "", &[col("a", RivetType::Int32)], None, "run_4")
             .unwrap();
-        assert_eq!(s.load_spec("q", None).unwrap().unwrap().primary_key, None);
+        assert_eq!(
+            s.load_spec("q", None, "").unwrap().unwrap().primary_key,
+            None
+        );
     }
 
     #[test]
     fn units_of_one_export_are_recorded_apart() {
         let s = StateStore::open_in_memory().unwrap();
-        s.record_load_spec("cdc", Some("a"), &[col("x", RivetType::Int32)], None, "r")
-            .unwrap();
-        s.record_load_spec("cdc", Some("b"), &[col("y", RivetType::Bool)], None, "r")
-            .unwrap();
+        s.record_load_spec(
+            "cdc",
+            Some("a"),
+            "",
+            &[col("x", RivetType::Int32)],
+            None,
+            "r",
+        )
+        .unwrap();
+        s.record_load_spec(
+            "cdc",
+            Some("b"),
+            "",
+            &[col("y", RivetType::Bool)],
+            None,
+            "r",
+        )
+        .unwrap();
 
         assert_eq!(
-            s.load_spec("cdc", Some("a")).unwrap().unwrap().columns[0].name,
+            s.load_spec("cdc", Some("a"), "").unwrap().unwrap().columns[0].name,
             "x"
         );
         assert_eq!(
-            s.load_spec("cdc", Some("b")).unwrap().unwrap().columns[0].name,
+            s.load_spec("cdc", Some("b"), "").unwrap().unwrap().columns[0].name,
             "y"
         );
-        assert!(s.load_spec("cdc", None).unwrap().is_none());
-        assert!(s.load_spec("other", Some("a")).unwrap().is_none());
+        assert!(s.load_spec("cdc", None, "").unwrap().is_none());
+        assert!(s.load_spec("other", Some("a"), "").unwrap().is_none());
     }
 
     #[test]
@@ -610,5 +683,75 @@ mod tests {
             LoadSpecColumn::from_mapping(&m),
             col("id", RivetType::Int64)
         );
+    }
+    /// One export name read from two sources keeps a spec and a key each; a third source with no
+    /// row of its own reads the key a state written before v38 holds under no source.
+    #[test]
+    fn two_sources_of_one_export_name_keep_a_spec_each() {
+        let s = StateStore::open_in_memory().unwrap();
+        let cols = vec![col("id", RivetType::Int64)];
+        s.record_load_spec(
+            "orders",
+            None,
+            "mysql://h:3306/a",
+            &cols,
+            Some(&["code".to_string()]),
+            "r_a",
+        )
+        .unwrap();
+        s.record_load_spec(
+            "orders",
+            None,
+            "postgres://h:5432/b",
+            &cols,
+            Some(&["no".to_string()]),
+            "r_b",
+        )
+        .unwrap();
+        let key = |src: &str| {
+            s.load_spec("orders", None, src)
+                .unwrap()
+                .and_then(|l| l.primary_key)
+        };
+        assert_eq!(key("mysql://h:3306/a"), Some(vec!["code".to_string()]));
+        assert_eq!(key("postgres://h:5432/b"), Some(vec!["no".to_string()]));
+        assert_eq!(key("mssql://h:1433/c"), None);
+        s.record_primary_key("orders", None, "", &["legacy_id".to_string()])
+            .unwrap();
+        assert_eq!(key("mssql://h:1433/c"), Some(vec!["legacy_id".to_string()]));
+        s.record_primary_key("orders", None, "mssql://h:1433/c", &["c_id".to_string()])
+            .unwrap();
+        assert_eq!(key("mssql://h:1433/c"), Some(vec!["c_id".to_string()]));
+        assert_eq!(key("mysql://h:3306/a"), Some(vec!["code".to_string()]));
+    }
+
+    /// Two `rivet init` runs of one export name on two sources keep a key each.
+    #[test]
+    fn two_inits_of_one_export_name_keep_a_key_each() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.record_primary_key("q", None, "mysql://h:3306/a", &["a_id".to_string()])
+            .unwrap();
+        s.record_primary_key("q", None, "mssql://h:1433/b", &["b_id".to_string()])
+            .unwrap();
+        let cols = vec![col("x", RivetType::Int64)];
+        for (src, run) in [("mysql://h:3306/a", "ra"), ("mssql://h:1433/b", "rb")] {
+            s.record_load_spec("q", None, src, &cols, None, run)
+                .unwrap();
+        }
+        let key = |src: &str, run: &str| {
+            let by_name = s
+                .load_spec("q", None, src)
+                .unwrap()
+                .and_then(|l| l.primary_key);
+            let of_run = s
+                .load_spec_of_run_with_init_key("q", None, src, run)
+                .unwrap()
+                .and_then(|l| l.primary_key);
+            (by_name, of_run)
+        };
+        let a = Some(vec!["a_id".to_string()]);
+        let b = Some(vec!["b_id".to_string()]);
+        assert_eq!(key("mysql://h:3306/a", "ra"), (a.clone(), a));
+        assert_eq!(key("mssql://h:1433/b", "rb"), (b.clone(), b));
     }
 }
