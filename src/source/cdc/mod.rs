@@ -1120,6 +1120,8 @@ impl CdcEngine {
                     &[],
                     // Nothing is read here, so there is nothing to spill.
                     None,
+                    // Nor anything to compare: the capture open that follows checks the slot.
+                    None,
                 )?);
                 Ok(())
             }
@@ -1440,6 +1442,7 @@ pub(crate) fn create_change_stream(
                     cfg.drain,
                     configured_tables,
                     spill_dir_for(cfg.checkpoint.as_deref(), &cfg.config_dir).as_deref(),
+                    cfg.checkpoint.as_deref(),
                 )
                 .map_err(|e| with_setup_hint(e, PG_CDC_HINT))?,
             ))
@@ -2410,6 +2413,7 @@ mod setup_hint {
             super::PeekBound::Unbounded,
             super::DrainMode::Continuous,
             &[],
+            None,
             None,
         );
         assert_names_refused_port(open.map(drop), super::PG_CDC_HINT);
