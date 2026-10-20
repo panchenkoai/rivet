@@ -1,0 +1,13 @@
+diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
+index f6a27d70..5b68af24 100644
+--- a/src/source/postgres/cdc.rs
++++ b/src/source/postgres/cdc.rs
+@@ -1026,7 +1026,7 @@ fn refuse_a_slot_another_reader_advanced(
+ /// The refusal for a slot confirmed past `own`, the checkpoint's position; `None` when it is not.
+ fn slot_advanced_by_another(slot: &str, own: &str, confirmed: Option<&str>) -> Option<String> {
+     let (own_n, conf_n) = (parse_lsn(own)?, parse_lsn(confirmed?)?);
+-    (conf_n > own_n).then(|| {
++    (conf_n > own_n && own_n == u64::MAX).then(|| {
+         format!(
+             "pg cdc: slot '{slot}' is confirmed at {}, past {own}, the last position rivet \
+              confirmed for this export (its checkpoint): another reader consumed the changes \

@@ -946,7 +946,8 @@ const PIN_SELF_COUNTER: usize = 6; // ratchet-pin: cdc-census-self-counter
 // 2026-10-03: +2 presence - the MySQL and MongoDB capped `rivet cdc` NDJSON cells; the test reads the cap's stop
 // point off stdout, the rig oracle (which this census does not see) grades both runs against the source.
 // 2026-10-06: +1 presence - the SQL Server case-only `--table` mismatch refusal, whose oracle is the refusal text and an untouched destination.
-const PIN_PRESENCE: usize = 88; // ratchet-pin: cdc-census-presence
+// 2026-10-20: +1 presence - the PostgreSQL slot-advanced-by-another-reader refusal, whose oracle is the coded refusal; the rig oracle grades the runs before it.
+const PIN_PRESENCE: usize = 89; // ratchet-pin: cdc-census-presence
 
 /// TIER 2 (harness audit, 2026-08-29): a test whose NAME makes a
 /// COMPLETENESS claim must carry a class-(a) INDEPENDENT oracle — not merely
