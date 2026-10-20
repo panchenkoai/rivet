@@ -660,6 +660,19 @@ fn forwarded_globals() -> Vec<&'static str> {
 }
 
 #[cfg(test)]
+mod forwarded_tests {
+    /// A silenced process hands `--no-notify` to its children; a parent-only flag is never handed on.
+    #[test]
+    fn a_silenced_process_hands_no_notify_to_its_children() {
+        crate::notify::silence();
+        assert!(crate::notify::silenced());
+        assert!(super::given("--no-notify"));
+        assert!(!super::given("--json-errors"));
+        assert_eq!(super::forwarded_globals(), ["--no-notify"]);
+    }
+}
+
+#[cfg(test)]
 mod foreign_counter_tests {
     use super::*;
 
