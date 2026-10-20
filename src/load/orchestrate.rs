@@ -19,7 +19,7 @@ use crate::load::ledger::ledger_status;
 use crate::load::ledger::{closing_status, ledger_load_id, ownership_of};
 use crate::load::partition_budget::{budgeted_uris, partition_budget_ok, partition_label};
 use crate::load::pin::{late_runs_stop, pin_plan_to_its_run};
-use crate::load::result::TableDone;
+use crate::load::result::{TableDone, Work};
 use crate::load::staging::{cleanup_target_leased, ledger_writers, maybe_gc_orphans};
 use crate::state::LoadStatus;
 use crate::state::{LoadRecord, StateRef, StateStore};
@@ -111,6 +111,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // backends, since the Postgres arm of `open_at_ref` migrates too — where the
     // sequential loop had one of each.
     let (state_ref, parent_had_state) = hand_off_state(state, args.pool, plans.len());
+    let journals = journals_of(&plans);
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
@@ -122,8 +123,9 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
         // paid for, where the re-baseline guard note-and-proceeds a doomed post-gap
         // baseline on the very host whose ledger just blipped.
         || reconnect(state_ref.as_ref(), "load").map(|s| (s, ledger_errored)),
-        |worker, _idx, plan| {
+        |worker, idx, plan| {
             let (state, ledger_errored) = (&worker.0, worker.1);
+            let journal = &journals[idx];
             // A worker that lost a ledger the RUN started with refuses its table.
             // The lease is taken as `state.map(..)`, so a ledger-less worker takes
             // NONE at all — a skip, not a refusal — then reads an empty skip set,
@@ -164,6 +166,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             state.as_ref(),
                             ledger_errored,
                             &load_id,
+                            journal,
                         )? {
                             Some(report) => {
                                 say(format!(
@@ -171,9 +174,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                                     plan.table,
                                     cdc_ok_line(&report)
                                 ));
-                                Ok(TableDone::Work {
-                                    rows: report.rows_appended,
-                                })
+                                Ok(TableDone::Work(Work::loaded(
+                                    report.rows_appended,
+                                    &report.changes_table,
+                                )))
                             }
                             None => {
                                 say(format!("CDC LOAD SKIP [{}]: up to date", plan.table));
@@ -193,6 +197,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             state.as_ref(),
                             &load_id,
                             &args.config,
+                            journal,
                         )? {
                             Some(report) => {
                                 say(format!(
@@ -200,9 +205,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                                     plan.table,
                                     report.summary()
                                 ));
-                                Ok(TableDone::Work {
-                                    rows: report.rows(),
-                                })
+                                Ok(TableDone::Work(Work::loaded(report.rows(), report.wrote())))
                             }
                             None => {
                                 say(format!(
@@ -223,7 +226,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     // (the mutants are unviable rather than uncaught) and a NEW mode
                     // has to be routed deliberately instead of inheriting this one.
                     load::plan::LoadMode::Full => {
-                        match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
+                        match load_one(plan, &run_id, drift, state.as_ref(), &load_id, journal)? {
                             Some(report) => {
                                 say(format!(
                                     "LOAD OK [{}]: {} row(s) in `{}`{}",
@@ -232,9 +235,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                                     report.target_table,
                                     cleaned_suffix(report.source_cleaned)
                                 ));
-                                Ok(TableDone::Work {
-                                    rows: report.rows_loaded,
-                                })
+                                Ok(TableDone::Work(Work::loaded(
+                                    report.rows_loaded,
+                                    &report.target_table,
+                                )))
                             }
                             None => {
                                 say(format!("LOAD SKIP [{}]: up to date", plan.table));
@@ -293,7 +297,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
     // the table, whatever order the workers finished in — so the representative
     // `aggregate_load_failures` picks out of a tie is the same on every run.
-    let result = command_result(&run_id, &plans, &outcomes, "loaded");
+    let result = command_result(&run_id, &plans, &outcomes, &journals, "loaded");
     let tables = match aggregate_load_failures(failures_of(outcomes)) {
         Some(e) => Err(e),
         None => Ok(()),
@@ -306,6 +310,7 @@ pub(super) fn command_result(
     run_id: &str,
     plans: &[load::plan::LoadPlan],
     outcomes: &[Result<TableDone>],
+    journals: &[load::result::JobJournal],
     done: &'static str,
 ) -> load::result::CommandResult {
     load::result::CommandResult {
@@ -313,11 +318,55 @@ pub(super) fn command_result(
         per_table: plans
             .iter()
             .zip(outcomes)
-            .map(|(plan, outcome)| {
-                load::result::table_result(&plan.export_name, &plan.table, done, outcome)
+            .zip(journals)
+            .map(|((plan, outcome), journal)| {
+                load::result::table_result(
+                    &plan.export_name,
+                    &plan.table,
+                    &address_of(plan, run_id, done),
+                    done,
+                    outcome,
+                    journal,
+                )
             })
             .collect(),
     }
+}
+
+/// What `plan`'s table is worked on through, named by its loader's own `fqtn` (building a loader
+/// does no I/O). A load (`done` = `loaded`) writes the change log of a `cdc` / `incremental` table,
+/// else the table; a load that wrote names what it wrote instead. A compact writes the base and
+/// reads the buffer of a layout that has one.
+pub(super) fn address_of(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    done: &str,
+) -> load::result::Address {
+    let loader = load::build_loader(plan, run_id, &Default::default());
+    let changes = loader.fqtn(&format!("{}__changes", plan.table));
+    let keeps_log = plan.mode != load::plan::LoadMode::Full;
+    match done {
+        "loaded" => load::result::Address {
+            target: if keeps_log {
+                changes
+            } else {
+                loader.fqtn(&plan.table)
+            },
+            buffer: None,
+        },
+        _ => load::result::Address {
+            target: loader.fqtn(&plan.table),
+            buffer: (keeps_log && plan.layout.compacts()).then_some(changes),
+        },
+    }
+}
+
+/// One journal per plan, naming jobs where the plan's warehouse does.
+pub(super) fn journals_of(plans: &[load::plan::LoadPlan]) -> Vec<load::result::JobJournal> {
+    plans
+        .iter()
+        .map(|p| load::result::JobJournal::new(p.load.target.names_jobs()))
+        .collect()
 }
 
 /// The typo warning for a prefix with no manifests — unless the ledger says runs were loaded from it, which `cleanup_source` then emptied.
@@ -994,6 +1043,8 @@ struct LoadJob<'a> {
     /// test passes a filesystem-backed store, and the envelope itself needs no test-only
     /// branch to tell them apart.
     store: crate::destination::gcs::GcsStore,
+    /// Where the load records the jobs it ran and the files and runs it consumed.
+    journal: load::result::JobJournal,
 }
 
 /// The audit + skip-ledger writer for one load. A struct (not a bare closure) so
@@ -1361,6 +1412,8 @@ fn execute_load<R>(
     if closing_record_applies(&remaining, &legs.consumed) {
         ctx.record_success(&remaining, rows as i64);
     }
+    job.journal
+        .consumed(inputs.uris.len(), inputs.source_run_ids.len(), rows);
     done(&inputs, &report);
     Ok(Some(report))
 }
@@ -1858,6 +1911,7 @@ fn load_one_cdc(
     state: Option<&StateStore>,
     ledger_errored: bool,
     load_id: &str,
+    journal: &load::result::JobJournal,
 ) -> Result<Option<load::CdcLoadReport>> {
     let job = LoadJob {
         plan,
@@ -1865,8 +1919,9 @@ fn load_one_cdc(
         load_id,
         allow_source_drift,
         mode: plan.mode,
-        loader: load::build_loader(plan, run_id),
+        loader: load::build_loader(plan, run_id, journal),
         store: load::open_store(&plan.destination)?,
+        journal: journal.clone(),
     };
     if plan.layout.compacts() {
         return load_one_cdc_base(job, pk, allow_source_drift, state);
@@ -1980,6 +2035,14 @@ impl IncrementalReport {
         match self {
             IncrementalReport::Table(r) => r.rows_loaded,
             IncrementalReport::Changelog(r) => r.rows_appended,
+        }
+    }
+
+    /// The object this load wrote, as its loader named it.
+    pub fn wrote(&self) -> &str {
+        match self {
+            IncrementalReport::Table(r) => &r.target_table,
+            IncrementalReport::Changelog(r) => &r.changes_table,
         }
     }
 
@@ -2167,6 +2230,7 @@ fn load_one_incremental(
     state: Option<&StateStore>,
     load_id: &str,
     config: &str,
+    journal: &load::result::JobJournal,
 ) -> Result<Option<IncrementalReport>> {
     let cursor = plan.cursor_column.clone().ok_or_else(|| {
         crate::error::coded(
@@ -2184,8 +2248,9 @@ fn load_one_incremental(
         load_id,
         allow_source_drift,
         mode: plan.mode,
-        loader: load::build_loader(plan, run_id),
+        loader: load::build_loader(plan, run_id, journal),
         store: load::open_store(&plan.destination)?,
+        journal: journal.clone(),
     };
     let fqtn = job.loader.fqtn(&plan.table);
     let loads = match state.map(|s| s.recent_loads(Some(&fqtn), 50)).transpose() {
@@ -2408,6 +2473,7 @@ fn load_one(
     allow_source_drift: bool,
     state: Option<&StateStore>,
     load_id: &str,
+    journal: &load::result::JobJournal,
 ) -> Result<Option<load::LoadReport>> {
     // Full loads OVERWRITE with the latest snapshot; the ledger (when `state`)
     // selects that single latest run, skips a re-load of it, and makes cleanup
@@ -2418,8 +2484,9 @@ fn load_one(
         load_id,
         allow_source_drift,
         mode: plan.mode,
-        loader: load::build_loader(plan, run_id),
+        loader: load::build_loader(plan, run_id, journal),
         store: load::open_store(&plan.destination)?,
+        journal: journal.clone(),
     };
     execute_load(
         job,
@@ -2781,6 +2848,7 @@ mod load_ledger_tests {
             loader: Box::new(load::tests::fake_loader(0)),
             store: crate::destination::gcs::GcsStore::open_fs(&dir.path().display().to_string())
                 .expect("a filesystem-backed store"),
+            journal: Default::default(),
         }
     }
 
@@ -6126,5 +6194,64 @@ mod overwritten_delta_tests {
                 source_cleaned: false,
             });
         assert_eq!((table.rows(), log.rows()), (7, 40));
+        assert_eq!((table.wrote(), log.wrote()), ("p.d.t", "p.d.t__changes"));
+    }
+
+    /// A load names the object it writes, a compact the base it writes and the buffer it reads,
+    /// each through the loader's own `fqtn`.
+    #[test]
+    fn each_command_names_what_it_works_on_by_its_loaders_fqtn() {
+        use crate::load::plan::{CdcLayout, LoadMode, test_plan};
+        use crate::load::result::Address;
+        let at = |target: &str, buffer: Option<&str>| Address {
+            target: target.into(),
+            buffer: buffer.map(str::to_string),
+        };
+        let full = test_plan(LoadMode::Full, "gs://b/p/");
+        let log = test_plan(LoadMode::Cdc, "gs://b/p/");
+        let mut base = test_plan(LoadMode::Incremental, "gs://b/p/");
+        base.layout = CdcLayout::BaseAndBuffer;
+        let address = crate::load::orchestrate::address_of;
+        assert_eq!(address(&full, "r", "loaded"), at("p.d.orders", None));
+        assert_eq!(
+            address(&log, "r", "loaded"),
+            at("p.d.orders__changes", None)
+        );
+        assert_eq!(
+            address(&base, "r", "loaded"),
+            at("p.d.orders__changes", None)
+        );
+        assert_eq!(address(&full, "r", "compacted"), at("p.d.orders", None));
+        assert_eq!(address(&log, "r", "compacted"), at("p.d.orders", None));
+        let mut snowflake = test_plan(LoadMode::Full, "gs://b/p/");
+        snowflake.load.target = crate::load::plan::LoadTarget::Snowflake {
+            connection: "c".into(),
+            warehouse: "w".into(),
+            database: "DB".into(),
+            schema: "SC".into(),
+            storage_integration: "i".into(),
+        };
+        let journals = crate::load::orchestrate::journals_of(&[full.clone(), snowflake.clone()]);
+        let ids = |j: &crate::load::result::JobJournal| {
+            crate::load::result::table_result(
+                "e",
+                "t",
+                &at("t", None),
+                "loaded",
+                &Ok(crate::load::result::TableDone::Skipped("up_to_date")),
+                j,
+            )
+            .warehouse_job_ids
+        };
+        assert_eq!(
+            journals.iter().map(ids).collect::<Vec<_>>(),
+            [Some(vec![]), None],
+            "BigQuery names its jobs, the snow CLI none"
+        );
+        assert_eq!(address(&snowflake, "r", "loaded"), at("DB.SC.orders", None));
+        assert_eq!(
+            address(&base, "r", "compacted"),
+            at("p.d.orders", Some("p.d.orders__changes"))
+        );
     }
 }

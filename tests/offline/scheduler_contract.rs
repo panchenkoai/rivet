@@ -467,15 +467,59 @@ fn check_table_result(
         let fields = [
             ("export", Str, false),
             ("table", Str, false),
+            ("target", Str, false),
+            ("buffer", Str, true),
             ("status", Word(statuses), false),
             ("skip_reason", Word(skips), true),
             ("rows", Int, false),
+            ("rows_inserted", Int, true),
+            ("rows_updated", Int, true),
+            ("rows_deleted", Int, true),
+            ("rows_merged", Int, true),
+            ("base_rows_after", Int, true),
+            ("files", Int, true),
+            ("runs", Int, true),
+            ("warehouse_job_ids", Nested, true),
+            ("bytes_processed", Int, true),
+            ("bytes_billed", Int, true),
             ("error", Nested, true),
         ];
         shape(r, &at, &fields)?;
         require((r["status"] == "failed") != r["error"].is_null(), || {
             format!("{at}: error iff failed")
         })?;
+        require(
+            r["warehouse_job_ids"].is_null()
+                || r["warehouse_job_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().all(Value::is_string)),
+            || format!("{at}.warehouse_job_ids: an array of strings, or null"),
+        )?;
+        let worked = r["status"] != "skipped" && r["status"] != "failed";
+        for key in [
+            "rows_inserted",
+            "rows_updated",
+            "rows_deleted",
+            "rows_merged",
+            "base_rows_after",
+            "files",
+            "runs",
+        ] {
+            require(worked || r[key].is_null(), || {
+                format!("{at}.{key}: only a table the command worked on has counts")
+            })?;
+        }
+        let merged = r["status"] == "compacted";
+        for key in ["rows_merged", "base_rows_after"] {
+            require(merged || r[key].is_null(), || {
+                format!("{at}.{key}: a compact count")
+            })?;
+        }
+        for key in ["files", "runs"] {
+            require(!merged || r[key].is_null(), || {
+                format!("{at}.{key}: a load count")
+            })?;
+        }
         require(
             (r["status"] == "skipped") != r["skip_reason"].is_null(),
             || format!("{at}: skip_reason iff skipped"),
@@ -491,6 +535,8 @@ fn check_table_result(
 fn check_xcom(v: &Value, at: &str) -> Check {
     let mut fields = UNIT.to_vec();
     fields.extend_from_slice(&[
+        ("target", Str, true),
+        ("buffer", Str, true),
         ("status", Str, false),
         ("run_id", Str, false),
         ("rows", Int, false),
@@ -513,6 +559,12 @@ fn check_xcom(v: &Value, at: &str) -> Check {
     })?;
     require(v["files"].is_null() == of_table, || {
         format!("{at}: files is a number for a run unit and null for a load or compact unit")
+    })?;
+    require(v["target"].is_null() != of_table, || {
+        format!("{at}: target names the object of a load or compact unit, null for a run unit")
+    })?;
+    require(of_table || v["buffer"].is_null(), || {
+        format!("{at}: only a compact unit reads a buffer")
     })?;
     require(!of_table || v["stop_reason"].is_null(), || {
         format!("{at}: only a run unit has a stop_reason")
