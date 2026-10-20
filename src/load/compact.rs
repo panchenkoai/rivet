@@ -684,6 +684,16 @@ mod document_tests {
 }
 
 #[cfg(test)]
+mod base_rows_tests {
+    /// The base's count after a merge is the loader's own count of it.
+    #[test]
+    fn the_base_rows_after_a_merge_are_the_loaders_count() {
+        let loader = crate::load::tests::fake_loader_holding("orders", 7);
+        assert_eq!(super::base_rows_after(&loader, "orders"), Some(7));
+    }
+}
+
+#[cfg(test)]
 mod compact_gate_tests {
     use super::*;
 

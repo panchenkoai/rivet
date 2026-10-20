@@ -5997,6 +5997,7 @@ mod overwritten_delta_tests {
                 source_cleaned: false,
             });
         assert_eq!((table.rows(), log.rows()), (7, 40));
+        assert_eq!((table.wrote(), log.wrote()), ("p.d.t", "p.d.t__changes"));
     }
 
     /// A load names the object it writes, a compact the base it writes and the buffer it reads,
@@ -6025,6 +6026,20 @@ mod overwritten_delta_tests {
         );
         assert_eq!(address(&full, "r", "compacted"), at("p.d.orders", None));
         assert_eq!(address(&log, "r", "compacted"), at("p.d.orders", None));
+        let mut snowflake = test_plan(LoadMode::Full, "gs://b/p/");
+        snowflake.load.target = crate::load::plan::LoadTarget::Snowflake {
+            connection: "c".into(),
+            warehouse: "w".into(),
+            database: "DB".into(),
+            schema: "SC".into(),
+            storage_integration: "i".into(),
+        };
+        let journals = crate::load::orchestrate::journals_of(&[full.clone(), snowflake.clone()]);
+        assert_eq!(
+            journals.iter().map(|j| j.names_jobs()).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert_eq!(address(&snowflake, "r", "loaded"), at("DB.SC.orders", None));
         assert_eq!(
             address(&base, "r", "compacted"),
             at("p.d.orders", Some("p.d.orders__changes"))

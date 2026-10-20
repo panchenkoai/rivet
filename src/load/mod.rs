@@ -1515,6 +1515,13 @@ pub(crate) mod tests {
         }
     }
 
+    /// [`fake_loader`] whose `table` holds `rows` rows.
+    pub(crate) fn fake_loader_holding(table: &str, rows: u64) -> FakeLoader {
+        let f = fake_loader(0);
+        f.counts.borrow_mut().insert(table.to_string(), rows);
+        f
+    }
+
     fn changelog_with(drift: ChangelogDrift) -> FakeLoader {
         let f = FakeLoader {
             rows: 3,

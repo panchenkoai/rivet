@@ -2244,6 +2244,42 @@ mod tests {
             (1, None, Some(1))
         );
     }
+
+    /// An empty `nextPageToken` ends the child list: it is not a page to ask for.
+    #[test]
+    fn an_empty_page_token_ends_the_child_list() {
+        use crate::load::result::{DmlCounts, JobJournal};
+        use stand::{Stand, json};
+        let stand = Stand::start(move |seen, nth| match (seen.method.as_str(), nth) {
+            ("POST", _) => json(
+                200,
+                r#"{"jobReference":{"projectId":"p","jobId":"s1"},"status":{"state":"DONE"},"statistics":{"query":{"statementType":"SCRIPT"}}}"#,
+            ),
+            (_, 0) => json(
+                200,
+                r#"{"jobs":[{"statistics":{"query":{"dmlStats":{"insertedRowCount":"1"}}}}],"nextPageToken":""}"#,
+            ),
+            _ => json(
+                200,
+                r#"{"jobs":[{"statistics":{"query":{"dmlStats":{"insertedRowCount":"100"}}}}]}"#,
+            ),
+        });
+        let journal = JobJournal::new(true);
+        stand
+            .api()
+            .journaled(journal.clone())
+            .run_query("SCRIPT", &labels())
+            .unwrap();
+        assert_eq!(
+            journal.jobs()[0].dml,
+            Some(DmlCounts {
+                inserted: 1,
+                updated: 0,
+                deleted: 0
+            })
+        );
+        assert_eq!(stand.asked("/jobs"), 2, "one insert, one list page");
+    }
 }
 
 /// A scripted BigQuery endpoint on a loopback port: every request is recorded and answered by the script.

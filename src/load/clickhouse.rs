@@ -1531,6 +1531,71 @@ mod tests {
         );
     }
 
+    /// An empty `X-ClickHouse-Query-Id` names no statement.
+    #[test]
+    fn an_empty_query_id_names_no_statement() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(query_id(&headers), None);
+        headers.insert("X-ClickHouse-Query-Id", "".parse().unwrap());
+        assert_eq!(query_id(&headers), None);
+        headers.insert("X-ClickHouse-Query-Id", "q-1".parse().unwrap());
+        assert_eq!(query_id(&headers).as_deref(), Some("q-1"));
+    }
+
+    /// Every statement ClickHouse answers is journaled under the query id it sent back.
+    #[test]
+    fn an_answered_statement_is_journaled_under_its_query_id() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0u8; length];
+                reader.read_exact(&mut body).unwrap();
+                let id = if n == 0 {
+                    "X-ClickHouse-Query-Id: q-123\r\n"
+                } else {
+                    ""
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{id}Content-Length: 1\r\nConnection: close\r\n\r\n1"
+                )
+                .unwrap();
+            }
+        });
+        unsafe { std::env::set_var("RIVET_CH_JOURNAL_TEST_PASSWORD", "x") };
+        let journal = crate::load::result::JobJournal::new(true);
+        let loader = ClickhouseLoader::new(
+            &format!("http://{addr}"),
+            "d",
+            "u",
+            "RIVET_CH_JOURNAL_TEST_PASSWORD",
+            crate::config::DestinationConfig::default(),
+        )
+        .journaled(journal.clone());
+        assert_eq!(loader.query("SELECT 1").unwrap(), "1");
+        assert_eq!(loader.query("SELECT 1").unwrap(), "1");
+        let ids: Vec<String> = journal.jobs().into_iter().map(|j| j.id).collect();
+        assert_eq!(ids, ["q-123"], "an answer without an id records nothing");
+    }
+
     #[test]
     fn the_row_count_is_the_parquet_footers() {
         use std::sync::Arc;

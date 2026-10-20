@@ -113,6 +113,12 @@ impl JobJournal {
         }
     }
 
+    /// Whether the target names its jobs.
+    #[cfg(test)]
+    pub(crate) fn names_jobs(&self) -> bool {
+        self.names_jobs
+    }
+
     fn journal(&self) -> std::sync::MutexGuard<'_, Journal> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -413,7 +419,7 @@ pub(crate) mod tests {
                 table_result(
                     "orders_cdc",
                     "orders",
-                    &at("proj.analytics.orders__changes", None),
+                    &at("proj.analytics.orders", None),
                     "loaded",
                     &Ok(TableDone::Work(Work::loaded(
                         1200,
