@@ -659,6 +659,9 @@ pub struct InitYamlDestination {
     pub clickhouse_user: Option<String>,
     /// `--snowflake-*`: the same, for a Snowflake load (all five, or none).
     pub snowflake: Option<InitSnowflakeTarget>,
+    /// The `[a-z0-9_]` stem of the `-o` file a CDC scaffold names its slot and `server_id` from, so
+    /// two configs on one cluster never share them; `None` writes the default names (stdout).
+    pub cdc_name_stem: Option<String>,
 }
 
 /// The five values a Snowflake `load:` block needs — every one is required by the loader.
@@ -752,8 +755,10 @@ pub fn init(
     tls: Option<&crate::config::TlsConfig>,
 ) -> Result<()> {
     yaml_destination.validate()?;
+    let mut yaml_destination = yaml_destination;
     if matches!(format, InitFormat::Yaml) {
         refuse_unsupported_forced_mode(source_url, mode_override)?;
+        yaml_destination.cdc_name_stem = output.and_then(yaml_scaffold::output_stem);
     }
     let (scaffold, snapshots) = match format {
         InitFormat::Yaml => init_yaml(
@@ -1637,12 +1642,13 @@ fn record_primary_keys(
             return;
         }
     };
+    let source_key = crate::config::source_state_key(kind, source_url);
     let mut failed: Vec<&str> = Vec::new();
     for s in snapshots {
         let relation = relation_for_key(&kind, s.source_schema.as_deref(), &s.source_table);
         match src.primary_key(&relation) {
             Ok(Some(pk)) => {
-                if let Err(e) = store.record_primary_key(&s.export_name, None, &pk) {
+                if let Err(e) = store.record_primary_key(&s.export_name, None, &source_key, &pk) {
                     log::debug!(
                         "init: primary key for '{}' not written: {e:#}",
                         s.export_name
@@ -2877,6 +2883,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             snowflake: None,
+            cdc_name_stem: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3033,6 +3040,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             snowflake: None,
+            cdc_name_stem: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3066,6 +3074,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             snowflake: None,
+            cdc_name_stem: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3104,6 +3113,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             snowflake: None,
+            cdc_name_stem: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3131,6 +3141,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             snowflake: None,
+            cdc_name_stem: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");

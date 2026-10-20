@@ -729,6 +729,7 @@ fn dispatch_init(
         clickhouse_database,
         clickhouse_user: Some(clickhouse_user),
         snowflake: snowflake.target()?,
+        cdc_name_stem: None,
     };
     let filter = init::TableFilter { include, exclude };
     let tls_config = resolve_init_tls(tls, tls_ca)?;

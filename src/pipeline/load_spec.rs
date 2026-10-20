@@ -24,6 +24,7 @@ pub(super) fn record_after_run(
     }
     let recorded = match &summary.open_mappings {
         Some(mappings) => record_from_run(
+            &config.source.state_key(),
             export,
             state,
             mappings,
@@ -45,6 +46,7 @@ pub(super) fn record_after_run(
 
 /// The spec from what the run itself resolved — no second source connection.
 fn record_from_run(
+    config_source_key: &str,
     export: &ExportConfig,
     state: &StateStore,
     mappings: &[crate::types::TypeMapping],
@@ -52,7 +54,14 @@ fn record_from_run(
     run_id: &str,
 ) -> Result<()> {
     let columns: Vec<LoadSpecColumn> = mappings.iter().map(LoadSpecColumn::from_mapping).collect();
-    state.record_load_spec(&export.name, None, &columns, primary_key, run_id)
+    state.record_load_spec(
+        &export.name,
+        None,
+        config_source_key,
+        &columns,
+        primary_key,
+        run_id,
+    )
 }
 
 fn capture_and_record(
@@ -79,10 +88,63 @@ fn capture_and_record(
         state.record_load_spec(
             &export.name,
             unit.table.as_deref(),
+            &config.source.state_key(),
             &columns,
             unit.primary_key.as_deref(),
             run_id,
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{RivetType, SourceColumn, TypeMapping};
+
+    /// A finished run records the columns and key it resolved as the load spec of (export,
+    /// table, source); a run of the same export from another source records its own beside it.
+    #[test]
+    fn a_finished_run_records_the_spec_a_load_reads_back_by_export_table_and_source() {
+        let yaml = |url: &str| {
+            format!(
+                "source:\n  type: postgres\n  url: \"{url}\"\nexports:\n  - name: orders\n    \
+                 table: orders\n    mode: full\n    format: parquet\n    \
+                 destination: {{ type: local, path: ./out }}\n"
+            )
+        };
+        let state = StateStore::open_in_memory().unwrap();
+        let mut recorded = Vec::new();
+        for (url, column) in [
+            ("postgresql://u@a/db", "id"),
+            ("postgresql://u@b/db", "code"),
+        ] {
+            let config = Config::from_yaml(&yaml(url)).unwrap();
+            let mut summary = RunSummary::stub_for_testing("run-1", "orders");
+            summary.open_mappings = Some(vec![TypeMapping::from_source(
+                &SourceColumn::simple(column, "bigint", false),
+                RivetType::Int64,
+            )]);
+            summary.open_primary_key = Some(vec![column.to_string()]);
+            record_after_run(
+                &config,
+                &config.exports[0],
+                &state,
+                Path::new("."),
+                None,
+                &summary,
+            );
+            recorded.push((config.source.state_key(), column));
+        }
+        for (source, column) in recorded {
+            let spec = state
+                .load_spec("orders", None, &source)
+                .unwrap()
+                .expect("the run recorded a spec under its source");
+            let names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
+            assert_eq!(names, [column], "{source}");
+            assert_eq!(spec.primary_key, Some(vec![column.to_string()]), "{source}");
+            assert_eq!(spec.run_id.as_deref(), Some("run-1"), "{source}");
+        }
+    }
 }

@@ -50,6 +50,14 @@ checkpoints, the CDC snapshot records, the load journal and load specs, metrics 
   and writing it there, so it must stay on a disk the scheduler keeps (not an ephemeral pod
   volume). A PostgreSQL slot's position is the server's and needs nothing.
 
+## Load specs on a shared state (v38)
+
+The columns and key a run records for `rivet load` (`export_load_spec`) are kept per export name,
+table and source since v38, so configs of one export name reading different databases on one
+state each load by their own spec and their own `rivet init` key. A row written before v38 has no
+source and stays the spec of any source of that name until the source records its own; the v38
+migration rebuilds the table, and the copy it leaves behind restores the v37 shape.
+
 ## The copy a migration leaves behind
 
 Before a migration runs its first statement, inside the migration lock, rivet writes a copy of the
@@ -136,7 +144,7 @@ END $$;
 COMMIT;
 ```
 
-A table the newer release created and the copy does not hold (none between v32 and v37) is left in
+A table the newer release created and the copy does not hold (none between v32 and v38) is left in
 place; the previous release ignores it. Drop it before upgrading again.
 
 ### What it costs
