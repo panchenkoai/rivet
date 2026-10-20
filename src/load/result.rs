@@ -102,9 +102,10 @@ fn document(result: &CommandResult) -> Result<String> {
 fn write_document(path: &Path, result: &CommandResult) -> Result<()> {
     let text = document(result)?;
     let unwritable = |what: String, e: std::io::Error| {
-        crate::error::coded(
+        crate::error::coded_io(
             crate::error::codes::CLI_OUTPUT_UNWRITABLE,
             format!("--summary-output: {what}: {e}"),
+            e,
         )
     };
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
