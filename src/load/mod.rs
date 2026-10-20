@@ -165,6 +165,23 @@ pub trait TargetLoader {
         )
     }
 
+    /// Buffer a tombstone into `<table>__changes` for every live row of the base `table`
+    /// whose key the buffer does not hold, after a re-baseline joined the buffer. Returns
+    /// the rows buffered. Only a warehouse that compacts has a base to read.
+    fn flag_absent_from_buffer(
+        &self,
+        table: &str,
+        _specs: &[TargetColumnSpec],
+        _pk: &[String],
+    ) -> Result<u64> {
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_LOAD_INVARIANT,
+            "a base-and-buffer re-baseline reached `{}`, which {:?} never compacts",
+            self.fqtn(table),
+            self.warehouse()
+        )
+    }
+
     /// The warehouse this adapter targets — lets the shared driver build the
     /// current-state view SQL (dialect keyword + identifier quoting) in ONE place
     /// per mode instead of once per adapter.
@@ -1449,6 +1466,15 @@ pub(crate) mod tests {
         }
         fn warehouse(&self) -> cdc::Warehouse {
             self.dialect.unwrap_or(cdc::Warehouse::BigQuery)
+        }
+        fn flag_absent_from_buffer(
+            &self,
+            table: &str,
+            _: &[TargetColumnSpec],
+            _: &[String],
+        ) -> Result<u64> {
+            self.wrote(format!("flag absent {table}"));
+            Ok(2)
         }
         fn create_view(&self, table: &str, _view_sql: &str) -> Result<()> {
             self.wrote(format!("view {table}"));

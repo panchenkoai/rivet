@@ -407,19 +407,6 @@ pub fn base_carries_delete_flag(base_and_buffer: bool, deleted_flag: bool) -> bo
     base_and_buffer && deleted_flag
 }
 
-/// Whether a whole-table pass may be folded into the changelog instead of landing as the
-/// base table.
-///
-/// Folding is the log-and-view layout's answer, where the name is a view and cannot be
-/// overwritten. Under base-and-buffer the first pass IS the base, so it must land as a
-/// table and never join the log.
-///
-/// Takes only the layout: whether a first pass EXISTS is carried by the `Option` the
-/// caller filters, so asking for it again here would put the same decision in two places.
-pub fn whole_table_pass_may_join_the_log(base_and_buffer: bool) -> bool {
-    !base_and_buffer
-}
-
 /// Whether a plan's `pk` / `cluster_by` / `partition` must name columns of the
 /// spec it is built from now, or may be checked later against the pinned run's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1384,18 +1371,6 @@ mod tests {
     /// Only the layout is graded here. Whether a first pass EXISTS is carried by the
     /// `Option` the caller filters, so it is the caller's `if let` — not this predicate —
     /// and duplicating it as a parameter would put one decision in two places.
-    #[test]
-    fn a_whole_table_pass_joins_the_log_only_under_the_view_layout() {
-        assert!(
-            whole_table_pass_may_join_the_log(false),
-            "log-and-view: a whole-table pass folds into the changelog"
-        );
-        assert!(
-            !whole_table_pass_may_join_the_log(true),
-            "base-and-buffer: the first pass IS the base and must land as a table"
-        );
-    }
-
     #[test]
     fn resolve_load_prefix_expands_deterministic_tokens_and_refuses_run_specific() {
         use crate::config::{DestinationConfig, DestinationType};

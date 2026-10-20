@@ -502,6 +502,49 @@ fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_
     );
 }
 
+/// `state reset` of an incremental export into ClickHouse: the next run holds the whole
+/// table again, and it is appended to the change log, never landed over it. Rows the source
+/// deleted before the reset stay in the view, on that cycle and the next.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn an_incremental_pass_after_a_state_reset_keeps_what_clickhouse_held_for_two_cycles() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_reset", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let view = format!("{}.{tbl}", db.0);
+    let held = || clickhouse_rows(&format!("SELECT id, v FROM {view} ORDER BY id FORMAT TSV"));
+
+    rig.run_ok();
+    load(&rig);
+    let before = held();
+    assert_eq!(before, pg_rows(&mut c, &tbl));
+    c.batch_execute(&format!("DELETE FROM {tbl} WHERE id <= 2"))
+        .expect("delete at the source");
+    let reset = rig.cli(&["state", "reset", "--export", rig.export_name()]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    for cycle in ["after the reset", "next cycle"] {
+        rig.run_ok();
+        load(&rig);
+        assert_eq!(
+            held(),
+            before,
+            "{cycle}: the rows the source deleted are kept"
+        );
+    }
+}
+
 /// A change log keyed on one `load.pk` cannot take a load keyed on another: rows the
 /// old key already collapsed cannot be told apart again, so the load refuses before
 /// writing and the view keeps serving what it served. One config on one state DB, its
