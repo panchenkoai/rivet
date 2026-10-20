@@ -735,7 +735,12 @@ pub fn load_type_reports(
             None => vec![None],
         };
         for unit in units {
-            match state.load_spec(&export.name, unit.as_deref(), &config.source.state_key()) {
+            let source = state.spec_source(
+                config.source.try_state_key().ok(),
+                &export.name,
+                unit.as_deref(),
+            )?;
+            match state.load_spec(&export.name, unit.as_deref(), &source) {
                 Ok(Some(spec)) if !spec.columns.is_empty() => {
                     let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
                     if let Some(pk) = spec.primary_key {

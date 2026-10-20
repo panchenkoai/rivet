@@ -265,6 +265,38 @@ impl StateStore {
         Ok(())
     }
 
+    /// The source a load reads `export_name`'s spec under: the config's own when it resolves on
+    /// this host, else the one source that recorded a spec of the unit (none: the legacy row),
+    /// refused when several did and nothing here says which config this is.
+    pub fn spec_source(
+        &self,
+        configured: Option<String>,
+        export_name: &str,
+        unit: Option<&str>,
+    ) -> Result<String> {
+        if let Some(source) = configured {
+            return Ok(source);
+        }
+        let mut sources = self.query(
+            "SELECT DISTINCT source FROM export_load_spec \
+             WHERE export_name = ?1 AND unit = ?2 AND source <> '' ORDER BY source",
+            &[export_name.into(), unit.unwrap_or("").into()],
+            |r| r.text(0),
+        )?;
+        match sources.len() {
+            0 => Ok(String::new()),
+            1 => Ok(sources.remove(0)),
+            n => crate::rivet_bail!(
+                crate::error::codes::LOAD_SPEC_SOURCE_UNRESOLVED,
+                "export '{export_name}'{}: {n} sources recorded a load spec on this state, and \
+                 this config's source does not resolve here, so the load cannot tell which spec \
+                 is this config's. Set the source's variable (`url_env:` / `password_env:`) for \
+                 `rivet load` too; the load reads it to pick its spec and never connects",
+                unit.map(|t| format!(" table '{t}'")).unwrap_or_default()
+            ),
+        }
+    }
+
     /// The recorded spec for one unit of `export_name`, or `None` when nothing recorded one.
     pub fn load_spec(
         &self,

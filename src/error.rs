@@ -1205,6 +1205,11 @@ pub mod codes {
         "a column builder got a type it cannot build — a bug; report it with the column's type",
     );
 
+    /// `rivet load` cannot resolve the config's source, and several sources recorded a spec of the export on this state.
+    pub const LOAD_SPEC_SOURCE_UNRESOLVED: Code = usage(
+        "RIVET_LOAD_SPEC_SOURCE_UNRESOLVED",
+        "set the source's variable (`url_env:` / `password_env:`) for `rivet load` as for `rivet run`",
+    );
     /// A `--export` / `-e` name no export in the config carries.
     pub const CLI_EXPORT_UNKNOWN: Code = usage(
         "RIVET_CLI_EXPORT_UNKNOWN",
@@ -1716,6 +1721,7 @@ pub mod codes {
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
+        LOAD_SPEC_SOURCE_UNRESOLVED,
         CLI_EXPORT_UNKNOWN,
         CLI_RUN_ID_EXPORT_MISMATCH,
         CLI_OPTION_UNSUPPORTED,
