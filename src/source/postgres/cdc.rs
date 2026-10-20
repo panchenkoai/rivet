@@ -954,14 +954,20 @@ impl PgChangeStream {
         };
         // The checkpoint first, then the slot: the checkpoint is the last position rivet
         // confirmed, which the open compares the slot with to see another reader's advance.
-        if let Some(ck) = &self.checkpoint
-            && let Err(e) = Position::new(json!({ "lsn": lsn })).save(ck)
-        {
+        if let Err(e) = self.record_confirmed(&lsn) {
             log::warn!("pg cdc: could not record the empty-transaction span at {lsn}: {e:#}");
             return;
         }
         if let Err(e) = self.advance_slot(&lsn) {
             log::warn!("pg cdc: could not release the empty-transaction span at {lsn}: {e:#}");
+        }
+    }
+
+    /// Save `lsn` as the export's checkpoint, the position rivet confirmed, when it has one.
+    fn record_confirmed(&self, lsn: &str) -> Result<()> {
+        match &self.checkpoint {
+            Some(ck) => Position::new(json!({ "lsn": lsn })).save(ck),
+            None => Ok(()),
         }
     }
 
