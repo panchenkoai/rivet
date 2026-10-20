@@ -1,0 +1,11 @@
+--- a/src/state/load_spec_store.rs
++++ b/src/state/load_spec_store.rs
+@@ -274,7 +274,7 @@ impl StateStore {
+         export_name: &str,
+         unit: Option<&str>,
+     ) -> Result<String> {
+-        if let Some(source) = configured {
++        if let Some(source) = configured.or(Some(String::new())) {
+             return Ok(source);
+         }
+         let mut sources = self.query(

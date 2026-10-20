@@ -26,6 +26,7 @@ mod pin;
 pub mod plan;
 pub(crate) mod pool;
 pub mod reconcile;
+pub mod result;
 mod snowflake;
 mod staging;
 

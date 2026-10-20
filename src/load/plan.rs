@@ -157,12 +157,103 @@ fn warehouse_table_name(table: &str, export_name: &str) -> String {
     if !table.contains('.') {
         return table.to_string();
     }
-    let folded = table.replace('.', "_");
+    let folded = folded_table(table);
     log::info!(
         "export '{export_name}': source table `{table}` is schema-qualified; the warehouse table \
          is `{folded}` (a dot would be read as part of the dataset name)"
     );
     folded
+}
+
+/// A source table's warehouse name: a schema-qualifying dot folded to `_`.
+fn folded_table(table: &str) -> String {
+    table.replace('.', "_")
+}
+
+/// The source table an export's unit reads: the unit, else the export's `table:`, else its name.
+fn source_table_of(export: &crate::config::ExportConfig, unit: Option<&str>) -> String {
+    unit.map(str::to_string)
+        .or_else(|| export.table.clone())
+        .unwrap_or_else(|| export.name.clone())
+}
+
+/// Which of a config's tables `rivet load` / `rivet compact` takes: every one, or those `--export` / `--table` name.
+#[derive(Debug, Clone, Default)]
+pub struct Selection {
+    pub export: Option<String>,
+    pub table: Option<String>,
+}
+
+impl Selection {
+    /// Whether the table `table` of export `export` is taken.
+    fn keeps(&self, export: &str, table: &str) -> bool {
+        self.export.as_deref().is_none_or(|e| e == export)
+            && self.table.as_deref().is_none_or(|t| t == table)
+    }
+
+    /// Refuse a selection that names no export or no table of `cfg`, listing what it could name.
+    fn check(&self, cfg: &crate::config::Config) -> Result<()> {
+        let recipes = crate::config::backfill_recipe_names(&cfg.exports);
+        let loadable: Vec<&crate::config::ExportConfig> = cfg
+            .exports
+            .iter()
+            .filter(|e| !recipes.contains(&e.name))
+            .collect();
+        if let Some(name) = self.export.as_deref()
+            && !loadable.iter().any(|e| e.name == name)
+        {
+            let mut known: Vec<&str> = loadable.iter().map(|e| e.name.as_str()).collect();
+            known.sort_unstable();
+            crate::rivet_bail!(
+                crate::error::codes::CLI_EXPORT_UNKNOWN,
+                "export '{name}' is not loaded by this config.\n  Loaded exports: {}",
+                list_or_none(&known)
+            );
+        }
+        let Some(table) = self.table.as_deref() else {
+            return Ok(());
+        };
+        let mut tables: Vec<String> = loadable
+            .iter()
+            .filter(|e| self.export.as_deref().is_none_or(|n| n == e.name))
+            .flat_map(|e| {
+                units_of(e)
+                    .into_iter()
+                    .map(|u| folded_table(&source_table_of(e, u.as_deref())))
+            })
+            .collect();
+        if tables.iter().any(|t| t == table) {
+            return Ok(());
+        }
+        tables.sort_unstable();
+        tables.dedup();
+        let known: Vec<&str> = tables.iter().map(String::as_str).collect();
+        crate::rivet_bail!(
+            crate::error::codes::CLI_TABLE_UNKNOWN,
+            "table '{table}' is not loaded by {}.\n  Loaded tables: {}",
+            self.export
+                .as_deref()
+                .map_or("this config".to_string(), |e| format!("export '{e}'")),
+            list_or_none(&known)
+        );
+    }
+}
+
+/// The names joined for a refusal, or `(none)`.
+fn list_or_none(names: &[&str]) -> String {
+    if names.is_empty() {
+        "(none)".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// The units an export loads: each table of a multiplex `tables:` list, else the export itself.
+fn units_of(export: &crate::config::ExportConfig) -> Vec<Option<String>> {
+    match export.multiplex_tables() {
+        Some(tables) => tables.iter().cloned().map(Some).collect(),
+        None => vec![None],
+    }
 }
 
 /// What a rivet config resolves to for a BigQuery load.
@@ -356,7 +447,7 @@ fn table_load_prefix(base_uri: &str, table: &str) -> Result<String> {
     ))
 }
 
-pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
+pub fn plan_loads(config_path: &str, selection: &Selection) -> Result<Vec<LoadPlan>> {
     // `Config::load`, not a raw `from_yaml`: it resolves `${VAR}`/`--param`
     // placeholders exactly as the `rivet check` child did. The old code parsed
     // the file TWICE with two different resolutions — an unexpanded `${BUCKET}`
@@ -369,6 +460,7 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
             "config has no exports"
         );
     }
+    selection.check(&cfg)?;
 
     // The `load:` target from the same config, shared by every export.
     let load = cfg.load.clone().context(
@@ -379,14 +471,26 @@ pub fn plan_loads(config_path: &str) -> Result<Vec<LoadPlan>> {
         .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
     let state = crate::state::StateStore::open(config_path)
         .context("opening the state DB, which holds the column types `rivet run` recorded")?;
-    let (reports, keys) = crate::preflight::load_type_reports(&cfg, &state, target)?;
+    let keep = |e: &crate::config::ExportConfig, unit: Option<&str>| {
+        selection.keeps(&e.name, &folded_table(&source_table_of(e, unit)))
+    };
+    let (reports, keys) = crate::preflight::load_type_reports(&cfg, &state, target, &keep)?;
 
     // Deferred: this plan is typed from the BY-NAME spec, which the load then pins
     // to the run it consumes (`pin::pin_plan_to_its_run`) — a same-named
     // export of another config may have written that row, and its columns are not
     // this table's. The fit is checked strictly after the pin, or by
     // `check_spec_fit` when no pin is possible.
-    build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)
+    let mut plans = build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)?;
+    // The source the specs were read under, so the load pins its runs' specs under the same one.
+    for plan in &mut plans {
+        plan.source_key = state.spec_source(
+            cfg.source.try_state_key().ok(),
+            &plan.export_name,
+            plan.unit.as_deref(),
+        )?;
+    }
+    Ok(plans)
 }
 
 /// The column an incremental load's view orders by: the continued key, else the export's cursor.
@@ -519,11 +623,7 @@ fn build_plans_keyed(
         // one BASE prefix, whose recursive manifest listing sweeps in every sibling
         // table's parts. That merges N source tables into one warehouse table with
         // every count agreeing (#252).
-        let source_table = report
-            .table
-            .clone()
-            .or_else(|| export.table.clone())
-            .unwrap_or_else(|| export.name.clone());
+        let source_table = source_table_of(export, report.table.as_deref());
         let table = warehouse_table_name(&source_table, &export.name);
 
         let dest = &export.destination;
@@ -2390,7 +2490,9 @@ load:
              exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n    \
              destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n"
         ));
-        let err = plan_loads(&path).unwrap_err().to_string();
+        let err = plan_loads(&path, &Selection::default())
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("no top-level `load:` block"),
             "the config gate must answer first, before the source is dialled: {err}"
@@ -2403,7 +2505,10 @@ load:
              destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
              target: bigquery\n  project: p\n  dataset: d\n  gc_orphan: true\n"
         ));
-        let err = format!("{:#}", plan_loads(&path).unwrap_err());
+        let err = format!(
+            "{:#}",
+            plan_loads(&path, &Selection::default()).unwrap_err()
+        );
         assert!(err.contains("gc_orphan"), "{err}");
     }
 
@@ -2450,7 +2555,7 @@ load:
             )
             .unwrap();
 
-        let plans = plan_loads(&path).unwrap();
+        let plans = plan_loads(&path, &Selection::default()).unwrap();
         assert_eq!(plans.len(), 1);
         let specs: Vec<(&str, String)> = plans[0]
             .specs
@@ -2469,11 +2574,61 @@ load:
         );
     }
 
+    /// A load host without the source's variable reads the one spec a run recorded on this state
+    /// (state v38 keys it by source); with two sources' specs it refuses by code instead of guessing.
+    #[test]
+    fn a_load_without_the_source_variable_reads_the_only_spec_and_refuses_two() {
+        use crate::types::{RivetType, TypeFidelity};
+        let var = "RIVET_TEST_LOAD_SPEC_SOURCE_NEVER_SET";
+        let (_dir, path) = cfg_file(&format!(
+            "source:\n  type: postgres\n  url_env: {var}\n\
+             exports:\n  - name: orders\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n"
+        ));
+        let col = crate::state::LoadSpecColumn {
+            name: "id".into(),
+            source_type: "native".into(),
+            rivet_type: RivetType::Int64,
+            fidelity: TypeFidelity::Exact,
+            nullable: false,
+            warnings: Vec::new(),
+        };
+        let state = crate::state::StateStore::open(&path).unwrap();
+        let record = |source: &str| {
+            state
+                .record_load_spec(
+                    "orders",
+                    None,
+                    source,
+                    std::slice::from_ref(&col),
+                    None,
+                    "run_1",
+                )
+                .unwrap()
+        };
+        record("postgres://h:5432/db");
+        let plans = plan_loads(&path, &Selection::default()).unwrap();
+        assert_eq!(plans[0].specs.len(), 1, "the run's spec types the load");
+        assert_eq!(plans[0].source_key, "postgres://h:5432/db");
+        record("postgres://other:5432/db");
+        let err = plan_loads(&path, &Selection::default()).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_SPEC_SOURCE_UNRESOLVED"),
+            "{err:#}"
+        );
+        assert_eq!(crate::error::classify_exit(&err), 1);
+    }
+
     /// With nothing recorded the load refuses, naming the export and the command that records it.
     #[test]
     fn plan_loads_without_a_recorded_spec_names_the_run_that_records_it() {
         let (_dir, path) = orders_on_a_closed_source();
-        let err = format!("{:#}", plan_loads(&path).unwrap_err());
+        let err = format!(
+            "{:#}",
+            plan_loads(&path, &Selection::default()).unwrap_err()
+        );
         assert!(
             err.contains("orders") && err.contains("rivet run"),
             "the refusal must name the export and `rivet run`: {err}"
@@ -3474,5 +3629,103 @@ load: { target: bigquery, project: p, dataset: d }
             code_of(build_plans(&s3, s3.load.as_ref().unwrap(), reports)),
             Some("RIVET_LOAD_DESTINATION_TYPE_UNSUPPORTED")
         );
+    }
+
+    /// `--export` / `--table` take what they name and refuse a name the config does not load,
+    /// listing what it does load; a backfill recipe is not a loaded export.
+    #[test]
+    fn a_selection_takes_what_it_names_and_refuses_what_the_config_does_not_load() {
+        let cfg = crate::config::Config::from_yaml(
+            r#"
+source:
+  type: postgres
+  url: "postgresql://localhost/test"
+exports:
+  - name: alpha
+    table: public.alpha
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: alpha/ }
+  - name: orders_base
+    table: orders
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: base/ }
+  - name: customers_base
+    table: customers
+    mode: full
+    format: parquet
+    destination: { type: gcs, bucket: b, prefix: cust/ }
+  - name: stream
+    tables: [orders, customers]
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc.ckpt
+      backfill: [orders_base, customers_base]
+    destination: { type: gcs, bucket: b, prefix: cdc/ }
+load:
+  target: bigquery
+  project: p
+  dataset: d
+"#,
+        )
+        .unwrap();
+        let sel = |export: Option<&str>, table: Option<&str>| Selection {
+            export: export.map(str::to_string),
+            table: table.map(str::to_string),
+        };
+        let refusal = |s: Selection| {
+            let err = s.check(&cfg).expect_err("must refuse");
+            (crate::error::error_code(&err), format!("{err:#}"))
+        };
+
+        assert!(sel(None, None).keeps("alpha", "public_alpha"));
+        assert!(sel(Some("alpha"), None).keeps("alpha", "x"));
+        assert!(!sel(Some("alpha"), None).keeps("stream", "x"));
+        assert!(sel(None, Some("orders")).keeps("stream", "orders"));
+        assert!(!sel(None, Some("orders")).keeps("stream", "customers"));
+        assert!(!sel(Some("alpha"), Some("orders")).keeps("stream", "orders"));
+        assert!(!sel(Some("stream"), Some("orders")).keeps("stream", "customers"));
+        assert!(sel(Some("stream"), Some("orders")).keeps("stream", "orders"));
+
+        sel(None, None).check(&cfg).unwrap();
+        sel(Some("stream"), None).check(&cfg).unwrap();
+        sel(None, Some("public_alpha")).check(&cfg).unwrap();
+        sel(Some("stream"), Some("customers")).check(&cfg).unwrap();
+
+        assert_eq!(
+            refusal(sel(Some("orders_base"), None)),
+            (
+                Some("RIVET_CLI_EXPORT_UNKNOWN"),
+                "export 'orders_base' is not loaded by this config.\n  Loaded exports: alpha, stream"
+                    .to_string()
+            ),
+            "a backfill recipe runs inside its CDC export and is not loaded by name"
+        );
+        assert_eq!(
+            refusal(sel(Some("alpha"), Some("customers"))),
+            (
+                Some("RIVET_CLI_TABLE_UNKNOWN"),
+                "table 'customers' is not loaded by export 'alpha'.\n  Loaded tables: public_alpha"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            refusal(sel(None, Some("nope"))),
+            (
+                Some("RIVET_CLI_TABLE_UNKNOWN"),
+                "table 'nope' is not loaded by this config.\n  Loaded tables: customers, orders, public_alpha"
+                    .to_string()
+            )
+        );
+        assert_eq!(list_or_none(&[]), "(none)");
+        assert_eq!(list_or_none(&["a", "b"]), "a, b");
+        let stream = cfg.exports.iter().find(|e| e.name == "stream").unwrap();
+        assert_eq!(
+            units_of(stream),
+            vec![Some("orders".to_string()), Some("customers".to_string())]
+        );
+        assert_eq!(units_of(&cfg.exports[0]), vec![None]);
     }
 }

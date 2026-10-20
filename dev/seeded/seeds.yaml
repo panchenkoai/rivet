@@ -3122,3 +3122,22 @@ seeds:
         cells: ["lib:a_whole_table_pass_over_an_existing_base_is_buffered_and_never_replaces_it"]
       oracle:
         cells: ["lib:a_whole_table_pass_over_an_existing_base_is_buffered_and_never_replaces_it"]
+
+  - name: load-spec-read-under-an-unresolved-source
+    class: "`rivet load` reads the source-keyed load spec under the key the config resolves on the load host, so a host without the source variable finds no spec and refuses every table"
+    history: "2026-10-20, a regression of #650 (state v38) caught on main f5ba44a3 by the generated CDC chains: `rivet load` without DATABASE_URL refused with RIVET_LOAD_SPEC_MISSING; fixed by `StateStore::spec_source`"
+    scope: source
+    patch: load-spec-read-under-an-unresolved-source/shared.patch
+    engines:
+      lib:
+        cells: ["lib:a_load_without_the_source_variable_reads_the_only_spec_and_refuses_two"]
+      postgres:
+        cells: [a_generated_cdc_config_drives_run_load_compact_postgres]
+      mysql:
+        cells: [a_generated_cdc_config_drives_run_load_compact_mysql]
+      mssql:
+        cells: [a_generated_cdc_config_drives_run_load_compact_mssql]
+      mongo:
+        cells: [a_generated_cdc_config_drives_run_load_compact_mongo]
+      oracle:
+        cells: ["lib:a_load_without_the_source_variable_reads_the_only_spec_and_refuses_two"]
