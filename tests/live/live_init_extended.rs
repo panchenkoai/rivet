@@ -489,3 +489,93 @@ fn init_clickhouse_flags_scaffold_the_load_block_and_require_each_other() {
         );
     }
 }
+
+/// `rivet init --azure-container --azure-account --azure-endpoint` writes a config that runs AS
+/// WRITTEN into Azurite with the account key in `AZURE_STORAGE_KEY` (and the source in `DATABASE_URL`,
+/// as every generated config takes it): the parts and the
+/// manifest land under `exports/<table>/`, and DuckDB's azure extension reads the source's ids and
+/// names back from the container.
+#[test]
+#[ignore = "live: requires docker compose postgres + azurite"]
+fn an_azure_scaffold_runs_as_written_into_azurite() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(7);
+    let container = unique_name("init-az").replace('_', "-");
+    ensure_azure_container(&container);
+    let dir = tempfile::tempdir().expect("a config dir");
+    let config = dir.path().join("rivet.yaml");
+    let init = std::process::Command::new(RIVET_BIN)
+        .args([
+            "init",
+            "--source",
+            POSTGRES_URL,
+            "--table",
+            table.name(),
+            "--azure-container",
+            &container,
+            "--azure-account",
+            AZURITE_ACCOUNT,
+            "--azure-endpoint",
+            AZURITE_ENDPOINT,
+            "-o",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .expect("spawn rivet init");
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let yaml = std::fs::read_to_string(&config).unwrap();
+    assert!(
+        !yaml.contains(AZURITE_KEY),
+        "the key never reaches the config:\n{yaml}"
+    );
+    let run = run_rivet_in_dir(
+        dir.path(),
+        &["run", "-c", "rivet.yaml"],
+        &[
+            ("AZURE_STORAGE_KEY", AZURITE_KEY),
+            ("DATABASE_URL", POSTGRES_URL),
+        ],
+    );
+    assert!(
+        run.status.success(),
+        "the generated config runs as written:\n{yaml}\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let prefix = format!("exports/{}/", table.name());
+    let names = azure_blob_names(&container, &prefix);
+    assert!(
+        names.iter().any(|n| n.ends_with("manifest.json")),
+        "{names:?}"
+    );
+    let mut c = pg_connect();
+    let source_ids: Vec<i64> = c
+        .query(&format!("SELECT id FROM {} ORDER BY id", table.name()), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let read = |col: &str| duckdb_store_column(ObjectStore::Azurite, &container, &prefix, col);
+    let mut ids: Vec<i64> = read("id").iter().map(|v| v.parse().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids, source_ids,
+        "DuckDB reads the source's ids from the container"
+    );
+    let source_names: std::collections::BTreeSet<String> = c
+        .query(&format!("SELECT name FROM {}", table.name()), &[])
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        read("name")
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        source_names,
+        "and its names"
+    );
+}

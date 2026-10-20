@@ -240,7 +240,7 @@ pub(super) fn scaffold_schema(
         });
     }
 
-    let dest_note = if dest.gcs_bucket.is_some() || dest.s3_bucket.is_some() {
+    let dest_note = if dest.is_bucket() {
         "# One export per table/view — per-table prefix `exports/<name>/` under the given bucket; review modes before running."
     } else {
         "# One export per table/view — review modes and destinations before running."
@@ -1401,30 +1401,7 @@ fn cdc_multiplex_load_lines(infos: &[TableInfo], dest: &InitYamlDestination) -> 
 /// stream itself appends `<table>/`, so `cdc/` becomes `cdc/orders/`,
 /// `cdc/users/`, … each with its own `manifest.json` + `_SUCCESS`.
 fn cdc_multiplex_destination(dest: &InitYamlDestination) -> Vec<String> {
-    if let Some(bucket) = &dest.gcs_bucket {
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: gcs".to_string(),
-            format!("      bucket: {}", yaml_quote_if_needed(bucket)),
-            "      prefix: cdc/".to_string(),
-        ];
-        if let Some(p) = &dest.gcs_credentials_file {
-            v.push(format!(
-                "      credentials_file: {}",
-                yaml_quote_if_needed(p)
-            ));
-        }
-        v
-    } else if let Some(bucket) = &dest.s3_bucket {
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: s3".to_string(),
-            format!("      bucket: {}", yaml_quote_if_needed(bucket)),
-            "      prefix: cdc/".to_string(),
-        ];
-        if let Some(r) = &dest.s3_region {
-            v.push(format!("      region: {}", yaml_quote_if_needed(r)));
-        }
+    if let Some(v) = bucket_destination(dest, "cdc/") {
         v
     } else {
         vec![
@@ -1566,33 +1543,7 @@ fn destination_scaffold(
     dest: &InitYamlDestination,
     mode: &str,
 ) -> Vec<String> {
-    let prefix = yaml_quote_if_needed(&table_export_prefix(info, source_type, mode));
-    if let Some(bucket) = &dest.gcs_bucket {
-        let bucket = yaml_quote_if_needed(bucket);
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: gcs".to_string(),
-            format!("      bucket: {bucket}"),
-            format!("      prefix: {prefix}"),
-        ];
-        if let Some(p) = &dest.gcs_credentials_file {
-            v.push(format!(
-                "      credentials_file: {}",
-                yaml_quote_if_needed(p)
-            ));
-        }
-        v
-    } else if let Some(bucket) = &dest.s3_bucket {
-        let bucket = yaml_quote_if_needed(bucket);
-        let mut v = vec![
-            "    destination:".to_string(),
-            "      type: s3".to_string(),
-            format!("      bucket: {bucket}"),
-            format!("      prefix: {prefix}"),
-        ];
-        if let Some(r) = &dest.s3_region {
-            v.push(format!("      region: {}", yaml_quote_if_needed(r)));
-        }
+    if let Some(v) = bucket_destination(dest, &table_export_prefix(info, source_type, mode)) {
         v
     } else {
         // Per-export subdirectory (symmetric with the bucket prefixes above) so
@@ -1614,6 +1565,53 @@ fn destination_scaffold(
         ]
     }
 }
+
+/// The `destination:` block of a bucket scaffold (`--gcs-bucket`, `--s3-bucket`, `--azure-container`)
+/// under `prefix`, or `None` for a local one. No credential is written: GCS and S3 take their
+/// ambient credentials, Azure the name of the env var that holds the account key.
+fn bucket_destination(dest: &InitYamlDestination, prefix: &str) -> Option<Vec<String>> {
+    let head = |kind: &str, bucket: &str| {
+        vec![
+            "    destination:".to_string(),
+            format!("      type: {kind}"),
+            format!("      bucket: {}", yaml_quote_if_needed(bucket)),
+            format!("      prefix: {}", yaml_quote_if_needed(prefix)),
+        ]
+    };
+    if let Some(bucket) = &dest.gcs_bucket {
+        let mut v = head("gcs", bucket);
+        if let Some(p) = &dest.gcs_credentials_file {
+            v.push(format!(
+                "      credentials_file: {}",
+                yaml_quote_if_needed(p)
+            ));
+        }
+        Some(v)
+    } else if let Some(bucket) = &dest.s3_bucket {
+        let mut v = head("s3", bucket);
+        if let Some(r) = &dest.s3_region {
+            v.push(format!("      region: {}", yaml_quote_if_needed(r)));
+        }
+        Some(v)
+    } else if let Some(az) = &dest.azure {
+        let mut v = head("azure", &az.container);
+        v.push(format!(
+            "      account_name: {}",
+            yaml_quote_if_needed(&az.account)
+        ));
+        v.push(format!("      account_key_env: {AZURE_KEY_ENV}"));
+        v.push("      # or `sas_token_env: <VAR>` in its place, for a SAS token".to_string());
+        if let Some(e) = &az.endpoint {
+            v.push(format!("      endpoint: {}", yaml_quote_if_needed(e)));
+        }
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// The env var an Azure scaffold names for the account key: the one the `az` CLI reads.
+pub(crate) const AZURE_KEY_ENV: &str = "AZURE_STORAGE_KEY";
 
 /// Suggest `target_row_group_mb` based on column shape.
 /// Wide tables with many text/JSON columns get smaller groups so downstream
@@ -2700,6 +2698,14 @@ mod tests {
             },
             InitYamlDestination {
                 s3_bucket: Some("b".into()),
+                ..Default::default()
+            },
+            InitYamlDestination {
+                azure: Some(crate::init::InitAzureTarget {
+                    container: "b".into(),
+                    account: "a".into(),
+                    endpoint: None,
+                }),
                 ..Default::default()
             },
         ];
@@ -3866,6 +3872,7 @@ mod load_block_tests {
             clickhouse_user: None,
             snowflake: None,
             cdc_name_stem: None,
+            azure: None,
         };
         assert!(
             load_block_lines(&bare, true, None, &mut ScaffoldDecisions::default()).is_empty(),

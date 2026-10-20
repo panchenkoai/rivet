@@ -209,6 +209,33 @@ To refresh many files at once (per-table YAMLs plus combined schema snapshots), 
 
 ---
 
+## Bucket destination: `--gcs-bucket` / `--s3-bucket` / `--azure-container`
+
+Each flag writes the export's `destination:` in that store, with the same prefix
+(`exports/<table>/`, `cdc/` for a CDC stream); at most one of them, and none with
+`--discover`. No credential is written. GCS and S3 take their ambient credentials;
+an Azure scaffold names its account and the env var of the account key:
+
+```bash
+rivet init --source "$PG_URL" --table orders \
+  --azure-container exports --azure-account myaccount -o rivet.yaml
+export AZURE_STORAGE_KEY=...   # or put `sas_token_env: <VAR>` in place of account_key_env
+rivet run -c rivet.yaml        # Parquet → az://exports/exports/orders/
+```
+
+```yaml
+    destination:
+      type: azure
+      bucket: exports
+      prefix: exports/orders/
+      account_name: myaccount
+      account_key_env: AZURE_STORAGE_KEY
+```
+
+`--azure-endpoint <URL>` writes `endpoint:` for a store at another address, such as
+Azurite (`http://127.0.0.1:10000/devstoreaccount1`); without it the endpoint is
+derived from the account.
+
 ## Warehouse scaffold: `--bigquery-project` / `--bigquery-dataset` / `--gcs-bucket`
 
 With the three flags together, the generated config carries the warehouse half of

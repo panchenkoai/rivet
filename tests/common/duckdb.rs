@@ -932,6 +932,32 @@ BlobEndpoint=http://azurite:10000/devstoreaccount1;');"
     }
 }
 
+/// Every value of `col` in the Parquet under `bucket/prefix` of a store DuckDB can list (MinIO,
+/// Azurite), as text, sorted: the values a client rivet does not use reads from the store itself.
+pub fn duckdb_store_column(
+    store: ObjectStore,
+    bucket: &str,
+    prefix: &str,
+    col: &str,
+) -> Vec<String> {
+    let scheme = match store {
+        ObjectStore::Minio => "s3",
+        ObjectStore::Azurite => "azure",
+        ObjectStore::FakeGcs => panic!("DuckDB cannot list fake-gcs; read its objects by name"),
+    };
+    let p = prefix.trim_matches('/');
+    let out = duckdb_run_sql_json(&format!(
+        "{} SELECT CAST({col} AS VARCHAR) FROM read_parquet('{scheme}://{bucket}/{p}/**/*.parquet') ORDER BY 1",
+        store_prelude(store)
+    ));
+    out["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no rows from the store ({out})"))
+        .iter()
+        .map(|r| r[0].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// Files and rows under `bucket/prefix`, as the STORE holds them.
 ///
 /// `gcs_objects` is required for [`ObjectStore::FakeGcs`] and ignored otherwise:

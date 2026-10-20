@@ -317,10 +317,18 @@ pub enum Commands {
         output: Option<String>,
         /// Emit a machine-readable JSON discovery artifact instead of a YAML scaffold.
         /// Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes.
-        /// Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags.
+        /// Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` / `--azure-container` flags.
         #[arg(
             long,
-            conflicts_with_all = ["gcs_bucket", "gcs_credentials_file", "s3_bucket", "s3_region"]
+            conflicts_with_all = [
+                "gcs_bucket",
+                "gcs_credentials_file",
+                "s3_bucket",
+                "s3_region",
+                "azure_container",
+                "azure_account",
+                "azure_endpoint"
+            ]
         )]
         discover: bool,
         /// Override the suggested extraction mode for every scaffolded export.
@@ -357,6 +365,32 @@ pub enum Commands {
         /// Optional AWS region for S3 scaffolds (when using `--s3-bucket`).
         #[arg(long = "s3-region", value_name = "REGION", requires = "s3_bucket")]
         s3_region: Option<String>,
+        /// Scaffold `destination: type: azure` with this Blob container (each export gets
+        /// `prefix: exports/<table>/`). Needs `--azure-account`; the config names the env var
+        /// `AZURE_STORAGE_KEY` for the account key (or put `sas_token_env:` in its place), never
+        /// the key itself. Incompatible with `--gcs-bucket`, `--s3-bucket` and `--discover`.
+        #[arg(
+            long = "azure-container",
+            value_name = "NAME",
+            requires = "azure_account",
+            group = "staging_bucket"
+        )]
+        azure_container: Option<String>,
+        /// The storage account of `--azure-container` (`<account>.blob.core.windows.net`).
+        #[arg(
+            long = "azure-account",
+            value_name = "NAME",
+            requires = "azure_container"
+        )]
+        azure_account: Option<String>,
+        /// An explicit Blob endpoint for `--azure-container`, e.g. Azurite's
+        /// `http://127.0.0.1:10000/devstoreaccount1`; omitted, it is derived from the account.
+        #[arg(
+            long = "azure-endpoint",
+            value_name = "URL",
+            requires = "azure_container"
+        )]
+        azure_endpoint: Option<String>,
         /// Scaffold a `load:` block for this BigQuery project. With
         /// `--bigquery-dataset` the generated config carries the warehouse target,
         /// a per-table partition guess and the base+buffer layout, so `rivet load`
@@ -380,7 +414,7 @@ pub enum Commands {
         bigquery_dataset: Option<String>,
         /// Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g.
         /// `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the
-        /// export stages in (`--gcs-bucket` or `--s3-bucket`).
+        /// export stages in (`--gcs-bucket`, `--s3-bucket` or `--azure-container`).
         #[arg(
             long = "clickhouse-url",
             value_name = "URL",
@@ -987,6 +1021,55 @@ mod tests {
             ],
             clap::error::ErrorKind::ArgumentConflict,
             "--discover + --gcs-bucket",
+        );
+    }
+
+    #[test]
+    fn init_clap_takes_an_azure_container_alone_with_its_account() {
+        let az = [
+            "--source",
+            "postgresql://localhost/db",
+            "--azure-container",
+            "c",
+        ];
+        assert_init_ok(
+            &[&az[..], &["--azure-account", "a"]].concat(),
+            "container + account",
+        );
+        assert_init_ok(
+            &[
+                &az[..],
+                &["--azure-account", "a", "--azure-endpoint", "http://e"],
+            ]
+            .concat(),
+            "container + account + endpoint",
+        );
+        assert_init_err(
+            &az,
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "a container without its account",
+        );
+        for other in [["--gcs-bucket", "g"], ["--s3-bucket", "s"]] {
+            assert_init_err(
+                &[&az[..], &["--azure-account", "a"], &other[..]].concat(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "--azure-container beside another bucket",
+            );
+        }
+        assert_init_err(
+            &[&az[..], &["--azure-account", "a", "--discover"]].concat(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "--discover + --azure-container",
+        );
+        assert_init_err(
+            &[
+                "--source",
+                "postgresql://localhost/db",
+                "--azure-account",
+                "a",
+            ],
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "an account without a container",
         );
     }
 
