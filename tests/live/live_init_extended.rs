@@ -548,6 +548,28 @@ fn an_azure_scaffold_runs_as_written_into_azurite() {
         names.iter().any(|n| n.ends_with("manifest.json")),
         "{names:?}"
     );
+    let landed = tempfile::tempdir().expect("a download dir");
+    let fetched = std::process::Command::new("az")
+        .args([
+            "storage",
+            "blob",
+            "download-batch",
+            "--source",
+            &container,
+            "--pattern",
+            &format!("{prefix}*.parquet"),
+            "--destination",
+            landed.path().to_str().unwrap(),
+            "--connection-string",
+            AZURITE_CONN_STRING,
+        ])
+        .output()
+        .expect("spawn az");
+    assert!(
+        fetched.status.success(),
+        "az downloads the parts: {}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
     let mut c = pg_connect();
     let source_ids: Vec<i64> = c
         .query(&format!("SELECT id FROM {} ORDER BY id", table.name()), &[])
@@ -555,12 +577,12 @@ fn an_azure_scaffold_runs_as_written_into_azurite() {
         .iter()
         .map(|r| r.get(0))
         .collect();
-    let read = |col: &str| duckdb_store_column(ObjectStore::Azurite, &container, &prefix, col);
-    let mut ids: Vec<i64> = read("id").iter().map(|v| v.parse().unwrap()).collect();
+    let parts = landed.path().join(&prefix);
+    let mut ids = dir_parquet_ids(&parts);
     ids.sort_unstable();
     assert_eq!(
         ids, source_ids,
-        "DuckDB reads the source's ids from the container"
+        "the parts az fetched hold the source's ids"
     );
     let source_names: std::collections::BTreeSet<String> = c
         .query(&format!("SELECT name FROM {}", table.name()), &[])
@@ -569,9 +591,7 @@ fn an_azure_scaffold_runs_as_written_into_azurite() {
         .map(|r| r.get(0))
         .collect();
     assert_eq!(
-        read("name")
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
+        dir_parquet_distinct_strings(&parts, "name"),
         source_names,
         "and its names"
     );
