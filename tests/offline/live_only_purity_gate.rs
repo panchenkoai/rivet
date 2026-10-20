@@ -121,7 +121,8 @@ const BASELINE: &[(&str, usize, usize, usize, usize)] = &[
     ("src/source/oracle/mod.rs::export_within_budget", 2, 0, 2, 2),
     // Excluded 2026-10-06 (its Ok(vec![]) stub only) at its existing per-column refusals; shrink as they are extracted.
     // 2026-10-15: the three LogMiner-capability refusals extracted into `mineable` (a pure predicate).
-    ("src/source/oracle/cdc.rs::resolve_tables", 1, 1, 0, 4),
+    // 2026-10-20: the per-column refusals too, into `unmineable`, the predicate `rivet init` shares.
+    ("src/source/oracle/cdc.rs::resolve_tables", 0, 0, 0, 0),
     // Excluded 2026-10-01 (its Ok(()) stub only) at its existing decisions; shrink as they are extracted.
     ("src/source/mssql/mod.rs::export", 3, 1, 2, 5),
     // The Postgres release of a state lease (heartbeat stop + row delete): glue.
