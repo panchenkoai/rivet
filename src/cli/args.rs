@@ -34,6 +34,9 @@ pub struct Cli {
     /// Output errors as {"error":"..."} JSON to stderr; useful for machine-readable orchestration
     #[arg(long, global = true)]
     pub json_errors: bool,
+    /// Send no notification (`notifications:`) from this process or the processes it starts; a scheduler alerts from the error object instead
+    #[arg(long, global = true)]
+    pub no_notify: bool,
 }
 
 /// Parse argv into [`Cli`]. When a config-taking subcommand (the documented
@@ -1163,6 +1166,26 @@ mod tests {
         let cli = Cli::try_parse_from(["rivet", "run", "--config", "c.yaml", "--json-errors"])
             .expect("should parse with global flag after subcommand");
         assert!(cli.json_errors);
+    }
+
+    /// Every global flag is forwarded to the process children or declared parent-only, read from the clap definition.
+    #[test]
+    fn every_global_flag_is_forwarded_to_children_or_declared_parent_only() {
+        use clap::CommandFactory;
+        let globals: std::collections::BTreeSet<String> = Cli::command()
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+            .collect();
+        // The parent's alone: `--json-errors` (a child reports over its event channel).
+        let parent_only = ["--json-errors"];
+        let declared: std::collections::BTreeSet<String> =
+            crate::pipeline::parallel_children::FORWARDED_GLOBALS
+                .iter()
+                .chain(&parent_only)
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(globals, declared);
     }
 
     #[test]

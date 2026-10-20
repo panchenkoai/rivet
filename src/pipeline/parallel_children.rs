@@ -153,7 +153,8 @@ pub(super) fn run_exports_as_child_processes(
     child_reaper::install_once();
     for export in exports {
         let mut cmd = Command::new(&exe);
-        cmd.arg("run")
+        cmd.args(forwarded_globals())
+            .arg("run")
             .arg("--config")
             .arg(&config_arg)
             .arg("--export")
@@ -636,6 +637,26 @@ mod child_reaper {
     pub(super) fn register(_pid: u32) {}
     pub(super) fn deregister(_pid: u32) {}
     pub(super) fn install_once() {}
+}
+
+/// The global flags a child inherits from this process; every other global flag is the parent's alone.
+pub const FORWARDED_GLOBALS: &[&str] = &["--no-notify"];
+
+/// Whether this process was given the forwarded global `flag`.
+fn given(flag: &str) -> bool {
+    match flag {
+        "--no-notify" => crate::notify::silenced(),
+        _ => false,
+    }
+}
+
+/// The argv of the forwarded global flags this process was given.
+fn forwarded_globals() -> Vec<&'static str> {
+    FORWARDED_GLOBALS
+        .iter()
+        .copied()
+        .filter(|f| given(f))
+        .collect()
 }
 
 #[cfg(test)]
