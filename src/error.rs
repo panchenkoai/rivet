@@ -72,6 +72,18 @@ impl ExitClass {
         }
     }
 
+    /// The class's name in a scheduler's error object (ADR-0039 D1); the only place the six names are written.
+    pub fn name(self) -> &'static str {
+        match self {
+            ExitClass::Generic => "generic",
+            ExitClass::Retryable => "retryable",
+            ExitClass::DataIntegrity => "data_integrity",
+            ExitClass::SchemaDrift => "schema_drift",
+            ExitClass::Refusal => "refusal",
+            ExitClass::Internal => "internal",
+        }
+    }
+
     /// The class a process exit code names, `None` for a signal or unknown code.
     pub fn from_code(code: i32) -> Option<Self> {
         [
@@ -1205,10 +1217,20 @@ pub mod codes {
         "a column builder got a type it cannot build — a bug; report it with the column's type",
     );
 
+    /// `rivet load` cannot resolve the config's source, and several sources recorded a spec of the export on this state.
+    pub const LOAD_SPEC_SOURCE_UNRESOLVED: Code = usage(
+        "RIVET_LOAD_SPEC_SOURCE_UNRESOLVED",
+        "set the source's variable (`url_env:` / `password_env:`) for `rivet load` as for `rivet run`",
+    );
     /// A `--export` / `-e` name no export in the config carries.
     pub const CLI_EXPORT_UNKNOWN: Code = usage(
         "RIVET_CLI_EXPORT_UNKNOWN",
         "pass `--export` a name declared under `exports:` in this config",
+    );
+    /// A `rivet load` / `rivet compact` `--table` that names no warehouse table the config loads.
+    pub const CLI_TABLE_UNKNOWN: Code = usage(
+        "RIVET_CLI_TABLE_UNKNOWN",
+        "pass `--table` a warehouse table this config loads, as the message lists",
     );
     /// `--run-id` names a run of another export than `--export`.
     pub const CLI_RUN_ID_EXPORT_MISMATCH: Code = usage(
@@ -1736,7 +1758,9 @@ pub mod codes {
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
+        LOAD_SPEC_SOURCE_UNRESOLVED,
         CLI_EXPORT_UNKNOWN,
+        CLI_TABLE_UNKNOWN,
         CLI_RUN_ID_EXPORT_MISMATCH,
         CLI_OPTION_UNSUPPORTED,
         CLI_REPORT_INVALID,
