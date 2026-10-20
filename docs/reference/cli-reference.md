@@ -182,6 +182,10 @@ The native column schema, target table, partition, and source URIs are all deriv
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job/query of this load run (BigQuery `rivet_run` label / Snowflake `QUERY_TAG`), so cost slices per run as well as per table. Defaults to a generated id
 * `--rebuild-changelog` — Rebuild a `<table>__changes` whose partitioning differs from the config's `load.partition` — a billed query copying every row — and swap it in. Without this flag such a load is refused naming the difference; a rebuild is never a side effect of a scheduled load
 * `--pool <N>` — Load the config's tables on N worker threads instead of one after another: every freeing worker takes the next table, so a slow table no longer blocks the ones queued behind it. A failing table still isolates to itself and the rest keep loading, and the per-table lease is unchanged — `rivet load` and `rivet compact` still refuse a table the other holds. Each worker opens its own ledger connection, so N is also N connections to the state backend (N + 1 on a PostgreSQL state, where one more renews the workers' leases); a worker that cannot reopen the ledger takes no table, and the other workers load the queue. Defaults to 16 — the ceiling — capped at the number of tables. Pass `--pool 1` for the strictly sequential pass
+* `-e`, `--export <EXPORT>` — Take only this export's tables
+* `--table <TABLE>` — Take only this warehouse table
+* `--json` — Print the per-table result as JSON to stdout (the result lines go to stderr)
+* `--summary-output <PATH>` — Write the per-table result as JSON to this file
 
 
 
@@ -196,6 +200,10 @@ Merge each base-and-buffer CDC table's `<table>__changes` buffer into its base t
 * `-c`, `--config <CONFIG>` — Path to YAML config file — the same one `rivet load` reads
 * `--run-id <RUN_ID>` — Correlation id stamped on every warehouse job of this compaction (BigQuery `rivet_run` label). Defaults to a generated id
 * `--pool <N>` — Merge the config's tables on N worker threads instead of one after another: every freeing worker takes the next table. A failing table still isolates to itself, and the per-table lease is unchanged — a table `rivet load` holds is still refused. Each worker opens its own ledger connection, so N is also N connections to the state backend (N + 1 on a PostgreSQL state, where one more renews the workers' leases); a worker that cannot reopen the ledger takes no table, and the other workers compact the queue. Defaults to 16 — the ceiling — capped at the number of tables. Pass `--pool 1` for the sequential pass
+* `-e`, `--export <EXPORT>` — Take only this export's tables
+* `--table <TABLE>` — Take only this warehouse table
+* `--json` — Print the per-table result as JSON to stdout (the result lines go to stderr)
+* `--summary-output <PATH>` — Write the per-table result as JSON to this file
 
 
 

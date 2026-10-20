@@ -271,6 +271,35 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
         Some("1"),
         "the UPDATE reached the base through the buffer"
     );
+
+    // 4. Rows leave the source, then `state reset`: the next run holds the whole table again
+    //    and has no cursor to resume from. It is buffered and merged by key, never landed over
+    //    the base, so the rows the source no longer holds stay — on this cycle and the next.
+    e.exec(&format!("DELETE FROM {table} WHERE id <= 4"));
+    rivet_ok(&["state", "reset", "-c", cfg, "-e", &export], &db);
+    for cycle in ["after the reset", "next cycle"] {
+        rivet_ok(&["run", "-c", cfg], &db);
+        let loaded = rivet_ok(&["load", "-c", cfg], &[]);
+        if cycle == "after the reset" {
+            assert!(
+                loaded.contains("already holds the base")
+                    && loaded.contains("never replacing the base"),
+                "the load says the pass joins the buffer: {loaded}"
+            );
+        }
+        rivet_ok(&["compact", "-c", cfg], &[]);
+        let rows = bq.read_bq_rows(&format!(
+            "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d, COUNTIF(id <= 4) AS gone_at_source \
+             FROM {}",
+            fq(&export)
+        ));
+        let got = |k: &str| rows[0][k].as_str().map(str::to_string);
+        assert_eq!(
+            (got("n"), got("d"), got("gone_at_source")),
+            (Some("15".into()), Some("15".into()), Some("4".into())),
+            "{cycle}: the base keeps every row it held, one per key"
+        );
+    }
 }
 
 #[test]
@@ -949,6 +978,75 @@ fn cdc_warehouse_chain(src: CdcSource, bq: &BqLive) {
         next_steps.contains("rivet compact -c") && !next_steps.contains("CHANGES ONLY"),
         "init's next steps must prescribe the cycle that just ran:\n{next_steps}"
     );
+    if src.bq_id == "id" {
+        rebaseline_keeps_the_base(bq, cfg, dir.path(), &generated, &export, &db);
+    }
+}
+
+/// The re-baseline every CDC data-loss refusal prints, run over a base that holds history
+/// the source no longer has (two live rows a migration copied in, one tombstone). Two
+/// cycles: the base keeps every row, the rows the new baseline does not hold are flagged
+/// deleted, the live rows equal the source, and the next cycle changes none of it.
+fn rebaseline_keeps_the_base(
+    bq: &BqLive,
+    cfg: &str,
+    dir: &std::path::Path,
+    generated: &str,
+    table: &str,
+    db: &[(&str, &str)],
+) {
+    let base = format!("`{}.{}.{table}`", bq.project, bq.dataset);
+    bq.exec(&format!(
+        "INSERT INTO {base} (id, name, __is_deleted) VALUES \
+         (101, 'h101', FALSE), (102, 'h102', FALSE), (103, 'h103', TRUE)"
+    ));
+    let before = bq.read_bq_count(table);
+    // The remedy, in its order: the checkpoint, the destination, the snapshot rows.
+    if let Some(ckpt) = generated
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("checkpoint:"))
+    {
+        let path = dir.join(
+            ckpt.split('#')
+                .next()
+                .unwrap_or(ckpt)
+                .trim()
+                .trim_matches('"'),
+        );
+        if path.exists() {
+            std::fs::remove_file(&path).expect("delete the checkpoint, as the remedy says");
+        }
+    }
+    let export = scaffolded_export(generated);
+    let _ = std::process::Command::new("timeout")
+        .args(["300", "gcloud", "storage", "rm", "-r", "--quiet"])
+        .arg(format!("gs://{}/exports/{export}/**", bq.bucket))
+        .output();
+    let state =
+        rusqlite::Connection::open(dir.join(".rivet_state.db")).expect("the config's state");
+    let dropped = state
+        .execute("DELETE FROM cdc_snapshot WHERE export_name = ?1", [&export])
+        .expect("drop the snapshot rows");
+    assert!(dropped > 0, "the stream had snapshot rows to drop");
+    let counts = || {
+        let rows = bq.read_bq_rows(&format!(
+            "SELECT COUNT(*) AS n, COUNTIF(NOT __is_deleted) AS live, \
+             COUNTIF(id IN (101, 102, 103) AND __is_deleted) AS history_flagged \
+             FROM {base}"
+        ));
+        ["n", "live", "history_flagged"].map(|k| rows[0][k].as_str().unwrap().to_string())
+    };
+    for cycle in ["re-baseline", "next cycle"] {
+        rivet_ok(&["run", "-c", cfg], db);
+        rivet_ok(&["load", "-c", cfg], &[]);
+        rivet_ok(&["compact", "-c", cfg], &[]);
+        assert_eq!(
+            counts(),
+            [before.clone(), "12".to_string(), "3".to_string()],
+            "{cycle}: every row the base held is kept, the source's 12 live keys are live, \
+             and the history the source does not hold is flagged deleted"
+        );
+    }
 }
 
 #[test]

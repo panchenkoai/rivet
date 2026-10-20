@@ -61,6 +61,12 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 # by the rig oracle: 241 s solo on devbox (2026-10-20).
 [[profile.default.overrides]]
 filter = 'test(/^live_init_delta::a_0_30_cdc_state_copied_to_postgres_/)'
+
+# The generated-config warehouse chains (live_init_delta) gained a second, two-cycle leg on
+# 2026-10-20 (state reset / CDC re-baseline over an existing base): 141-185 s solo on devbox
+# with the main build, killed at 240 s in a seeded-recall control run.
+[[profile.default.overrides]]
+filter = 'test(/^live_init_delta::a_generated_config_drives_run_load_compact_into_the_warehouse_/) or test(/^live_init_delta::a_generated_cdc_config_drives_run_load_compact_/)'
 slow-timeout = { period = "300s", terminate-after = 4 }
 
 # The SQL Server CDC cells queue on one cross-process lock (`cross_process_serial("mssql_cdc")`),
