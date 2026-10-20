@@ -2137,6 +2137,8 @@ fn rivet_run_subcommand_has_exactly_the_adr_0013_flag_set() {
         "json-errors",
         // global, ADR-0039 D9: notifications off for a scheduler that alerts itself:
         "no-notify",
+        // global, ADR-0039 D7: how long a busy run lease is waited on:
+        "lock-wait",
         "help",
         "version",
     ]
