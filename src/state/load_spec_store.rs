@@ -363,6 +363,40 @@ mod tests {
         }
     }
 
+    /// The source a load reads a spec under: the configured one, else the only one recorded (or
+    /// the legacy row), and a coded usage stop when two configs of the name recorded one.
+    #[test]
+    fn the_spec_source_is_the_configured_one_else_the_only_one_recorded() {
+        let s = StateStore::open_in_memory().unwrap();
+        let cols = [col("id", RivetType::Int64)];
+        let pick =
+            |configured: Option<&str>| s.spec_source(configured.map(str::to_string), "t", None);
+        assert_eq!(pick(None).unwrap(), "", "nothing recorded: the legacy row");
+        s.record_load_spec("t", None, "", &cols, None, "r0")
+            .unwrap();
+        assert_eq!(pick(None).unwrap(), "", "only the legacy row");
+        s.record_load_spec("t", None, "pg://a", &cols, None, "r1")
+            .unwrap();
+        assert_eq!(pick(None).unwrap(), "pg://a");
+        assert_eq!(
+            pick(Some("pg://z")).unwrap(),
+            "pg://z",
+            "a resolved source is used as is"
+        );
+        s.record_load_spec("t", None, "pg://b", &cols, None, "r2")
+            .unwrap();
+        let err = pick(None).unwrap_err();
+        assert_eq!(
+            (
+                crate::error::error_code(&err),
+                crate::error::classify_exit(&err)
+            ),
+            (Some("RIVET_LOAD_SPEC_SOURCE_UNRESOLVED"), 1),
+            "{err:#}"
+        );
+        assert_eq!(pick(Some("pg://b")).unwrap(), "pg://b");
+    }
+
     #[test]
     fn a_spec_whose_per_run_row_fails_records_nothing() {
         let s = StateStore::open_in_memory().unwrap();
