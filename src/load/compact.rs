@@ -4,10 +4,11 @@ use crate::error::Result;
 use crate::load;
 use crate::load::ledger::{ledger_load_id, ledger_status, ownership_of};
 use crate::load::orchestrate::{
-    failures_of, hand_off_state, holds, lease_still_held, needs_source_engine, no_outcome_error,
-    open_state, reconnect, require_pk, resolve_run_id, take_table_lease,
+    command_result, failures_of, hand_off_state, holds, lease_still_held, needs_source_engine,
+    no_outcome_error, open_state, reconnect, require_pk, resolve_run_id, take_table_lease,
 };
 use crate::load::pin::pin_plan_to_its_run;
+use crate::load::result::TableDone;
 use crate::load::{ObjectKind, Ownership};
 use crate::state::{LoadRecord, StateStore};
 use anyhow::Context as _;
@@ -19,6 +20,10 @@ pub struct CompactArgs {
     /// Worker threads to merge the config's tables on; `None` takes the default
     /// pool (16, capped at the table count), not a sequential pass.
     pub pool: Option<usize>,
+    /// The tables `--export` / `--table` name; every table when both are absent.
+    pub selection: load::plan::Selection,
+    /// Where the human lines and the `--json` / `--summary-output` document go.
+    pub report: load::result::Report,
 }
 
 /// What `rivet compact` may do with the base it is about to MERGE into.
@@ -107,33 +112,42 @@ pub(crate) fn compact_gate(
     }
 }
 
-/// Why `rivet compact` passes a table by, or `None` for a base-and-buffer CDC table.
+/// Why `rivet compact` passes a table by, as its `skip_reason` word and its text, or `None` for a base-and-buffer CDC table.
 fn compact_skip_reason(
     mode: &load::plan::LoadMode,
     layout: &load::plan::CdcLayout,
     warehouse_compacts: bool,
-) -> Option<&'static str> {
+) -> Option<(&'static str, &'static str)> {
     match mode {
         // A full load OVERWRITES the whole table on every pass, so there is never
         // an accumulated buffer to merge — whatever a layout says.
-        load::plan::LoadMode::Full => Some("a full load overwrites its table; nothing to merge"),
+        load::plan::LoadMode::Full => Some((
+            "full_load",
+            "a full load overwrites its table; nothing to merge",
+        )),
         // No layout makes a base here, so the layout hints below would be refused.
-        _ if !warehouse_compacts => Some(
+        _ if !warehouse_compacts => Some((
+            "warehouse_never_compacts",
             "this warehouse keeps a change log behind a view and never compacts; nothing to merge",
-        ),
+        )),
         // Otherwise compaction belongs to the LAYOUT, not the mode: any table kept
         // as a physical base with a disposable buffer has something to merge. An
         // incremental export asks for that with `load.layout: base_buffer`.
         _ if layout.compacts() => None,
-        load::plan::LoadMode::Cdc => Some(
+        load::plan::LoadMode::Cdc => Some((
+            "log_view",
             "a changelog + view table (no `cdc.backfill:` and no `load.layout: base_buffer`); \
              nothing to merge",
-        ),
-        load::plan::LoadMode::Incremental => Some(
+        )),
+        load::plan::LoadMode::Incremental => Some((
+            "log_view",
             "a changelog + view table; `load.layout: base_buffer` gives it a base to merge into",
-        ),
+        )),
     }
 }
+
+/// The compact's skip reason when the run found no buffer to merge.
+const NO_BUFFER: &str = "no_buffer";
 
 /// What decides the WINNER in this table's compaction: a CDC stream ranks by its
 /// log position, an incremental export by the cursor its current state is ordered
@@ -218,7 +232,7 @@ fn compact_gate_of(
 /// drop the buffer. One MERGE per table (per partition window), labelled
 /// `rivet_op:merge`; a table without a buffer is a no-op, said so.
 pub fn run_compacts(args: CompactArgs) -> Result<()> {
-    let plans = load::plan::plan_loads(&args.config)?;
+    let plans = load::plan::plan_loads(&args.config, &args.selection)?;
     let run_id = resolve_run_id(args.run_id.clone());
     let state = open_state(&args.config, "compacting without a ledger");
     let cfg = crate::config::Config::load(&args.config).context("parsing rivet config")?;
@@ -247,11 +261,11 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         load::pool::effective_pool(args.pool, plans.len()),
         || reconnect(state_ref.as_ref(), "compact"),
         |state, _idx, plan| {
-            if let Some(why) =
+            if let Some((word, why)) =
                 compact_skip_reason(&plan.mode, &plan.layout, plan.load.target.compacts())
             {
                 eprintln!("  compact [{}]: skipped — {why}", plan.table);
-                return Ok(());
+                return Ok(TableDone::Skipped(word));
             }
             // Counted BEFORE the refusal below, not after: a refused table IS an
             // attempt — the run took it up and then refused it — and it becomes a
@@ -277,7 +291,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 );
             }
             let load_id = ledger_load_id(&run_id, "compact", &plan.table);
-            let outcome = (|| -> Result<()> {
+            let outcome = (|| -> Result<TableDone> {
                 let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
                 let loader = load::build_loader(&pinned, &run_id);
                 let target_fqtn = loader.fqtn(&pinned.table);
@@ -359,17 +373,20 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                 }
                 let report = report?;
                 if report.had_buffer {
-                    println!(
+                    args.report.say(&format!(
                         "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE statement(s); buffer dropped",
                         plan.table, report.changes_rows, report.base, report.merge_jobs
-                    );
+                    ));
+                    Ok(TableDone::Work {
+                        rows: report.changes_rows,
+                    })
                 } else {
-                    println!(
+                    args.report.say(&format!(
                         "COMPACT SKIP [{}]: no `{}__changes` buffer — nothing to merge",
                         plan.table, plan.table
-                    );
+                    ));
+                    Ok(TableDone::Skipped(NO_BUFFER))
                 }
-                Ok(())
             })();
             if let Err(e) = &outcome {
                 eprintln!("  COMPACT FAILED [{}]: {e:#}", plan.table);
@@ -381,11 +398,12 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     // Folded in CONFIG order, like the load leg: the pool returns one result per
     // table, indexed by the table, so the `|`-joined list below reads the same on
     // every run of the same failing config.
+    let result = command_result(&run_id, &plans, &outcomes, "compacted");
     let mut failures = failures_of(outcomes);
     let attempted = attempted
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(failures.len());
-    match failures.len() {
+    let tables = match failures.len() {
         0 => Ok(()),
         1 => Err(failures.pop().unwrap()),
         // COVERAGE, stated rather than implied: nothing calls `run_compacts` but
@@ -395,7 +413,8 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         // never produces (the ordering INSIDE the worker is the defect surface), so
         // the honest close is a live compact whose ledger drops mid-run.
         n => Err(several_failed(n, attempted, &failures)),
-    }
+    };
+    load::result::exit_of(tables, args.report.finish(&result))
 }
 
 /// Several tables' compaction failed: one line naming each, carrying the code of the most stop-worthy one.
@@ -503,14 +522,15 @@ mod tests {
         // — the reason must name the levers that exist, not one that changes nothing.
         assert!(
             super::compact_skip_reason(&LoadMode::Cdc, &CdcLayout::LogAndView, true).is_some_and(
-                |w| w.contains("cdc.backfill:")
+                |(word, w)| word == "log_view"
+                    && w.contains("cdc.backfill:")
                     && w.contains("load.layout: base_buffer")
                     && !w.contains("initial:")
             )
         );
         assert!(
             super::compact_skip_reason(&LoadMode::Full, &CdcLayout::LogAndView, true)
-                .is_some_and(|w| w.contains("overwrites its table"))
+                .is_some_and(|(word, w)| word == "full_load" && w.contains("overwrites its table"))
         );
         // The LAYOUT decides, not the mode: an ordinary incremental export that
         // asked for `load.layout: base_buffer` has a buffer to merge, and one that
@@ -521,17 +541,80 @@ mod tests {
         );
         assert!(
             super::compact_skip_reason(&LoadMode::Incremental, &CdcLayout::LogAndView, true)
-                .is_some_and(|w| w.contains("base_buffer"))
+                .is_some_and(|(word, w)| word == "log_view" && w.contains("base_buffer"))
         );
         // A warehouse that never compacts must not suggest a layout it refuses.
         for mode in [LoadMode::Cdc, LoadMode::Incremental] {
-            let why =
+            let (word, why) =
                 super::compact_skip_reason(&mode, &CdcLayout::LogAndView, false).expect("skipped");
+            assert_eq!(word, "warehouse_never_compacts");
             assert!(
                 why.contains("never compacts") && !why.contains("base_buffer"),
                 "{why}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod document_tests {
+    use crate::load::plan::{CdcLayout, LoadMode};
+    use crate::load::result::{CommandResult, TableDone, table_result};
+
+    /// The word `compact_skip_reason` gives a table of this shape.
+    fn skipped(mode: LoadMode, layout: CdcLayout, compacts: bool) -> anyhow::Result<TableDone> {
+        let (word, _) = super::compact_skip_reason(&mode, &layout, compacts).expect("skipped");
+        Ok(TableDone::Skipped(word))
+    }
+
+    /// The documents `rivet compact` builds from the outcomes the two fixtures describe, key for key.
+    #[test]
+    fn the_compact_documents_are_the_contract_fixtures() {
+        let entry = |export: &str, table: &str, outcome: anyhow::Result<TableDone>| {
+            table_result(export, table, "compacted", &outcome)
+        };
+        let doc = CommandResult {
+            run_id: "20261006T102300.789-compact".into(),
+            per_table: vec![
+                entry("orders_cdc", "orders", Ok(TableDone::Work { rows: 1200 })),
+                entry(
+                    "users_cdc",
+                    "users",
+                    Ok(TableDone::Skipped(super::NO_BUFFER)),
+                ),
+                entry(
+                    "countries",
+                    "countries",
+                    skipped(LoadMode::Full, CdcLayout::LogAndView, true),
+                ),
+                entry(
+                    "audit_cdc",
+                    "audit",
+                    skipped(LoadMode::Cdc, CdcLayout::LogAndView, true),
+                ),
+                entry(
+                    "events",
+                    "events",
+                    Err(anyhow::anyhow!("table 'events': connection reset by peer")),
+                ),
+            ],
+        };
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            crate::load::result::tests::fixture("compact_result.json")
+        );
+        let log_only = CommandResult {
+            run_id: "20261006T102400.012-compact".into(),
+            per_table: vec![entry(
+                "orders_cdc",
+                "orders",
+                skipped(LoadMode::Cdc, CdcLayout::LogAndView, false),
+            )],
+        };
+        assert_eq!(
+            serde_json::to_value(&log_only).unwrap(),
+            crate::load::result::tests::fixture("compact_result_log_only.json")
+        );
     }
 }
 

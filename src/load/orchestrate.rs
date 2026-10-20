@@ -19,6 +19,7 @@ use crate::load::ledger::ledger_status;
 use crate::load::ledger::{closing_status, ledger_load_id, ownership_of};
 use crate::load::partition_budget::{budgeted_uris, partition_budget_ok, partition_label};
 use crate::load::pin::{late_runs_stop, pin_plan_to_its_run};
+use crate::load::result::TableDone;
 use crate::load::staging::{cleanup_target_leased, ledger_writers, maybe_gc_orphans};
 use crate::state::LoadStatus;
 use crate::state::{LoadRecord, StateRef, StateStore};
@@ -32,6 +33,10 @@ pub struct LoadArgs {
     /// Worker threads to load the config's tables on; `None` takes the default
     /// pool (16, capped at the table count), not a sequential pass.
     pub pool: Option<usize>,
+    /// The tables `--export` / `--table` name; every table when both are absent.
+    pub selection: load::plan::Selection,
+    /// Where the human lines and the `--json` / `--summary-output` document go.
+    pub report: load::result::Report,
 }
 
 /// `rivet load`: config-driven warehouse load. The top-level `load:` block
@@ -39,7 +44,7 @@ pub struct LoadArgs {
 /// config loads its exports into the shared target on a pool of up to 16
 /// workers, capped at the table count; `--pool 1` is the sequential pass.
 pub fn run_loads(args: LoadArgs) -> Result<()> {
-    let plans = load::plan::plan_loads(&args.config)?;
+    let plans = load::plan::plan_loads(&args.config, &args.selection)?;
     // One run id for the whole invocation, shared across every table — so warehouse
     // cost slices per load run (all tables together) as well as per table.
     let run_id = resolve_run_id(args.run_id.clone());
@@ -138,7 +143,8 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
             }
             let load_id = ledger_load_id(&run_id, "load", &plan.table);
             let drift = plan.load.allow_source_drift;
-            let outcome = (|| -> Result<()> {
+            let say = |line: String| args.report.say(&line);
+            let outcome = (|| -> Result<TableDone> {
                 // Typed from the spec of the run this load consumes, not the by-name
                 // row. Inside the per-table closure: a spec the config does not fit is
                 // THIS table's failure, and the others still load.
@@ -160,9 +166,19 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             &load_id,
                         )? {
                             Some(report) => {
-                                println!("CDC LOAD OK [{}]: {}", plan.table, cdc_ok_line(&report))
+                                say(format!(
+                                    "CDC LOAD OK [{}]: {}",
+                                    plan.table,
+                                    cdc_ok_line(&report)
+                                ));
+                                Ok(TableDone::Work {
+                                    rows: report.rows_appended,
+                                })
                             }
-                            None => println!("CDC LOAD SKIP [{}]: up to date", plan.table),
+                            None => {
+                                say(format!("CDC LOAD SKIP [{}]: up to date", plan.table));
+                                Ok(TableDone::Skipped(load::result::UP_TO_DATE))
+                            }
                         }
                     }
                     // Incremental: APPEND the delta + a cursor-ordered current-state view.
@@ -179,13 +195,22 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                             &args.config,
                         )? {
                             Some(report) => {
-                                println!(
+                                say(format!(
                                     "INCREMENTAL LOAD OK [{}]: {}",
                                     plan.table,
                                     report.summary()
-                                )
+                                ));
+                                Ok(TableDone::Work {
+                                    rows: report.rows(),
+                                })
                             }
-                            None => println!("INCREMENTAL LOAD SKIP [{}]: up to date", plan.table),
+                            None => {
+                                say(format!(
+                                    "INCREMENTAL LOAD SKIP [{}]: up to date",
+                                    plan.table
+                                ));
+                                Ok(TableDone::Skipped(load::result::UP_TO_DATE))
+                            }
                         }
                     }
                     // Full/chunked: ledger-driven latest-run OVERWRITE.
@@ -199,18 +224,25 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     // has to be routed deliberately instead of inheriting this one.
                     load::plan::LoadMode::Full => {
                         match load_one(plan, &run_id, drift, state.as_ref(), &load_id)? {
-                            Some(report) => println!(
-                                "LOAD OK [{}]: {} row(s) in `{}`{}",
-                                plan.table,
-                                report.rows_loaded,
-                                report.target_table,
-                                cleaned_suffix(report.source_cleaned)
-                            ),
-                            None => println!("LOAD SKIP [{}]: up to date", plan.table),
+                            Some(report) => {
+                                say(format!(
+                                    "LOAD OK [{}]: {} row(s) in `{}`{}",
+                                    plan.table,
+                                    report.rows_loaded,
+                                    report.target_table,
+                                    cleaned_suffix(report.source_cleaned)
+                                ));
+                                Ok(TableDone::Work {
+                                    rows: report.rows_loaded,
+                                })
+                            }
+                            None => {
+                                say(format!("LOAD SKIP [{}]: up to date", plan.table));
+                                Ok(TableDone::Skipped(load::result::UP_TO_DATE))
+                            }
                         }
                     }
                 }
-                Ok(())
             })();
             if let Err(e) = &outcome {
                 // Name the table on the way out: the aggregate must say WHICH load
@@ -232,7 +264,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     crate::redact::redact_secrets(&format!("{e:#}"))
                 );
             }
-            outcome.map_err(|e| e.context(format!("load '{}'", plan.table)))?;
+            let done = outcome.map_err(|e| e.context(format!("load '{}'", plan.table)))?;
             if plan.load.gc_orphans {
                 // The store is opened HERE rather than inside `maybe_gc_orphans` so
                 // the GC body itself takes a store and is offline-testable against a
@@ -247,7 +279,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                     ),
                 }
             }
-            Ok(())
+            Ok(done)
         },
         // A panic becomes THIS table's failure, not the run's silent end. Named as
         // a bug on the way out: catching it must not disguise an abort as an
@@ -261,10 +293,30 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
     // Folded in CONFIG order: `run_workers` returns one result per table, indexed by
     // the table, whatever order the workers finished in — so the representative
     // `aggregate_load_failures` picks out of a tie is the same on every run.
-    let failures = failures_of(outcomes);
-    match aggregate_load_failures(failures) {
+    let result = command_result(&run_id, &plans, &outcomes, "loaded");
+    let tables = match aggregate_load_failures(failures_of(outcomes)) {
         Some(e) => Err(e),
         None => Ok(()),
+    };
+    load::result::exit_of(tables, args.report.finish(&result))
+}
+
+/// The document of one load or compact: each plan's entry, in config order.
+pub(super) fn command_result(
+    run_id: &str,
+    plans: &[load::plan::LoadPlan],
+    outcomes: &[Result<TableDone>],
+    done: &'static str,
+) -> load::result::CommandResult {
+    load::result::CommandResult {
+        run_id: run_id.to_string(),
+        per_table: plans
+            .iter()
+            .zip(outcomes)
+            .map(|(plan, outcome)| {
+                load::result::table_result(&plan.export_name, &plan.table, done, outcome)
+            })
+            .collect(),
     }
 }
 
@@ -521,7 +573,7 @@ pub(super) fn no_outcome_error(op: &str, table: &str) -> anyhow::Error {
 }
 
 /// The failed outcomes, in the order the pool returned them.
-pub(super) fn failures_of(outcomes: Vec<Result<()>>) -> Vec<anyhow::Error> {
+pub(super) fn failures_of<T>(outcomes: Vec<Result<T>>) -> Vec<anyhow::Error> {
     outcomes.into_iter().filter_map(Result::err).collect()
 }
 
@@ -889,7 +941,7 @@ fn prepare_load(
         // handed back as inputs with no URIs, so the caller records them consumed:
         // left unrecorded, every empty cycle was re-evaluated by every later load
         // (a pilot read 50 manifests per idle table per cycle, growing by one each).
-        println!(
+        eprintln!(
             "  {} → {}: {} run(s) produced no files — nothing to load",
             plan.table,
             plan.load.target.name(),
@@ -1313,10 +1365,11 @@ fn execute_load<R>(
     Ok(Some(report))
 }
 
-/// The base-and-buffer CDC load: the baseline legs OVERWRITE the physical base
+/// The base-and-buffer CDC load: the first baseline CREATES the physical base
 /// (`<table>`, source columns + `__is_deleted`), the stream's runs APPEND into the
-/// per-cycle buffer `<table>__changes` that `rivet compact` merges and drops. No
-/// view, no adoption, no re-baseline refusal — a new baseline replaces the base.
+/// per-cycle buffer `<table>__changes` that `rivet compact` merges and drops. A
+/// re-baseline over an existing base never replaces it: the baseline joins the buffer,
+/// and a base row the baseline no longer holds is flagged deleted there.
 fn load_one_cdc_base(
     job: LoadJob<'_>,
     pk: &[String],
@@ -1354,7 +1407,21 @@ fn load_one_cdc_base(
                      loaded, its files are not read"
                 );
             }
-            if let [_, ..] = baseline.as_slice() {
+            let base_kind = match baseline.as_slice() {
+                [] => load::ObjectKind::Absent,
+                [_, ..] => load::before_write(loader.object_kind(&plan.table))?,
+            };
+            let rebaseline =
+                whole_table_run_joins_the_log(true, base_kind, load::ObjectKind::Absent);
+            let mut buffered = stream.clone();
+            if rebaseline {
+                load::refuse_stale_buffer(loader, &plan.table, true)?;
+                let fqtn = loader.fqtn(&plan.table);
+                for (_, m) in &baseline {
+                    eprintln!("{}", whole_pass_into_buffer_note(&fqtn, &m.run_id));
+                }
+                buffered = baseline.iter().cloned().chain(stream).collect();
+            } else if let [_, ..] = baseline.as_slice() {
                 let uris = load::before_write(load::reconcile::select_load_uris(
                     store,
                     &plan.gcs_prefix,
@@ -1389,6 +1456,7 @@ fn load_one_cdc_base(
                 legs.landed(&ids, r.rows_loaded);
                 landed.push(r.rows_loaded);
             }
+            let stream = buffered;
             let stream_uris = if stream.is_empty() {
                 Vec::new()
             } else {
@@ -1431,6 +1499,9 @@ fn load_one_cdc_base(
                 landed.push(r.rows_appended);
                 report = Some(r);
             }
+            if rebaseline {
+                flag_what_the_baseline_no_longer_holds(plan, loader, pk)?;
+            }
             let report = report.unwrap_or_else(|| load::CdcLoadReport {
                 rows_appended: 0,
                 changes_table: loader.fqtn(&format!("{}__changes", plan.table)),
@@ -1470,6 +1541,34 @@ fn cdc_ok_line(report: &load::CdcLoadReport) -> String {
             report.rows_appended, report.changes_table, report.target
         ),
     }
+}
+
+/// After a re-baseline joined the buffer: flag each live base row the baseline does not
+/// hold as deleted, or say why the base keeps them as they are.
+///
+/// The baseline reads the whole table after the stream's anchor, so a key it does not
+/// hold is gone from the source unless the stream since re-inserted it — and a key the
+/// stream mentions is in the buffer, which the flag leaves to the stream. A base without
+/// the delete flag would DELETE on a tombstone, so it keeps the rows instead.
+fn flag_what_the_baseline_no_longer_holds(
+    plan: &load::plan::LoadPlan,
+    loader: &dyn load::TargetLoader,
+    pk: &[String],
+) -> Result<()> {
+    let fqtn = loader.fqtn(&plan.table);
+    if !load::plan::base_carries_delete_flag(true, plan.deleted_flag) {
+        eprintln!(
+            "  note: `{fqtn}` carries no `__is_deleted` flag, so a row the new baseline no \
+             longer holds is kept in the base as it is"
+        );
+        return Ok(());
+    }
+    let flagged = loader.flag_absent_from_buffer(&plan.table, &plan.specs, pk)?;
+    eprintln!(
+        "  re-baseline → `{fqtn}`: {flagged} base row(s) the baseline no longer holds are \
+         buffered as deleted; `rivet compact` flags them `__is_deleted`, never drops them"
+    );
+    Ok(())
 }
 
 /// The buffer's Parquet, or `None` when the stream's runs produced no parts (an
@@ -1876,6 +1975,14 @@ pub enum IncrementalReport {
 }
 
 impl IncrementalReport {
+    /// The rows this load landed.
+    pub fn rows(&self) -> u64 {
+        match self {
+            IncrementalReport::Table(r) => r.rows_loaded,
+            IncrementalReport::Changelog(r) => r.rows_appended,
+        }
+    }
+
     /// One line saying what landed where.
     pub fn summary(&self) -> String {
         match self {
@@ -1947,12 +2054,31 @@ impl SplitRuns {
 /// cannot replace a view at all. An absent name joins too when `<table>__changes` exists:
 /// a load that adopted the table died before building the view, and landing a new table
 /// beside that log would make every later delta refuse. Otherwise it lands as a new table.
-fn whole_table_run_joins_the_log(kind: load::ObjectKind, changes: load::ObjectKind) -> bool {
+///
+/// Under base-and-buffer the same holds for the base: an existing base takes a whole pass
+/// (an incremental run with no cursor, a CDC re-baseline) through the buffer, which
+/// `rivet compact` merges by key, so a row the pass no longer holds stays in the base. Only
+/// an absent base is created from the pass; a buffer left without its base is the stale
+/// buffer `refuse_stale_buffer` stops on, never a log to join.
+fn whole_table_run_joins_the_log(
+    base_and_buffer: bool,
+    kind: load::ObjectKind,
+    changes: load::ObjectKind,
+) -> bool {
     match kind {
         load::ObjectKind::Table | load::ObjectKind::View => true,
-        load::ObjectKind::Absent => changes == load::ObjectKind::Table,
+        load::ObjectKind::Absent => !base_and_buffer && changes == load::ObjectKind::Table,
         load::ObjectKind::Other => false,
     }
+}
+
+/// Why a whole-table pass is appended to the buffer instead of replacing the base.
+fn whole_pass_into_buffer_note(fqtn: &str, run_id: &str) -> String {
+    format!(
+        "  note: `{fqtn}` already holds the base, and run {run_id} re-read the whole table — it \
+         is appended to the buffer `{fqtn}__changes` for `rivet compact` to merge by key, \
+         never replacing the base: a row the pass no longer holds stays in it"
+    )
 }
 
 /// Why a whole-table run is appended to the change log instead of landing as `<table>`.
@@ -2118,22 +2244,18 @@ fn load_incremental_job(
             // answer, where the name is a view and cannot be overwritten.
             let base_and_buffer = plan.layout.log_is_disposable();
             let mut split = split_runs(&inputs.runs);
-            // `filter` rather than a nested `if`: the layout question has a named, graded
-            // home, and expressing "there is a first pass" through the Option keeps this
-            // body free of the inline decision the mutation corpus cannot reach.
-            let joins_the_log = split
-                .first_pass
-                .as_ref()
-                .filter(|_| load::plan::whole_table_pass_may_join_the_log(base_and_buffer));
-            if let Some((_, first)) = joins_the_log {
+            if let Some((_, first)) = split.first_pass.as_ref() {
                 let kind = load::before_write(loader.object_kind(&plan.table))?;
                 let changes =
                     load::before_write(loader.object_kind(&format!("{}__changes", plan.table)))?;
-                if whole_table_run_joins_the_log(kind, changes) {
-                    eprintln!(
-                        "{}",
-                        whole_table_run_note(kind, &loader.fqtn(&plan.table), &first.run_id)
-                    );
+                if whole_table_run_joins_the_log(base_and_buffer, kind, changes) {
+                    load::refuse_stale_buffer(loader, &plan.table, base_and_buffer)?;
+                    let fqtn = loader.fqtn(&plan.table);
+                    let note = match base_and_buffer {
+                        true => whole_pass_into_buffer_note(&fqtn, &first.run_id),
+                        false => whole_table_run_note(kind, &fqtn, &first.run_id),
+                    };
+                    eprintln!("{note}");
                     split.whole_table_run_joins_the_log();
                 }
             }
@@ -3133,6 +3255,119 @@ mod load_ledger_tests {
             (healed.refusal, healed.writes, again.refusal, again.writes),
             (None, vec!["materialize healed".to_string()], None, vec![]),
             "(cycle-1 error, cycle-1 writes, cycle-2 error, cycle-2 writes)"
+        );
+    }
+
+    /// A base-and-buffer base that already holds rows is never replaced by a whole-table pass:
+    /// an incremental run with no cursor (after `state reset`, a lost state) and a CDC
+    /// re-baseline are appended to the buffer for `rivet compact` to merge by key, cycle after
+    /// cycle; only an absent base is created from the pass.
+    #[test]
+    fn a_whole_table_pass_over_an_existing_base_is_buffered_and_never_replaces_it() {
+        use load::ObjectKind::Table;
+        use load::plan::{CdcLayout, LoadMode};
+        let mut seen = Vec::new();
+        for (tag, exists, flag) in [
+            ("kept", true, true),
+            ("fresh", false, true),
+            ("noflag", true, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStore::open_in_memory().unwrap();
+            let table = format!("{tag}_inc_base");
+            let plan = plan_of(
+                &dir,
+                &table,
+                LoadMode::Incremental,
+                CdcLayout::BaseAndBuffer,
+            );
+            loaded_before(&state, &format!("db.{table}"));
+            stage_incremental_run(&dir, "r-1", "2026-10-20T00:00:00Z", None);
+            let fake = || {
+                let f = load::tests::fake_loader(1);
+                if exists {
+                    f.with_kind(&table, Table).with_rows(&table, 5)
+                } else {
+                    f
+                }
+            };
+            let first = incremental_cycle(&dir, &state, &plan, "L1", fake());
+            let again = incremental_cycle(&dir, &state, &plan, "L2", fake());
+            seen.push((
+                "incremental",
+                tag,
+                first.refusal,
+                first.writes,
+                again.writes,
+            ));
+
+            let dir = tempfile::tempdir().unwrap();
+            let state = StateStore::open_in_memory().unwrap();
+            let table = format!("{tag}_cdc_base");
+            let mut plan = base_plan(&dir, &table);
+            plan.deleted_flag = flag;
+            loaded_before(&state, &format!("db.{table}"));
+            stage_run(&dir, "r-base", "keyset");
+            let fake = || {
+                let f = load::tests::fake_loader(1);
+                if exists {
+                    f.with_kind(&table, Table).with_rows(&table, 5)
+                } else {
+                    f
+                }
+            };
+            let first = cdc_base_cycle(&dir, &state, &plan, "L1", fake());
+            let again = cdc_base_cycle(&dir, &state, &plan, "L2", fake());
+            seen.push(("cdc", tag, first.refusal, first.writes, again.writes));
+        }
+        let w = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    "incremental",
+                    "kept",
+                    None,
+                    w(&["append kept_inc_base"]),
+                    w(&[])
+                ),
+                (
+                    "cdc",
+                    "kept",
+                    None,
+                    w(&["append kept_cdc_base", "flag absent kept_cdc_base"]),
+                    w(&[])
+                ),
+                (
+                    "incremental",
+                    "fresh",
+                    None,
+                    w(&["materialize fresh_inc_base"]),
+                    w(&[])
+                ),
+                (
+                    "cdc",
+                    "fresh",
+                    None,
+                    w(&["materialize fresh_cdc_base"]),
+                    w(&[])
+                ),
+                (
+                    "incremental",
+                    "noflag",
+                    None,
+                    w(&["append noflag_inc_base"]),
+                    w(&[])
+                ),
+                (
+                    "cdc",
+                    "noflag",
+                    None,
+                    w(&["append noflag_cdc_base"]),
+                    w(&[])
+                ),
+            ],
+            "(mode, base, cycle-1 error, cycle-1 writes, cycle-2 writes)"
         );
     }
 
@@ -4764,12 +4999,34 @@ mod live_only_decisions {
     #[test]
     fn a_whole_table_run_joins_the_log_whenever_the_target_already_exists() {
         use load::ObjectKind::*;
-        assert!(whole_table_run_joins_the_log(View, Absent));
-        assert!(whole_table_run_joins_the_log(Table, Absent));
-        assert!(!whole_table_run_joins_the_log(Absent, Absent));
+        for base_and_buffer in [false, true] {
+            assert!(whole_table_run_joins_the_log(base_and_buffer, View, Absent));
+            assert!(whole_table_run_joins_the_log(
+                base_and_buffer,
+                Table,
+                Absent
+            ));
+            assert!(!whole_table_run_joins_the_log(
+                base_and_buffer,
+                Absent,
+                Absent
+            ));
+            assert!(!whole_table_run_joins_the_log(
+                base_and_buffer,
+                Other,
+                Table
+            ));
+        }
         // An adoption interrupted before its view: the log exists, the name does not.
-        assert!(whole_table_run_joins_the_log(Absent, Table));
-        assert!(!whole_table_run_joins_the_log(Other, Table));
+        assert!(whole_table_run_joins_the_log(false, Absent, Table));
+        assert_eq!(
+            whole_pass_into_buffer_note("p.d.orders", "f1"),
+            "  note: `p.d.orders` already holds the base, and run f1 re-read the whole table — it \
+             is appended to the buffer `p.d.orders__changes` for `rivet compact` to merge by key, \
+             never replacing the base: a row the pass no longer holds stays in it"
+        );
+        // A buffer without its base is a stale buffer, never a log to join.
+        assert!(!whole_table_run_joins_the_log(true, Absent, Table));
 
         let on_table = whole_table_run_note(Table, "p.d.orders", "f1");
         assert!(
@@ -5850,5 +6107,24 @@ mod overwritten_delta_tests {
         assert_eq!(warn(false, &[load("full", "success")]), None);
         assert_eq!(warn(true, &[load("full", "failed")]), None);
         assert_eq!(warn(true, &[]), None);
+    }
+
+    /// An incremental report counts the rows of whichever load it was.
+    #[test]
+    fn an_incremental_report_counts_the_rows_its_load_landed() {
+        let table = crate::load::orchestrate::IncrementalReport::Table(crate::load::LoadReport {
+            rows_loaded: 7,
+            target_table: "p.d.t".into(),
+            source_cleaned: false,
+        });
+        let log =
+            crate::load::orchestrate::IncrementalReport::Changelog(crate::load::CdcLoadReport {
+                rows_appended: 40,
+                changes_table: "p.d.t__changes".into(),
+                target: "p.d.t".into(),
+                target_kind: crate::load::ChangelogTarget::View,
+                source_cleaned: false,
+            });
+        assert_eq!((table.rows(), log.rows()), (7, 40));
     }
 }

@@ -399,6 +399,55 @@ fn batch_into_clickhouse(rig: Rig, db: &Db) -> Rig {
         ))
 }
 
+/// `rivet load` runs where the source's variable is not set (a load task holds no source
+/// credential): it types the table from the spec the run recorded on this state and lands the
+/// source's rows. On 0.32.2's v38 state the load read the spec under the source key it resolved,
+/// empty here, and refused every table, `RIVET_LOAD_SPEC_MISSING`.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_load_without_the_source_variable_types_its_table_from_the_runs_spec() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_noenv", 5);
+    let db = Db::new("rivet_chtest");
+    let dir = tempfile::tempdir().expect("config dir");
+    let var = "RIVET_TEST_CH_SOURCE_URL";
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "source:\n  type: postgres\n  url_env: {var}\nexports:\n  - name: {tbl}\n    \
+             table: {tbl}\n    mode: full\n    format: parquet\n    destination: {{ type: gcs, \
+             bucket: {BUCKET}, prefix: \"{prefix}/{tbl}/\", endpoint: \"{FAKE_GCS_ENDPOINT}\", \
+             allow_anonymous: true }}\nload: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", \
+             database: {db}, user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id] }}\n",
+            prefix = unique_name("chnoenv"),
+            db = db.0
+        ),
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let ok = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = run_rivet_env(args, envs);
+        assert!(
+            out.status.success(),
+            "rivet {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    ok(&["run", "-c", cfg], &[(var, POSTGRES_URL)]);
+    ok(&["load", "-c", cfg], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        )),
+        pg_rows(&mut c, &tbl),
+        "the load landed the source's rows"
+    );
+}
+
 /// A whole-table load replaces the table: the second load serves the source as it
 /// is now, not the union of both runs.
 #[test]
@@ -500,6 +549,49 @@ fn an_incremental_export_into_clickhouse_adopts_the_table_and_serves_the_latest_
         clickhouse_rows(&format!("SELECT id, v FROM {view} ORDER BY id FORMAT TSV")),
         pg_rows(&mut c, &tbl)
     );
+}
+
+/// `state reset` of an incremental export into ClickHouse: the next run holds the whole
+/// table again, and it is appended to the change log, never landed over it. Rows the source
+/// deleted before the reset stay in the view, on that cycle and the next.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn an_incremental_pass_after_a_state_reset_keeps_what_clickhouse_held_for_two_cycles() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_reset", 5);
+    let db = Db::new("rivet_chtest");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&tbl)
+            .mode("incremental")
+            .export_line("cursor_column: updated_at"),
+        &db,
+    );
+    let view = format!("{}.{tbl}", db.0);
+    let held = || clickhouse_rows(&format!("SELECT id, v FROM {view} ORDER BY id FORMAT TSV"));
+
+    rig.run_ok();
+    load(&rig);
+    let before = held();
+    assert_eq!(before, pg_rows(&mut c, &tbl));
+    c.batch_execute(&format!("DELETE FROM {tbl} WHERE id <= 2"))
+        .expect("delete at the source");
+    let reset = rig.cli(&["state", "reset", "--export", rig.export_name()]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    for cycle in ["after the reset", "next cycle"] {
+        rig.run_ok();
+        load(&rig);
+        assert_eq!(
+            held(),
+            before,
+            "{cycle}: the rows the source deleted are kept"
+        );
+    }
 }
 
 /// A change log keyed on one `load.pk` cannot take a load keyed on another: rows the
@@ -2444,6 +2536,169 @@ fn rolled_back_to(as_old: fn(&Rig) -> Option<Rig>, must_migrate: bool) {
     }
 }
 
+/// The `rivet load` / `rivet compact` result document (ADR-0039 D3) of `args`, its exit code and stderr.
+fn result_document(rig: &Rig, args: &[&str], password: &str) -> (serde_json::Value, i32, String) {
+    let out = rig.cli_env(args, &[(PASSWORD_ENV, password)]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let doc = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout is not the document ({e}):\n{}\n{stderr}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    (doc, out.status.code().expect("an exit code"), stderr)
+}
+
+/// `rows` of each `per_table[]` entry as `(table, status, skip_reason, rows)`.
+fn entries(doc: &serde_json::Value) -> Vec<(String, String, Option<String>, i64)> {
+    doc["per_table"]
+        .as_array()
+        .expect("per_table")
+        .iter()
+        .map(|e| {
+            (
+                e["table"].as_str().unwrap().to_string(),
+                e["status"].as_str().unwrap().to_string(),
+                e["skip_reason"].as_str().map(str::to_string),
+                e["rows"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// `--export`, `--table`, `--json` and `--summary-output` of `rivet load` and `rivet compact`: each
+/// table's entry names what the warehouse holds after it, read back over ClickHouse's own HTTP client;
+/// a failed table carries the error object whose exit code is the process's; a name the config does
+/// not load is refused by code.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn load_and_compact_report_each_selected_table_as_the_warehouse_holds_it() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (one, _t1, mut c1) = pg_batch_seeded("rivet_ch_doc_a", 3);
+    let (two, _t2, mut c2) = pg_batch_seeded("rivet_ch_doc_b", 5);
+    let db = Db::new("rivet_chtest");
+    let second = unique_name("doc_b");
+    let rig = batch_into_clickhouse(
+        Rig::pg_batch(&one)
+            .mode("full")
+            .also_batch_export(&second, &two, "full"),
+        &db,
+    );
+    let first = rig.export_name().to_string();
+    let count = |t: &str| -> i64 {
+        ch(&format!("SELECT count() FROM {}.{t} FORMAT TSV", db.0))
+            .parse()
+            .expect("a count")
+    };
+    let exists = |t: &str| {
+        ch(&format!(
+            "SELECT count() FROM system.tables WHERE database = '{}' AND name = '{t}' FORMAT TSV",
+            db.0
+        )) == "1"
+    };
+    rig.run_ok();
+
+    // 1. One export, the document on stdout and in the file: only its table, as ClickHouse holds it.
+    let scratch = tempfile::tempdir().expect("a scratch dir");
+    let file = scratch.path().join("out").join("load.json");
+    let file_arg = file.to_str().unwrap();
+    let (doc, code, err) = result_document(
+        &rig,
+        &[
+            "load",
+            "--export",
+            &first,
+            "--json",
+            "--summary-output",
+            file_arg,
+        ],
+        CLICKHOUSE_PASSWORD,
+    );
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        entries(&doc),
+        vec![(one.clone(), "loaded".into(), None, count(&one))]
+    );
+    let loaded = |t: &str| {
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{t} ORDER BY id FORMAT TSV",
+            db.0
+        ))
+    };
+    assert_eq!(
+        loaded(&one),
+        pg_rows(&mut c1, &one),
+        "the table holds the source's values"
+    );
+    assert_eq!(doc["per_table"][0]["export"], first.as_str());
+    assert!(!exists(&two), "--export loaded only its own table");
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(written, doc, "the file holds the document stdout printed");
+    assert!(
+        err.contains(&format!("LOAD OK [{one}]")),
+        "under --json the line goes to stderr: {err}"
+    );
+
+    // 2. One table, refused by the warehouse: the failed entry's error object carries the exit.
+    let (doc, code, err) = result_document(&rig, &["load", "--table", &two, "--json"], "wrong");
+    assert_ne!(code, 0, "{err}");
+    assert_eq!(entries(&doc), vec![(two.clone(), "failed".into(), None, 0)]);
+    let error = &doc["per_table"][0]["error"];
+    assert_eq!(error["exit_code"], code, "{error}");
+    assert_eq!(error["retryable"], error["class"] == "retryable", "{error}");
+    assert!(!exists(&two), "the refused table was not written");
+
+    // 3. Every table: a full load re-materializes its newest run, the incremental one lands its first pass.
+    let (doc, code, err) = result_document(&rig, &["load", "--json"], CLICKHOUSE_PASSWORD);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        entries(&doc),
+        vec![
+            (one.clone(), "loaded".into(), None, count(&one)),
+            (two.clone(), "loaded".into(), None, count(&two)),
+        ],
+        "{err}"
+    );
+    assert_eq!(
+        loaded(&two),
+        pg_rows(&mut c2, &two),
+        "the table holds the source's values"
+    );
+
+    // 4. A full load has nothing to compact, and says which word of the closed set.
+    let (doc, code, err) = result_document(&rig, &["compact", "--json"], CLICKHOUSE_PASSWORD);
+    assert_eq!(code, 0, "{err}");
+    let full = |t: &str| {
+        (
+            t.to_string(),
+            "skipped".to_string(),
+            Some("full_load".to_string()),
+            0,
+        )
+    };
+    assert_eq!(entries(&doc), vec![full(&one), full(&two)]);
+
+    // 5. Names the config does not load are refused by code, before any work.
+    for (args, code) in [
+        (vec!["load", "--table", "nope"], "RIVET_CLI_TABLE_UNKNOWN"),
+        (
+            vec!["compact", "--export", "nope"],
+            "RIVET_CLI_EXPORT_UNKNOWN",
+        ),
+        (
+            vec!["load", "--export", first.as_str(), "--table", two.as_str()],
+            "RIVET_CLI_TABLE_UNKNOWN",
+        ),
+    ] {
+        let out = rig.cli_env(&args, &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+        assert!(err.contains(&format!("[{code}]")), "{args:?}: {err}");
+    }
+}
 /// One `(key, v)` table named `tbl` on a source, with its own key column name.
 struct NamedSource {
     url: &'static str,

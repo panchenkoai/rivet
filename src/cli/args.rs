@@ -227,6 +227,18 @@ pub enum Commands {
         /// `--pool 1` for the strictly sequential pass.
         #[arg(long, value_name = "N")]
         pool: Option<usize>,
+        /// Take only this export's tables
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Take only this warehouse table
+        #[arg(long, value_name = "TABLE")]
+        table: Option<String>,
+        /// Print the per-table result as JSON to stdout (the result lines go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Write the per-table result as JSON to this file
+        #[arg(long, value_name = "PATH")]
+        summary_output: Option<String>,
     },
     /// Merge each base-and-buffer CDC table's `<table>__changes` buffer into its
     /// base table (`MERGE` by primary key: updates, inserts, deletes flagged as
@@ -251,6 +263,18 @@ pub enum Commands {
         /// at the number of tables. Pass `--pool 1` for the sequential pass.
         #[arg(long, value_name = "N")]
         pool: Option<usize>,
+        /// Take only this export's tables
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Take only this warehouse table
+        #[arg(long, value_name = "TABLE")]
+        table: Option<String>,
+        /// Print the per-table result as JSON to stdout (the result lines go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Write the per-table result as JSON to this file
+        #[arg(long, value_name = "PATH")]
+        summary_output: Option<String>,
     },
     /// Manage export state
     State {

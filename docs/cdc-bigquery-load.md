@@ -85,16 +85,27 @@ classic *log + periodic compaction*.
 ## The base-and-buffer layout (`backfill:` streams) and `rivet compact`
 
 A stream whose baseline comes from `cdc.backfill:` does NOT use the view above.
-Its baseline legs overwrite a **physical base table** `<table>` — the source
+Its first baseline creates a **physical base table** `<table>` — the source
 columns plus one service column, `__is_deleted BOOL` (written as `false` inside
 the baseline Parquet, so no NULL ever appears) — and the stream's runs append
 into `<table>__changes`, a **per-cycle buffer** without a partition. The cycle is
 
 ```sh
 rivet run     -c cfg.yaml   # anchor once, baseline once, then only the changes
-rivet load    -c cfg.yaml   # baseline → <table> (batched, staging + CLONE); changes → <table>__changes
+rivet load    -c cfg.yaml   # first baseline → <table> (batched, staging + CLONE); changes → <table>__changes
 rivet compact -c cfg.yaml   # MERGE <table>__changes into <table>; DROP the buffer
 ```
+
+**A base that exists is never replaced.** A later baseline (the re-baseline every CDC
+data-loss refusal prints) and an incremental run with no cursor to resume from (after
+`rivet state reset`, or a lost state DB) are appended to `<table>__changes` like any change,
+and `compact` merges them by key: a row the base holds and the pass does not stays in the
+base. After a CDC re-baseline, each live base row the new baseline does not hold is buffered
+as a delete, so `compact` flags it `__is_deleted = TRUE` with its last values (the baseline
+read the whole table after the stream's anchor, so the source no longer has that row); a
+base without the flag column keeps those rows as they are. A buffer that still holds changes
+from before the pass is refused (`RIVET_LOAD_BUFFER_NOT_COMPACTED`): run `rivet compact`
+first.
 
 `compact` is **one scripted job per table**: the latest change per key (the
 same `__pos` order the view uses) is upserted; a **delete flags** the base row
