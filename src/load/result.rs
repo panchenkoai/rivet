@@ -113,12 +113,6 @@ impl JobJournal {
         }
     }
 
-    /// Whether the target names its jobs.
-    #[cfg(test)]
-    pub(crate) fn names_jobs(&self) -> bool {
-        self.names_jobs
-    }
-
     fn journal(&self) -> std::sync::MutexGuard<'_, Journal> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }

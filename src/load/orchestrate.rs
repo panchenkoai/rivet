@@ -6035,9 +6035,21 @@ mod overwritten_delta_tests {
             storage_integration: "i".into(),
         };
         let journals = crate::load::orchestrate::journals_of(&[full.clone(), snowflake.clone()]);
+        let ids = |j: &crate::load::result::JobJournal| {
+            crate::load::result::table_result(
+                "e",
+                "t",
+                &at("t", None),
+                "loaded",
+                &Ok(crate::load::result::TableDone::Skipped("up_to_date")),
+                j,
+            )
+            .warehouse_job_ids
+        };
         assert_eq!(
-            journals.iter().map(|j| j.names_jobs()).collect::<Vec<_>>(),
-            [true, false]
+            journals.iter().map(ids).collect::<Vec<_>>(),
+            [Some(vec![]), None],
+            "BigQuery names its jobs, the snow CLI none"
         );
         assert_eq!(address(&snowflake, "r", "loaded"), at("DB.SC.orders", None));
         assert_eq!(
