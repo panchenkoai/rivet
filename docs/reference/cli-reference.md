@@ -21,6 +21,7 @@ This document contains the help content for the `rivet` command-line program.
 * [`rivet state progression`↴](#rivet-state-progression)
 * [`rivet state runs`↴](#rivet-state-runs)
 * [`rivet state finish-run`↴](#rivet-state-finish-run)
+* [`rivet state copy`↴](#rivet-state-copy)
 * [`rivet state vacuum`↴](#rivet-state-vacuum)
 * [`rivet state loads`↴](#rivet-state-loads)
 * [`rivet completions`↴](#rivet-completions)
@@ -215,6 +216,7 @@ Manage export state
 * `progression` — Show committed / verified export boundaries (the last fully-exported cursor position)
 * `runs` — Show the run-status ledger (extraction-run lifecycle rows gc/cleanup read)
 * `finish-run` — Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful successor) — the escape hatch for a prefix frozen by a stale `running` row
+* `copy` — Copy this config's SQLite state into an empty PostgreSQL state: every table, in one transaction, each table's row count checked; the SQLite file is only read
 * `vacuum` — Shrink a SQLite state DB: rewrite it without the free pages deletes and migrations leave behind (takes the write lock while it runs; PostgreSQL state is left to autovacuum)
 * `loads` — Show the load ledger (`rivet load` runs recorded in the state DB)
 
@@ -349,6 +351,19 @@ Terminal-stamp a run-status row you KNOW is dead (hard crash, no successful succ
 
 * `-c`, `--config <CONFIG>`
 * `--run-id <RUN_ID>` — The run id to close (find it with `rivet state runs -c <config> --running`)
+
+
+
+## `rivet state copy`
+
+Copy this config's SQLite state into an empty PostgreSQL state: every table, in one transaction, each table's row count checked; the SQLite file is only read
+
+**Usage:** `rivet state copy [OPTIONS] --config <CONFIG>`
+
+###### **Options:**
+
+* `-c`, `--config <CONFIG>`
+* `--to <URL>` — The PostgreSQL state to copy into; defaults to RIVET_STATE_URL
 
 
 

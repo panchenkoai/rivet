@@ -57,6 +57,12 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 # The three BigQuery key-move cells added 2026-10-03 (ADR-0030) took 206-237 s solo (two loads, a
 # compact and the oracle's BigQuery grades) and were killed at 240 s in a seeded-recall control run.
 
+# The state-copy cell runs a 0.30.0 cycle and two cycles of this tree into BigQuery, each graded
+# by the rig oracle: 241 s solo on devbox (2026-10-20).
+[[profile.default.overrides]]
+filter = 'test(/^live_init_delta::a_0_30_cdc_state_copied_to_postgres_/)'
+slow-timeout = { period = "300s", terminate-after = 4 }
+
 # The SQL Server CDC cells queue on one cross-process lock (`cross_process_serial("mssql_cdc")`),
 # so a cell's clock includes its wait. The rig oracle images the source before every CDC run
 # (about a second each), and the queue reached 224-237 s for cells that passed and 240 s for two

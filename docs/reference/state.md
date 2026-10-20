@@ -22,6 +22,34 @@ Moving a config's state to a `sqlite:` path is refused, `RIVET_STATE_URL_LEAVES_
 copy the state first, with every run stopped (`sqlite3 .rivet_state.db ".backup <new path>"`, which
 takes the `-wal` file with it), or unset the variable.
 
+## Moving a SQLite state to PostgreSQL (`rivet state copy`)
+
+```sh
+rivet state copy -c rivet.yaml --to 'postgresql://rivet@db:5432/rivet_app?sslmode=require'
+```
+
+With every run of the config stopped, `rivet state copy` reads the config's SQLite state (the
+file beside the config, or the `sqlite:` path `RIVET_STATE_URL` names) and writes every table of it
+into the PostgreSQL state `--to` names (or a PostgreSQL `RIVET_STATE_URL`): cursors, chunk
+checkpoints, the CDC snapshot records, the load journal and load specs, metrics and run history.
+
+- A state of an older release is brought to this release's schema on an in-memory copy; the file
+  itself is only read, and keeps its schema version. It is the way back: unset `RIVET_STATE_URL`
+  to use it again (it does not see what the runs did after the copy).
+- The copy is one transaction. Each table's row count is compared with the source before the
+  commit (`RIVET_STATE_COPY_COUNT_MISMATCH`, exit 3, commits nothing).
+- The target must hold no rivet state: a database, or a schema reached through `search_path`
+  (`?options=-csearch_path%3D<schema>`), of its own. One with state rows is refused,
+  `RIVET_STATE_COPY_TARGET_NOT_EMPTY` (exit 5), naming the tables that hold them.
+- After the copy, run every command of the config with `RIVET_STATE_URL` set to the PostgreSQL
+  state. The next run continues each cursor and each CDC stream; `rivet load` and `rivet compact`
+  find the tables earlier loads wrote in the journal they now read, so they do not refuse them as
+  someone else's.
+- **A CDC checkpoint is a file, not a state row.** `cdc.checkpoint` stays where the config names
+  it (resolved from the config's directory), and the copy prints that path. The runs keep reading
+  and writing it there, so it must stay on a disk the scheduler keeps (not an ephemeral pod
+  volume). A PostgreSQL slot's position is the server's and needs nothing.
+
 ## The copy a migration leaves behind
 
 Before a migration runs its first statement, inside the migration lock, rivet writes a copy of the

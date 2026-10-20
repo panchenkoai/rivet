@@ -4,6 +4,7 @@ use crate::error::Result;
 
 mod cdc_snapshot_store;
 mod checkpoint;
+pub mod copy;
 mod cursor;
 mod file_log;
 mod journal_store;
