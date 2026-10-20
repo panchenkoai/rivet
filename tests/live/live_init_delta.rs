@@ -1253,3 +1253,71 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
         .join("snapshot");
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
 }
+
+/// The `server_id:` a MySQL CDC scaffold names.
+fn scaffolded_server_id(generated: &str) -> String {
+    generated
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("server_id:"))
+        .and_then(|s| s.split_whitespace().next())
+        .expect("a mysql cdc scaffold must name a server_id")
+        .to_string()
+}
+
+/// Two CDC configs of one table on one cluster, generated with different `-o` files, name their
+/// own slot (PostgreSQL) and `server_id` (MySQL) after the file: through 0.32.1 both wrote
+/// `rivet_<table>` / `4271`, so the second config read the first one's stream.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc mysql-cdc"]
+fn two_cdc_configs_of_one_cluster_name_their_own_stream_objects() {
+    let pg_table = unique_name("rivet_two_cfg");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
+    c.batch_execute(&format!("CREATE TABLE {pg_table} (id BIGINT PRIMARY KEY)"))
+        .expect("table");
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, pg_table.clone());
+    let my_table = unique_name("rivet_two_cfg");
+    {
+        use mysql::prelude::Queryable as _;
+        mysql::Pool::new(MYSQL_CDC_URL)
+            .unwrap()
+            .get_conn()
+            .unwrap()
+            .query_drop(format!("CREATE TABLE {my_table} (id BIGINT PRIMARY KEY)"))
+            .unwrap();
+    }
+    let _m = MysqlCdcTable(my_table.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let scaffold = |url: &str, table: &str, file: &str| {
+        let out = dir.path().join(file);
+        init_ok(&[
+            "init",
+            "--source",
+            url,
+            "--table",
+            table,
+            "--mode",
+            "cdc",
+            "--output",
+            out.to_str().unwrap(),
+        ]);
+        std::fs::read_to_string(out).unwrap()
+    };
+    let (staging, prod) = (
+        scaffold(POSTGRES_CDC_URL, &pg_table, "staging.yaml"),
+        scaffold(POSTGRES_CDC_URL, &pg_table, "prod.yaml"),
+    );
+    assert_eq!(
+        scaffolded_slot(&staging),
+        format!("rivet_staging_{pg_table}")
+    );
+    assert_eq!(scaffolded_slot(&prod), format!("rivet_prod_{pg_table}"));
+    let (staging, prod) = (
+        scaffold(MYSQL_CDC_URL, &my_table, "staging-my.yaml"),
+        scaffold(MYSQL_CDC_URL, &my_table, "prod-my.yaml"),
+    );
+    assert_ne!(
+        scaffolded_server_id(&staging),
+        scaffolded_server_id(&prod),
+        "two configs of one server get two replica ids"
+    );
+}

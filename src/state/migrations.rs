@@ -584,6 +584,30 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (36, "ALTER TABLE run_status ADD COLUMN source TEXT;"),
     // v37: the sealed plan (`plan_id`) a run applied to exit 0, so a replay of that plan answers with the run instead of extracting again; NULL for every other run.
     (37, "ALTER TABLE run_status ADD COLUMN plan_id TEXT;"),
+    // v38: the by-name load spec is keyed by the source too, so configs of one export name
+    // reading different databases on one shared state keep a spec (and an init key) each; a row
+    // written before v38 has `source = ''` and is read as the spec of any source until one of its own exists.
+    (
+        38,
+        "ALTER TABLE export_load_spec RENAME TO export_load_spec_v37;
+        CREATE TABLE export_load_spec (
+             export_name TEXT NOT NULL,
+             unit TEXT NOT NULL DEFAULT '',
+             source TEXT NOT NULL DEFAULT '',
+             columns_json TEXT,
+             primary_key_json TEXT,
+             key_origin TEXT,
+             run_id TEXT,
+             origin TEXT NOT NULL,
+             captured_at TEXT NOT NULL,
+             PRIMARY KEY (export_name, unit, source)
+         );
+        INSERT INTO export_load_spec
+            (export_name, unit, source, columns_json, primary_key_json, key_origin, run_id, origin, captured_at)
+            SELECT export_name, unit, '', columns_json, primary_key_json, key_origin, run_id, origin, captured_at
+            FROM export_load_spec_v37;
+        DROP TABLE export_load_spec_v37;",
+    ),
 ];
 
 /// PostgreSQL-compatible DDL.  Column types differ from SQLite (BIGSERIAL,
@@ -1087,6 +1111,13 @@ const PG_MIGRATIONS: &[(i64, &str)] = &[
     (
         37,
         "ALTER TABLE run_status ADD COLUMN IF NOT EXISTS plan_id TEXT;",
+    ),
+    // v38: see the SQLite ladder. Replayable: the column is added once and the key rebuilt.
+    (
+        38,
+        "ALTER TABLE export_load_spec ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT '';
+        ALTER TABLE export_load_spec DROP CONSTRAINT IF EXISTS export_load_spec_pkey;
+        ALTER TABLE export_load_spec ADD CONSTRAINT export_load_spec_pkey PRIMARY KEY (export_name, unit, source);",
     ),
 ];
 
@@ -1755,6 +1786,7 @@ mod tests {
             (30, "export_state"),
             (32, "export_load_spec_run"),
             (34, "keyset_range"),
+            (38, "export_load_spec"),
         ];
         for &(v, sql) in MIGRATIONS {
             if let Some(pg_tables) = pg.get(&v) {
@@ -1912,6 +1944,53 @@ mod tests {
         };
         range("pg/a").expect("a source's own range 0");
         range("pg/a").expect_err("one range per index and source");
+    }
+
+    /// v38 keys the by-name load spec by the source: a v37 row survives as the spec of no source
+    /// (`''`), and two sources then keep one row each under one export name.
+    #[test]
+    fn v38_keys_the_load_spec_by_source_and_keeps_a_v37_row_as_sourceless() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_schema_version_table(&conn);
+        for &(ver, sql) in MIGRATIONS {
+            if ver <= 37 {
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{sql}\nINSERT INTO schema_version (version) VALUES ({ver});\nCOMMIT;"
+                ))
+                .unwrap();
+            }
+        }
+        conn.execute_batch(
+            "INSERT INTO export_load_spec (export_name, unit, primary_key_json, key_origin, origin, captured_at) \
+             VALUES ('orders', '', '[\"id\"]', 'init', 'init', 't');",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
+        conn.execute_batch(
+            "INSERT INTO export_load_spec (export_name, unit, source, primary_key_json, origin, captured_at) \
+             VALUES ('orders', '', 'mysql://h:3306/a', '[\"code\"]', 'run', 't'), \
+                    ('orders', '', 'postgres://h:5432/b', '[\"no\"]', 'run', 't');",
+        )
+        .unwrap();
+        let mut q = conn
+            .prepare(
+                "SELECT source || '=' || primary_key_json FROM export_load_spec ORDER BY source",
+            )
+            .unwrap();
+        let rows: Vec<String> = q
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "=[\"id\"]".to_string(),
+                "mysql://h:3306/a=[\"code\"]".to_string(),
+                "postgres://h:5432/b=[\"no\"]".to_string()
+            ]
+        );
     }
 
     /// v37 adds `run_status.plan_id` on a populated v36 state and on a fresh one: a run written before it reads NULL, a run that applied a plan is found by the plan.

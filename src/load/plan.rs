@@ -176,6 +176,8 @@ pub struct LoadPlan {
     /// The captured source table for a multiplex `tables:` export, `None` for a
     /// single-relation one — the `unit` the state DB keys its load specs by.
     pub unit: Option<String>,
+    /// The source the export reads (`SourceConfig::state_key`), the third part of a load spec's key.
+    pub source_key: String,
     pub table: String,
     /// The resolved `load.partition` of the table the load writes.
     pub partition: Option<TablePartition>,
@@ -690,6 +692,7 @@ fn build_plans_keyed(
         plans.push(LoadPlan {
             export_name: export.name.clone(),
             unit: report.table.clone(),
+            source_key: cfg.source.state_key(),
             table,
             partition,
             specs,
@@ -987,6 +990,7 @@ pub(crate) fn test_plan(mode: LoadMode, gcs_prefix: &str) -> LoadPlan {
         clustering: Clustering::Auto(vec![]),
         pinned_run: None,
         layout: CdcLayout::LogAndView,
+        source_key: String::new(),
     }
 }
 
@@ -2430,6 +2434,7 @@ load:
             .record_load_spec(
                 "orders",
                 None,
+                "",
                 &[
                     col("id", RivetType::Int64),
                     col(

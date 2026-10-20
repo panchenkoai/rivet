@@ -1,0 +1,13 @@
+diff --git a/src/init/mod.rs b/src/init/mod.rs
+index 3cc09fd7..1720c520 100644
+--- a/src/init/mod.rs
++++ b/src/init/mod.rs
+@@ -758,7 +758,7 @@ pub fn init(
+     let mut yaml_destination = yaml_destination;
+     if matches!(format, InitFormat::Yaml) {
+         refuse_unsupported_forced_mode(source_url, mode_override)?;
+-        yaml_destination.cdc_name_stem = output.and_then(yaml_scaffold::output_stem);
++        yaml_destination.cdc_name_stem = output.and(None);
+     }
+     let (scaffold, snapshots) = match format {
+         InitFormat::Yaml => init_yaml(
