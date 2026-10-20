@@ -1532,6 +1532,22 @@ seeds:
       oracle:
         na: "the permission gate is SQL Server's DMV read; Oracle samples no server counters"
 
+  - name: init-cdc-stream-names-shared
+    class: "two CDC configs `rivet init -o` writes for one cluster name the same PostgreSQL slot and MySQL `server_id`, so the second reads the first one's stream"
+    history: "0.32.2 item 3, 2026-10-18: measured on main: `-o staging.yaml` and `-o prod.yaml` both wrote `slot: rivet_<table>` (and `server_id: 4271`)"
+    scope: source
+    patch: init-cdc-stream-names-shared/shared.patch
+    engines:
+      postgres:
+        cells: [two_cdc_configs_of_one_cluster_name_their_own_stream_objects]
+      mysql:
+        cells: [two_cdc_configs_of_one_cluster_name_their_own_stream_objects]
+      mssql:
+        na: "a SQL Server stream is named by its capture instance, which init reads from the catalog (one per table, shared by design)"
+      mongo:
+        na: "a MongoDB change stream has no server-side slot or replica id; its position is the config's own checkpoint"
+      oracle:
+        na: "LogMiner keeps no server-side object per reader; the position is the config's own checkpoint"
   - name: io-error-classified-by-its-path-text
     class: "an `io::Error` (a missing directory, a read-only file) is retried as transient because a path in its message contains a network word (`dns`, `reset`), so a permanent stop exits 2"
     history: "0.32.2, 2026-10-20: #639's mutation shard baseline failed `an_unwritable_aggregate_path_is_refused_by_code` with exit 2 for 1 because its temp dir was named `.tmprDnsA7`; RED on main c1cf6a92 with a directory named `dns`"
