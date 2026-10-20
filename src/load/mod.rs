@@ -166,6 +166,23 @@ pub trait TargetLoader {
         )
     }
 
+    /// Buffer a tombstone into `<table>__changes` for every live row of the base `table`
+    /// whose key the buffer does not hold, after a re-baseline joined the buffer. Returns
+    /// the rows buffered. Only a warehouse that compacts has a base to read.
+    fn flag_absent_from_buffer(
+        &self,
+        table: &str,
+        _specs: &[TargetColumnSpec],
+        _pk: &[String],
+    ) -> Result<u64> {
+        crate::rivet_bail!(
+            crate::error::codes::INTERNAL_LOAD_INVARIANT,
+            "a base-and-buffer re-baseline reached `{}`, which {:?} never compacts",
+            self.fqtn(table),
+            self.warehouse()
+        )
+    }
+
     /// The warehouse this adapter targets — lets the shared driver build the
     /// current-state view SQL (dialect keyword + identifier quoting) in ONE place
     /// per mode instead of once per adapter.
@@ -1137,8 +1154,12 @@ pub fn open_store(dest: &crate::config::DestinationConfig) -> Result<GcsStore> {
 /// The one place a resolved plan's [`LoadTarget`](plan::LoadTarget) maps to a
 /// concrete [`TargetLoader`] adapter — wiring partition / cluster / connection /
 /// run-id from the config. The count gate and cleanup are the driver's, so the
-/// adapter carries no `expected_rows`.
-pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader> {
+/// adapter carries no `expected_rows`. Every job it runs is recorded in `journal`.
+pub fn build_loader(
+    plan: &plan::LoadPlan,
+    run_id: &str,
+    journal: &result::JobJournal,
+) -> Box<dyn TargetLoader> {
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
@@ -1152,7 +1173,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             )
             .batched_by_footers(plan.destination.clone())
             .layout(plan.layout)
-            .renamed(plan.renames.clone()),
+            .renamed(plan.renames.clone())
+            .journaled(journal.clone()),
         ),
         LoadTarget::Snowflake {
             connection,
@@ -1194,7 +1216,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             .ca_file(ca_file.clone())
             .cluster_by(plan.clustering.columns().to_vec())
             .partition_by(plan.partition.as_ref().map(|p| p.expr.clone()))
-            .cdc(plan.mode == plan::LoadMode::Cdc),
+            .cdc(plan.mode == plan::LoadMode::Cdc)
+            .journaled(journal.clone()),
         ),
     }
 }
@@ -1451,6 +1474,15 @@ pub(crate) mod tests {
         fn warehouse(&self) -> cdc::Warehouse {
             self.dialect.unwrap_or(cdc::Warehouse::BigQuery)
         }
+        fn flag_absent_from_buffer(
+            &self,
+            table: &str,
+            _: &[TargetColumnSpec],
+            _: &[String],
+        ) -> Result<u64> {
+            self.wrote(format!("flag absent {table}"));
+            Ok(2)
+        }
         fn create_view(&self, table: &str, _view_sql: &str) -> Result<()> {
             self.wrote(format!("view {table}"));
             self.views.borrow_mut().push(table.into());
@@ -1507,6 +1539,13 @@ pub(crate) mod tests {
             rows,
             ..Default::default()
         }
+    }
+
+    /// [`fake_loader`] whose `table` holds `rows` rows.
+    pub(crate) fn fake_loader_holding(table: &str, rows: u64) -> FakeLoader {
+        let f = fake_loader(0);
+        f.counts.borrow_mut().insert(table.to_string(), rows);
+        f
     }
 
     fn changelog_with(drift: ChangelogDrift) -> FakeLoader {
@@ -1973,6 +2012,64 @@ pub(crate) mod tests {
                 "{changes_rows}/{prior}: nothing touched"
             );
         }
+    }
+
+    /// A warehouse that never compacts has no base to flag rows in: the default refuses as a bug.
+    #[test]
+    fn a_rebaseline_flag_on_a_warehouse_that_never_compacts_is_an_internal_stop() {
+        struct Plain(FakeLoader);
+        impl TargetLoader for Plain {
+            fn fqtn(&self, t: &str) -> String {
+                self.0.fqtn(t)
+            }
+            fn changes_has_prior_changes(&self, t: &str) -> Result<bool> {
+                self.0.changes_has_prior_changes(t)
+            }
+            fn object_kind(&self, t: &str) -> Result<ObjectKind> {
+                self.0.object_kind(t)
+            }
+            fn column_overlap(&self, t: &str, n: &[&str]) -> Result<(u64, u64)> {
+                self.0.column_overlap(t, n)
+            }
+            fn row_count(&self, t: &str) -> Result<u64> {
+                self.0.row_count(t)
+            }
+            fn adopt_as_changelog(&self, t: &str) -> Result<()> {
+                self.0.adopt_as_changelog(t)
+            }
+            fn materialize(
+                &self,
+                t: &str,
+                s: &[TargetColumnSpec],
+                u: &[String],
+                e: Option<u64>,
+            ) -> Result<u64> {
+                self.0.materialize(t, s, u, e)
+            }
+            fn append_changelog(
+                &self,
+                t: &str,
+                s: &[TargetColumnSpec],
+                u: &[String],
+                p: &[String],
+            ) -> Result<u64> {
+                self.0.append_changelog(t, s, u, p)
+            }
+            fn warehouse(&self) -> cdc::Warehouse {
+                cdc::Warehouse::ClickHouse
+            }
+            fn create_view(&self, t: &str, sql: &str) -> Result<()> {
+                self.0.create_view(t, sql)
+            }
+        }
+        let err = Plain(fake_loader(0))
+            .flag_absent_from_buffer("t", &spec_ok(), &["id".to_string()])
+            .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_INTERNAL_LOAD_INVARIANT"),
+            "{err:#}"
+        );
     }
 
     #[test]

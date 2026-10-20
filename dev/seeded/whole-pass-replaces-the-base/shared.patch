@@ -1,0 +1,11 @@
+--- a/src/load/orchestrate.rs
++++ b/src/load/orchestrate.rs
+@@ -2006,7 +2006,7 @@ fn whole_table_run_joins_the_log(
+     changes: load::ObjectKind,
+ ) -> bool {
+     match kind {
+-        load::ObjectKind::Table | load::ObjectKind::View => true,
++        load::ObjectKind::Table | load::ObjectKind::View => !base_and_buffer,
+         load::ObjectKind::Absent => !base_and_buffer && changes == load::ObjectKind::Table,
+         load::ObjectKind::Other => false,
+     }

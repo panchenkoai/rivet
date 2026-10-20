@@ -1060,3 +1060,217 @@ fn a_compaction_that_dies_before_its_merge_leaves_the_buffer_whole() {
         "applied once, at its latest value"
     );
 }
+
+/// One `rivet load --json` / `rivet compact --json` and its only `per_table[]` entry.
+fn digest_of(rig: &Rig, command: &str) -> serde_json::Value {
+    let out = rig.cli(&[command, "--json"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "rivet {command} failed:\n{stderr}");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not the document ({e}):\n{stderr}"));
+    doc["per_table"][0].clone()
+}
+
+/// `bq --format=json` with `args`, in the stand's project and location: a client rivet does not use.
+fn bq_json(bq: &BqLive, args: &[&str]) -> serde_json::Value {
+    let out = std::process::Command::new("bq")
+        .arg(format!("--project_id={}", bq.project))
+        .arg(format!("--location={}", stand_bq_location()))
+        .arg("--format=json")
+        .args(args)
+        .output()
+        .expect("run bq");
+    assert!(
+        out.status.success(),
+        "bq {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("bq JSON")
+}
+
+/// A count BigQuery sends as a decimal string.
+fn bq_number(v: &serde_json::Value) -> u64 {
+    v.as_str().map_or(0, |s| s.parse().expect("a number"))
+}
+
+/// What `bq` says of the jobs a digest names: `(bytes processed, bytes billed)` summed over the
+/// jobs, and `(inserted, updated, deleted)` summed over each job's own `dmlStats` or, for a
+/// script, its children's.
+fn jobs_as_bq_reads_them(bq: &BqLive, ids: &[String]) -> ((u64, u64), (u64, u64, u64)) {
+    let (mut bytes, mut dml) = ((0, 0), (0, 0, 0));
+    let mut add_dml = |job: &serde_json::Value| {
+        let d = &job["statistics"]["query"]["dmlStats"];
+        dml.0 += bq_number(&d["insertedRowCount"]);
+        dml.1 += bq_number(&d["updatedRowCount"]);
+        dml.2 += bq_number(&d["deletedRowCount"]);
+    };
+    for id in ids {
+        let job = bq_json(bq, &["show", "-j", id]);
+        assert_eq!(job["status"]["state"], "DONE", "{job}");
+        let q = &job["statistics"]["query"];
+        bytes.0 += bq_number(&q["totalBytesProcessed"]);
+        bytes.1 += bq_number(&q["totalBytesBilled"]);
+        if q["statementType"] == "SCRIPT" {
+            let children = bq_json(bq, &["ls", "-j", "--parent_job_id", id, "-n", "1000"]);
+            for child in children.as_array().expect("a job list") {
+                let child = bq_json(
+                    bq,
+                    &[
+                        "show",
+                        "-j",
+                        child["jobReference"]["jobId"].as_str().unwrap(),
+                    ],
+                );
+                add_dml(&child);
+            }
+        } else {
+            add_dml(&job);
+        }
+    }
+    (bytes, dml)
+}
+
+fn ids_of(entry: &serde_json::Value) -> Vec<String> {
+    entry["warehouse_job_ids"]
+        .as_array()
+        .unwrap_or_else(|| panic!("BigQuery names its jobs: {entry}"))
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The digest of a BigQuery load and compact, held to what `bq` reads back: the job ids are jobs
+/// BigQuery ran, their bytes add up to the digest's, the compact's inserted / updated rows are its
+/// MERGE jobs' `dmlStats` and the source's own changes, `rows_merged` is the buffer `bq` counted
+/// before the merge, and `base_rows_after` the base it counts after. A delete here is a flag, which
+/// BigQuery counts as an update, so `rows_deleted` is `null`.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds"]
+fn a_bigquery_load_and_compact_digest_is_what_bq_reads_back() {
+    let Some(bq) = BqLive::from_env("digest") else {
+        return;
+    };
+    let mut scn = CdcScenario::mysql_with("digest", "id BIGINT PRIMARY KEY, v INT", |r, t| {
+        r.cdc("backfill: auto")
+            .also_batch_export("baseline", t, "chunked")
+            .also_export_line("chunk_by_key: id")
+            .also_export_line("chunk_size: 2")
+            .dest_gcs_live(&bq.bucket, &bq.prefix)
+            .top_line(&bq.load_line(", pk: [id]"))
+    });
+    let table = scn.table.clone();
+    let changes = format!("{table}__changes");
+    let _cleanup = bq.cleanup(&[&table, &changes]);
+    for id in 1..=5 {
+        scn.insert(id);
+    }
+    scn.settle();
+    scn.rig.run_ok();
+
+    // The first load lands the baseline in the base.
+    let load = digest_of(&scn.rig, "load");
+    assert_eq!(load["status"], "loaded", "{load}");
+    assert_eq!(load["rows_inserted"], 5, "{load}");
+    assert_eq!(bq.read_bq_count(&table), "5");
+    let count = |fqtn: &str| -> String {
+        bq.read_bq_rows(&format!("SELECT COUNT(*) AS n FROM `{fqtn}`"))[0]["n"]
+            .as_str()
+            .expect("a count")
+            .to_string()
+    };
+    let ((processed, billed), _) = jobs_as_bq_reads_them(&bq, &ids_of(&load));
+    assert_eq!(
+        (
+            load["bytes_processed"].as_u64(),
+            load["bytes_billed"].as_u64()
+        ),
+        (Some(processed), Some(billed)),
+        "{load}"
+    );
+    assert!(load["runs"].as_u64().is_some_and(|n| n >= 1), "{load}");
+    assert!(
+        load["files"].as_u64().is_some_and(|n| n >= 3),
+        "five rows in parts of two: {load}"
+    );
+    for key in [
+        "rows_updated",
+        "rows_deleted",
+        "rows_merged",
+        "base_rows_after",
+    ] {
+        assert!(load[key].is_null(), "{key}: {load}");
+    }
+
+    // Three inserts, one update, one delete: the buffer gets the five changes.
+    for id in 6..=8 {
+        scn.insert(id);
+    }
+    scn.update(1);
+    scn.delete(2);
+    scn.settle();
+    scn.rig.run_ok();
+    let load = digest_of(&scn.rig, "load");
+    assert_eq!(load["rows_inserted"], 5, "{load}");
+    let wrote = load["target"]
+        .as_str()
+        .expect("the loader's name for the log it wrote")
+        .to_string();
+    assert!(load["buffer"].is_null(), "a load reads no buffer: {load}");
+    let buffered = count(&wrote);
+    assert_eq!(
+        buffered, "5",
+        "the log the entry names holds the five changes"
+    );
+
+    let compact = digest_of(&scn.rig, "compact");
+    assert_eq!(compact["status"], "compacted", "{compact}");
+    let ids = ids_of(&compact);
+    let ((processed, billed), (inserted, updated, deleted)) = jobs_as_bq_reads_them(&bq, &ids);
+    assert_eq!(
+        (
+            compact["bytes_processed"].as_u64(),
+            compact["bytes_billed"].as_u64()
+        ),
+        (Some(processed), Some(billed)),
+        "{compact}"
+    );
+    assert_eq!(
+        (
+            compact["rows_inserted"].as_u64(),
+            compact["rows_updated"].as_u64()
+        ),
+        (Some(inserted), Some(updated)),
+        "the counts are the MERGE jobs' own: {compact}"
+    );
+    assert_eq!(
+        (inserted, updated, deleted),
+        (3, 2, 0),
+        "three new keys; the update and the flagged delete update their rows"
+    );
+    assert!(
+        compact["rows_deleted"].is_null(),
+        "a flag is not a delete: {compact}"
+    );
+    assert_eq!(compact["rows_merged"].to_string(), buffered, "{compact}");
+    assert_eq!(
+        compact["buffer"].as_str(),
+        Some(wrote.as_str()),
+        "the compact read the buffer the load wrote: {compact}"
+    );
+    let base = compact["target"]
+        .as_str()
+        .expect("the base the MERGE wrote");
+    assert_eq!(
+        compact["base_rows_after"].to_string(),
+        count(base),
+        "{compact}"
+    );
+    assert_eq!(
+        compact["base_rows_after"], 8,
+        "nothing is physically deleted"
+    );
+    assert!(
+        compact["files"].is_null() && compact["runs"].is_null(),
+        "{compact}"
+    );
+}
