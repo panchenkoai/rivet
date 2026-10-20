@@ -112,7 +112,9 @@ pub(super) fn pin_plan_to_its_run(
     let pinned_names: Vec<&str> = spec.columns.iter().map(|c| c.name.as_str()).collect();
     // Without the ledger's answer the respelling check below cannot run: unpin, like every
     // other unreadable input here, rather than pin with the check silently off.
-    let loaded = match s.loaded_source_run_ids(&load::build_loader(plan, op).fqtn(&plan.table)) {
+    let loaded = match s
+        .loaded_source_run_ids(&load::build_loader(plan, op, &Default::default()).fqtn(&plan.table))
+    {
         Ok(loaded) => loaded,
         Err(e) => {
             return unpinned(&format!(

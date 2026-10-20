@@ -59,6 +59,8 @@ pub struct ClickhouseLoader {
     /// A PEM file of extra root certificates for an `https://` URL.
     ca_file: Option<String>,
     client: OnceLock<reqwest::blocking::Client>,
+    /// Where every statement the server answered is recorded under its query id.
+    journal: crate::load::result::JobJournal,
 }
 
 impl ClickhouseLoader {
@@ -83,7 +85,14 @@ impl ClickhouseLoader {
             partition_by: None,
             ca_file: None,
             client: OnceLock::new(),
+            journal: Default::default(),
         }
+    }
+
+    /// Record every statement this loader runs in `journal`.
+    pub(crate) fn journaled(mut self, journal: crate::load::result::JobJournal) -> Self {
+        self.journal = journal;
+        self
     }
 
     /// Trust the root certificates in `ca_file` beside the built-in ones.
@@ -200,6 +209,12 @@ impl ClickhouseLoader {
             .headers()
             .get("X-ClickHouse-Exception-Code")
             .and_then(|v| v.to_str().ok()?.parse().ok());
+        if let Some(id) = query_id(resp.headers()) {
+            self.journal.record(crate::load::result::WarehouseJob {
+                id,
+                ..Default::default()
+            });
+        }
         let text = resp.text().map_err(|e| {
             (
                 Failure::Transport,
@@ -614,6 +629,15 @@ fn retry_after(failure: Failure, repeat: Repeat, attempt: u32) -> bool {
         }
     };
     transient && attempt < MAX_ATTEMPTS
+}
+
+/// The id ClickHouse gave the statement it answered (`X-ClickHouse-Query-Id`), when it sent one.
+fn query_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get("X-ClickHouse-Query-Id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 /// The HTTP client, trusting `ca_file`'s certificates beside the built-in roots; no pooled
@@ -1806,7 +1830,7 @@ mod tests {
             named_collection: None,
             ca_file: None,
         };
-        let cdc = crate::load::build_loader(&plan, "run");
+        let cdc = crate::load::build_loader(&plan, "run", &Default::default());
         let err = cdc
             .adopt_as_changelog("t")
             .expect_err("a CDC log cannot adopt a table");
@@ -1819,7 +1843,7 @@ mod tests {
             "{err:#}"
         );
         plan.mode = crate::load::plan::LoadMode::Incremental;
-        let inc = crate::load::build_loader(&plan, "run");
+        let inc = crate::load::build_loader(&plan, "run", &Default::default());
         let err = inc
             .adopt_as_changelog("t")
             .expect_err("nothing listens on :1");

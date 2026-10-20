@@ -4,11 +4,12 @@ use crate::error::Result;
 use crate::load;
 use crate::load::ledger::{ledger_load_id, ledger_status, ownership_of};
 use crate::load::orchestrate::{
-    command_result, failures_of, hand_off_state, holds, lease_still_held, needs_source_engine,
-    no_outcome_error, open_state, reconnect, require_pk, resolve_run_id, take_table_lease,
+    command_result, failures_of, hand_off_state, holds, journals_of, lease_still_held,
+    needs_source_engine, no_outcome_error, open_state, reconnect, require_pk, resolve_run_id,
+    take_table_lease,
 };
 use crate::load::pin::pin_plan_to_its_run;
-use crate::load::result::TableDone;
+use crate::load::result::{TableDone, Work};
 use crate::load::{ObjectKind, Ownership};
 use crate::state::{LoadRecord, StateStore};
 use anyhow::Context as _;
@@ -256,11 +257,13 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     // connections and TWO migrations — on both backends — where the sequential loop
     // had one of each.
     let (state_ref, parent_had_state) = hand_off_state(state, args.pool, plans.len());
+    let journals = journals_of(&plans);
     let outcomes = load::pool::run_workers(
         &plans,
         load::pool::effective_pool(args.pool, plans.len()),
         || reconnect(state_ref.as_ref(), "compact"),
-        |state, _idx, plan| {
+        |state, idx, plan| {
+            let journal = &journals[idx];
             if let Some((word, why)) =
                 compact_skip_reason(&plan.mode, &plan.layout, plan.load.target.compacts())
             {
@@ -293,7 +296,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
             let load_id = ledger_load_id(&run_id, "compact", &plan.table);
             let outcome = (|| -> Result<TableDone> {
                 let pinned = pin_plan_to_its_run(plan, state.as_ref(), &cfg, "compact")?;
-                let loader = load::build_loader(&pinned, &run_id);
+                let loader = load::build_loader(&pinned, &run_id, journal);
                 let target_fqtn = loader.fqtn(&pinned.table);
                 let lease = take_table_lease(state.as_ref(), &target_fqtn)?;
                 // The export's OWN mode, not a hardcoded label. Compact runs on
@@ -377,9 +380,12 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
                         "COMPACT OK [{}]: {} change row(s) merged into `{}` in {} MERGE statement(s); buffer dropped",
                         plan.table, report.changes_rows, report.base, report.merge_jobs
                     ));
-                    Ok(TableDone::Work {
-                        rows: report.changes_rows,
-                    })
+                    Ok(TableDone::Work(Work::compacted(
+                        report.changes_rows,
+                        journal.dml(),
+                        pinned.deleted_flag,
+                        base_rows_after(loader.as_ref(), &pinned.table),
+                    )))
                 } else {
                     args.report.say(&format!(
                         "COMPACT SKIP [{}]: no `{}__changes` buffer — nothing to merge",
@@ -398,7 +404,7 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
     // Folded in CONFIG order, like the load leg: the pool returns one result per
     // table, indexed by the table, so the `|`-joined list below reads the same on
     // every run of the same failing config.
-    let result = command_result(&run_id, &plans, &outcomes, "compacted");
+    let result = command_result(&run_id, &plans, &outcomes, &journals, "compacted");
     let mut failures = failures_of(outcomes);
     let attempted = attempted
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -415,6 +421,20 @@ pub fn run_compacts(args: CompactArgs) -> Result<()> {
         n => Err(several_failed(n, attempted, &failures)),
     };
     load::result::exit_of(tables, args.report.finish(&result))
+}
+
+/// The base's row count after its merge, from the warehouse's table metadata (BigQuery
+/// `tables.get`, no job); `None`, said so, when it cannot be read: the merge itself succeeded.
+fn base_rows_after(loader: &dyn load::TargetLoader, table: &str) -> Option<u64> {
+    loader
+        .row_count(table)
+        .inspect_err(|e| {
+            eprintln!(
+                "  note: `{}` merged, but its row count could not be read: {e:#}",
+                loader.fqtn(table)
+            );
+        })
+        .ok()
 }
 
 /// Several tables' compaction failed: one line naming each, carrying the code of the most stop-worthy one.
@@ -559,7 +579,10 @@ mod tests {
 #[cfg(test)]
 mod document_tests {
     use crate::load::plan::{CdcLayout, LoadMode};
-    use crate::load::result::{CommandResult, TableDone, table_result};
+    use crate::load::result::tests::journal_of;
+    use crate::load::result::{
+        CommandResult, DmlCounts, JobJournal, TableDone, Work, table_result,
+    };
 
     /// The word `compact_skip_reason` gives a table of this shape.
     fn skipped(mode: LoadMode, layout: CdcLayout, compacts: bool) -> anyhow::Result<TableDone> {
@@ -571,12 +594,32 @@ mod document_tests {
     #[test]
     fn the_compact_documents_are_the_contract_fixtures() {
         let entry = |export: &str, table: &str, outcome: anyhow::Result<TableDone>| {
-            table_result(export, table, "compacted", &outcome)
+            table_result(export, table, "compacted", &outcome, &JobJournal::new(true))
         };
+        let merge = journal_of(&[(
+            "rivet_compact_orders_1",
+            Some(52_428_800),
+            Some(DmlCounts {
+                inserted: 200,
+                updated: 950,
+                deleted: 50,
+            }),
+        )]);
         let doc = CommandResult {
             run_id: "20261006T102300.789-compact".into(),
             per_table: vec![
-                entry("orders_cdc", "orders", Ok(TableDone::Work { rows: 1200 })),
+                table_result(
+                    "orders_cdc",
+                    "orders",
+                    "compacted",
+                    &Ok(TableDone::Work(Work::compacted(
+                        1200,
+                        merge.dml(),
+                        false,
+                        Some(10_150),
+                    ))),
+                    &merge,
+                ),
                 entry(
                     "users_cdc",
                     "users",

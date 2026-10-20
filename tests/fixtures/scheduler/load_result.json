@@ -7,6 +7,19 @@
       "status": "loaded",
       "skip_reason": null,
       "rows": 1200,
+      "rows_inserted": 1200,
+      "rows_updated": null,
+      "rows_deleted": null,
+      "rows_merged": null,
+      "base_rows_after": null,
+      "files": 3,
+      "runs": 2,
+      "warehouse_job_ids": [
+        "rivet_load_orders_1",
+        "rivet_load_orders_2"
+      ],
+      "bytes_processed": 0,
+      "bytes_billed": 0,
       "error": null
     },
     {
@@ -15,6 +28,16 @@
       "status": "skipped",
       "skip_reason": "up_to_date",
       "rows": 0,
+      "rows_inserted": null,
+      "rows_updated": null,
+      "rows_deleted": null,
+      "rows_merged": null,
+      "base_rows_after": null,
+      "files": null,
+      "runs": null,
+      "warehouse_job_ids": [],
+      "bytes_processed": null,
+      "bytes_billed": null,
       "error": null
     },
     {
@@ -23,6 +46,18 @@
       "status": "failed",
       "skip_reason": null,
       "rows": 0,
+      "rows_inserted": null,
+      "rows_updated": null,
+      "rows_deleted": null,
+      "rows_merged": null,
+      "base_rows_after": null,
+      "files": null,
+      "runs": null,
+      "warehouse_job_ids": [
+        "rivet_load_events_1"
+      ],
+      "bytes_processed": null,
+      "bytes_billed": null,
       "error": {
         "code": null,
         "kind": null,
