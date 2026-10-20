@@ -579,7 +579,8 @@ mod tests {
 #[cfg(test)]
 mod document_tests {
     use crate::load::plan::{CdcLayout, LoadMode};
-    use crate::load::result::tests::journal_of;
+    use crate::load::result::Address;
+    use crate::load::result::tests::{at, journal_of};
     use crate::load::result::{
         CommandResult, DmlCounts, JobJournal, TableDone, Work, table_result,
     };
@@ -593,8 +594,22 @@ mod document_tests {
     /// The documents `rivet compact` builds from the outcomes the two fixtures describe, key for key.
     #[test]
     fn the_compact_documents_are_the_contract_fixtures() {
+        let address = |table: &str| -> Address {
+            let fqtn = format!("proj.analytics.{table}");
+            let buffer = ["orders", "users", "events"]
+                .contains(&table)
+                .then(|| format!("{fqtn}__changes"));
+            at(&fqtn, buffer.as_deref())
+        };
         let entry = |export: &str, table: &str, outcome: anyhow::Result<TableDone>| {
-            table_result(export, table, "compacted", &outcome, &JobJournal::new(true))
+            table_result(
+                export,
+                table,
+                &address(table),
+                "compacted",
+                &outcome,
+                &JobJournal::new(true),
+            )
         };
         let merge = journal_of(&[(
             "rivet_compact_orders_1",
@@ -611,6 +626,10 @@ mod document_tests {
                 table_result(
                     "orders_cdc",
                     "orders",
+                    &at(
+                        "proj.analytics.orders",
+                        Some("proj.analytics.orders__changes"),
+                    ),
                     "compacted",
                     &Ok(TableDone::Work(Work::compacted(
                         1200,
@@ -648,10 +667,13 @@ mod document_tests {
         );
         let log_only = CommandResult {
             run_id: "20261006T102400.012-compact".into(),
-            per_table: vec![entry(
+            per_table: vec![table_result(
                 "orders_cdc",
                 "orders",
-                skipped(LoadMode::Cdc, CdcLayout::LogAndView, false),
+                &at("analytics.orders", None),
+                "compacted",
+                &skipped(LoadMode::Cdc, CdcLayout::LogAndView, false),
+                &JobJournal::new(true),
             )],
         };
         assert_eq!(

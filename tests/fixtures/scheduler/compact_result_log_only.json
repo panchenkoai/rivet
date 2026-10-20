@@ -4,6 +4,8 @@
     {
       "export": "orders_cdc",
       "table": "orders",
+      "target": "analytics.orders",
+      "buffer": null,
       "status": "skipped",
       "skip_reason": "warehouse_never_compacts",
       "rows": 0,

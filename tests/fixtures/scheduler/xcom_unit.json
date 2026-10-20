@@ -1,6 +1,8 @@
 {
   "export": "orders_cdc",
   "table": null,
+  "target": null,
+  "buffer": null,
   "status": "failed",
   "run_id": "20261006T101500.123-orders_cdc",
   "rows": 0,

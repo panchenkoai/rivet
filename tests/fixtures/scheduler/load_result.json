@@ -4,6 +4,8 @@
     {
       "export": "orders_cdc",
       "table": "orders",
+      "target": "proj.analytics.orders__changes",
+      "buffer": null,
       "status": "loaded",
       "skip_reason": null,
       "rows": 1200,
@@ -25,6 +27,8 @@
     {
       "export": "countries",
       "table": "countries",
+      "target": "proj.analytics.countries",
+      "buffer": null,
       "status": "skipped",
       "skip_reason": "up_to_date",
       "rows": 0,
@@ -43,6 +47,8 @@
     {
       "export": "events",
       "table": "events",
+      "target": "proj.analytics.events",
+      "buffer": null,
       "status": "failed",
       "skip_reason": null,
       "rows": 0,

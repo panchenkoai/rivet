@@ -174,7 +174,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                                     plan.table,
                                     cdc_ok_line(&report)
                                 ));
-                                Ok(TableDone::Work(Work::loaded(report.rows_appended)))
+                                Ok(TableDone::Work(Work::loaded(
+                                    report.rows_appended,
+                                    &report.changes_table,
+                                )))
                             }
                             None => {
                                 say(format!("CDC LOAD SKIP [{}]: up to date", plan.table));
@@ -202,7 +205,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                                     plan.table,
                                     report.summary()
                                 ));
-                                Ok(TableDone::Work(Work::loaded(report.rows())))
+                                Ok(TableDone::Work(Work::loaded(report.rows(), report.wrote())))
                             }
                             None => {
                                 say(format!(
@@ -232,7 +235,10 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
                                     report.target_table,
                                     cleaned_suffix(report.source_cleaned)
                                 ));
-                                Ok(TableDone::Work(Work::loaded(report.rows_loaded)))
+                                Ok(TableDone::Work(Work::loaded(
+                                    report.rows_loaded,
+                                    &report.target_table,
+                                )))
                             }
                             None => {
                                 say(format!("LOAD SKIP [{}]: up to date", plan.table));
@@ -314,9 +320,44 @@ pub(super) fn command_result(
             .zip(outcomes)
             .zip(journals)
             .map(|((plan, outcome), journal)| {
-                load::result::table_result(&plan.export_name, &plan.table, done, outcome, journal)
+                load::result::table_result(
+                    &plan.export_name,
+                    &plan.table,
+                    &address_of(plan, run_id, done),
+                    done,
+                    outcome,
+                    journal,
+                )
             })
             .collect(),
+    }
+}
+
+/// What `plan`'s table is worked on through, named by its loader's own `fqtn` (building a loader
+/// does no I/O). A load (`done` = `loaded`) writes the change log of a `cdc` / `incremental` table,
+/// else the table; a load that wrote names what it wrote instead. A compact writes the base and
+/// reads the buffer of a layout that has one.
+pub(super) fn address_of(
+    plan: &load::plan::LoadPlan,
+    run_id: &str,
+    done: &str,
+) -> load::result::Address {
+    let loader = load::build_loader(plan, run_id, &Default::default());
+    let changes = loader.fqtn(&format!("{}__changes", plan.table));
+    let keeps_log = plan.mode != load::plan::LoadMode::Full;
+    match done {
+        "loaded" => load::result::Address {
+            target: if keeps_log {
+                changes
+            } else {
+                loader.fqtn(&plan.table)
+            },
+            buffer: None,
+        },
+        _ => load::result::Address {
+            target: loader.fqtn(&plan.table),
+            buffer: (keeps_log && plan.layout.compacts()).then_some(changes),
+        },
     }
 }
 
@@ -1947,6 +1988,14 @@ impl IncrementalReport {
         match self {
             IncrementalReport::Table(r) => r.rows_loaded,
             IncrementalReport::Changelog(r) => r.rows_appended,
+        }
+    }
+
+    /// The object this load wrote, as its loader named it.
+    pub fn wrote(&self) -> &str {
+        match self {
+            IncrementalReport::Table(r) => &r.target_table,
+            IncrementalReport::Changelog(r) => &r.changes_table,
         }
     }
 
@@ -5948,5 +5997,37 @@ mod overwritten_delta_tests {
                 source_cleaned: false,
             });
         assert_eq!((table.rows(), log.rows()), (7, 40));
+    }
+
+    /// A load names the object it writes, a compact the base it writes and the buffer it reads,
+    /// each through the loader's own `fqtn`.
+    #[test]
+    fn each_command_names_what_it_works_on_by_its_loaders_fqtn() {
+        use crate::load::plan::{CdcLayout, LoadMode, test_plan};
+        use crate::load::result::Address;
+        let at = |target: &str, buffer: Option<&str>| Address {
+            target: target.into(),
+            buffer: buffer.map(str::to_string),
+        };
+        let full = test_plan(LoadMode::Full, "gs://b/p/");
+        let log = test_plan(LoadMode::Cdc, "gs://b/p/");
+        let mut base = test_plan(LoadMode::Incremental, "gs://b/p/");
+        base.layout = CdcLayout::BaseAndBuffer;
+        let address = crate::load::orchestrate::address_of;
+        assert_eq!(address(&full, "r", "loaded"), at("p.d.orders", None));
+        assert_eq!(
+            address(&log, "r", "loaded"),
+            at("p.d.orders__changes", None)
+        );
+        assert_eq!(
+            address(&base, "r", "loaded"),
+            at("p.d.orders__changes", None)
+        );
+        assert_eq!(address(&full, "r", "compacted"), at("p.d.orders", None));
+        assert_eq!(address(&log, "r", "compacted"), at("p.d.orders", None));
+        assert_eq!(
+            address(&base, "r", "compacted"),
+            at("p.d.orders", Some("p.d.orders__changes"))
+        );
     }
 }

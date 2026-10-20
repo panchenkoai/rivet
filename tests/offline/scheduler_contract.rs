@@ -467,6 +467,8 @@ fn check_table_result(
         let fields = [
             ("export", Str, false),
             ("table", Str, false),
+            ("target", Str, false),
+            ("buffer", Str, true),
             ("status", Word(statuses), false),
             ("skip_reason", Word(skips), true),
             ("rows", Int, false),
@@ -533,6 +535,8 @@ fn check_table_result(
 fn check_xcom(v: &Value, at: &str) -> Check {
     let mut fields = UNIT.to_vec();
     fields.extend_from_slice(&[
+        ("target", Str, true),
+        ("buffer", Str, true),
         ("status", Str, false),
         ("run_id", Str, false),
         ("rows", Int, false),
@@ -555,6 +559,12 @@ fn check_xcom(v: &Value, at: &str) -> Check {
     })?;
     require(v["files"].is_null() == of_table, || {
         format!("{at}: files is a number for a run unit and null for a load or compact unit")
+    })?;
+    require(v["target"].is_null() != of_table, || {
+        format!("{at}: target names the object of a load or compact unit, null for a run unit")
+    })?;
+    require(of_table || v["buffer"].is_null(), || {
+        format!("{at}: only a compact unit reads a buffer")
     })?;
     require(!of_table || v["stop_reason"].is_null(), || {
         format!("{at}: only a run unit has a stop_reason")

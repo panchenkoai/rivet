@@ -9,7 +9,7 @@ use serde::Serialize;
 pub(crate) const UP_TO_DATE: &str = "up_to_date";
 
 /// What one table of a load or compact came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableDone {
     /// The command did its work.
     Work(Work),
@@ -18,9 +18,11 @@ pub(crate) enum TableDone {
 }
 
 /// The counts of one table's work, each as the warehouse or the ledger returned it; `None` is unknown, never 0.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Work {
     pub rows: u64,
+    /// The object a load wrote, as its loader named it; `None` keeps the table's [`Address`].
+    pub wrote: Option<String>,
     pub rows_inserted: Option<u64>,
     pub rows_updated: Option<u64>,
     pub rows_deleted: Option<u64>,
@@ -31,9 +33,10 @@ pub(crate) struct Work {
 impl Work {
     /// A load whose `rows` are what it landed in the table consumers read, or appended to its
     /// log; what it inserted in all, a baseline leg included, is the journal's.
-    pub(crate) fn loaded(rows: u64) -> Self {
+    pub(crate) fn loaded(rows: u64, wrote: &str) -> Self {
         Work {
             rows,
+            wrote: Some(wrote.to_string()),
             ..Work::default()
         }
     }
@@ -48,6 +51,7 @@ impl Work {
     ) -> Self {
         Work {
             rows,
+            wrote: None,
             rows_inserted: dml.map(|d| d.inserted),
             rows_updated: dml.map(|d| d.updated),
             rows_deleted: dml.filter(|_| !flagged).map(|d| d.deleted),
@@ -143,11 +147,22 @@ fn sum_reported(jobs: &[WarehouseJob], field: fn(&WarehouseJob) -> Option<u64>) 
     jobs.iter().filter_map(field).reduce(|a, b| a + b)
 }
 
+/// The warehouse objects a table's command works on, named by its loader's own `fqtn`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Address {
+    /// What the command writes: a load's table or change log, a compact's base.
+    pub target: String,
+    /// The buffer a compact reads from; `None` for a load and for a table without one.
+    pub buffer: Option<String>,
+}
+
 /// One `per_table[]` entry.
 #[derive(Debug, Serialize)]
 pub(crate) struct TableResult {
     pub export: String,
     pub table: String,
+    pub target: String,
+    pub buffer: Option<String>,
     pub status: &'static str,
     pub skip_reason: Option<&'static str>,
     pub rows: u64,
@@ -176,12 +191,13 @@ pub(crate) struct CommandResult {
 pub(crate) fn table_result(
     export: &str,
     table: &str,
+    address: &Address,
     done: &'static str,
     outcome: &Result<TableDone>,
     journal: &JobJournal,
 ) -> TableResult {
     let (status, skip_reason, work, error) = match outcome {
-        Ok(TableDone::Work(work)) => (done, None, *work, None),
+        Ok(TableDone::Work(work)) => (done, None, work.clone(), None),
         Ok(TableDone::Skipped(why)) => ("skipped", Some(*why), Work::default(), None),
         Err(e) => (
             "failed",
@@ -195,6 +211,8 @@ pub(crate) fn table_result(
     TableResult {
         export: export.to_string(),
         table: table.to_string(),
+        target: work.wrote.clone().unwrap_or_else(|| address.target.clone()),
+        buffer: address.buffer.clone().filter(|_| status != "skipped"),
         status,
         skip_reason,
         rows: work.rows,
@@ -314,8 +332,9 @@ pub(crate) mod tests {
         let loaded = table_result(
             "e",
             "t",
+            &Address::default(),
             "loaded",
-            &Ok(TableDone::Work(Work::loaded(7))),
+            &Ok(TableDone::Work(Work::loaded(7, "t"))),
             &none,
         );
         assert_eq!(
@@ -326,6 +345,7 @@ pub(crate) mod tests {
         let skipped = table_result(
             "e",
             "t",
+            &Address::default(),
             "loaded",
             &Ok(TableDone::Skipped(UP_TO_DATE)),
             &none,
@@ -335,7 +355,14 @@ pub(crate) mod tests {
             ("skipped", Some("up_to_date"), 0)
         );
         let refused = crate::error::coded(crate::error::codes::LOAD_TABLE_BUSY, "busy");
-        let failed = table_result("e", "t", "compacted", &Err(refused), &none);
+        let failed = table_result(
+            "e",
+            "t",
+            &Address::default(),
+            "compacted",
+            &Err(refused),
+            &none,
+        );
         assert_eq!((failed.status, failed.skip_reason), ("failed", None));
         let error = failed
             .error
@@ -348,6 +375,14 @@ pub(crate) mod tests {
                 "busy"
             ))
         );
+    }
+
+    /// The address of a table whose loader names it `target`, beside `buffer`.
+    pub(crate) fn at(target: &str, buffer: Option<&str>) -> Address {
+        Address {
+            target: target.into(),
+            buffer: buffer.map(str::to_string),
+        }
     }
 
     /// A journal of a target that names its jobs, holding `jobs`.
@@ -378,13 +413,18 @@ pub(crate) mod tests {
                 table_result(
                     "orders_cdc",
                     "orders",
+                    &at("proj.analytics.orders__changes", None),
                     "loaded",
-                    &Ok(TableDone::Work(Work::loaded(1200))),
+                    &Ok(TableDone::Work(Work::loaded(
+                        1200,
+                        "proj.analytics.orders__changes",
+                    ))),
                     &orders,
                 ),
                 table_result(
                     "countries",
                     "countries",
+                    &at("proj.analytics.countries", None),
                     "loaded",
                     &Ok(TableDone::Skipped(UP_TO_DATE)),
                     &JobJournal::new(true),
@@ -392,6 +432,7 @@ pub(crate) mod tests {
                 table_result(
                     "events",
                     "events",
+                    &at("proj.analytics.events", None),
                     "loaded",
                     &Err(anyhow::anyhow!("table 'events': connection reset by peer")),
                     &journal_of(&[("rivet_load_events_1", None, None)]),
@@ -410,8 +451,9 @@ pub(crate) mod tests {
         let quiet = table_result(
             "e",
             "t",
+            &Address::default(),
             "loaded",
-            &Ok(TableDone::Work(Work::loaded(5))),
+            &Ok(TableDone::Work(Work::loaded(5, "t"))),
             &journal_of(&[("q1", None, None), ("q2", None, None)]),
         );
         assert_eq!(
@@ -426,8 +468,9 @@ pub(crate) mod tests {
         let entry = table_result(
             "e",
             "t",
+            &Address::default(),
             "loaded",
-            &Ok(TableDone::Work(Work::loaded(5))),
+            &Ok(TableDone::Work(Work::loaded(5, "t"))),
             &unnamed,
         );
         assert_eq!(entry.warehouse_job_ids, None);
@@ -439,8 +482,9 @@ pub(crate) mod tests {
         let entry = table_result(
             "e",
             "t",
+            &Address::default(),
             "loaded",
-            &Ok(TableDone::Work(Work::loaded(5))),
+            &Ok(TableDone::Work(Work::loaded(5, "t"))),
             &summed,
         );
         assert_eq!(
@@ -485,7 +529,7 @@ pub(crate) mod tests {
             (flagged.rows_updated, flagged.rows_deleted),
             (Some(22), None)
         );
-        let loaded = Work::loaded(9);
+        let loaded = Work::loaded(9, "t");
         assert_eq!(
             (loaded.rows, loaded.rows_inserted, loaded.rows_merged),
             (9, None, None)
@@ -543,8 +587,9 @@ pub(crate) mod tests {
             per_table: vec![table_result(
                 "e",
                 "t",
+                &Address::default(),
                 "loaded",
-                &Ok(TableDone::Work(Work::loaded(3))),
+                &Ok(TableDone::Work(Work::loaded(3, "t"))),
                 &JobJournal::default(),
             )],
         };

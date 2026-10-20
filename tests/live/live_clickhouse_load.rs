@@ -2670,24 +2670,22 @@ fn a_clickhouse_load_digest_is_what_clickhouse_logged_for_its_queries() {
             "cycle {cycle}: the inserts wrote what the digest says: {entry}"
         );
         assert_eq!(entry["rows_inserted"], entry["rows"]);
+        let target = entry["target"]
+            .as_str()
+            .expect("the loader's name for the table");
+        assert!(entry["buffer"].is_null(), "a load reads no buffer: {entry}");
+        let held = clickhouse_rows(&format!(
+            "SELECT id, v FROM {target} ORDER BY id FORMAT TSV"
+        ));
         assert_eq!(
             entry["rows"],
-            serde_json::json!(
-                clickhouse_rows(&format!(
-                    "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
-                    db.0
-                ))
-                .len()
-            ),
+            serde_json::json!(held.len()),
             "cycle {cycle}"
         );
         assert_eq!(
-            clickhouse_rows(&format!(
-                "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
-                db.0
-            )),
+            held,
             pg_rows(&mut c, &tbl),
-            "cycle {cycle}: the table holds the source's values"
+            "cycle {cycle}: the table the entry names holds the source's values"
         );
         assert_eq!(
             entry["files"],

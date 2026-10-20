@@ -1172,6 +1172,12 @@ fn a_bigquery_load_and_compact_digest_is_what_bq_reads_back() {
     assert_eq!(load["status"], "loaded", "{load}");
     assert_eq!(load["rows_inserted"], 5, "{load}");
     assert_eq!(bq.read_bq_count(&table), "5");
+    let count = |fqtn: &str| -> String {
+        bq.read_bq_rows(&format!("SELECT COUNT(*) AS n FROM `{fqtn}`"))[0]["n"]
+            .as_str()
+            .expect("a count")
+            .to_string()
+    };
     let ((processed, billed), _) = jobs_as_bq_reads_them(&bq, &ids_of(&load));
     assert_eq!(
         (
@@ -1205,8 +1211,16 @@ fn a_bigquery_load_and_compact_digest_is_what_bq_reads_back() {
     scn.rig.run_ok();
     let load = digest_of(&scn.rig, "load");
     assert_eq!(load["rows_inserted"], 5, "{load}");
-    let buffered = bq.read_bq_count(&changes);
-    assert_eq!(buffered, "5");
+    let wrote = load["target"]
+        .as_str()
+        .expect("the loader's name for the log it wrote")
+        .to_string();
+    assert!(load["buffer"].is_null(), "a load reads no buffer: {load}");
+    let buffered = count(&wrote);
+    assert_eq!(
+        buffered, "5",
+        "the log the entry names holds the five changes"
+    );
 
     let compact = digest_of(&scn.rig, "compact");
     assert_eq!(compact["status"], "compacted", "{compact}");
@@ -1239,8 +1253,16 @@ fn a_bigquery_load_and_compact_digest_is_what_bq_reads_back() {
     );
     assert_eq!(compact["rows_merged"].to_string(), buffered, "{compact}");
     assert_eq!(
+        compact["buffer"].as_str(),
+        Some(wrote.as_str()),
+        "the compact read the buffer the load wrote: {compact}"
+    );
+    let base = compact["target"]
+        .as_str()
+        .expect("the base the MERGE wrote");
+    assert_eq!(
         compact["base_rows_after"].to_string(),
-        bq.read_bq_count(&table),
+        count(base),
         "{compact}"
     );
     assert_eq!(

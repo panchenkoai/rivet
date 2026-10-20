@@ -1,6 +1,8 @@
 {
   "export": "orders_cdc",
   "table": "orders",
+  "target": "proj.analytics.orders__changes",
+  "buffer": null,
   "status": "loaded",
   "run_id": "20261006T101900.456-load",
   "rows": 1200,

@@ -1,5 +1,7 @@
 - **The `rivet load` / `rivet compact` document said how many rows, not what the warehouse did with
-  them or what it cost.** **Now** each `per_table[]` entry also carries `rows_inserted`, `rows_updated`,
+  them or what it cost.** **Now** each `per_table[]` entry also carries `target` (the object the command wrote, named exactly as
+  its loader addressed it: a load's table or `__changes` log, a compact's base) and `buffer` (the buffer a
+  compact read), `rows_inserted`, `rows_updated`,
   `rows_deleted`, `rows_merged`, `base_rows_after`, `files`, `runs`, `warehouse_job_ids`,
   `bytes_processed` and `bytes_billed` (ADR-0039 D3). Every count is what the warehouse or the ledger
   returned: a compact's inserted / updated / deleted rows are its BigQuery MERGE jobs' `dmlStats` (a
