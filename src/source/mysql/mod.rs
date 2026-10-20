@@ -56,6 +56,7 @@ pub use proxy::MysqlProxyKind;
 pub struct MysqlSource {
     pool: Pool,
     proxy_kind: MysqlProxyKind,
+    session: std::sync::Arc<SessionPlan>,
 }
 
 /// Pool options that prevent eager pre-connection. The default mysql::Pool
@@ -64,6 +65,9 @@ pub struct MysqlSource {
 fn lean_pool_opts() -> PoolOpts {
     PoolOpts::default()
         .with_constraints(PoolConstraints::new(1, 100).expect("valid pool constraints"))
+        // The session settings stay on a connection rivet's own pool hands back, so a reused
+        // connection needs no SET (`MysqlSessionGuard`); a reset would drop them unseen.
+        .with_reset_connection(false)
 }
 
 /// Sample the FOREIGN-pressure proxy for the concurrency governor:
@@ -124,21 +128,49 @@ impl MysqlSource {
     /// all funnel through here (also handy in tests that share the pool for
     /// post-export state inspection).
     pub fn from_pool(pool: Pool) -> Self {
+        Self::over(pool, false)
+    }
+
+    /// A source over `pool`; `keeps_session` when the pool hands connections back unreset (rivet's own).
+    fn over(pool: Pool, keeps_session: bool) -> Self {
         let proxy_kind = detect_mysql_proxy_kind(&pool);
+        Self::with_kind(pool, keeps_session, proxy_kind)
+    }
+
+    /// Connect rivet's own pool to `url`. The proxy probe runs on a connection of its own, closed
+    /// after it: it reads `@@` variables, after which ProxySQL keeps a session on one backend.
+    fn connect_own(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+        let pool = connect_pool(url, tls)?;
+        let proxy_kind = match dial_conn(url, tls) {
+            Ok(mut probe) => proxy::detect_proxy_on_conn(&mut probe),
+            Err(_) => detect_mysql_proxy_kind(&pool),
+        };
+        Ok(Self::with_kind(pool, true, proxy_kind))
+    }
+
+    /// A source over `pool`, whose proxy kind is known.
+    fn with_kind(pool: Pool, keeps_session: bool, proxy_kind: MysqlProxyKind) -> Self {
         warn_proxy_kind(proxy_kind);
-        Self { pool, proxy_kind }
+        Self {
+            pool,
+            proxy_kind,
+            session: std::sync::Arc::new(SessionPlan {
+                keeps_session,
+                ..Default::default()
+            }),
+        }
     }
 
     /// Connect with no transport security (legacy path); the live tests reach it
     /// through the library surface, so the binary unit sees it as unused.
     #[allow(dead_code)]
     pub fn connect(url: &str) -> Result<Self> {
-        Ok(Self::from_pool(connect_pool(url, None)?))
+        Self::connect_own(url, None)
     }
 
     /// Connect honoring the user's [`TlsConfig`].
     pub fn connect_with_tls(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
-        Ok(Self::from_pool(connect_pool(url, tls)?))
+        Self::connect_own(url, tls)
     }
 
     /// Expose the proxy classification for diagnostic tools (preflight,
@@ -162,7 +194,7 @@ pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
     crate::source::require_tls_or_loopback(url, tls)?;
     let opts = with_tls(
-        OptsBuilder::from_opts(Opts::from_url(url)?).pool_opts(lean_pool_opts()),
+        session_opts(OptsBuilder::from_opts(Opts::from_url(url)?)).pool_opts(lean_pool_opts()),
         tls,
     );
     let pool = Pool::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))?;
@@ -175,8 +207,22 @@ pub(crate) fn connect_pool(url: &str, tls: Option<&TlsConfig>) -> Result<Pool> {
 /// Dial one MySQL `Conn` under the same TLS gate and host:port-naming error as [`connect_pool`].
 pub(crate) fn dial_conn(url: &str, tls: Option<&TlsConfig>) -> Result<Conn> {
     crate::source::require_tls_or_loopback(url, tls)?;
-    let opts = with_tls(OptsBuilder::from_opts(Opts::from_url(url)?), tls);
+    let opts = with_tls(
+        session_opts(OptsBuilder::from_opts(Opts::from_url(url)?)),
+        tls,
+    );
     Conn::new(opts).map_err(|e| crate::source::describe_connect_error(url, e.into()))
+}
+
+/// The largest packet the driver splits its own writes at, given so it does not ask the server.
+const CLIENT_MAX_ALLOWED_PACKET: usize = 64 * 1024 * 1024;
+
+/// Options under which the driver's handshake reads no `@@` variable (`@@socket`,
+/// `@@max_allowed_packet`): ProxySQL stops multiplexing a session that reads one.
+fn session_opts(builder: OptsBuilder) -> OptsBuilder {
+    builder
+        .prefer_socket(false)
+        .max_allowed_packet(Some(CLIENT_MAX_ALLOWED_PACKET))
 }
 
 /// Apply an enforced [`TlsConfig`] to the driver's SSL options; anything else stays plaintext.
@@ -431,22 +477,6 @@ fn build_mysql_ssl_opts(cfg: &TlsConfig) -> SslOpts {
     ssl
 }
 
-/// RAII reset of the per-connection session state the export mutates
-/// (`time_zone`, optionally `max_execution_time`) — the MySQL analogue of
-/// `postgres::PgTxnGuard` (Epic 18 B1).
-///
-/// MySQL hands connections back to the `mysql` crate's pool on drop, and may sit
-/// behind ProxySQL / MaxScale that reuse a physical backend across logical
-/// connections. The previous end-of-`export()` reset covered success and the
-/// `Err` return (no `?`), but **not** a panic mid-export, nor an early `?` on
-/// the `SET max_execution_time` itself (MariaDB spells it `max_statement_time`,
-/// so that SET errors — and `time_zone`, already set, would leak). Arming the
-/// reset on `Drop` closes both: whatever exit path the export takes, the
-/// connection is clean before it returns to the pool.
-/// The session's `time_zone` and its offset from UTC in seconds, read on the connection that reads the rows.
-const SESSION_UTC_OFFSET: &str =
-    "SELECT @@session.time_zone, TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6))";
-
 /// Refuse a session whose clock is not UTC after rivet set `time_zone = '+00:00'`.
 ///
 /// Every TIMESTAMP is read in the session time zone and written as UTC, so a SET that did not
@@ -497,44 +527,136 @@ mod session_time_zone_tests {
     }
 }
 
+/// The server defaults a session is derived from, read once per pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerDefaults {
+    sql_mode: String,
+    max_exec_ms: u64,
+}
+
+/// Reads the server's `sql_mode` and `max_execution_time` without a `@@` variable, whose read
+/// makes ProxySQL stop multiplexing the session.
+const SERVER_DEFAULTS: &str =
+    "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('sql_mode', 'max_execution_time')";
+
+/// The session clock's offset from UTC, read without a session variable so a multiplexing proxy keeps multiplexing.
+const SESSION_OFFSET: &str = "SELECT TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), NOW(6))";
+
+/// The session settings of one pool's connections: the server defaults, read once, and the
+/// `max_execution_time` each connection was last given, by connection id.
+#[derive(Debug, Default)]
+struct SessionPlan {
+    /// Whether the pool keeps a connection's session when it is handed back (rivet's own pool).
+    keeps_session: bool,
+    defaults: std::sync::OnceLock<ServerDefaults>,
+    given: std::sync::Mutex<std::collections::HashMap<u32, u64>>,
+}
+
+impl SessionPlan {
+    /// The server defaults, read on `conn` the first time they are asked for.
+    fn defaults(&self, conn: &mut mysql::PooledConn) -> Result<ServerDefaults> {
+        if let Some(d) = self.defaults.get() {
+            return Ok(d.clone());
+        }
+        let rows: Vec<(String, String)> = conn.query(SERVER_DEFAULTS)?;
+        let value = |name: &str| {
+            rows.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
+        let read = ServerDefaults {
+            sql_mode: value("sql_mode").unwrap_or_default(),
+            max_exec_ms: value("max_execution_time")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        };
+        Ok(self.defaults.get_or_init(|| read).clone())
+    }
+}
+
+/// The server's `sql_mode` without `NO_BACKSLASH_ESCAPES`, which the inline keyset boundary literals need off.
+fn wanted_sql_mode(global: &str) -> String {
+    global
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("NO_BACKSLASH_ESCAPES"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The literal SETs a connection needs: all three the first time (`given` is `None`), else only
+/// `max_execution_time` when this read wants another one than the connection was given. The
+/// time zone is UTC (Parquet writes `isAdjustedToUTC=true`), `sql_mode` the server's without
+/// `NO_BACKSLASH_ESCAPES`, and `max_execution_time` the configured one, else the server's.
+fn session_sets(
+    defaults: &ServerDefaults,
+    given: Option<u64>,
+    max_exec_ms: Option<u64>,
+) -> Vec<String> {
+    let max = max_exec_ms.unwrap_or(defaults.max_exec_ms);
+    let mut sets = Vec::new();
+    if given.is_none() {
+        sets.push("SET time_zone = '+00:00'".to_string());
+        sets.push(format!(
+            "SET SESSION sql_mode = '{}'",
+            wanted_sql_mode(&defaults.sql_mode)
+                .replace('\\', "\\\\")
+                .replace('\'', "''")
+        ));
+    }
+    if given != Some(max) {
+        sets.push(format!("SET SESSION max_execution_time = {max}"));
+    }
+    sets
+}
+
+/// A pooled connection in the session a read needs.
+///
+/// The settings are literal SETs, sent once per connection and kept on it: the pool is rivet's
+/// own, and a later read that wants another `max_execution_time` sends that one literal. A literal
+/// SET is what ProxySQL tracks and replays on whichever backend connection it multiplexes the
+/// session onto; an expression (`REPLACE(@@sql_mode, ..)`, `@@global.time_zone`) it cannot parse
+/// and locks the session to one hostgroup, and a read of a session variable stops multiplexing.
+/// The session clock is checked on every checkout, so a proxy that dropped the SET is refused
+/// before a row is read.
 struct MysqlSessionGuard<'a> {
     conn: &'a mut mysql::PooledConn,
-    reset_max_exec: bool,
 }
 
 impl<'a> MysqlSessionGuard<'a> {
-    /// Apply the session SETs and arm the reset. `time_zone` is always set (UTC
-    /// normalisation so Parquet writes `isAdjustedToUTC=true`); the guard is
-    /// constructed *immediately* after it, so if the later `max_execution_time`
-    /// SET fails (or anything panics), `Drop` still resets `time_zone`.
-    fn apply(conn: &'a mut mysql::PooledConn, max_exec_ms: Option<u64>) -> Result<Self> {
-        conn.query_drop("SET time_zone = '+00:00'")?;
-        let mut guard = Self {
-            conn,
-            reset_max_exec: false,
+    /// Bring the session to what a read needs and refuse one whose clock is not UTC.
+    fn apply(
+        conn: &'a mut mysql::PooledConn,
+        plan: &SessionPlan,
+        max_exec_ms: Option<u64>,
+    ) -> Result<Self> {
+        let defaults = plan.defaults(conn)?;
+        let id = conn.connection_id();
+        let given = match plan.keeps_session {
+            true => plan
+                .given
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&id)
+                .copied(),
+            false => None,
         };
-        // Pin sql_mode so NO_BACKSLASH_ESCAPES is OFF: the parallel-keyset inline
-        // boundary literals (escape_mysql_literal) use backslash escaping, which is
-        // ONLY correct when backslash is an escape char. Under a server default of
-        // NO_BACKSLASH_ESCAPES a boundary like 'C:\data' would parse as a DIFFERENT
-        // value than the `?`-bound next-page cursor, silently dropping/dup'ing the
-        // row on that boundary (the encode-leg class the process rules pins for PG). Removing
-        // just that flag keeps the server's other modes (strictness etc.) intact.
-        guard
-            .conn
-            .query_drop("SET SESSION sql_mode = REPLACE(@@sql_mode, 'NO_BACKSLASH_ESCAPES', '')")?;
-        if let Some(ms) = max_exec_ms {
-            guard
-                .conn
-                .query_drop(format!("SET SESSION max_execution_time = {ms}"))?;
-            guard.reset_max_exec = true;
+        let sets = session_sets(&defaults, given, max_exec_ms);
+        for set in &sets {
+            conn.query_drop(set)?;
         }
-        let (zone, offset_s): (String, i64) = guard
-            .conn
-            .query_first(SESSION_UTC_OFFSET)?
-            .unwrap_or_else(|| (String::new(), 0));
-        refuse_a_session_off_utc(&zone, offset_s)?;
-        Ok(guard)
+        if !sets.is_empty() {
+            plan.given
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, max_exec_ms.unwrap_or(defaults.max_exec_ms));
+        }
+        let offset_s: i64 = conn.query_first(SESSION_OFFSET)?.unwrap_or(0);
+        if offset_s != 0 {
+            let zone: Option<String> = conn.query_first("SELECT @@session.time_zone")?;
+            refuse_a_session_off_utc(zone.as_deref().unwrap_or(""), offset_s)?;
+        }
+        Ok(Self { conn })
     }
 
     fn conn(&mut self) -> &mut mysql::PooledConn {
@@ -542,24 +664,55 @@ impl<'a> MysqlSessionGuard<'a> {
     }
 }
 
-impl Drop for MysqlSessionGuard<'_> {
-    fn drop(&mut self) {
-        // Best-effort; the connection is about to return to the pool either way.
-        let _ = self.conn.query_drop("SET time_zone = @@global.time_zone");
-        let _ = self
-            .conn
-            .query_drop("SET SESSION sql_mode = @@global.sql_mode");
-        if self.reset_max_exec {
-            let _ = self.conn.query_drop("SET SESSION max_execution_time = 0");
+#[cfg(test)]
+mod session_set_tests {
+    use super::*;
+
+    fn defaults() -> ServerDefaults {
+        ServerDefaults {
+            sql_mode: "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES".into(),
+            max_exec_ms: 0,
         }
+    }
+
+    /// A new connection gets three literal SETs; a reused one none, or one when its timeout changes.
+    #[test]
+    fn a_connection_is_set_once_by_literals_and_again_only_for_another_timeout() {
+        assert_eq!(
+            session_sets(&defaults(), None, Some(300_000)),
+            [
+                "SET time_zone = '+00:00'",
+                "SET SESSION sql_mode = 'STRICT_TRANS_TABLES'",
+                "SET SESSION max_execution_time = 300000",
+            ]
+        );
+        assert!(session_sets(&defaults(), Some(300_000), Some(300_000)).is_empty());
+        assert_eq!(
+            session_sets(&defaults(), Some(300_000), None),
+            ["SET SESSION max_execution_time = 0"],
+            "an export without a timeout gets the server's back, as a literal"
+        );
+        assert!(session_sets(&defaults(), Some(0), None).is_empty());
+        for sql in session_sets(&defaults(), None, Some(1)) {
+            assert!(!sql.contains('@'), "a literal, never an expression: {sql}");
+        }
+    }
+
+    #[test]
+    fn the_wanted_sql_mode_is_the_servers_without_no_backslash_escapes() {
+        assert_eq!(wanted_sql_mode("NO_BACKSLASH_ESCAPES"), "");
+        assert_eq!(
+            wanted_sql_mode("ANSI_QUOTES,no_backslash_escapes,STRICT_ALL_TABLES"),
+            "ANSI_QUOTES,STRICT_ALL_TABLES"
+        );
+        assert_eq!(wanted_sql_mode(""), "");
     }
 }
 
 /// Execute the MySQL query and stream results to sink.
 ///
-/// Session-state cleanup (`time_zone`, `max_execution_time`) is handled by the
-/// caller's [`MysqlSessionGuard`], which resets it on `Drop` regardless of how
-/// this function exits (success, `Err`, or panic).
+/// The session (`time_zone`, `sql_mode`, `max_execution_time`) is set by the caller's
+/// [`MysqlSessionGuard`] before the read.
 ///
 /// `sample_pool`: when `tuning.adaptive` is true, a clone of the source pool used
 /// to obtain a second connection for extraction-pressure sampling without interfering
@@ -748,14 +901,11 @@ impl super::Source for MysqlSource {
 
         let mut conn = self.pool.get_conn()?;
 
-        // Per-connection session state, reset on `Drop` (Epic 18 B1) so a pooled
-        // connection — returned to the mysql-crate pool or reused behind
-        // ProxySQL/MaxScale — never carries our settings into the next checkout,
-        // even on a panic or an early return. `time_zone` normalises TIMESTAMP to
-        // UTC (Parquet `isAdjustedToUTC=true`); `max_execution_time` bounds the
-        // statement when a timeout is configured.
+        // The session a read needs, set once per pooled connection by literal SETs (ProxySQL
+        // tracks `time_zone`, `sql_mode` and `max_execution_time` and replays them on the backend
+        // it multiplexes the session onto).
         let max_exec_ms = max_execution_ms(request.tuning.statement_timeout_s);
-        let mut guard = MysqlSessionGuard::apply(&mut conn, max_exec_ms)?;
+        let mut guard = MysqlSessionGuard::apply(&mut conn, &self.session, max_exec_ms)?;
 
         let sample_pool = if request.tuning.adaptive {
             Some(self.pool.clone())
@@ -771,9 +921,6 @@ impl super::Source for MysqlSource {
             request.column_overrides,
             sink,
         );
-        // Reset now (success or `Err`); the `Drop` impl is the backstop for a
-        // panic or early return inside `mysql_run_export`.
-        drop(guard);
 
         // The empty-result fallback to `Schema::empty()` lives here for
         // parity with the PG implementation, even though `exec_iter` always
@@ -803,7 +950,7 @@ impl super::Source for MysqlSource {
             name.replace('\'', "''")
         );
         let mut conn = self.pool.get_conn()?;
-        let mut guard = MysqlSessionGuard::apply(&mut conn, None)?;
+        let mut guard = MysqlSessionGuard::apply(&mut conn, &self.session, None)?;
         let cols: Vec<String> = guard.conn().query(sql)?;
         Ok(crate::source::split_key_list(Some(cols.join("\u{1f}"))))
     }
@@ -815,7 +962,7 @@ impl super::Source for MysqlSource {
         // sample_key_boundaries runs INLINE escaped boundary literals through here; a
         // sampler whose sql_mode disagrees with the workers' mis-parses a backslash-
         // bearing key and drifts the percentile split points (the M1 hole this closes).
-        let mut guard = MysqlSessionGuard::apply(&mut conn, None)?;
+        let mut guard = MysqlSessionGuard::apply(&mut conn, &self.session, None)?;
         let row: Option<mysql::Row> = guard.conn().query_first(sql)?;
         match row {
             Some(r) => {
@@ -920,35 +1067,34 @@ impl super::Source for MysqlSource {
     }
 
     fn server_context(&mut self) -> Option<String> {
-        // Best-effort per var (a proxy or older server may omit one).
-        // `@@max_execution_time` (ms) is the query-level limit that surfaces as
-        // ERROR 3024 — the single field that makes a timeout post-mortem possible.
-        let version = self.query_scalar("SELECT @@version").ok().flatten();
-        let max_exec = self
-            .query_scalar("SELECT @@max_execution_time")
-            .ok()
-            .flatten();
-        // GLOBAL (server truth), not the SESSION value — query_scalar now runs through
-        // MysqlSessionGuard, which pins the session `time_zone`/`sql_mode` (bug #2). A
-        // session read would report the guard's normalized values (+00:00, NO_BACKSLASH_
-        // ESCAPES stripped) and HIDE the exact server settings this forensic snapshot
-        // exists to surface (a tz shift / a backslash-escape data issue).
-        let sql_mode = self.query_scalar("SELECT @@global.sql_mode").ok().flatten();
-        let time_zone = self
-            .query_scalar("SELECT @@global.time_zone")
-            .ok()
-            .flatten();
-        let wait_timeout = self.query_scalar("SELECT @@wait_timeout").ok().flatten();
-        let max_conns = self.query_scalar("SELECT @@max_connections").ok().flatten();
+        // One `SHOW GLOBAL VARIABLES`, never a `@@` read: ProxySQL stops multiplexing a session
+        // that reads one. Global values: the server truth this forensic snapshot exists for, not
+        // the session the guard set (+00:00, NO_BACKSLASH_ESCAPES stripped). Best-effort per
+        // variable (a proxy or older server may omit one). `max_execution_time` (ms) is the limit
+        // that surfaces as ERROR 3024.
+        let rows: Vec<(String, String)> = (|| -> Result<Vec<(String, String)>> {
+            let mut conn = self.pool.get_conn()?;
+            let mut guard = MysqlSessionGuard::apply(&mut conn, &self.session, None)?;
+            Ok(guard.conn().query(
+                "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('version', 'max_execution_time', \
+                 'sql_mode', 'time_zone', 'wait_timeout', 'max_connections')",
+            )?)
+        })()
+        .unwrap_or_default();
+        let var = |name: &str| {
+            rows.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        };
         Some(
             serde_json::json!({
                 "engine": "mysql",
-                "version": version,
-                "max_execution_time_ms": max_exec,
-                "sql_mode": sql_mode,
-                "time_zone": time_zone,
-                "wait_timeout_s": wait_timeout,
-                "max_connections": max_conns,
+                "version": var("version"),
+                "max_execution_time_ms": var("max_execution_time"),
+                "sql_mode": var("sql_mode"),
+                "time_zone": var("time_zone"),
+                "wait_timeout_s": var("wait_timeout"),
+                "max_connections": var("max_connections"),
             })
             .to_string(),
         )
