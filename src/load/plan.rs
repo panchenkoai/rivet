@@ -481,7 +481,16 @@ pub fn plan_loads(config_path: &str, selection: &Selection) -> Result<Vec<LoadPl
     // export of another config may have written that row, and its columns are not
     // this table's. The fit is checked strictly after the pin, or by
     // `check_spec_fit` when no pin is possible.
-    build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)
+    let mut plans = build_plans_keyed(&cfg, &load, reports, &keys, SpecFit::Deferred)?;
+    // The source the specs were read under, so the load pins its runs' specs under the same one.
+    for plan in &mut plans {
+        plan.source_key = state.spec_source(
+            cfg.source.try_state_key().ok(),
+            &plan.export_name,
+            plan.unit.as_deref(),
+        )?;
+    }
+    Ok(plans)
 }
 
 /// The column an incremental load's view orders by: the continued key, else the export's cursor.
@@ -2588,6 +2597,53 @@ load:
             Clustering::Auto(vec!["id".into()]),
             "cluster_by: auto is the key, and stays auto"
         );
+    }
+
+    /// A load host without the source's variable reads the one spec a run recorded on this state
+    /// (state v38 keys it by source); with two sources' specs it refuses by code instead of guessing.
+    #[test]
+    fn a_load_without_the_source_variable_reads_the_only_spec_and_refuses_two() {
+        use crate::types::{RivetType, TypeFidelity};
+        let var = "RIVET_TEST_LOAD_SPEC_SOURCE_NEVER_SET";
+        let (_dir, path) = cfg_file(&format!(
+            "source:\n  type: postgres\n  url_env: {var}\n\
+             exports:\n  - name: orders\n    table: t\n    mode: full\n    format: parquet\n    \
+             destination:\n      type: gcs\n      bucket: b\n      prefix: p/\nload:\n  \
+             target: bigquery\n  project: p\n  dataset: d\n"
+        ));
+        let col = crate::state::LoadSpecColumn {
+            name: "id".into(),
+            source_type: "native".into(),
+            rivet_type: RivetType::Int64,
+            fidelity: TypeFidelity::Exact,
+            nullable: false,
+            warnings: Vec::new(),
+        };
+        let state = crate::state::StateStore::open(&path).unwrap();
+        let record = |source: &str| {
+            state
+                .record_load_spec(
+                    "orders",
+                    None,
+                    source,
+                    std::slice::from_ref(&col),
+                    None,
+                    "run_1",
+                )
+                .unwrap()
+        };
+        record("postgres://h:5432/db");
+        let plans = plan_loads(&path, &Selection::default()).unwrap();
+        assert_eq!(plans[0].specs.len(), 1, "the run's spec types the load");
+        assert_eq!(plans[0].source_key, "postgres://h:5432/db");
+        record("postgres://other:5432/db");
+        let err = plan_loads(&path, &Selection::default()).unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_LOAD_SPEC_SOURCE_UNRESOLVED"),
+            "{err:#}"
+        );
+        assert_eq!(crate::error::classify_exit(&err), 1);
     }
 
     /// With nothing recorded the load refuses, naming the export and the command that records it.

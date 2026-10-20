@@ -404,6 +404,55 @@ fn batch_into_clickhouse_at(rig: Rig, db: &Db, prefix: &str) -> Rig {
         ))
 }
 
+/// `rivet load` runs where the source's variable is not set (a load task holds no source
+/// credential): it types the table from the spec the run recorded on this state and lands the
+/// source's rows. On 0.32.2's v38 state the load read the spec under the source key it resolved,
+/// empty here, and refused every table, `RIVET_LOAD_SPEC_MISSING`.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_load_without_the_source_variable_types_its_table_from_the_runs_spec() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_noenv", 5);
+    let db = Db::new("rivet_chtest");
+    let dir = tempfile::tempdir().expect("config dir");
+    let var = "RIVET_TEST_CH_SOURCE_URL";
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "source:\n  type: postgres\n  url_env: {var}\nexports:\n  - name: {tbl}\n    \
+             table: {tbl}\n    mode: full\n    format: parquet\n    destination: {{ type: gcs, \
+             bucket: {BUCKET}, prefix: \"{prefix}/{tbl}/\", endpoint: \"{FAKE_GCS_ENDPOINT}\", \
+             allow_anonymous: true }}\nload: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", \
+             database: {db}, user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id] }}\n",
+            prefix = unique_name("chnoenv"),
+            db = db.0
+        ),
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let ok = |args: &[&str], envs: &[(&str, &str)]| {
+        let out = run_rivet_env(args, envs);
+        assert!(
+            out.status.success(),
+            "rivet {args:?}:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    ok(&["run", "-c", cfg], &[(var, POSTGRES_URL)]);
+    ok(&["load", "-c", cfg], &[(PASSWORD_ENV, CLICKHOUSE_PASSWORD)]);
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT id, v FROM {}.{tbl} ORDER BY id FORMAT TSV",
+            db.0
+        )),
+        pg_rows(&mut c, &tbl),
+        "the load landed the source's rows"
+    );
+}
+
 /// A whole-table load replaces the table: the second load serves the source as it
 /// is now, not the union of both runs.
 #[test]

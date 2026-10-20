@@ -265,6 +265,38 @@ impl StateStore {
         Ok(())
     }
 
+    /// The source a load reads `export_name`'s spec under: the config's own when it resolves on
+    /// this host, else the one source that recorded a spec of the unit (none: the legacy row),
+    /// refused when several did and nothing here says which config this is.
+    pub fn spec_source(
+        &self,
+        configured: Option<String>,
+        export_name: &str,
+        unit: Option<&str>,
+    ) -> Result<String> {
+        if let Some(source) = configured {
+            return Ok(source);
+        }
+        let mut sources = self.query(
+            "SELECT DISTINCT source FROM export_load_spec \
+             WHERE export_name = ?1 AND unit = ?2 AND source <> '' ORDER BY source",
+            &[export_name.into(), unit.unwrap_or("").into()],
+            |r| r.text(0),
+        )?;
+        match sources.len() {
+            0 => Ok(String::new()),
+            1 => Ok(sources.remove(0)),
+            n => crate::rivet_bail!(
+                crate::error::codes::LOAD_SPEC_SOURCE_UNRESOLVED,
+                "export '{export_name}'{}: {n} sources recorded a load spec on this state, and \
+                 this config's source does not resolve here, so the load cannot tell which spec \
+                 is this config's. Set the source's variable (`url_env:` / `password_env:`) for \
+                 `rivet load` too; the load reads it to pick its spec and never connects",
+                unit.map(|t| format!(" table '{t}'")).unwrap_or_default()
+            ),
+        }
+    }
+
     /// The recorded spec for one unit of `export_name`, or `None` when nothing recorded one.
     pub fn load_spec(
         &self,
@@ -329,6 +361,40 @@ mod tests {
             nullable: true,
             warnings: Vec::new(),
         }
+    }
+
+    /// The source a load reads a spec under: the configured one, else the only one recorded (or
+    /// the legacy row), and a coded usage stop when two configs of the name recorded one.
+    #[test]
+    fn the_spec_source_is_the_configured_one_else_the_only_one_recorded() {
+        let s = StateStore::open_in_memory().unwrap();
+        let cols = [col("id", RivetType::Int64)];
+        let pick =
+            |configured: Option<&str>| s.spec_source(configured.map(str::to_string), "t", None);
+        assert_eq!(pick(None).unwrap(), "", "nothing recorded: the legacy row");
+        s.record_load_spec("t", None, "", &cols, None, "r0")
+            .unwrap();
+        assert_eq!(pick(None).unwrap(), "", "only the legacy row");
+        s.record_load_spec("t", None, "pg://a", &cols, None, "r1")
+            .unwrap();
+        assert_eq!(pick(None).unwrap(), "pg://a");
+        assert_eq!(
+            pick(Some("pg://z")).unwrap(),
+            "pg://z",
+            "a resolved source is used as is"
+        );
+        s.record_load_spec("t", None, "pg://b", &cols, None, "r2")
+            .unwrap();
+        let err = pick(None).unwrap_err();
+        assert_eq!(
+            (
+                crate::error::error_code(&err),
+                crate::error::classify_exit(&err)
+            ),
+            (Some("RIVET_LOAD_SPEC_SOURCE_UNRESOLVED"), 1),
+            "{err:#}"
+        );
+        assert_eq!(pick(Some("pg://b")).unwrap(), "pg://b");
     }
 
     #[test]
