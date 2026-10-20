@@ -2607,3 +2607,227 @@ fn load_and_compact_report_each_selected_table_as_the_warehouse_holds_it() {
         assert!(err.contains(&format!("[{code}]")), "{args:?}: {err}");
     }
 }
+/// One `(key, v)` table named `tbl` on a source, with its own key column name.
+struct NamedSource {
+    url: &'static str,
+    key: &'static str,
+    rig: fn(&str) -> Rig,
+}
+
+/// Create `tbl (key BIGINT PRIMARY KEY, v BIGINT)` with three rows on `src`, dropping it first.
+fn seed_named(src: &NamedSource, tbl: &str) {
+    let ddl = format!(
+        "CREATE TABLE {tbl} ({k} BIGINT PRIMARY KEY, v BIGINT)",
+        k = src.key
+    );
+    let rows = format!(
+        "INSERT INTO {tbl} ({k}, v) VALUES (1, 10), (2, 20), (3, 30)",
+        k = src.key
+    );
+    if src.url.starts_with("postgres") {
+        let mut c = postgres::Client::connect(src.url, postgres::NoTls).expect("pg");
+        c.batch_execute(&format!("DROP TABLE IF EXISTS {tbl}; {ddl}; {rows}"))
+            .expect("pg seed");
+    } else if src.url.starts_with("mysql") {
+        let mut c = mysql::Pool::new(src.url).unwrap().get_conn().unwrap();
+        c.query_drop(format!("DROP TABLE IF EXISTS {tbl}")).unwrap();
+        c.query_drop(ddl).unwrap();
+        c.query_drop(rows).unwrap();
+    } else {
+        mssql_exec(&format!("DROP TABLE IF EXISTS dbo.{tbl}; {ddl}; {rows}"));
+    }
+}
+
+/// Drop `tbl` on `src`.
+fn drop_named(src: &NamedSource, tbl: &str) {
+    let sql = format!("DROP TABLE IF EXISTS {tbl}");
+    if src.url.starts_with("postgres") {
+        if let Ok(mut c) = postgres::Client::connect(src.url, postgres::NoTls) {
+            let _ = c.batch_execute(&sql);
+        }
+    } else if src.url.starts_with("mysql") {
+        if let Ok(mut c) = mysql::Pool::new(src.url).and_then(|p| p.get_conn()) {
+            let _ = c.query_drop(sql);
+        }
+    } else {
+        let _ = std::panic::catch_unwind(|| mssql_exec(&sql));
+    }
+}
+
+/// Five configs, five databases, one table name, one PostgreSQL state: each `rivet init` records
+/// its own source's key and each `query:` export (which records none at run time) loads into
+/// ClickHouse keyed by its own. Before v38 the by-name spec was one row per export name, the last
+/// `rivet init` won, and four of the five loads keyed by a column their table does not have.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres + postgres-cdc + mysql + mysql-cdc + mssql + RIVET_TEST_STATE_URL"]
+fn five_configs_with_one_table_name_on_one_state_each_load_by_their_own_key() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    // A database of its own on the state server: this cell migrates it to this tree's schema.
+    let scratch_state = ScratchStateDb::new("rivet_spec_state");
+    let state = scratch_state.url();
+    let sources = [
+        NamedSource {
+            url: POSTGRES_URL,
+            key: "id",
+            rig: Rig::pg_batch,
+        },
+        NamedSource {
+            url: POSTGRES_CDC_URL,
+            key: "ref_no",
+            rig: |t| Rig::pg_batch(t).source_url(POSTGRES_CDC_URL),
+        },
+        NamedSource {
+            url: MYSQL_URL,
+            key: "order_id",
+            rig: Rig::mysql_batch,
+        },
+        NamedSource {
+            url: MYSQL_CDC_URL,
+            key: "num",
+            rig: |t| Rig::mysql_batch(t).source_url(MYSQL_CDC_URL),
+        },
+        NamedSource {
+            url: MSSQL_URL,
+            key: "code",
+            rig: Rig::mssql_batch,
+        },
+    ];
+    let tbl = unique_name("rivet_spec_name");
+    struct Dropped<'a>(&'a [NamedSource], &'a str);
+    impl Drop for Dropped<'_> {
+        fn drop(&mut self) {
+            for s in self.0 {
+                drop_named(s, self.1);
+            }
+        }
+    }
+    let _dropped = Dropped(&sources, &tbl);
+    let scratch = tempfile::tempdir().unwrap();
+    for (i, src) in sources.iter().enumerate() {
+        seed_named(src, &tbl);
+        let out = scratch.path().join(format!("init{i}.yaml"));
+        let init = crate::common::run_rivet_env(
+            &[
+                "init",
+                "--source",
+                src.url,
+                "--table",
+                &tbl,
+                "-o",
+                out.to_str().unwrap(),
+            ],
+            &[("RIVET_STATE_URL", state.as_str())],
+        );
+        assert!(
+            init.status.success(),
+            "init {i}: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+    }
+    let dbs: Vec<Db> = sources.iter().map(|_| Db::new("rivet_spec")).collect();
+    for (src, db) in sources.iter().zip(&dbs) {
+        let rig = (src.rig)(&tbl)
+            .query(&format!("SELECT {k}, v FROM {tbl}", k = src.key))
+            .export_named(&tbl)
+            .on_postgres_state(state.clone())
+            .dest_gcs(BUCKET, &unique_name("chsame"), FAKE_GCS_ENDPOINT)
+            .top_line(&format!(
+                "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+                 user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: auto }}",
+                db.0
+            ));
+        rig.run_ok();
+        load(&rig);
+        assert_eq!(
+            clickhouse_rows(&format!(
+                "SELECT {k}, v FROM {}.{tbl} ORDER BY {k} FORMAT TSV",
+                db.0,
+                k = src.key
+            )),
+            vec![(1, 10), (2, 20), (3, 30)],
+            "{}: the load keyed by `{}`",
+            src.url,
+            src.key
+        );
+    }
+}
+
+/// A state the previous release (v37) wrote keeps loading after this release migrates it to v38:
+/// the key that release's `rivet init` recorded by export name alone is read as the key of the
+/// config's source, and the migration leaves its copy for the way back.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres + RIVET_PREV_RELEASE_BIN at a v37 release"]
+fn a_v37_state_the_previous_release_wrote_loads_after_the_v38_migration() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let tbl = unique_name("rivet_v37_up");
+    let mut c = pg_connect();
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (ref_no BIGINT PRIMARY KEY, v BIGINT); \
+         INSERT INTO {tbl} VALUES (1, 10), (2, 20)"
+    ))
+    .expect("seed");
+    let _t = PgTable::adopt(tbl.clone());
+    let db = Db::new("rivet_v37");
+    let rig = Rig::pg_batch(&tbl)
+        .query(&format!("SELECT ref_no, v FROM {tbl}"))
+        .export_named(&tbl)
+        .dest_gcs(BUCKET, &unique_name("chv37"), FAKE_GCS_ENDPOINT)
+        .top_line(&format!(
+            "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
+             user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: auto }}",
+            db.0
+        ));
+    let Some(old) = rig.as_previous_release() else {
+        return;
+    };
+    let dir = rig.config_path().parent().unwrap().to_path_buf();
+    // The previous release's `rivet init` records the key in the state beside the config.
+    let init_out = dir.join("init.yaml");
+    let prev = std::env::var("RIVET_PREV_RELEASE_BIN").expect("checked by as_previous_release");
+    let (_, init) = crate::common::output_of(&mut crate::common::rivet_command_as(
+        &prev,
+        &[
+            "init",
+            "--source",
+            POSTGRES_URL,
+            "--table",
+            &tbl,
+            "-o",
+            init_out.to_str().unwrap(),
+        ],
+        &[("RIVET_STATE_URL", "")],
+    ));
+    assert!(
+        init.status.success(),
+        "the previous release's init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    old.run_ok();
+    load(&rig);
+    let copies = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(".rivet_state.db.v37") && n.ends_with(".bak")
+        })
+        .count();
+    if copies == 0 {
+        crate::common::skip_live(
+            "RIVET_PREV_RELEASE_BIN writes this tree's state schema: no v37 state to migrate",
+        );
+        return;
+    }
+    assert_eq!(
+        clickhouse_rows(&format!(
+            "SELECT ref_no, v FROM {}.{tbl} ORDER BY ref_no FORMAT TSV",
+            db.0
+        )),
+        vec![(1, 10), (2, 20)],
+        "the load keyed by the key the v37 init recorded"
+    );
+}
