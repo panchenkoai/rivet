@@ -279,7 +279,14 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
     rivet_ok(&["state", "reset", "-c", cfg, "-e", &export], &db);
     for cycle in ["after the reset", "next cycle"] {
         rivet_ok(&["run", "-c", cfg], &db);
-        rivet_ok(&["load", "-c", cfg], &[]);
+        let loaded = rivet_ok(&["load", "-c", cfg], &[]);
+        if cycle == "after the reset" {
+            assert!(
+                loaded.contains("already holds the base")
+                    && loaded.contains("never replacing the base"),
+                "the load says the pass joins the buffer: {loaded}"
+            );
+        }
         rivet_ok(&["compact", "-c", cfg], &[]);
         let rows = bq.read_bq_rows(&format!(
             "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS d, COUNTIF(id <= 4) AS gone_at_source \
@@ -999,7 +1006,16 @@ fn rebaseline_keeps_the_base(
         .lines()
         .find_map(|l| l.trim().strip_prefix("checkpoint:"))
     {
-        let _ = std::fs::remove_file(dir.join(ckpt.trim().trim_matches('"')));
+        let path = dir.join(
+            ckpt.split('#')
+                .next()
+                .unwrap_or(ckpt)
+                .trim()
+                .trim_matches('"'),
+        );
+        if path.exists() {
+            std::fs::remove_file(&path).expect("delete the checkpoint, as the remedy says");
+        }
     }
     let export = scaffolded_export(generated);
     let _ = std::process::Command::new("timeout")

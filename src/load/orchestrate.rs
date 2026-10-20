@@ -4959,6 +4959,12 @@ mod live_only_decisions {
         }
         // An adoption interrupted before its view: the log exists, the name does not.
         assert!(whole_table_run_joins_the_log(false, Absent, Table));
+        assert_eq!(
+            whole_pass_into_buffer_note("p.d.orders", "f1"),
+            "  note: `p.d.orders` already holds the base, and run f1 re-read the whole table — it \
+             is appended to the buffer `p.d.orders__changes` for `rivet compact` to merge by key, \
+             never replacing the base: a row the pass no longer holds stays in it"
+        );
         // A buffer without its base is a stale buffer, never a log to join.
         assert!(!whole_table_run_joins_the_log(true, Absent, Table));
 
