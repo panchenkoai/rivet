@@ -3067,3 +3067,14 @@ seeds:
         cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
       mongo:
         cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
+
+  - name: state-copy-leaves-sequences-behind
+    class: "`rivet state copy` writes the rows with their ids and leaves each serial column's sequence at 1, so the first run through the copied PostgreSQL state collides with a copied id and fails"
+    history: "0.32.2 item 9, 2026-10-20: the copy writes ids explicitly; seeded so the sequence move cannot be dropped"
+    scope: state
+    engines:
+      postgres-state:
+        patch: state-copy-leaves-sequences-behind/postgres-state.patch
+        cells: [a_0_30_cdc_state_copied_to_postgres_continues_its_stream_and_owns_its_tables]
+      sqlite-state:
+        na: "`rivet state copy` writes into a PostgreSQL state only; a SQLite file is its source, which it only reads"
