@@ -724,4 +724,34 @@ mod tests {
         assert_eq!(key("mssql://h:1433/c"), Some(vec!["c_id".to_string()]));
         assert_eq!(key("mysql://h:3306/a"), Some(vec!["code".to_string()]));
     }
+
+    /// Two `rivet init` runs of one export name on two sources keep a key each.
+    #[test]
+    fn two_inits_of_one_export_name_keep_a_key_each() {
+        let s = StateStore::open_in_memory().unwrap();
+        s.record_primary_key("q", None, "mysql://h:3306/a", &["a_id".to_string()])
+            .unwrap();
+        s.record_primary_key("q", None, "mssql://h:1433/b", &["b_id".to_string()])
+            .unwrap();
+        let cols = vec![col("x", RivetType::Int64)];
+        for (src, run) in [("mysql://h:3306/a", "ra"), ("mssql://h:1433/b", "rb")] {
+            s.record_load_spec("q", None, src, &cols, None, run)
+                .unwrap();
+        }
+        let key = |src: &str, run: &str| {
+            let by_name = s
+                .load_spec("q", None, src)
+                .unwrap()
+                .and_then(|l| l.primary_key);
+            let of_run = s
+                .load_spec_of_run_with_init_key("q", None, src, run)
+                .unwrap()
+                .and_then(|l| l.primary_key);
+            (by_name, of_run)
+        };
+        let a = Some(vec!["a_id".to_string()]);
+        let b = Some(vec!["b_id".to_string()]);
+        assert_eq!(key("mysql://h:3306/a", "ra"), (a.clone(), a));
+        assert_eq!(key("mssql://h:1433/b", "rb"), (b.clone(), b));
+    }
 }

@@ -443,6 +443,20 @@ seeds:
       postgres-state:
         na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
 
+  - name: load-spec-last-writer-of-one-name
+    class: "the by-name load spec is one row per export name, so on a state shared by configs of one name reading different sources the last `rivet init` (or run) decides every config's load key"
+    history: "client simulation on 0.32.0 (D3) and owner decision 2026-10-18 (v38 approved); measured on main 34ec3d30 with five configs on one PostgreSQL state: the second config's load refused RIVET_LOAD_KEY_COLUMN_INVALID keyed by the fifth one's `code`"
+    scope: state
+    engines:
+      postgres-state:
+        patch: load-spec-last-writer-of-one-name/postgres-state.patch
+        cells:
+          - five_configs_with_one_table_name_on_one_state_each_load_by_their_own_key
+          - "lib:two_sources_of_one_export_name_keep_a_spec_each"
+      sqlite-state:
+        patch: load-spec-last-writer-of-one-name/postgres-state.patch
+        cells: ["lib:two_sources_of_one_export_name_keep_a_spec_each", "lib:two_inits_of_one_export_name_keep_a_key_each"]
+
   - name: pg-migration-not-idempotent
     class: a PostgreSQL state migration that fails when the ladder replays over tables already in its shape
     history: "#413 - v32 read columns_json from a table that no longer had it; 317 gate cells failed"
