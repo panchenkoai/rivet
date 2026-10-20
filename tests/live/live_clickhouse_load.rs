@@ -2502,7 +2502,7 @@ fn five_configs_with_one_table_name_on_one_state_each_load_by_their_own_key() {
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
     // A database of its own on the state server: this cell migrates it to this tree's schema.
-    let scratch_state = ScratchStateDb::new("rivet_same_state");
+    let scratch_state = ScratchStateDb::new("rivet_spec_state");
     let state = scratch_state.url();
     let sources = [
         NamedSource {
@@ -2531,7 +2531,7 @@ fn five_configs_with_one_table_name_on_one_state_each_load_by_their_own_key() {
             rig: Rig::mssql_batch,
         },
     ];
-    let tbl = unique_name("rivet_same_name");
+    let tbl = unique_name("rivet_spec_name");
     struct Dropped<'a>(&'a [NamedSource], &'a str);
     impl Drop for Dropped<'_> {
         fn drop(&mut self) {
@@ -2563,7 +2563,7 @@ fn five_configs_with_one_table_name_on_one_state_each_load_by_their_own_key() {
             String::from_utf8_lossy(&init.stderr)
         );
     }
-    let dbs: Vec<Db> = sources.iter().map(|_| Db::new("rivet_same")).collect();
+    let dbs: Vec<Db> = sources.iter().map(|_| Db::new("rivet_spec")).collect();
     for (src, db) in sources.iter().zip(&dbs) {
         let rig = (src.rig)(&tbl)
             .query(&format!("SELECT {k}, v FROM {tbl}", k = src.key))
