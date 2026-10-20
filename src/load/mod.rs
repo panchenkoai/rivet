@@ -2000,6 +2000,64 @@ pub(crate) mod tests {
         }
     }
 
+    /// A warehouse that never compacts has no base to flag rows in: the default refuses as a bug.
+    #[test]
+    fn a_rebaseline_flag_on_a_warehouse_that_never_compacts_is_an_internal_stop() {
+        struct Plain(FakeLoader);
+        impl TargetLoader for Plain {
+            fn fqtn(&self, t: &str) -> String {
+                self.0.fqtn(t)
+            }
+            fn changes_has_prior_changes(&self, t: &str) -> Result<bool> {
+                self.0.changes_has_prior_changes(t)
+            }
+            fn object_kind(&self, t: &str) -> Result<ObjectKind> {
+                self.0.object_kind(t)
+            }
+            fn column_overlap(&self, t: &str, n: &[&str]) -> Result<(u64, u64)> {
+                self.0.column_overlap(t, n)
+            }
+            fn row_count(&self, t: &str) -> Result<u64> {
+                self.0.row_count(t)
+            }
+            fn adopt_as_changelog(&self, t: &str) -> Result<()> {
+                self.0.adopt_as_changelog(t)
+            }
+            fn materialize(
+                &self,
+                t: &str,
+                s: &[TargetColumnSpec],
+                u: &[String],
+                e: Option<u64>,
+            ) -> Result<u64> {
+                self.0.materialize(t, s, u, e)
+            }
+            fn append_changelog(
+                &self,
+                t: &str,
+                s: &[TargetColumnSpec],
+                u: &[String],
+                p: &[String],
+            ) -> Result<u64> {
+                self.0.append_changelog(t, s, u, p)
+            }
+            fn warehouse(&self) -> cdc::Warehouse {
+                cdc::Warehouse::ClickHouse
+            }
+            fn create_view(&self, t: &str, sql: &str) -> Result<()> {
+                self.0.create_view(t, sql)
+            }
+        }
+        let err = Plain(fake_loader(0))
+            .flag_absent_from_buffer("t", &spec_ok(), &["id".to_string()])
+            .unwrap_err();
+        assert_eq!(
+            crate::error::error_code(&err),
+            Some("RIVET_INTERNAL_LOAD_INVARIANT"),
+            "{err:#}"
+        );
+    }
+
     #[test]
     fn a_rename_that_loses_rows_is_reported() {
         struct ShortCopy(FakeLoader);
