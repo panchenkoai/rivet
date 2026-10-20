@@ -6,6 +6,22 @@ PostgreSQL database `RIVET_STATE_URL` names. The state has a schema version that
 releases. A newer rivet migrates an older state the first time it opens it; an older rivet refuses
 a newer state with `RIVET_STATE_SCHEMA_NEWER` (exit 5) and never rewrites it.
 
+## Where the state lives
+
+- `RIVET_STATE_URL` unset or empty: the SQLite file `.rivet_state.db` beside the config.
+- `RIVET_STATE_URL=postgres://...` / `postgresql://...`: that PostgreSQL database (see the TLS rule
+  in [cli.md](cli.md#security)).
+- `RIVET_STATE_URL=sqlite:<path>`: that SQLite file, for every command (`init`, `run`, `load`,
+  `state ...`). An absolute path is used as written (`sqlite:/var/lib/rivet/app.db`, or
+  `sqlite:///var/lib/rivet/app.db`); a relative one is anchored to the config's directory, like the
+  default file, so it does not move with the working directory. Nothing is created beside the
+  config.
+
+Moving a config's state to a `sqlite:` path is refused, `RIVET_STATE_URL_LEAVES_STATE_BEHIND`
+(exit 5), while the file beside the config holds its cursors or runs and the new path holds none:
+copy the state first, with every run stopped (`sqlite3 .rivet_state.db ".backup <new path>"`, which
+takes the `-wal` file with it), or unset the variable.
+
 ## The copy a migration leaves behind
 
 Before a migration runs its first statement, inside the migration lock, rivet writes a copy of the

@@ -60,7 +60,8 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_PROBE_UNREADABLE` | refusal | 5 | chunk, page or partition the export on a column of a type the message lists, remove `parallel:` from a keyset export, or use `mode: full` |
 | `RIVET_SOURCE_COLUMNS_CHANGED_UNDER_READ` | environment | 2 if transient, else 1 | run the export again: the next run probes and reads the table as it is now |
 | `RIVET_SOURCE_OVERRIDE_WIRE_MISMATCH` | usage | 1 | remove or correct the column's `columns:` override (batch: or CAST the column to that type in the export's `query:`; CDC: then re-snapshot the table) |
-| `RIVET_STATE_URL_SCHEME_UNSUPPORTED` | usage | 1 | set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to keep the state in the SQLite file beside the config |
+| `RIVET_STATE_URL_SCHEME_UNSUPPORTED` | usage | 1 | set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL or to `sqlite:<path>`, or unset it to keep the state in the SQLite file beside the config |
+| `RIVET_STATE_URL_LEAVES_STATE_BEHIND` | refusal | 5 | copy the state beside the config to the path `RIVET_STATE_URL` names with every run stopped (`sqlite3 <old> ".backup <new>"`), or unset RIVET_STATE_URL |
 | `RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED` | refusal | 5 | set `default_time_zone = '+00:00'` on the MySQL server, keep rivet's session variables on one backend in the proxy (ProxySQL: session-variable tracking, no multiplexing for rivet's user), or connect directly |
 | `RIVET_CLI_CHECK_REPORTED_ERRORS` | environment | 2 if transient, else 1 | fix what the ERROR lines above name (the source, the state, the destination), then run `rivet check` again |
 | `RIVET_STATE_URL_TLS_REQUIRED` | refusal | 5 | add `?sslmode=require` (or `verify-ca` / `verify-full`) to `RIVET_STATE_URL` with TLS enabled on the state server, or `?sslmode=disable` to accept plaintext on a private network |

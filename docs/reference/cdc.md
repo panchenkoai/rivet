@@ -893,6 +893,24 @@ A checkpoint written against another database (a different `DBID`, a `RESETLOGS`
 since, or another pluggable database) is refused the same way: an SCN means nothing
 outside the database that issued it.
 
+### Copying a CDC config (staging beside production)
+
+A CDC stream's position belongs to one reader. A copy of a CDC config that reads the same cluster
+needs its own stream objects and its own state, or the two configs consume each other's changes:
+
+- **PostgreSQL**: its own `slot:` (`rivet init --mode cdc -o <file>` names it after the file). The
+  slot is consume-on-read: a second config reading the same slot takes the changes the first one
+  has not read yet. With a `checkpoint:`, rivet records the last position it confirmed before it
+  advances the slot, and a run whose slot another reader moved past that position is refused,
+  `RIVET_SOURCE_CDC_LOG_GAP` (exit 5, "another reader consumed the changes between them"): the
+  changes are gone from this stream, so re-baseline it as the text says. Without a `checkpoint:`
+  nothing is compared.
+- **MySQL**: its own `server_id:` (two readers with one id evict each other's binlog connection)
+  and its own `checkpoint:`; the binlog itself is not consumed by a reader, so a second config loses
+  nothing from it.
+- **Every engine**: its own `checkpoint:` path and its own state (a state DB of its own, or a config
+  directory of its own for the SQLite file).
+
 ### Recovery, in one line
 
 Re-run to resume from the last checkpoint (the common case). If the run reports the
