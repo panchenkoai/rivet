@@ -1519,6 +1519,25 @@ seeds:
       oracle:
         na: "the permission gate is SQL Server's DMV read; Oracle samples no server counters"
 
+  - name: pg-slot-advanced-by-another-reader
+    class: "a PostgreSQL CDC export continues from a slot another config consumed past its checkpoint, so the changes in between are missing from its output with exit 0"
+    history: "0.32.2 item 4, 2026-10-20: measured on main c1cf6a92: config A, config B on one slot in turn; A's third run exit 0 without B's row"
+    scope: source
+    patch: pg-slot-advanced-by-another-reader/postgres.patch
+    engines:
+      postgres:
+        cells:
+          - a_slot_another_config_advanced_is_refused_instead_of_losing_its_changes
+          - "lib:a_slot_confirmed_past_the_checkpoint_is_refused_and_one_at_or_before_it_reads"
+      mysql:
+        na: "the MySQL binlog is not consumed by a reader: a second config reads the same events, and its position is its own checkpoint"
+      mssql:
+        na: "SQL Server change tables are not consumed by a reader; positions are each config's checkpoint"
+      mongo:
+        na: "a MongoDB change stream is not consumed by a reader; its resume token is the config's checkpoint"
+      oracle:
+        na: "LogMiner reads archived logs no reader consumes; the position is the config's checkpoint"
+
   - name: accepted-edit-not-recorded
     class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"
     history: "2026-10-08, owner decision on #493 - a refused edit that is meant had no way out that kept the cursor (`state accept` did not exist on the PR's head 3dd6ade4); seeded so the command cannot answer `Accepted` without re-binding the row"
