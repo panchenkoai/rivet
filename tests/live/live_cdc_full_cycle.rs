@@ -337,3 +337,48 @@ fn rebaseline_remedy_after_a_truncate_leaves_no_removed_key_live_in_bigquery_pos
          pre-truncate insert (4) and the truncated rows (1-3) are not"
     );
 }
+
+/// Two configs of one cluster sharing a PostgreSQL slot name, run in turn: the second consumes
+/// changes from the slot the first one reads, and the first one's next run is refused (the
+/// changes between its checkpoint and the slot went to the other reader) instead of continuing
+/// past them with exit 0.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_slot_another_config_advanced_is_refused_instead_of_losing_its_changes() {
+    let tbl = unique_name("rivet_slot_shared");
+    let slot = unique_name("rivet_shared_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT)"
+    ))
+    .expect("table");
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let ckpts = tempfile::tempdir().unwrap();
+    let config = |name: &str| {
+        Rig::pg_cdc(&tbl, &slot)
+            .export_named(name)
+            .cdc_line(&format!(
+                "checkpoint: {}",
+                ckpts.path().join(format!("{name}.ckpt")).display()
+            ))
+    };
+    let first = config(&unique_name("cfg_a"));
+    let second = config(&unique_name("cfg_b"));
+    first.run_ok();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 1)"))
+        .unwrap();
+    first.run_ok();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 2)"))
+        .unwrap();
+    second.run_ok();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (3, 3)"))
+        .unwrap();
+    let out = first.run_args(&[]);
+    assert_refused(&out, Refused::by_code("RIVET_SOURCE_CDC_LOG_GAP", 5));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("another reader consumed"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

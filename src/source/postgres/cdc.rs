@@ -112,6 +112,8 @@ pub(crate) struct PgChangeStream {
     /// terminates at the ceiling. Failing OPEN is the rule — a delayed termination
     /// is recoverable, an early exit is a dropped commit.
     barrier_nonce: Option<String>,
+    /// The export's checkpoint file, kept at the slot's position before every advance rivet makes.
+    checkpoint: Option<std::path::PathBuf>,
 }
 
 /// The run-start warning emitted when a logical replication slot has to be
@@ -598,6 +600,7 @@ impl PgChangeStream {
         mode: DrainMode,
         configured_tables: &[String],
         spill_dir: Option<&std::path::Path>,
+        checkpoint: Option<&std::path::Path>,
     ) -> Result<Self> {
         // The batch dial: the plaintext gate, the forced-ssl connector, and a host:port-naming error.
         let mut client = super::connect_client(conn_str, tls)?;
@@ -612,7 +615,9 @@ impl PgChangeStream {
             )?
             .get(0);
         match slot_action(slot, exists, prior) {
-            SlotAction::Reuse => {}
+            SlotAction::Reuse => {
+                refuse_a_slot_another_reader_advanced(&mut client, slot, checkpoint)?
+            }
             SlotAction::Refuse(why) => {
                 return Err(crate::source::cdc::checkpoint_identity::log_gap(why));
             }
@@ -706,6 +711,7 @@ impl PgChangeStream {
             frontier_text: None,
             configured_tables: configured_tables.to_vec(),
             barrier_nonce,
+            checkpoint: checkpoint.map(std::path::Path::to_path_buf),
         })
     }
 
@@ -946,6 +952,14 @@ impl PgChangeStream {
         let Some(lsn) = self.frontier_text.take() else {
             return;
         };
+        // The checkpoint first, then the slot: the checkpoint is the last position rivet
+        // confirmed, which the open compares the slot with to see another reader's advance.
+        if let Some(ck) = &self.checkpoint
+            && let Err(e) = Position::new(json!({ "lsn": lsn })).save(ck)
+        {
+            log::warn!("pg cdc: could not record the empty-transaction span at {lsn}: {e:#}");
+            return;
+        }
         if let Err(e) = self.advance_slot(&lsn) {
             log::warn!("pg cdc: could not release the empty-transaction span at {lsn}: {e:#}");
         }
@@ -972,6 +986,57 @@ impl PgChangeStream {
         self.exhausted = false;
         Ok(())
     }
+}
+
+/// Refuse a slot another reader advanced past the last position rivet confirmed for this export.
+///
+/// rivet writes the checkpoint before it advances the slot (the sink's ack, the empty-span
+/// release), so its own slot is never past its checkpoint. A slot that is was consumed by another
+/// reader (a second config of this cluster sharing the slot name): the changes between the two
+/// positions went to it and are gone from this stream, which would otherwise continue past them
+/// with exit 0. Without a checkpoint there is no position to compare and nothing is refused.
+fn refuse_a_slot_another_reader_advanced(
+    client: &mut postgres::Client,
+    slot: &str,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<()> {
+    let Some(path) = checkpoint else {
+        return Ok(());
+    };
+    let Some(own) = Position::load(path)?.and_then(|p| {
+        p.json()
+            .get("lsn")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }) else {
+        return Ok(());
+    };
+    let confirmed: Option<String> = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )?
+        .get(0);
+    match slot_advanced_by_another(slot, &own, confirmed.as_deref()) {
+        Some(why) => Err(crate::source::cdc::checkpoint_identity::log_gap(why)),
+        None => Ok(()),
+    }
+}
+
+/// The refusal for a slot confirmed past `own`, the checkpoint's position; `None` when it is not.
+fn slot_advanced_by_another(slot: &str, own: &str, confirmed: Option<&str>) -> Option<String> {
+    let (own_n, conf_n) = (parse_lsn(own)?, parse_lsn(confirmed?)?);
+    (conf_n > own_n).then(|| {
+        format!(
+            "pg cdc: slot '{slot}' is confirmed at {}, past {own}, the last position rivet \
+             confirmed for this export (its checkpoint): another reader consumed the changes \
+             between them from this slot (a second config of this cluster with the same slot \
+             name), so they are lost to this stream. Give every config its own slot, \
+             checkpoint and state, then {}",
+            confirmed.unwrap_or_default(),
+            crate::source::cdc::checkpoint_identity::RECOVER
+        )
+    })
 }
 
 /// Why a configured table no relation answers to cannot be captured.
@@ -3267,6 +3332,7 @@ mod tests {
             frontier_text: None,
             configured_tables: Vec::new(),
             barrier_nonce: None,
+            checkpoint: None,
         }
     }
 
@@ -3282,6 +3348,7 @@ mod tests {
             crate::source::cdc::PeekBound::Sized(10),
             DrainMode::Continuous,
             &[],
+            None,
             None,
         );
         assert!(open.is_err(), "the recorder answers no prepared statement");
@@ -3664,6 +3731,7 @@ mod tests {
             crate::source::cdc::PeekBound::Sized(10_000),
             DrainMode::Continuous,
             &[], // this test routes nothing — it reads the stream directly
+            None,
             None,
         )
         .unwrap();
@@ -4105,5 +4173,23 @@ mod slot_creation_warning_tests {
             ),
             other => panic!("a key-only identity must warn, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod foreign_advance_tests {
+    use super::slot_advanced_by_another;
+
+    #[test]
+    fn a_slot_confirmed_past_the_checkpoint_is_refused_and_one_at_or_before_it_reads() {
+        let why = slot_advanced_by_another("s", "0/16B3740", Some("0/16B3780")).expect("past");
+        assert!(
+            why.contains("another reader consumed") && why.contains("0/16B3780"),
+            "{why}"
+        );
+        assert!(slot_advanced_by_another("s", "0/16B3740", Some("0/16B3740")).is_none());
+        assert!(slot_advanced_by_another("s", "1/0", Some("0/FFFFFFFF")).is_none());
+        assert!(slot_advanced_by_another("s", "0/10", None).is_none());
+        assert!(slot_advanced_by_another("s", "junk", Some("0/20")).is_none());
     }
 }
