@@ -1,0 +1,13 @@
+diff --git a/src/error/retry.rs b/src/error/retry.rs
+index af28e789..36f24efa 100644
+--- a/src/error/retry.rs
++++ b/src/error/retry.rs
+@@ -113,7 +113,7 @@ fn classify_io_kind(kind: std::io::ErrorKind) -> Option<RetryClass> {
+         | TimedOut | UnexpectedEof | Interrupted | WouldBlock => Some(TRANSIENT_RECONNECT),
+         NotFound | PermissionDenied | AlreadyExists | NotADirectory | IsADirectory
+         | DirectoryNotEmpty | ReadOnlyFilesystem | StorageFull | FileTooLarge | InvalidInput
+-        | InvalidData | InvalidFilename | Unsupported => Some(PERMANENT),
++        | InvalidData | InvalidFilename | Unsupported => None,
+         _ => None,
+     }
+ }

@@ -451,6 +451,11 @@ pub fn coded(code: Code, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CodedError::new(code, message))
 }
 
+/// [`coded`] over the `io::Error` it reports, kept in the chain so its kind classifies the retry.
+pub fn coded_io(code: Code, message: impl Into<String>, source: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(source).context(CodedError::new(code, message))
+}
+
 /// `message` built around `inner`, carrying `inner`'s code when it has one, else `fallback`.
 pub fn recoded(inner: &anyhow::Error, fallback: Code, message: impl Into<String>) -> anyhow::Error {
     coded(code_of(inner).unwrap_or(fallback), message)

@@ -1532,6 +1532,22 @@ seeds:
       oracle:
         na: "the permission gate is SQL Server's DMV read; Oracle samples no server counters"
 
+  - name: io-error-classified-by-its-path-text
+    class: "an `io::Error` (a missing directory, a read-only file) is retried as transient because a path in its message contains a network word (`dns`, `reset`), so a permanent stop exits 2"
+    history: "0.32.2, 2026-10-20: #639's mutation shard baseline failed `an_unwritable_aggregate_path_is_refused_by_code` with exit 2 for 1 because its temp dir was named `.tmprDnsA7`; RED on main c1cf6a92 with a directory named `dns`"
+    scope: source
+    patch: io-error-classified-by-its-path-text/shared.patch
+    engines:
+      postgres:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      mysql:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      mssql:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      mongo:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      oracle:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
   - name: pg-slot-advanced-by-another-reader
     class: "a PostgreSQL CDC export continues from a slot another config consumed past its checkpoint, so the changes in between are missing from its output with exit 0"
     history: "0.32.2 item 4, 2026-10-20: measured on main c1cf6a92: config A, config B on one slot in turn; A's third run exit 0 without B's row"
