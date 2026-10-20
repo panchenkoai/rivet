@@ -104,8 +104,10 @@ pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> 
             .unwrap_or(0)
             .max(0),
     };
+    let cdc_unmineable = cdc_unmineable(conn, &schema, &table)?;
     Ok(TableInfo {
         cdc_capture_instance: None,
+        cdc_unmineable,
         density,
         schema,
         table,
@@ -113,6 +115,31 @@ pub(super) fn introspect(conn: &mut OracleSource, schema: &str, table: &str) -> 
         total_bytes: None,
         columns,
     })
+}
+
+/// Why LogMiner cannot capture `schema.table`, asked through the predicate the capture itself
+/// refuses by, over the catalog rows it reads ([`crate::source::oracle::cdc::unmineable`]).
+fn cdc_unmineable(conn: &mut OracleSource, schema: &str, table: &str) -> Result<Option<String>> {
+    use crate::source::oracle::cdc;
+    let sql = cdc::catalog_columns_sql(&format!("'{}'", lit(schema)), &format!("'{}'", lit(table)));
+    let rows = conn.query_rows(&sql)?;
+    let major = conn
+        .query_scalar(cdc::MAJOR_VERSION_SQL)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    Ok(unmineable_of(schema, table, &rows, major))
+}
+
+/// [`crate::source::oracle::cdc::unmineable`] over the catalog rows the capture reads.
+fn unmineable_of(
+    schema: &str,
+    table: &str,
+    rows: &[Vec<Option<String>>],
+    major: u32,
+) -> Option<String> {
+    use crate::source::oracle::cdc;
+    let catalog: Vec<cdc::CatalogColumn> = rows.iter().map(|r| cdc::catalog_column(r)).collect();
+    cdc::unmineable(schema, table, &catalog, major)
 }
 
 /// Rows a never-analyzed table's estimate counts up to: past the 100K mode threshold, cheap to read.
@@ -263,6 +290,31 @@ fn catalog_type(data_type: &str, precision: Option<u32>, scale: Option<i32>) -> 
 
 #[cfg(test)]
 mod tests {
+    /// Init leaves out exactly what the capture refuses, with the refusal's own text: one predicate.
+    #[test]
+    fn init_and_the_capture_refuse_a_table_by_one_predicate() {
+        let row = |name: &str, ty: &str| {
+            vec![
+                Some("APP".to_string()),
+                Some("DOCS".to_string()),
+                Some(name.to_string()),
+                Some(ty.to_string()),
+                Some("NO".to_string()),
+                Some("NO".to_string()),
+            ]
+        };
+        let rows = [row("ID", "NUMBER"), row("BODY", "BLOB")];
+        let why = super::unmineable_of("APP", "DOCS", &rows, 19).expect("a BLOB is refused");
+        let catalog: Vec<_> = rows
+            .iter()
+            .map(|r| crate::source::oracle::cdc::catalog_column(r))
+            .collect();
+        let refusal = crate::source::oracle::cdc::refuse_unmineable("APP", "DOCS", &catalog, 19)
+            .expect_err("the capture refuses it too");
+        assert_eq!(format!("{refusal}"), why);
+        assert_eq!(super::unmineable_of("APP", "DOCS", &rows[..1], 19), None);
+    }
+
     use super::*;
 
     fn col(name: &str, nullable: bool, pk: bool) -> ColumnInfo {
@@ -368,6 +420,7 @@ mod tests {
         };
         let table = |pk: [&str; 7], stamp: [&str; 7]| TableInfo {
             cdc_capture_instance: None,
+            cdc_unmineable: None,
             schema: "RIVET".into(),
             table: "T".into(),
             row_estimate: 500_000,

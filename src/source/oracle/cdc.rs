@@ -578,54 +578,112 @@ fn container(conn: &Connection) -> Result<(String, String, String)> {
     }
 }
 
-/// Resolve and vet every configured table in the PDB: types, name lengths, identity columns.
-/// Refuse a table LogMiner cannot mine whole: a name past its limit, a column type it never decodes, or more columns than the preview mines.
-fn mineable(o: &str, t: &str, refused: &[String], columns: usize) -> Result<()> {
-    if o.len() > MAX_MINED_NAME || t.len() > MAX_MINED_NAME {
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED,
-            "oracle cdc: `{o}.{t}` has a name over {MAX_MINED_NAME} bytes, which LogMiner \
+/// One column as `all_tab_cols` describes it, for the check that LogMiner can capture its table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CatalogColumn {
+    pub name: String,
+    pub data_type: String,
+    pub identity: bool,
+    pub virtual_col: bool,
+}
+
+/// The columns of the table `owner_pred`.`table_pred` name (SQL predicates), as the capture reads them:
+/// `(owner, table_name, column_name, data_type, identity_column, virtual_column)`.
+pub(crate) fn catalog_columns_sql(owner_pred: &str, table_pred: &str) -> String {
+    format!(
+        "SELECT owner, table_name, column_name, data_type, identity_column, \
+                virtual_column FROM all_tab_cols \
+          WHERE owner = {owner_pred} AND table_name = {table_pred} AND hidden_column = 'NO' \
+          ORDER BY column_id"
+    )
+}
+
+/// The server's major version, which decides whether LogMiner mines a table with an identity column.
+pub(crate) const MAJOR_VERSION_SQL: &str = "SELECT TO_CHAR(MAX(TO_NUMBER(REGEXP_SUBSTR(version, '^[0-9]+')))) \
+     FROM product_component_version";
+
+/// Why LogMiner cannot capture `owner.table` whole in this preview, or `None` when it can: a name
+/// past its limit, a column it cannot address or never decodes, or more columns than the preview
+/// mines. `rivet init` asks this before it writes a CDC export, and the capture before it mines.
+pub(crate) fn unmineable(
+    owner: &str,
+    table: &str,
+    cols: &[CatalogColumn],
+    major: u32,
+) -> Option<String> {
+    if owner.len() > MAX_MINED_NAME || table.len() > MAX_MINED_NAME {
+        return Some(format!(
+            "oracle cdc: `{owner}.{table}` has a name over {MAX_MINED_NAME} bytes, which LogMiner \
              reports as UNSUPPORTED and never decodes"
-        )
+        ));
+    }
+    let mut refused = Vec::new();
+    for c in cols {
+        let name = &c.name;
+        if name.len() > MAX_MINED_NAME || name.contains(['.', '"', '\'']) {
+            refused.push(format!("{name} (a name LogMiner cannot address)"));
+        } else if c.virtual_col {
+            refused.push(format!(
+                "{name} (a virtual column: it has no redo, so every change would carry NULL)"
+            ));
+        } else if c.identity && major < 23 {
+            refused.push(format!(
+                "{name} (an identity column: LogMiner ignores the whole table before 23)"
+            ));
+        }
+        if ColKind::of(&c.data_type).is_none() {
+            refused.push(format!("{name} {}", c.data_type));
+        }
     }
     if !refused.is_empty() {
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED,
-            "oracle cdc: `{o}.{t}` cannot be captured in this preview: {}. Supported: NUMBER, \
+        return Some(format!(
+            "oracle cdc: `{owner}.{table}` cannot be captured in this preview: {}. Supported: NUMBER, \
              FLOAT, BINARY_FLOAT/DOUBLE, DATE, TIMESTAMP (any zone form), VARCHAR2, NVARCHAR2, \
              CHAR, NCHAR, RAW. Export the table in batch, or capture a table without them.",
             refused.join(", ")
-        )
+        ));
     }
-    if columns > MAX_COLUMNS {
-        crate::rivet_bail!(
-            crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED,
-            "oracle cdc: `{o}.{t}` has {columns} columns; the preview mines at most {MAX_COLUMNS}"
-        )
+    if cols.len() > MAX_COLUMNS {
+        return Some(format!(
+            "oracle cdc: `{owner}.{table}` has {} columns; the preview mines at most {MAX_COLUMNS}",
+            cols.len()
+        ));
     }
-    Ok(())
+    None
+}
+
+/// Refuse a table [`unmineable`] names a reason for.
+pub(crate) fn refuse_unmineable(
+    owner: &str,
+    table: &str,
+    cols: &[CatalogColumn],
+    major: u32,
+) -> Result<()> {
+    match unmineable(owner, table, cols, major) {
+        Some(why) => crate::rivet_bail!(crate::error::codes::SOURCE_CDC_TABLE_UNSUPPORTED, "{why}"),
+        None => Ok(()),
+    }
+}
+
+/// The catalog row `(owner, table, column, type, identity, virtual)` as a [`CatalogColumn`].
+pub(crate) fn catalog_column(r: &[Option<String>]) -> CatalogColumn {
+    let cell = |i: usize| r.get(i).cloned().flatten().unwrap_or_default();
+    CatalogColumn {
+        name: cell(2),
+        data_type: cell(3),
+        identity: cell(4) == "YES",
+        virtual_col: cell(5) == "YES",
+    }
 }
 
 fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captured>> {
-    let major: u32 = scalar(
-        conn,
-        "SELECT TO_CHAR(MAX(TO_NUMBER(REGEXP_SUBSTR(version, '^[0-9]+')))) \
-         FROM product_component_version",
-    )?
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(0);
+    let major: u32 = scalar(conn, MAJOR_VERSION_SQL)?
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let mut out = Vec::new();
     for cfg in configured {
         let (owner, table) = crate::sql::oracle_catalog_preds(cfg);
-        let cols = rows(
-            conn,
-            &format!(
-                "SELECT owner, table_name, column_name, data_type, identity_column, \
-                        virtual_column FROM all_tab_cols \
-                  WHERE owner = {owner} AND table_name = {table} AND hidden_column = 'NO' \
-                  ORDER BY column_id"
-            ),
-        )?;
+        let cols = rows(conn, &catalog_columns_sql(&owner, &table))?;
         if cols.is_empty() {
             crate::rivet_bail!(
                 crate::error::codes::SOURCE_CDC_PREREQUISITE,
@@ -635,27 +693,12 @@ fn resolve_tables(conn: &Connection, configured: &[String]) -> Result<Vec<Captur
         }
         let cell = |r: &Vec<Option<String>>, i: usize| r[i].clone().unwrap_or_default();
         let (o, t) = (cell(&cols[0], 0), cell(&cols[0], 1));
-        let mut refused = Vec::new();
-        let mut columns = Vec::new();
-        for r in &cols {
-            let (name, ty) = (cell(r, 2), cell(r, 3));
-            if name.len() > MAX_MINED_NAME || name.contains(['.', '"', '\'']) {
-                refused.push(format!("{name} (a name LogMiner cannot address)"));
-            } else if cell(r, 5) == "YES" {
-                refused.push(format!(
-                    "{name} (a virtual column: it has no redo, so every change would carry NULL)"
-                ));
-            } else if cell(r, 4) == "YES" && major < 23 {
-                refused.push(format!(
-                    "{name} (an identity column: LogMiner ignores the whole table before 23)"
-                ));
-            }
-            match ColKind::of(&ty) {
-                Some(k) => columns.push((name, k)),
-                None => refused.push(format!("{name} {ty}")),
-            }
-        }
-        mineable(&o, &t, &refused, columns.len())?;
+        let catalog: Vec<CatalogColumn> = cols.iter().map(|r| catalog_column(r)).collect();
+        refuse_unmineable(&o, &t, &catalog, major)?;
+        let columns: Vec<(String, ColKind)> = catalog
+            .iter()
+            .filter_map(|c| ColKind::of(&c.data_type).map(|k| (c.name.clone(), k)))
+            .collect();
         let (ev_schema, ev_table) = event_spelling(cfg);
         let names: Arc<[String]> = columns.iter().map(|(n, _)| n.clone()).collect();
         let rowid_stable = scalar(
@@ -2324,13 +2367,55 @@ mod error_code_tests {
 
     /// A name past LogMiner's limit, an unmined column type, or too many columns: one code, usage, exit 1.
     #[test]
-    fn a_table_logminer_cannot_mine_is_refused_by_code() {
-        let err = mineable("O", "T", &["C BLOB".into()], 1).unwrap_err();
+    fn a_table_logminer_cannot_mine_is_refused_by_its_reason() {
+        let col = |name: &str, ty: &str| CatalogColumn {
+            name: name.into(),
+            data_type: ty.into(),
+            identity: false,
+            virtual_col: false,
+        };
+        let id = [col("ID", "NUMBER")];
+        assert_eq!(unmineable("O", "T", &id, 19), None);
+        assert!(refuse_unmineable("O", "T", &id, 19).is_ok());
+        let err = refuse_unmineable("O", "T", &[col("B", "BLOB")], 19).unwrap_err();
         crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED", 1);
-        let err = mineable(&"O".repeat(MAX_MINED_NAME + 1), "T", &[], 1).unwrap_err();
-        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED", 1);
-        let err = mineable("O", "T", &[], MAX_COLUMNS + 1).unwrap_err();
-        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_TABLE_UNSUPPORTED", 1);
-        assert!(mineable("O", "T", &[], 1).is_ok());
+        let blob = unmineable("O", "T", &[col("ID", "NUMBER"), col("B", "BLOB")], 19).unwrap();
+        assert!(blob.contains("B BLOB"), "{blob}");
+        let long = unmineable("O", &"T".repeat(MAX_MINED_NAME + 1), &id, 19).unwrap();
+        assert!(long.contains("over 30 bytes"), "{long}");
+        assert!(unmineable("O", &"T".repeat(MAX_MINED_NAME), &id, 19).is_none());
+        let wide: Vec<CatalogColumn> = (0..=MAX_COLUMNS)
+            .map(|i| col(&format!("C{i}"), "NUMBER"))
+            .collect();
+        assert!(unmineable("O", "T", &wide, 19).unwrap().contains("columns"));
+        assert!(unmineable("O", "T", &wide[..MAX_COLUMNS], 19).is_none());
+        let identity = [CatalogColumn {
+            identity: true,
+            ..col("ID", "NUMBER")
+        }];
+        assert!(unmineable("O", "T", &identity, 19).is_some());
+        assert!(unmineable("O", "T", &identity, 23).is_none());
+        let virt = [CatalogColumn {
+            virtual_col: true,
+            ..col("V", "NUMBER")
+        }];
+        assert!(unmineable("O", "T", &virt, 23).is_some());
+        assert!(unmineable("O", "T", &[col("A.B", "NUMBER")], 23).is_some());
+        assert_eq!(
+            catalog_column(&[
+                Some("O".into()),
+                Some("T".into()),
+                Some("C".into()),
+                Some("BLOB".into()),
+                Some("YES".into()),
+                Some("NO".into()),
+            ]),
+            CatalogColumn {
+                name: "C".into(),
+                data_type: "BLOB".into(),
+                identity: true,
+                virtual_col: false,
+            }
+        );
     }
 }
