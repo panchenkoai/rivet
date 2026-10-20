@@ -2501,9 +2501,9 @@ fn five_configs_with_one_table_name_on_one_state_each_load_by_their_own_key() {
     require_alive(LiveService::ClickHouse);
     require_alive(LiveService::FakeGcs);
     ensure_gcs_bucket(BUCKET);
-    let Some(state) = crate::common::pg_state_url() else {
-        return;
-    };
+    // A database of its own on the state server: this cell migrates it to this tree's schema.
+    let scratch_state = ScratchStateDb::new("rivet_same_state");
+    let state = scratch_state.url();
     let sources = [
         NamedSource {
             url: POSTGRES_URL,
@@ -2623,8 +2623,10 @@ fn a_v37_state_the_previous_release_wrote_loads_after_the_v38_migration() {
     };
     let dir = rig.config_path().parent().unwrap().to_path_buf();
     // The previous release's `rivet init` records the key in the state beside the config.
-    let scratch = dir.join("init.yaml");
-    let init = old.cli_env(
+    let init_out = dir.join("init.yaml");
+    let prev = std::env::var("RIVET_PREV_RELEASE_BIN").expect("checked by as_previous_release");
+    let (_, init) = crate::common::output_of(&mut crate::common::rivet_command_as(
+        &prev,
         &[
             "init",
             "--source",
@@ -2632,11 +2634,15 @@ fn a_v37_state_the_previous_release_wrote_loads_after_the_v38_migration() {
             "--table",
             &tbl,
             "-o",
-            scratch.to_str().unwrap(),
+            init_out.to_str().unwrap(),
         ],
         &[("RIVET_STATE_URL", "")],
+    ));
+    assert!(
+        init.status.success(),
+        "the previous release's init: {}",
+        String::from_utf8_lossy(&init.stderr)
     );
-    let _ = init;
     old.run_ok();
     load(&rig);
     let copies = std::fs::read_dir(&dir)
