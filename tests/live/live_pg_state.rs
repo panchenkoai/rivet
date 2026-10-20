@@ -736,3 +736,152 @@ fn a_remote_pg_state_without_tls_is_refused_by_code_and_sslmode_disable_opts_out
         "one warning line: {stderr}"
     );
 }
+
+/// `RIVET_STATE_URL=sqlite:<path>` keeps a config's state in that file for every command: `init`
+/// records the source key there, `run` keeps its cursor there, and nothing is created beside the
+/// config. A second state URL that would leave the file beside the config behind is refused.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_sqlite_state_url_keeps_init_and_run_in_one_file_and_refuses_to_leave_state_behind() {
+    let mut c = crate::common::pg_connect();
+    let tbl = crate::common::unique_name("rivet_sqlite_url");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, updated_at TIMESTAMP NOT NULL); \
+         INSERT INTO {tbl} SELECT g, TIMESTAMP '2026-01-01' + g * INTERVAL '1 minute' \
+         FROM generate_series(1, 5) g"
+    ))
+    .expect("seed");
+    let _t = crate::common::PgTable::adopt(tbl.clone());
+    let cfg_dir = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let state = state_dir.path().join("state.db");
+    let url = format!("sqlite:{}", state.display());
+    let cfg = cfg_dir.path().join("rivet.yaml");
+    let envs = [
+        ("RIVET_STATE_URL", url.as_str()),
+        ("DATABASE_URL", crate::common::POSTGRES_URL),
+    ];
+    let said = |o: &std::process::Output| String::from_utf8_lossy(&o.stderr).into_owned();
+    let init = crate::common::run_rivet_env(
+        &[
+            "init",
+            "--source",
+            crate::common::POSTGRES_URL,
+            "--table",
+            &tbl,
+            "--mode",
+            "incremental",
+            "-o",
+            cfg.to_str().unwrap(),
+        ],
+        &envs,
+    );
+    assert!(init.status.success(), "{}", said(&init));
+    let db = rusqlite::Connection::open(&state).expect("the state file the URL names");
+    let origin: String = db
+        .query_row(
+            "SELECT key_origin FROM export_load_spec WHERE export_name = ?1",
+            [&tbl],
+            |r| r.get(0),
+        )
+        .expect("init recorded the key in the file the URL names");
+    assert_eq!(origin, "init");
+    for _ in 0..2 {
+        let run = crate::common::run_rivet_env(&["run", "-c", cfg.to_str().unwrap()], &envs);
+        assert!(run.status.success(), "{}", said(&run));
+    }
+    let cursors: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM export_state WHERE export_name = ?1 AND last_cursor_value IS NOT NULL",
+            [&tbl],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cursors, 1, "the run's cursor is in the file the URL names");
+    assert!(
+        !cfg_dir.path().join(".rivet_state.db").exists(),
+        "nothing is created beside the config"
+    );
+
+    // The file beside the config holds state; a URL naming an empty file elsewhere is refused.
+    db.execute_batch(&format!(
+        "VACUUM INTO '{}'",
+        cfg_dir.path().join(".rivet_state.db").display()
+    ))
+    .unwrap();
+    let elsewhere = format!("sqlite:{}", state_dir.path().join("new.db").display());
+    let refused = crate::common::run_rivet_env(
+        &["run", "-c", cfg.to_str().unwrap()],
+        &[
+            ("RIVET_STATE_URL", elsewhere.as_str()),
+            ("DATABASE_URL", crate::common::POSTGRES_URL),
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(5), "{}", said(&refused));
+    assert!(
+        said(&refused).contains("RIVET_STATE_URL_LEAVES_STATE_BEHIND"),
+        "{}",
+        said(&refused)
+    );
+    assert!(
+        !state_dir.path().join("new.db").exists(),
+        "nothing was opened"
+    );
+}
+
+/// The move a `sqlite:` state URL would make without the state is refused and walked out: refused
+/// twice, a second empty file refused again, and unsetting the variable delivers from the state
+/// beside the config.
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_sqlite_state_url_that_leaves_the_state_behind_is_refused_and_walked_out() {
+    let mut c = crate::common::pg_connect();
+    let tbl = crate::common::unique_name("rivet_sqlite_move");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY); INSERT INTO {tbl} SELECT g FROM generate_series(1, 3) g"
+    ))
+    .expect("seed");
+    let _t = crate::common::PgTable::adopt(tbl.clone());
+    let mut rig = crate::common::Rig::pg_batch(&tbl);
+    // An empty RIVET_STATE_URL is the file beside the config, whatever backend the gate grades.
+    let beside = [("RIVET_STATE_URL", "")];
+    let first = rig.run_args_env(&[], &beside);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    let new = format!("sqlite:{}", elsewhere.path().join("new.db").display());
+    let other = format!("sqlite:{}", elsewhere.path().join("other.db").display());
+    let want = crate::common::Refused::by_code("RIVET_STATE_URL_LEAVES_STATE_BEHIND", 5);
+    let text = rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[("RIVET_STATE_URL", new.as_str())],
+        want,
+        vec![
+            crate::common::Remedy::wrong(
+                "points RIVET_STATE_URL at another empty file",
+                crate::common::Then::Refuses(want),
+                |_| {},
+            )
+            .rerun_env(&[("RIVET_STATE_URL", other.as_str())])
+            .in_place(),
+            crate::common::Remedy::new(
+                "unset RIVET_STATE_URL to keep using the file beside the config",
+                crate::common::Then::DeliversTheSource,
+                |_| {},
+            )
+            .rerun_env(&beside)
+            .in_place(),
+        ],
+    );
+    assert!(
+        text.contains(".backup"),
+        "the refusal names the copy: {text}"
+    );
+    assert!(
+        !elsewhere.path().join("new.db").exists(),
+        "nothing was opened"
+    );
+}

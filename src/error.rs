@@ -439,6 +439,11 @@ pub fn coded(code: Code, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(CodedError::new(code, message))
 }
 
+/// [`coded`] over the `io::Error` it reports, kept in the chain so its kind classifies the retry.
+pub fn coded_io(code: Code, message: impl Into<String>, source: std::io::Error) -> anyhow::Error {
+    anyhow::Error::new(source).context(CodedError::new(code, message))
+}
+
 /// `message` built around `inner`, carrying `inner`'s code when it has one, else `fallback`.
 pub fn recoded(inner: &anyhow::Error, fallback: Code, message: impl Into<String>) -> anyhow::Error {
     coded(code_of(inner).unwrap_or(fallback), message)
@@ -784,6 +789,11 @@ pub mod codes {
         "RIVET_STATE_URL_TLS_REQUIRED",
         "add `?sslmode=require` (or `verify-ca` / `verify-full`) to `RIVET_STATE_URL` with TLS enabled on the state server, or `?sslmode=disable` to accept plaintext on a private network",
     );
+    /// `RIVET_STATE_URL=sqlite:<path>` names an empty file while the file beside the config holds the state.
+    pub const STATE_URL_LEAVES_STATE_BEHIND: Code = refusal(
+        "RIVET_STATE_URL_LEAVES_STATE_BEHIND",
+        "copy the state beside the config to the path `RIVET_STATE_URL` names with every run stopped (`sqlite3 <old> \".backup <new>\"`), or unset RIVET_STATE_URL",
+    );
     /// A MySQL session that is not at UTC after rivet set it, so every TIMESTAMP would land shifted.
     pub const SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: Code = refusal(
         "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED",
@@ -792,7 +802,7 @@ pub mod codes {
     /// `RIVET_STATE_URL` set to something that is not a PostgreSQL URL.
     pub const STATE_URL_SCHEME_UNSUPPORTED: Code = usage(
         "RIVET_STATE_URL_SCHEME_UNSUPPORTED",
-        "set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL, or unset it to keep the state in the SQLite file beside the config",
+        "set `RIVET_STATE_URL` to a `postgres://` or `postgresql://` URL or to `sqlite:<path>`, or unset it to keep the state in the SQLite file beside the config",
     );
     /// The state store cannot be written: read-only when it is opened, or it did not take a run's first write.
     pub const STATE_NOT_WRITABLE: Code = environment(
@@ -1631,6 +1641,7 @@ pub mod codes {
         SOURCE_COLUMNS_CHANGED_UNDER_READ,
         SOURCE_OVERRIDE_WIRE_MISMATCH,
         STATE_URL_SCHEME_UNSUPPORTED,
+        STATE_URL_LEAVES_STATE_BEHIND,
         SOURCE_SESSION_TIME_ZONE_NOT_APPLIED,
         CLI_CHECK_REPORTED_ERRORS,
         STATE_URL_TLS_REQUIRED,

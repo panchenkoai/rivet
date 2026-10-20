@@ -419,6 +419,19 @@ seeds:
       sqlite-state:
         na: "a SQLite state is a file beside the config; it has no connection and no TLS"
 
+  - name: sqlite-state-url-ignored-or-moved-blind
+    class: "`RIVET_STATE_URL=sqlite:<path>` is not honoured (refused as an unknown scheme, so init and run keep the state beside the config), or a move to an empty `sqlite:` file starts every export over and leaves the load journal behind"
+    history: "0.32.2 item 5, 2026-10-18: owner asked for a SQLite state outside the config directory (client sim); measured on main 8ef02e5f: `sqlite:/x/state.db` refused RIVET_STATE_URL_SCHEME_UNSUPPORTED, nothing written there"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-state-url-ignored-or-moved-blind/sqlite-state.patch
+        cells:
+          - a_sqlite_state_url_keeps_init_and_run_in_one_file_and_refuses_to_leave_state_behind
+          - a_sqlite_state_url_that_leaves_the_state_behind_is_refused_and_walked_out
+          - "lib:a_sqlite_url_that_leaves_the_state_beside_the_config_behind_is_refused"
+      postgres-state:
+        na: "a `sqlite:` state URL names a SQLite file; a PostgreSQL state is the server's"
   - name: sqlite-writer-starved-by-a-sibling
     class: "a state write on the SQLite file is refused `database is locked` after the busy timeout because a sibling writer in the same process takes the write lock in every gap (SQLite's busy wait has no queue)"
     history: "0.32.1 D6, 2026-10-18: CI flake of a_replan_beside_another_writer_of_the_state_waits_for_it on #634 (`1 of 1000 replans failed beside 94629 writes`); measured on devbox: BEGIN IMMEDIATE refused after 15.4 s beside 530 000 writes; the forced cell is red 3/3 on main 51a1b69c"
@@ -1535,6 +1548,40 @@ seeds:
         na: "a MongoDB change stream has no server-side slot or replica id; its position is the config's own checkpoint"
       oracle:
         na: "LogMiner keeps no server-side object per reader; the position is the config's own checkpoint"
+  - name: io-error-classified-by-its-path-text
+    class: "an `io::Error` (a missing directory, a read-only file) is retried as transient because a path in its message contains a network word (`dns`, `reset`), so a permanent stop exits 2"
+    history: "0.32.2, 2026-10-20: #639's mutation shard baseline failed `an_unwritable_aggregate_path_is_refused_by_code` with exit 2 for 1 because its temp dir was named `.tmprDnsA7`; RED on main c1cf6a92 with a directory named `dns`"
+    scope: source
+    patch: io-error-classified-by-its-path-text/shared.patch
+    engines:
+      postgres:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      mysql:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      mssql:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      mongo:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+      oracle:
+        cells: ["lib:an_unwritable_path_named_like_a_network_failure_is_not_transient"]
+  - name: pg-slot-advanced-by-another-reader
+    class: "a PostgreSQL CDC export continues from a slot another config consumed past its checkpoint, so the changes in between are missing from its output with exit 0"
+    history: "0.32.2 item 4, 2026-10-20: measured on main c1cf6a92: config A, config B on one slot in turn; A's third run exit 0 without B's row"
+    scope: source
+    patch: pg-slot-advanced-by-another-reader/postgres.patch
+    engines:
+      postgres:
+        cells:
+          - a_slot_another_config_advanced_is_refused_instead_of_losing_its_changes
+          - "lib:a_slot_confirmed_past_the_checkpoint_is_refused_and_one_at_or_before_it_reads"
+      mysql:
+        na: "the MySQL binlog is not consumed by a reader: a second config reads the same events, and its position is its own checkpoint"
+      mssql:
+        na: "SQL Server change tables are not consumed by a reader; positions are each config's checkpoint"
+      mongo:
+        na: "a MongoDB change stream is not consumed by a reader; its resume token is the config's checkpoint"
+      oracle:
+        na: "LogMiner reads archived logs no reader consumes; the position is the config's checkpoint"
 
   - name: accepted-edit-not-recorded
     class: "`rivet state accept` reports an edited query as accepted and leaves the stored progress bound to the query it was written reading, so the next run is refused as before"
