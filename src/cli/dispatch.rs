@@ -70,6 +70,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     if cli.no_notify {
         crate::notify::silence();
     }
+    crate::state::set_lock_wait(cli.lock_wait);
     match cli.command {
         Commands::Run(args) => dispatch_run(args),
         Commands::Check {

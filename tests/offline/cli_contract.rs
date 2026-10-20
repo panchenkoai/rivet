@@ -630,3 +630,84 @@ fn no_notify_silences_the_run_and_every_process_child() {
         ]
     );
 }
+
+/// `--lock-wait` over a run lease another process holds (this test): 0 refuses at once with the
+/// busy code, 2 waits, says so, and stops by `RIVET_STATE_LOCK_TIMEOUT`, and a longer wait takes the
+/// lease as soon as its holder lets go. Every case is exit 2, which a scheduler retries.
+#[test]
+fn lock_wait_refuses_at_zero_times_out_by_code_and_takes_a_lease_let_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg,
+        "source:\n  type: postgres\n  url: \"postgresql://u:p@127.0.0.1:1/db\"\nexports:\n  \
+         - name: orders\n    query: \"SELECT 1 AS x\"\n    mode: full\n    format: csv\n    \
+         destination: { type: local, path: ./out }\n",
+    )
+    .unwrap();
+    let cfg = cfg.to_str().unwrap();
+    let config = rivet::config::Config::load(cfg).unwrap();
+    let key = rivet::pipeline::run_lease_key("orders", &config.source.state_key());
+    let state = rivet::state::StateStore::open(cfg).unwrap();
+    let held = state
+        .try_load_lease(&key)
+        .unwrap()
+        .expect("the test holds the run lease");
+    let reset = |wait: &str| {
+        let mut cmd = Command::new(RIVET_BIN);
+        cmd.args([
+            "--lock-wait",
+            wait,
+            "state",
+            "reset",
+            "-c",
+            cfg,
+            "-e",
+            "orders",
+        ]);
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("RIVET_") {
+                cmd.env_remove(&k);
+            }
+        }
+        cmd
+    };
+    let timed = |mut cmd: Command| {
+        let started = std::time::Instant::now();
+        let out = cmd.output().expect("rivet");
+        (out, started.elapsed())
+    };
+
+    let (out, _) = timed(reset("0"));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("[RIVET_STATE_RUN_IN_PROGRESS]"), "{err}");
+    assert!(!err.contains("waiting up to"), "0 does not wait: {err}");
+
+    let (out, took) = timed(reset("2"));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("[RIVET_STATE_LOCK_TIMEOUT]"), "{err}");
+    assert!(err.contains("waiting up to 2 s"), "the wait is said: {err}");
+
+    assert!(
+        took >= std::time::Duration::from_secs(2),
+        "it waited: {took:?}"
+    );
+
+    let started = std::time::Instant::now();
+    let child = reset("30")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "taken once let go: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+}

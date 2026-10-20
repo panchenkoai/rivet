@@ -293,6 +293,15 @@ fn lease_ttl_s() -> u64 {
         .unwrap_or(30)
 }
 
+/// A holder id (`host:pid:nonce`) as a sentence names it.
+fn holder_text(holder: &str) -> String {
+    let mut parts = holder.splitn(3, ':');
+    match (parts.next(), parts.next()) {
+        (Some(host), Some(pid)) => format!("pid {pid} on host {host}"),
+        _ => format!("`{holder}`"),
+    }
+}
+
 /// This host's name, the part of a holder id that says where its pid lives.
 fn host_name() -> String {
     let mut buf = [0u8; 256];
@@ -331,7 +340,81 @@ fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
     db.with_file_name(name)
 }
 
+/// How long a take of a lease another live process holds waits, in seconds (`--lock-wait`); 0 answers at once.
+static LOCK_WAIT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set how long this process waits for a lease another live process holds (`--lock-wait`).
+pub fn set_lock_wait(seconds: u64) {
+    LOCK_WAIT_S.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long this process waits for a lease another live process holds, in seconds.
+pub fn lock_wait_s() -> u64 {
+    LOCK_WAIT_S.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How often a waiting take says again that it is waiting.
+const WAIT_NOTE_EVERY: Duration = Duration::from_secs(60);
+
+/// The longest pause between two attempts of a waiting take.
+const WAIT_POLL: Duration = Duration::from_secs(1);
+
 impl StateStore {
+    /// Take `key`, trying again while another live process holds it for up to `--lock-wait`:
+    /// `None` at once when the wait is 0 (the caller's own refusal), the lease once it is free, and
+    /// `RIVET_STATE_LOCK_TIMEOUT` when the wait ran out. `what` names the lease and its holder.
+    pub fn take_lease_waiting(
+        &self,
+        key: &str,
+        what: &dyn Fn() -> String,
+    ) -> Result<Option<LoadLease<'_>>> {
+        let wait = Duration::from_secs(lock_wait_s());
+        let started = Instant::now();
+        let mut noted: Option<Instant> = None;
+        loop {
+            if let Some(lease) = self.try_load_lease(key)? {
+                return Ok(Some(lease));
+            }
+            if wait.is_zero() {
+                return Ok(None);
+            }
+            let waited = started.elapsed();
+            if waited >= wait {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_LOCK_TIMEOUT,
+                    "{}, held by {}, was still held after {} s (`--lock-wait {}`); nothing was done",
+                    what(),
+                    self.lease_holder(key)?,
+                    waited.as_secs(),
+                    wait.as_secs()
+                );
+            }
+            if noted.is_none_or(|at| at.elapsed() >= WAIT_NOTE_EVERY) {
+                log::warn!(
+                    "{} is held by {}: waiting up to {} s for it (`--lock-wait`)",
+                    what(),
+                    self.lease_holder(key)?,
+                    wait.as_secs()
+                );
+                noted = Some(Instant::now());
+            }
+            std::thread::sleep(WAIT_POLL.min(wait - waited));
+        }
+    }
+
+    /// Who holds `key`, as far as the state records: a PostgreSQL holder names its host and pid.
+    fn lease_holder(&self, key: &str) -> Result<String> {
+        if let StateRef::Sqlite(_) = &self.state_ref {
+            return Ok("another rivet process on this host".to_string());
+        }
+        let holder = self.query_opt(
+            "SELECT holder FROM state_lease WHERE lease_key = ?1",
+            &[key.into()],
+            |r| r.text(0),
+        )?;
+        Ok(holder.map_or_else(|| "another rivet process".to_string(), |h| holder_text(&h)))
+    }
+
     /// Try to take the load lease for `key` (the target table); `None` when
     /// another process holds it.
     pub fn try_load_lease(&self, key: &str) -> Result<Option<LoadLease<'_>>> {
