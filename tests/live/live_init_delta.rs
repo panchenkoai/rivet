@@ -1447,6 +1447,184 @@ fn two_configs_oracle() -> TwoConfigSource {
     (src, Box::new(t), &["--schema", "RIVET"])
 }
 
+/// Two configs that already share one checkpoint (the 0.32.1 `init -o` pair: own destination and
+/// stream objects, one `./cdc/<table>.ckpt`), the checkpoint written before 0.32.2 so it has no
+/// owner record: the first run on this binary claims it, the other config is refused by code on
+/// every run before it reads a change, and the first keeps delivering.
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it(
+    (src, _guard, extra): TwoConfigSource,
+) {
+    (src.apply)(&[Op::Ins(1), Op::Ins(2)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+    args.extend(src.init_args.iter().map(String::as_str));
+    args.extend(extra);
+    args.extend(["--output", "a.yaml"]);
+    rivet_ok_in(dir.path(), &args, &[]);
+    let a = std::fs::read_to_string(dir.path().join("a.yaml")).unwrap();
+    let ckpt_line = a
+        .lines()
+        .find(|l| l.trim().starts_with("checkpoint:"))
+        .expect("a CDC scaffold names its checkpoint")
+        .to_string();
+    let mut b = a.replace("path: ./output/", "path: ./prod-output/");
+    let slots: Vec<Slot> = match a.split("slot: ").nth(1) {
+        Some(rest) => {
+            let slot = rest
+                .split([',', '}', '\n', ' '])
+                .next()
+                .unwrap()
+                .to_string();
+            b = b.replace(&format!("slot: {slot}"), &format!("slot: {slot}_b"));
+            vec![Slot::new(slot.clone()), Slot::new(format!("{slot}_b"))]
+        }
+        None => Vec::new(),
+    };
+    if let Some(rest) = a.split("server_id: ").nth(1) {
+        let id = rest.split_whitespace().next().unwrap();
+        b = b.replace(
+            &format!("server_id: {id}"),
+            &format!("server_id: {}", id.parse::<u64>().unwrap() + 1),
+        );
+    }
+    assert!(
+        b.contains(&ckpt_line),
+        "the pair shares one checkpoint:\n{b}"
+    );
+    std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
+    let a_cfg = dir.path().join("a.yaml").display().to_string();
+    match std::env::var("RIVET_PREV_RELEASE_BIN") {
+        Ok(bin) if !bin.is_empty() => {
+            eprintln!("the checkpoint is written by the previous release ({bin})");
+            let out = run_rivet_as(&bin, &["run", "--config", &a_cfg], &db);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        _ => {
+            eprintln!(
+                "RIVET_PREV_RELEASE_BIN unset: the checkpoint is written by this binary and its \
+                 owner record removed, the shape a 0.32.1 run leaves"
+            );
+            rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+            let owners: Vec<_> = files_under(dir.path())
+                .into_iter()
+                .filter(|f| f.to_string_lossy().ends_with(".ckpt.owner"))
+                .collect();
+            assert_eq!(owners.len(), 1, "{owners:?}");
+            std::fs::remove_file(&owners[0]).unwrap();
+        }
+    }
+    (src.apply)(&[Op::Ins(3)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    for attempt in 1..=2 {
+        let out = run_rivet_in_dir(dir.path(), &["run", "-c", "b.yaml"], &db);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(5), "attempt {attempt}:\n{said}");
+        assert!(
+            said.contains("[RIVET_SOURCE_CDC_CHECKPOINT_SHARED]") && said.contains("a.yaml"),
+            "attempt {attempt}:\n{said}"
+        );
+    }
+    (src.apply)(&[Op::Ins(4)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    assert!(
+        !dir.path().join("prod-output").exists(),
+        "the refused config wrote nothing"
+    );
+    let place = scaffolded_path(dir.path(), &a);
+    let dirs: std::collections::BTreeSet<std::path::PathBuf> = files_under(&place)
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
+        .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    let ids: std::collections::BTreeSet<i64> = dirs.iter().flat_map(|d| ids_in(d)).collect();
+    assert_eq!(
+        ids,
+        (1..=4).collect(),
+        "the claiming config kept delivering"
+    );
+    drop(slots);
+}
+
+/// `rivet init -o a.yaml` again after the first `a.yaml` was moved aside, its stream's checkpoint
+/// still in `./cdc/`: refused by code on both attempts writing nothing; another `-o` name writes a
+/// scaffold that runs.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn init_over_a_taken_cdc_checkpoint_is_refused_twice_and_another_name_runs_mysql() {
+    let (src, _guard, extra) = two_configs_mysql();
+    (src.apply)(&[Op::Ins(1), Op::Ins(2)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let init = |file: &str| {
+        let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+        args.extend(src.init_args.iter().map(String::as_str));
+        args.extend(extra);
+        args.extend(["--output", file]);
+        run_rivet_in_dir(dir.path(), &args, &[])
+    };
+    assert!(init("a.yaml").status.success());
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    std::fs::rename(dir.path().join("a.yaml"), dir.path().join("a-old.yaml")).unwrap();
+    for attempt in 1..=2 {
+        let out = init("a.yaml");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(5), "attempt {attempt}:\n{said}");
+        assert!(
+            said.contains("[RIVET_INIT_CDC_NAME_TAKEN]") && said.contains("a-old.yaml"),
+            "attempt {attempt} names the checkpoint's config:\n{said}"
+        );
+        assert!(!dir.path().join("a.yaml").exists(), "nothing was written");
+    }
+    assert!(init("c.yaml").status.success(), "another -o name");
+    (src.apply)(&[Op::Ins(3)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "c.yaml"], &db);
+    let c = std::fs::read_to_string(dir.path().join("c.yaml")).unwrap();
+    let place = scaffolded_path(dir.path(), &c);
+    let dirs: std::collections::BTreeSet<std::path::PathBuf> = files_under(&place)
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
+        .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    let ids: std::collections::BTreeSet<i64> = dirs.iter().flat_map(|d| ids_in(d)).collect();
+    assert_eq!(
+        ids,
+        (1..=3).collect(),
+        "the new config baselines and streams on its own checkpoint"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_mysql() {
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_mysql());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_postgres() {
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_postgres());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_mssql());
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_oracle());
+}
+
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn two_init_configs_in_one_dir_keep_their_streams_apart_mysql() {

@@ -1564,7 +1564,7 @@ seeds:
         na: "LogMiner keeps no server-side object per reader; the position is the config's own checkpoint"
   - name: init-cdc-checkpoint-shared-by-name
     class: "two CDC configs `rivet init -o` writes for one table into one directory name one checkpoint, so each stream resumes where the other stopped and skips what it read, exit 0"
-    history: "0.32.2, owner decision 2026-10-21: `-o a.yaml` and `-o b.yaml` both wrote `checkpoint: ./cdc/<table>.ckpt` and `./output/<table>_cdc/`; fixed by stem-derived names and RIVET_INIT_CONFIG_EXISTS"
+    history: "0.32.2, owner decision 2026-10-21: `-o a.yaml` and `-o b.yaml` both wrote `checkpoint: ./cdc/<table>.ckpt` and `./output/<table>_cdc/`; fixed by stem-derived names and RIVET_INIT_CDC_NAME_TAKEN"
     scope: source
     patch: init-cdc-checkpoint-shared-by-name/shared.patch
     engines:

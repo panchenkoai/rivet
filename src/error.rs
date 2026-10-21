@@ -1554,7 +1554,12 @@ pub mod codes {
         "RIVET_DEST_IO_RUNTIME_UNAVAILABLE",
         "raise the process's thread and open-file limits, or lower the export parallelism, then run again",
     );
-    /// `rivet init -o` met a config at the output path, or a CDC checkpoint or destination another config names.
+    /// `rivet init -o` would write a CDC checkpoint that exists, or a checkpoint or destination another config names.
+    pub const INIT_CDC_NAME_TAKEN: Code = refusal(
+        "RIVET_INIT_CDC_NAME_TAKEN",
+        "write the config under another `-o` name: the stem names its checkpoint and destination",
+    );
+    /// `rivet init -o` met a config at the output path.
     pub const INIT_CONFIG_EXISTS: Code = refusal(
         "RIVET_INIT_CONFIG_EXISTS",
         "move the existing config aside, or write elsewhere with `-o <new-path>`",
@@ -1830,6 +1835,7 @@ pub mod codes {
         DEST_CREDENTIALS_INVALID,
         DEST_PREFIX_MODE_MISMATCH,
         DEST_IO_RUNTIME_UNAVAILABLE,
+        INIT_CDC_NAME_TAKEN,
         INIT_CONFIG_EXISTS,
         INIT_TABLE_NOT_FOUND,
         INIT_NO_TABLES,

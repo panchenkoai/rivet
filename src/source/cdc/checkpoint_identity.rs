@@ -53,6 +53,12 @@ pub(crate) fn owner_path(ckpt: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
+/// The owner record beside the checkpoint at `ckpt`, when one was written and reads.
+pub(crate) fn owner_of(ckpt: &std::path::Path) -> Option<CheckpointOwner> {
+    let text = std::fs::read_to_string(owner_path(ckpt)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// Whether export `export` of the config at `config` names the checkpoint `ckpt` (a config that
 /// cannot be read is taken to name it: refusing is the safe answer).
 fn still_names(config: &std::path::Path, export: &str, ckpt: &std::path::Path) -> bool {
@@ -95,9 +101,7 @@ pub(crate) fn claim_checkpoint(
         export: export.to_string(),
     };
     let record = owner_path(ckpt);
-    let held: Option<CheckpointOwner> = std::fs::read_to_string(&record)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok());
+    let held = owner_of(ckpt);
     if let Some(owner) = &held {
         if owner == &me {
             return Ok(());
