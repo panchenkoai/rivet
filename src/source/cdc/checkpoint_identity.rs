@@ -53,6 +53,26 @@ pub(crate) fn owner_path(ckpt: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
+/// `p` spelled one way whatever exists of it: its longest existing ancestor canonical (so
+/// `/var` and `/private/var` agree), the rest lexical without `.` or a trailing `/`.
+pub(crate) fn canonical_place(p: &std::path::Path) -> std::path::PathBuf {
+    let lexical: std::path::PathBuf = p.components().collect();
+    let mut head = lexical.as_path();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(head) {
+            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(up), Some(name)) => {
+                tail.push(name.to_os_string());
+                head = up;
+            }
+            _ => return lexical,
+        }
+    }
+}
+
 /// The owner record beside the checkpoint at `ckpt`, when one was written and reads.
 pub(crate) fn owner_of(ckpt: &std::path::Path) -> Option<CheckpointOwner> {
     let text = std::fs::read_to_string(owner_path(ckpt)).ok()?;
@@ -69,11 +89,7 @@ fn still_names(config: &std::path::Path, export: &str, ckpt: &std::path::Path) -
         return true;
     };
     let dir = config.parent().unwrap_or(std::path::Path::new("."));
-    let same = |p: &std::path::Path| {
-        let canon =
-            |q: &std::path::Path| std::fs::canonicalize(q).unwrap_or_else(|_| q.to_path_buf());
-        canon(p) == canon(ckpt)
-    };
+    let same = |p: &std::path::Path| canonical_place(p) == canonical_place(ckpt);
     cfg.exports.iter().any(|e| {
         e.name == export
             && e.cdc
@@ -94,10 +110,7 @@ pub(crate) fn claim_checkpoint(
     export: &str,
 ) -> Result<()> {
     let me = CheckpointOwner {
-        config: std::fs::canonicalize(config)
-            .unwrap_or_else(|_| config.to_path_buf())
-            .display()
-            .to_string(),
+        config: canonical_place(config).display().to_string(),
         export: export.to_string(),
     };
     let record = owner_path(ckpt);
@@ -251,6 +264,17 @@ mod owner_tests {
         let b = config(dir.path(), "b.yaml", "orders_cdc", "./cdc/shared.ckpt");
         claim_checkpoint(&ckpt, &a, "orders_cdc")
             .expect("a checkpoint with no owner record is claimed");
+        let unwritten = dir.path().join("cdc/not_yet.ckpt");
+        config(dir.path(), "c.yaml", "orders_cdc", "./cdc/not_yet.ckpt");
+        config(dir.path(), "d.yaml", "orders_cdc", "./cdc/not_yet.ckpt");
+        claim_checkpoint(&unwritten, &dir.path().join("c.yaml"), "orders_cdc").unwrap();
+        let other_spelling = canonical_place(dir.path())
+            .join(".")
+            .join("cdc/not_yet.ckpt");
+        let err = claim_checkpoint(&other_spelling, &dir.path().join("d.yaml"), "orders_cdc")
+            .expect_err("a checkpoint not written yet is still the other config's");
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5);
+        std::fs::remove_file(dir.path().join("d.yaml")).unwrap();
         claim_checkpoint(&ckpt, &a, "orders_cdc").expect("its owner reads it again");
         for _ in 0..2 {
             let err = claim_checkpoint(&ckpt, &b, "orders_cdc").unwrap_err();

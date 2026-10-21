@@ -972,32 +972,13 @@ fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
     }
 }
 
-/// `p` spelled one way whatever exists of it: its longest existing ancestor canonical (so
-/// `/var` and `/private/var` agree), the rest lexical without `.` or a trailing `/`.
-fn canonical_place(p: &std::path::Path) -> std::path::PathBuf {
-    let lexical: std::path::PathBuf = p.components().collect();
-    let mut head = lexical.as_path();
-    let mut tail = Vec::new();
-    loop {
-        if let Ok(real) = std::fs::canonicalize(head) {
-            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
-        }
-        match (head.parent(), head.file_name()) {
-            (Some(up), Some(name)) => {
-                tail.push(name.to_os_string());
-                head = up;
-            }
-            _ => return lexical,
-        }
-    }
-}
-
 /// Where a CDC export of `cfg` (a config in `dir`) keeps its stream: its checkpoint file and its destination.
 fn cdc_places(
     cfg: &crate::config::Config,
     dir: &std::path::Path,
 ) -> Vec<(String, Option<std::path::PathBuf>, String)> {
-    let canon = |p: std::path::PathBuf| canonical_place(&p);
+    let canon =
+        |p: std::path::PathBuf| crate::source::cdc::checkpoint_identity::canonical_place(&p);
     cfg.exports
         .iter()
         .filter(|e| e.cdc.is_some())
