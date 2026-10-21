@@ -1,0 +1,17 @@
+diff --git a/src/state/load_lease.rs b/src/state/load_lease.rs
+index afeb7513..7a0b30ec 100644
+--- a/src/state/load_lease.rs
++++ b/src/state/load_lease.rs
+@@ -330,10 +330,8 @@ fn lease_file_token(key: &str) -> String {
+         .chars()
+         .take(LEASE_TOKEN_CHARS)
+         .collect();
+-    format!(
+-        "{readable}-{:016x}",
+-        xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+-    )
++    let _ = (readable, xxhash_rust::xxh3::xxh3_64(key.as_bytes()));
++    crate::manifest::file_token(key)
+ }
+ 
+ /// The sidecar an SQLite-state lease locks: beside the DB file, one per lease key.
