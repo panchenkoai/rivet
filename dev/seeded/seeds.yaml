@@ -3098,6 +3098,17 @@ seeds:
       mongo:
         cells: ["lib:keeping_date_resolves_the_names_and_leaves_date_for_the_apply"]
 
+  - name: state-copy-leaves-sequences-behind
+    class: "`rivet state copy` writes the rows with their ids and leaves each serial column's sequence at 1, so the first run through the copied PostgreSQL state collides with a copied id and fails"
+    history: "0.32.2 item 9, 2026-10-20: the copy writes ids explicitly; seeded so the sequence move cannot be dropped"
+    scope: state
+    engines:
+      postgres-state:
+        patch: state-copy-leaves-sequences-behind/postgres-state.patch
+        cells: [a_0_30_cdc_state_copied_to_postgres_continues_its_stream_and_owns_its_tables]
+      sqlite-state:
+        na: "`rivet state copy` writes into a PostgreSQL state only; a SQLite file is its source, which it only reads"
+
   - name: whole-pass-replaces-the-base
     class: "a whole-table pass (an incremental run with no cursor, a CDC re-baseline) lands over an existing base-and-buffer base instead of joining its buffer, so every row only the base held (rows the source deleted, tombstones, copied history) is lost with exit 0"
     history: "2026-10-20 - D1/D2 of the client cut-over simulation (Airflow + BigQuery, 0.32.1): `rivet state reset` then a cycle took a base from 3334 to 2178 rows, the printed CDC re-baseline from 16681 (5801 flagged) to 10772 (0 flagged); fixed by routing both through `whole_table_run_joins_the_log(base_and_buffer, ..)` and buffering the rows a re-baseline no longer holds as deletes"
