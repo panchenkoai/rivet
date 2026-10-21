@@ -1086,6 +1086,34 @@ mod tests {
     /// coverage — so `replace -> PathBuf with Default::default()`, `delete !` and
     /// `&& -> ||` all sailed through the offline gate. It decides where a resume
     /// looks for its position, so a wrong answer re-anchors the stream at NOW.
+    /// The run's claim reads the export's `cdc.checkpoint` against its config's directory: a second
+    /// config of the directory naming the same file is refused by code.
+    #[test]
+    fn a_run_claims_the_checkpoint_its_export_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let yaml = |out: &str| {
+            format!(
+                "source:\n  type: mysql\n  url: \"mysql://u:p@localhost/app\"\nexports:\n  - name: o\n    \
+                 table: orders\n    mode: cdc\n    format: parquet\n    cdc:\n      checkpoint: ./cdc/o.ckpt\n    \
+                 destination: {{ type: local, path: {out} }}\n"
+            )
+        };
+        for (file, out) in [("a.yaml", "./a"), ("b.yaml", "./b")] {
+            std::fs::write(dir.path().join(file), yaml(out)).unwrap();
+        }
+        let at = |f: &str| dir.path().join(f).display().to_string();
+        let export = |f: &str| {
+            crate::config::Config::load(&at(f))
+                .unwrap()
+                .exports
+                .remove(0)
+        };
+        super::claim_checkpoint(&at("a.yaml"), &export("a.yaml")).unwrap();
+        assert!(dir.path().join("cdc/o.ckpt.owner").exists());
+        let err = super::claim_checkpoint(&at("b.yaml"), &export("b.yaml")).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5);
+    }
+
     #[test]
     fn resolve_checkpoint_prefers_the_config_dir_and_keeps_an_existing_cwd_file() {
         let cfg_dir = tempfile::tempdir().expect("config dir");

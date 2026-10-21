@@ -256,6 +256,16 @@ mod owner_tests {
     /// A checkpoint is claimed by its first reader and refused to a second config's export on
     /// every attempt while the first still names it; written before 0.32.2 (no owner record), or
     /// left by a config that moved, it is claimed.
+    /// The owner record is written beside a checkpoint whose directory does not exist yet.
+    #[test]
+    fn a_first_claim_makes_the_checkpoint_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = config(dir.path(), "a.yaml", "orders_cdc", "./cdc/new/a.ckpt");
+        let ckpt = dir.path().join("cdc/new/a.ckpt");
+        claim_checkpoint(&ckpt, &a, "orders_cdc").unwrap();
+        assert!(owner_path(&ckpt).exists());
+    }
+
     #[test]
     fn a_checkpoint_another_config_still_reads_is_refused_on_every_attempt() {
         let dir = tempfile::tempdir().unwrap();

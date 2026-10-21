@@ -3009,6 +3009,21 @@ mod tests {
         let plain = schema(&InitYamlDestination::default());
         assert!(plain.contains("checkpoint: ./cdc/app_cdc.ckpt "), "{plain}");
         assert!(plain.contains("path: ./output/cdc/"), "{plain}");
+        let oracle = generate_schema_config(
+            &[t("orders"), t("invoices")],
+            "oracle://u:p@localhost:1521/FREEPDB1",
+            &crate::init::SourceProvenance::Inline,
+            "Oracle schema \"APP\"",
+            &staging,
+            Some("cdc"),
+            None,
+        )
+        .unwrap();
+        let ckpt = oracle
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("checkpoint: "))
+            .unwrap_or_else(|| panic!("an Oracle stream names its checkpoint:\n{oracle}"));
+        assert!(ckpt.starts_with("./cdc/staging_"), "{oracle}");
     }
 
     /// The whole-schema PostgreSQL stream names its one slot after the `-o` stem, and keeps the

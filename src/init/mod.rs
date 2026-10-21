@@ -3774,6 +3774,15 @@ mod cdc_names_taken_tests {
         let shared_dest = super::refuse_cdc_names_taken(&at("b.yaml"), &mine).unwrap_err();
         std::fs::write(at("a.yaml"), cdc_yaml("./cdc/a.ckpt", "./output/a/")).unwrap();
         assert!(super::refuse_cdc_names_taken(&at("b.yaml"), &mine).is_ok());
+        // A `.yml` sibling is a config too; a file of another kind, or this one itself, is not.
+        std::fs::write(at("c.yml"), cdc_yaml("./cdc/b.ckpt", "./output/c/")).unwrap();
+        let yml = super::refuse_cdc_names_taken(&at("b.yaml"), &mine).unwrap_err();
+        assert!(format!("{yml:#}").contains("c.yml"), "{yml:#}");
+        std::fs::remove_file(at("c.yml")).unwrap();
+        std::fs::write(at("c.txt"), cdc_yaml("./cdc/b.ckpt", "./output/c/")).unwrap();
+        std::fs::write(at("b.yaml"), &mine).unwrap();
+        assert!(super::refuse_cdc_names_taken(&at("b.yaml"), &mine).is_ok());
+        std::fs::remove_file(at("b.yaml")).unwrap();
         std::fs::create_dir_all(dir.path().join("cdc")).unwrap();
         std::fs::write(dir.path().join("cdc/b.ckpt"), "{}").unwrap();
         let exists = super::refuse_cdc_names_taken(&at("b.yaml"), &mine).unwrap_err();
