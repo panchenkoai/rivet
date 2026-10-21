@@ -1,0 +1,23 @@
+diff --git a/src/pipeline/cdc/sink.rs b/src/pipeline/cdc/sink.rs
+index c66d2ee7..ecc111bd 100644
+--- a/src/pipeline/cdc/sink.rs
++++ b/src/pipeline/cdc/sink.rs
+@@ -593,8 +593,7 @@ pub(crate) fn run_to_files(
+                     // (the checkpoint stays on the last commit) and the table continues in a new
+                     // part with its columns as the source holds them now: dropping its values was
+                     // #644. An old name is left to `image_cell`, which maps a rename by position.
+-                    let lacking =
+-                        columns_the_schema_lacks(&sinks[at].out.columns, &sinks[at].gone, &ev);
++                    let lacking: Vec<String> = Vec::new();
+                     if !lacking.is_empty() {
+                         let table = sinks[at].out.table.clone();
+                         let fresh = match reschema.as_mut() {
+@@ -712,7 +711,7 @@ pub(crate) fn run_to_files(
+         // column added while the run was open: asked again here, a table it no longer covers
+         // whole stops the run by code instead of ending clean over values it never read.
+         let tables: Vec<String> = sinks.iter().map(|s| s.out.table.clone()).collect();
+-        if let crate::source::cdc::RowImage::Partial { why } = stream.row_image(&tables) {
++        if let (true, crate::source::cdc::RowImage::Partial { why }) = (false, stream.row_image(&tables)) {
+             crate::rivet_bail!(
+                 crate::error::codes::SOURCE_CDC_SCHEMA_CHANGED,
+                 "{} cdc: {why} — a column was added to a captured table while the run was open, \
