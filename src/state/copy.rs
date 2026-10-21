@@ -471,8 +471,8 @@ mod tests {
     /// `RIVET_STATE_URL` is read from the process environment (checked in a child of this test).
     #[test]
     fn the_state_url_is_read_from_the_environment() {
-        const CHILD: &str = "RIVET_TEST_STATE_URL_VAR_CHILD";
-        if std::env::var(CHILD).is_ok() {
+        const MARK: &str = "rivet_state_url_child_marker";
+        if std::env::args().any(|a| a == MARK) {
             assert_eq!(
                 super::super::state_url_var().as_deref(),
                 Some("postgresql://u@h/db")
@@ -483,8 +483,9 @@ mod tests {
             .args([
                 "--exact",
                 "state::copy::tests::the_state_url_is_read_from_the_environment",
+                "--skip",
+                MARK,
             ])
-            .env(CHILD, "1")
             .env("RIVET_STATE_URL", "postgresql://u@h/db")
             .output()
             .unwrap();
