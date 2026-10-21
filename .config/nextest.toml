@@ -57,6 +57,11 @@ slow-timeout = { period = "300s", terminate-after = 4 }
 # The three BigQuery key-move cells added 2026-10-03 (ADR-0030) took 206-237 s solo (two loads, a
 # compact and the oracle's BigQuery grades) and were killed at 240 s in a seeded-recall control run.
 
+# The state-copy cell runs a 0.30.0 cycle and two cycles of this tree into BigQuery, each graded
+# by the rig oracle: 241 s solo on devbox (2026-10-20).
+[[profile.default.overrides]]
+filter = 'test(/^live_init_delta::a_0_30_cdc_state_copied_to_postgres_/)'
+
 # The generated-config warehouse chains (live_init_delta) gained a second, two-cycle leg on
 # 2026-10-20 (state reset / CDC re-baseline over an existing base): 141-185 s solo on devbox
 # with the main build, killed at 240 s in a seeded-recall control run.

@@ -85,6 +85,13 @@ scenarios:
     mssql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+  - id: refusal_state_copy_target_not_empty
+    what: "RIVET_STATE_COPY_TARGET_NOT_EMPTY: `rivet state copy` into a PostgreSQL state that already holds state rows (the second copy of one SQLite state), refused before any row is written"
+    postgres: { test: a_state_copy_into_a_state_with_rows_is_refused_and_walked_out }
+    mysql:    { na: "the refusal is the state copy's and does not depend on the source engine: the postgres row carries it (its cell streams a MySQL source)" }
+    mssql:    { na: "the refusal is the state copy's and does not depend on the source engine: the postgres row carries it" }
+    mongo:    { na: "the refusal is the state copy's and does not depend on the source engine: the postgres row carries it" }
+    oracle:   { na: "the refusal is the state copy's and does not depend on the source engine: the postgres row carries it" }
   - id: refusal_source_session_time_zone_not_applied
     what: "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: a MySQL session still off UTC after rivet's `SET time_zone` (a proxy answered it without forwarding); a direct connection delivers, the same run again through the proxy refuses"
     mysql:    { test: a_session_time_zone_the_proxy_dropped_is_refused_before_a_row_is_read }

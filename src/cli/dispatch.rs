@@ -75,6 +75,9 @@ fn load_report(json: bool, summary_output: Option<String>) -> load::result::Repo
 /// render it as plain text or JSON via the `--json-errors` global flag.
 pub fn dispatch(cli: Cli) -> Result<()> {
     validate_cli(&cli.command)?;
+    if cli.no_notify {
+        crate::notify::silence();
+    }
     match cli.command {
         Commands::Run(args) => dispatch_run(args),
         Commands::Check {
@@ -987,6 +990,7 @@ fn dispatch_state(action: StateAction) -> Result<()> {
         } => show_runs(&config, running, last, json),
         StateAction::FinishRun { config, run_id } => finish_run_cmd(&config, &run_id),
         StateAction::Vacuum { config } => vacuum_cmd(&config),
+        StateAction::Copy { config, to } => copy_state_cmd(&config, to),
         StateAction::Loads {
             config,
             target,
@@ -1083,6 +1087,35 @@ fn show_runs(config: &str, running_only: bool, last: usize, json: bool) -> Resul
 /// loudly on a typo'd id and no-ops honestly on an already-terminal row —
 /// only a `running` row is ever touched.
 /// `rivet state vacuum`: compact a SQLite state DB and print the size change.
+fn copy_state_cmd(config: &str, to: Option<String>) -> Result<()> {
+    require_config_file(config)?;
+    let (source, target) = crate::state::copy::endpoints(config, to)?;
+    let report = crate::state::copy::copy_sqlite_to_postgres(&source, &target)?;
+    for (table, rows) in &report.tables {
+        println!("  {table}: {rows} row(s)");
+    }
+    println!(
+        "{}",
+        crate::state::copy::done_note(&source, &target, &report, &checkpoint_files(config))
+    );
+    Ok(())
+}
+
+/// The `cdc.checkpoint` files a config's exports name, resolved as a run resolves them.
+fn checkpoint_files(config: &str) -> Vec<std::path::PathBuf> {
+    let Ok(cfg) = crate::config::Config::load(config) else {
+        return Vec::new();
+    };
+    let dir = std::path::Path::new(config)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    cfg.exports
+        .iter()
+        .filter_map(|e| e.cdc.as_ref()?.checkpoint.as_ref())
+        .map(|p| crate::source::cdc::resolve_checkpoint(p, dir))
+        .collect()
+}
+
 fn vacuum_cmd(config: &str) -> Result<()> {
     require_config_file(config)?;
     match StateStore::open(config)?.vacuum()? {
