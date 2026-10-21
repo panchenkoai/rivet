@@ -4308,6 +4308,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_name_the_catalog_holds_is_a_new_column_and_one_it_lacks_is_gone() {
+        let mut fresh = int_col();
+        fresh[0].column_name = "c".into();
+        let lacking = vec!["c".to_string(), "old".to_string()];
+        assert_eq!(
+            place_lacking(&lacking, Some(&fresh), 1, 2),
+            Ok((vec!["c".to_string()], vec!["old".to_string()]))
+        );
+        assert_eq!(
+            place_lacking(&lacking, Some(&int_col()), 1, 2),
+            Ok((Vec::new(), lacking.clone())),
+            "a catalog that names neither: both are gone"
+        );
+        assert_eq!(
+            place_lacking(&lacking, None, 2, 2),
+            Ok((Vec::new(), lacking.clone())),
+            "no catalog, the same arity: names only, left to the positional map"
+        );
+        assert_eq!(place_lacking(&lacking, None, 1, 2), Err(()));
+    }
+
+    #[test]
+    fn a_name_the_table_no_longer_has_is_asked_of_the_catalog_once() {
+        let with_b = |id: i64| {
+            let mut e = insert(id);
+            e.after = Some(vec![RivetValue::Int(id), RivetValue::Int(7)]);
+            e.image_names = Some(std::sync::Arc::from(vec!["v".to_string(), "b".to_string()]));
+            e
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![with_b(1), with_b(2), with_b(3)]),
+            acked: Vec::new(),
+        };
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut config = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        let counter = std::rc::Rc::clone(&asked);
+        config.reschema = Some(Box::new(move |_: &str| {
+            counter.set(counter.get() + 1);
+            Ok(int_col())
+        }));
+        let (manifests, r) = run_to_files(&mut stream, config);
+        r.unwrap();
+        assert_eq!(
+            asked.get(),
+            1,
+            "the gone name is remembered, not asked again per change"
+        );
+        assert_eq!((manifests[0].part_count, manifests[0].row_count), (1, 3));
+        let vs: Vec<i64> = part_rows(dir.path()).into_iter().map(|r| r.1).collect();
+        assert_eq!(vs, vec![1, 2, 3]);
+    }
+
     /// `(file, v, __op, __pos, __seq)` of every row of every parquet part under `dir`, in file order.
     fn part_rows(dir: &Path) -> Vec<(String, i64, String, String, i64)> {
         use arrow::array::{Int64Array, StringArray};
