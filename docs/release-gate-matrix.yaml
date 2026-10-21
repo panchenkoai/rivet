@@ -406,11 +406,16 @@ infra:
       RED-proven against a log with one extra ungraded first run"
   - id: seeded_recall
     status: partial
+    # A row whose every declared cell skips on the stand for a reason it names (Snowflake, a stand profile) is
+    # NOT-GRADED-HERE: listed, never a catch, and held under this count; one more is a FAIL.
+    not_graded_here_ceiling: 0  # ratchet-pin: seeded-not-graded-here
     note: "verify_seeded_recall re-introduces every known bug class in dev/seeded/seeds.yaml as a
       source patch in a scratch worktree, builds it, and requires the declared catching cells
       (green on the unpatched tree) to go red; MISSED / STALE / BROKEN / NO-CONTROL rows fail.
-      RESIDUAL: opt-in (--with-seeded-recall / RIVET_ORACLE_SEEDED_RECALL=1, or `make seeded-recall`),
-      it records a SKIP otherwise; several classes have engines with no catching cell (see the manifest)"
+      On in release-oracle-full (a run without it is a reduced gate). A row whose every declared cell
+      skipped on the stand is NOT-GRADED-HERE (a SKIP row naming each skip reason) under
+      not_graded_here_ceiling; a row with a green control and a seed that left nothing red stays MISSED.
+      RESIDUAL: several classes have engines with no catching cell (see the manifest)"
   - id: cdc_standby
     infra: ["pg-cdc-standby"]
     status: test

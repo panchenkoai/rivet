@@ -32,6 +32,10 @@ SCOPES = {
 }
 OPTIONAL = ("lib",)
 CAUGHT, MISSED, STALE, BROKEN, NO_CONTROL, NA = "CAUGHT", "MISSED", "STALE", "BROKEN", "NO-CONTROL", "N/A"
+#: Every declared cell skipped on this stand for a reason it named: reported, never a catch, held under a ceiling.
+NOT_GRADED_HERE = "NOT-GRADED-HERE"
+#: The gate matrix row whose `not_graded_here_ceiling` bounds the NOT-GRADED-HERE rows.
+GATE_MATRIX = ROOT / "docs" / "release-gate-matrix.yaml"
 LIB = "lib:"
 
 
@@ -133,8 +137,9 @@ def cell_outcomes(out: str, skipped: dict[str, str], cells: tuple[str, ...]) -> 
     return res
 
 
-def grade(row: Row, control: dict[str, str], seeded: dict[str, str] | None) -> Verdict:
-    """CAUGHT iff a cell green on the unpatched tree is red on the patched one; `seeded=None` = the patched tree did not build."""
+def grade(row: Row, control: dict[str, str], seeded: dict[str, str] | None,
+          skipped: dict[str, str] | None = None) -> Verdict:
+    """CAUGHT iff a cell green on the unpatched tree is red on the patched one; `seeded=None` = the patched tree did not build; `skipped` = each control cell's own skip reason."""
     if row.na:
         return Verdict(row, NA, row.na)
     if seeded is None:
@@ -142,6 +147,9 @@ def grade(row: Row, control: dict[str, str], seeded: dict[str, str] | None) -> V
     if not row.cells:
         return Verdict(row, MISSED, "no cell catches this class on this engine")
     green = [c for c in row.cells if control.get(c) == "PASS"]
+    if not green and all(control.get(c) == "SKIP" for c in row.cells):
+        why = "; ".join(f"{c}: {(skipped or {}).get(c, 'skipped')}" for c in row.cells)
+        return Verdict(row, NOT_GRADED_HERE, f"every declared cell skipped on this stand ({why})")
     if not green:
         said = ", ".join(f"{c}={control.get(c, 'ABSENT')}" for c in row.cells)
         return Verdict(row, NO_CONTROL, f"no declared cell is green on the unpatched tree ({said})")
@@ -241,6 +249,7 @@ class Cargo:
             env["RIVET_TEST_STATE_TOXI_URL"] = urllib.parse.urlunsplit(
                 (t.scheme, f"{t.username}:{t.password}@127.0.0.1:15433", t.path, "", ""))
         self.env = env
+        self.skipped: dict[str, str] = {}
 
     @staticmethod
     def binaries(cells) -> list[str]:
@@ -270,6 +279,7 @@ class Cargo:
                 "-E", nextest_filter([c.removeprefix(LIB) for c in cells])],
                cwd=self.tree, env={**self.env, "RIVET_SKIP_LOG": str(skip_log)})
         log.write_text(p.stdout)
+        self.skipped = {k.split("::")[-1]: why for k, why in self_skipped(skip_log).items()}
         return cell_outcomes(p.stdout, self_skipped(skip_log), tuple(cells))
 
 
@@ -281,14 +291,35 @@ def recompiled(build_out: str) -> bool:
 # ── the run ───────────────────────────────────────────────────────────────────
 
 
-def record(led: Ledger, out: list[Verdict]) -> None:
-    """One ledger row per graded verdict: CAUGHT passes, N/A is not a row, anything else (MISSED, STALE, BROKEN, NO-CONTROL) fails the gate."""
+def not_graded_here_ceiling(matrix: Path = GATE_MATRIX) -> int:
+    """The gate matrix's bound on NOT-GRADED-HERE rows (row `seeded_recall`, key `not_graded_here_ceiling`)."""
+    rows = (yaml.safe_load(matrix.read_text()) or {}).get("infra") or []
+    row = next((r for r in rows if r.get("id") == "seeded_recall"), None)
+    if row is None or not isinstance(row.get("not_graded_here_ceiling"), int):
+        raise SystemExit(f"{matrix}: the seeded_recall row names no integer not_graded_here_ceiling")
+    return row["not_graded_here_ceiling"]
+
+
+def record(led: Ledger, out: list[Verdict], ceiling: int | None = None) -> None:
+    """One ledger row per graded verdict: CAUGHT passes, N/A is not a row, NOT-GRADED-HERE is a SKIP row held under `ceiling` (more is a FAIL), anything else (MISSED, STALE, BROKEN, NO-CONTROL) fails the gate."""
+    here = []
     for v in out:
         msg = f"seeded {v.row.seed} × {v.row.engine}: {v.status} — {v.detail}"
         if v.status == CAUGHT:
             led.passed(v.row.engine, "seeded", v.row.seed, "-", msg)
+        elif v.status == NOT_GRADED_HERE:
+            led.skipped(v.row.engine, "seeded", v.row.seed, "-", msg)
+            here.append(f"{v.row.seed} × {v.row.engine}")
         elif v.status != NA:
             led.failed(v.row.engine, "seeded", v.row.seed, "-", msg)
+    limit = not_graded_here_ceiling() if ceiling is None else ceiling
+    if len(here) > limit:
+        led.failed("-", "seeded", "not_graded_here", "-",
+                   f"seeded recall: {len(here)} row(s) NOT-GRADED-HERE, over the gate matrix's ceiling of {limit} "
+                   f"(docs/release-gate-matrix.yaml seeded_recall): a row whose cells now skip on this stand is new: "
+                   + ", ".join(here))
+    elif here:
+        print(f"  {len(here)} row(s) NOT-GRADED-HERE (ceiling {limit}): " + ", ".join(here))
 
 
 def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
@@ -317,6 +348,7 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
     live = [r for r in rows if r not in verdicts and not r.na]
     control_cells = sorted({c for r in live for c in r.cells})
     control: dict[str, str] = {}
+    control_skips: dict[str, str] = {}
     if control_cells:
         led.phase(f"CONTROL — {len(control_cells)} cell(s) on the unpatched tree")
         b = cargo.build(control_cells, logs / "control.build.log")
@@ -324,6 +356,7 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
             led.bad(f"the unpatched tree does not build (see {logs / 'control.build.log'})")
         else:
             control = cargo.run(control_cells, logs / "control.log")
+            control_skips = dict(cargo.skipped)
             for c, v in control.items():
                 (led.ok if v == "PASS" else led.bad)(f"control {c}: {v}")
 
@@ -344,9 +377,9 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
         finally:
             restore(tree, snap)
         for r in group:
-            verdicts[r] = grade(r, control, seeded)
+            verdicts[r] = grade(r, control, seeded, control_skips)
 
-    out = [verdicts.get(r) or grade(r, control, {}) for r in rows]
+    out = [verdicts.get(r) or grade(r, control, {}, control_skips) for r in rows]
     record(led, out)
     print(render(out))
     print(f"  seeded-defect recall took {(time.perf_counter() - t0) / 60:.1f} min; logs under {logs}")
@@ -441,10 +474,21 @@ def self_test() -> int:
     table = render([Verdict(pg, CAUGHT, "t2"), Verdict(Row("s", "mysql", "p", ()), MISSED, "none"),
                     Verdict(Row("s", "mongo", na="x"), NA, "x")])
     assert "recall: 1/2" in table and "MISSED     s × mysql" in table, table
+    skip = Row("s", "mysql", "p", ("t1", "t2"))
+    v = grade(skip, {"t1": "SKIP", "t2": "SKIP"}, {}, {"t1": "no SNOWFLAKE_TEST_CONNECTION"})
+    assert v.status == NOT_GRADED_HERE and "no SNOWFLAKE_TEST_CONNECTION" in v.detail, v
+    assert grade(skip, {"t1": "SKIP", "t2": "FAIL"}, {}).status == NO_CONTROL, "a red control is not a stand skip"
+    assert grade(skip, {"t1": "SKIP", "t2": "PASS"}, {"t2": "SKIP"}).status == MISSED, \
+        "a green control the seed made skip is no catch"
+    for ceiling, red in ((1, False), (0, True)):
+        led = Ledger(colour=False)
+        record(led, [v], ceiling=ceiling)
+        assert [c.status.name for c in led.cells][:1] == ["SKIP"] and led.red is red, (ceiling, led.cells)
+    assert isinstance(not_graded_here_ceiling(), int)
     for status in (MISSED, STALE, BROKEN, NO_CONTROL):
         led = Ledger(colour=False)
         record(led, [Verdict(pg, CAUGHT, "t2"), Verdict(Row("s", "mysql", "p", ()), status, "x"),
-                     Verdict(Row("s", "mongo", na="x"), NA, "x")])
+                     Verdict(Row("s", "mongo", na="x"), NA, "x")], ceiling=0)
         assert led.red and [c.status.name for c in led.cells] == ["PASS", "FAIL"], (status, led.cells)
     real = parse_manifest(yaml.safe_load(MANIFEST.read_text()))
     assert not unknown_cells(real), unknown_cells(real)

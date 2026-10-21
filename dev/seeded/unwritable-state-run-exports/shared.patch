@@ -27,3 +27,17 @@ index 77ec5447..049f9ed7 100644
      super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
      Ok(())
  }
+diff --git a/src/state/load_lease.rs b/src/state/load_lease.rs
+index 63fe71b9..8ea55a09 100644
+--- a/src/state/load_lease.rs
++++ b/src/state/load_lease.rs
+@@ -494,7 +494,8 @@ impl StateStore {
+             }
+             StateRef::Sqlite(db) => {
+                 use std::os::unix::io::AsRawFd;
+-                let file = std::fs::File::create(lease_path(db, key))?;
++                let file = std::fs::File::create(lease_path(db, key))
++                    .or_else(|_| std::fs::File::open(lease_path(db, key)))?;
+                 let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                 if rc == 0 {
+                     return Ok(Some(LoadLease {
