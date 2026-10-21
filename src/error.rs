@@ -912,6 +912,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT",
         "re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
+    /// A CDC export's checkpoint is the one another config's export still reads.
+    pub const SOURCE_CDC_CHECKPOINT_SHARED: Code = refusal(
+        "RIVET_SOURCE_CDC_CHECKPOINT_SHARED",
+        "give the export a `cdc.checkpoint` of its own, then re-baseline it",
+    );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
         "restore the checkpoint file, or re-baseline the stream: delete it, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
@@ -1550,6 +1555,11 @@ pub mod codes {
         "raise the process's thread and open-file limits, or lower the export parallelism, then run again",
     );
     /// `rivet init -o` met a config at the output path.
+    /// `rivet init` would name a CDC checkpoint or destination another stream already uses.
+    pub const INIT_CDC_NAME_TAKEN: Code = refusal(
+        "RIVET_INIT_CDC_NAME_TAKEN",
+        "write the config under another `-o` name, or move the other config aside",
+    );
     pub const INIT_CONFIG_EXISTS: Code = refusal(
         "RIVET_INIT_CONFIG_EXISTS",
         "move the existing config aside, or write elsewhere with `-o <new-path>`",
@@ -1652,6 +1662,7 @@ pub mod codes {
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,
+        SOURCE_CDC_CHECKPOINT_SHARED,
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
         SOURCE_CDC_TRUNCATED,
@@ -1804,6 +1815,7 @@ pub mod codes {
         DEST_CREDENTIALS_INVALID,
         DEST_PREFIX_MODE_MISMATCH,
         DEST_IO_RUNTIME_UNAVAILABLE,
+        INIT_CDC_NAME_TAKEN,
         INIT_CONFIG_EXISTS,
         INIT_TABLE_NOT_FOUND,
         INIT_NO_TABLES,

@@ -814,6 +814,7 @@ pub fn init(
     match output {
         Some(path) => {
             require_explicit_state(path, crate::state::StateStore::names_a_server())?;
+            refuse_cdc_names_taken(path, &text)?;
             write_config_output(path, &text)?;
             record_strategy_snapshots(path, &snapshots);
             record_primary_keys(path, source_url, tls, &snapshots);
@@ -969,6 +970,120 @@ fn no_tables_error(filter: &TableFilter) -> anyhow::Error {
             "No tables or views found (check --schema and privileges)",
         )
     }
+}
+
+/// `p` spelled one way whatever exists of it: its longest existing ancestor canonical (so
+/// `/var` and `/private/var` agree), the rest lexical without `.` or a trailing `/`.
+fn canonical_place(p: &std::path::Path) -> std::path::PathBuf {
+    let lexical: std::path::PathBuf = p.components().collect();
+    let mut head = lexical.as_path();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(head) {
+            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(up), Some(name)) => {
+                tail.push(name.to_os_string());
+                head = up;
+            }
+            _ => return lexical,
+        }
+    }
+}
+
+/// Where a CDC export of `cfg` (a config in `dir`) keeps its stream: its checkpoint file and its destination.
+fn cdc_places(
+    cfg: &crate::config::Config,
+    dir: &std::path::Path,
+) -> Vec<(String, Option<std::path::PathBuf>, String)> {
+    let canon = |p: std::path::PathBuf| canonical_place(&p);
+    cfg.exports
+        .iter()
+        .filter(|e| e.cdc.is_some())
+        .map(|e| {
+            let ckpt = e
+                .cdc
+                .as_ref()
+                .and_then(|c| c.checkpoint.as_deref())
+                .map(|raw| canon(crate::source::cdc::resolve_checkpoint(raw, dir)));
+            let d = &e.destination;
+            let place = match &d.path {
+                Some(p) => canon(dir.join(p)).display().to_string(),
+                None => format!(
+                    "{:?}://{}/{}",
+                    d.destination_type,
+                    d.bucket.as_deref().unwrap_or(""),
+                    d.prefix.as_deref().unwrap_or("").trim_end_matches('/')
+                ),
+            };
+            (e.name.clone(), ckpt, place)
+        })
+        .collect()
+}
+
+/// Refuse a scaffold whose CDC checkpoint already exists, or whose checkpoint or destination
+/// another config in the same directory names: two streams on one checkpoint each skip what the
+/// other read, and on one destination they mix their runs. Nothing is written.
+fn refuse_cdc_names_taken(path: &str, text: &str) -> Result<()> {
+    let Ok(mine) = crate::config::Config::from_yaml(text) else {
+        return Ok(());
+    };
+    let out = std::path::Path::new(path);
+    let dir = out
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let taken = |what: String| {
+        crate::error::coded(
+            crate::error::codes::INIT_CDC_NAME_TAKEN,
+            format!(
+                "init: {what}. Nothing was written. Write the config under another name (`-o \
+                 <other>.yaml` names its checkpoint and destination after the file), or move the \
+                 other one aside"
+            ),
+        )
+    };
+    let ours = cdc_places(&mine, dir);
+    for (export, ckpt, _) in &ours {
+        if let Some(c) = ckpt.as_ref().filter(|c| c.exists()) {
+            return Err(taken(format!(
+                "export '{export}' would keep its CDC position in '{}', which already exists — \
+                 another stream's checkpoint",
+                c.display()
+            )));
+        }
+    }
+    let siblings = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    for entry in siblings {
+        let other = entry.path();
+        let yaml = other.extension().is_some_and(|x| x == "yaml" || x == "yml");
+        if !yaml || other.file_name() == out.file_name() {
+            continue;
+        }
+        let Ok(cfg) = crate::config::Config::load(&other.display().to_string()) else {
+            continue;
+        };
+        for (theirs, ckpt, place) in cdc_places(&cfg, dir) {
+            for (export, my_ckpt, my_place) in &ours {
+                if my_ckpt.is_some() && my_ckpt == &ckpt {
+                    return Err(taken(format!(
+                        "export '{export}' would share its CDC checkpoint with export '{theirs}' \
+                         of '{}'",
+                        other.display()
+                    )));
+                }
+                if my_place == &place {
+                    return Err(taken(format!(
+                        "export '{export}' would share its CDC destination `{place}` with export \
+                         '{theirs}' of '{}'",
+                        other.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write the scaffold to `-o <path>`, naming the path + cause on failure. The
@@ -3616,5 +3731,44 @@ mod explicit_state_tests {
             assert!(super::require_explicit_state(gone, true).is_err());
         }
         super::require_explicit_state(gone, false).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cdc_names_taken_tests {
+    /// A one-table MySQL CDC config whose checkpoint is `ckpt` and whose destination is `out`.
+    fn cdc_yaml(ckpt: &str, out: &str) -> String {
+        format!(
+            "source:\n  type: mysql\n  url: \"mysql://u:p@localhost/app\"\nexports:\n  - name: orders_cdc\n    \
+             table: orders\n    mode: cdc\n    format: parquet\n    cdc:\n      checkpoint: {ckpt}\n      \
+             server_id: 4300\n    destination: {{ type: local, path: {out} }}\n"
+        )
+    }
+
+    /// A scaffold is refused, writing nothing, when its checkpoint exists or a sibling config
+    /// names its checkpoint or its destination; one that shares neither is written.
+    #[test]
+    fn a_scaffold_naming_another_streams_checkpoint_or_destination_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |f: &str| dir.path().join(f).display().to_string();
+        let mine = cdc_yaml("./cdc/b.ckpt", "./output/b/");
+        assert!(super::refuse_cdc_names_taken(&at("b.yaml"), &mine).is_ok());
+        std::fs::write(at("a.yaml"), cdc_yaml("./cdc/b.ckpt", "./output/a/")).unwrap();
+        let shared_ckpt = super::refuse_cdc_names_taken(&at("b.yaml"), &mine).unwrap_err();
+        std::fs::write(at("a.yaml"), cdc_yaml("./cdc/a.ckpt", "./output/b/")).unwrap();
+        let shared_dest = super::refuse_cdc_names_taken(&at("b.yaml"), &mine).unwrap_err();
+        std::fs::write(at("a.yaml"), cdc_yaml("./cdc/a.ckpt", "./output/a/")).unwrap();
+        assert!(super::refuse_cdc_names_taken(&at("b.yaml"), &mine).is_ok());
+        std::fs::create_dir_all(dir.path().join("cdc")).unwrap();
+        std::fs::write(dir.path().join("cdc/b.ckpt"), "{}").unwrap();
+        let exists = super::refuse_cdc_names_taken(&at("b.yaml"), &mine).unwrap_err();
+        for (err, says) in [
+            (shared_ckpt, "share its CDC checkpoint"),
+            (shared_dest, "share its CDC destination"),
+            (exists, "already exists"),
+        ] {
+            crate::error::assert_coded(&err, "RIVET_INIT_CDC_NAME_TAKEN", 5);
+            assert!(format!("{err:#}").contains(says), "{err:#}");
+        }
     }
 }

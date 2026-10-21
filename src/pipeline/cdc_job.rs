@@ -355,6 +355,17 @@ fn capture_instance_mismatch(
     )
 }
 
+/// Claim the export's `cdc.checkpoint` for the config at `config_path` (none: nothing to claim).
+pub(super) fn claim_checkpoint(config_path: &str, export: &ExportConfig) -> Result<()> {
+    let Some(raw) = export.cdc.as_ref().and_then(|c| c.checkpoint.as_deref()) else {
+        return Ok(());
+    };
+    let config = std::path::Path::new(config_path);
+    let dir = config.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let ckpt = crate::source::cdc::resolve_checkpoint(raw, dir);
+    crate::source::cdc::checkpoint_identity::claim_checkpoint(&ckpt, config, &export.name)
+}
+
 pub(super) fn initial_snapshot_pending(
     config: &Config,
     export: &ExportConfig,
