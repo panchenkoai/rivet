@@ -80,6 +80,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_STATE_CHUNK_RUN_SUPERSEDED` | refusal | 5 | `rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run starts a fresh pass |
 | `RIVET_STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED` | refusal | 5 | re-run once with `parallel: 1` to finish the interrupted run, then raise `parallel:` |
 | `RIVET_STATE_RUN_IN_PROGRESS` | busy | 2 | wait for the run to finish, or stop its process, then repeat the command |
+| `RIVET_STATE_LOCK_TIMEOUT` | busy | 2 | the other process still holds it: retry once it ends, or give `--lock-wait` more seconds |
 | `RIVET_STATE_CHUNK_CHECKPOINT_GONE` | refusal | 5 | run the export again: it starts a new chunk run (the parts the lost run wrote stay in the destination, in no manifest) |
 | `RIVET_STATE_CHUNK_PLAN_CHANGED` | refusal | 5 | restore the query and the chunk settings the interrupted run had and run once to finish it; or `rivet state reset-chunks -c <config> --export <name>` abandons it and the next run starts over |
 | `RIVET_STATE_CHUNK_WINDOWS_BROKEN` | refusal | 5 | `rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run plans the export again and reads every key |

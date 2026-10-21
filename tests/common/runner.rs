@@ -86,6 +86,9 @@ pub fn rivet_command_as(
         }
     }
     note_ignored_shell_state_url();
+    // The harness grades a busy lease as the immediate refusal it was before `--lock-wait`; a cell
+    // that grades the wait passes `--lock-wait` (or this variable) itself.
+    cmd.env("RIVET_LOCK_WAIT", "0");
     if let Some(url) = super::state::state_url_under_test() {
         cmd.env("RIVET_STATE_URL", url);
     }

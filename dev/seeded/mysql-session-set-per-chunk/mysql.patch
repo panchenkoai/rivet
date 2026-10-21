@@ -1,0 +1,11 @@
+--- a/src/source/mysql/mod.rs
++++ b/src/source/mysql/mod.rs
+@@ -632,7 +632,7 @@ impl<'a> MysqlSessionGuard<'a> {
+     ) -> Result<Self> {
+         let defaults = plan.defaults(conn)?;
+         let id = conn.connection_id();
+-        let given = match plan.keeps_session {
++        let given = match plan.keeps_session && false {
+             true => plan
+                 .given
+                 .lock()
