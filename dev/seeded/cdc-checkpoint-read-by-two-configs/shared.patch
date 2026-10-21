@@ -1,12 +1,12 @@
 diff --git a/src/source/cdc/checkpoint_identity.rs b/src/source/cdc/checkpoint_identity.rs
-index dd737820..f093cb23 100644
+index 2b56b9cb..fce50c9a 100644
 --- a/src/source/cdc/checkpoint_identity.rs
 +++ b/src/source/cdc/checkpoint_identity.rs
-@@ -95,6 +95,7 @@ pub(crate) fn claim_checkpoint(
+@@ -114,6 +114,7 @@ pub(crate) fn claim_checkpoint(
          export: export.to_string(),
      };
      let record = owner_path(ckpt);
-+    let _ = std::fs::remove_file(&record);
-     let held: Option<CheckpointOwner> = std::fs::read_to_string(&record)
-         .ok()
-         .and_then(|s| serde_json::from_str(&s).ok());
++    let _ = std::fs::remove_file(owner_path(ckpt));
+     let held = owner_of(ckpt);
+     if let Some(owner) = &held {
+         if owner == &me {
