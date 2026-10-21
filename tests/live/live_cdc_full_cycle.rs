@@ -525,4 +525,22 @@ fn the_previous_release_reads_a_checkpoint_this_one_wrote() {
         "{}",
         String::from_utf8_lossy(&ran.stderr)
     );
+    let continued: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    let slot_at: String = c
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .unwrap()
+        .get(0);
+    assert_ne!(
+        continued["lsn"], written["lsn"],
+        "it read the change after the checkpoint"
+    );
+    assert_eq!(
+        continued["lsn"].as_str(),
+        Some(slot_at.as_str()),
+        "and acked it"
+    );
 }
