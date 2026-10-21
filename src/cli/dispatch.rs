@@ -62,6 +62,19 @@ fn check_export_selection(config: &Config, export: Option<&str>) -> Result<()> {
     );
 }
 
+/// The Azure destination of `rivet init`, when `--azure-container` was given (clap requires the account with it).
+fn azure_target(
+    container: Option<String>,
+    account: Option<String>,
+    endpoint: Option<String>,
+) -> Option<init::InitAzureTarget> {
+    Some(init::InitAzureTarget {
+        container: container?,
+        account: account.unwrap_or_default(),
+        endpoint,
+    })
+}
+
 /// Where a `rivet load` / `rivet compact` sends its result document.
 fn load_report(json: bool, summary_output: Option<String>) -> load::result::Report {
     load::result::Report {
@@ -166,6 +179,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             gcs_credentials_file,
             s3_bucket,
             s3_region,
+            azure_container,
+            azure_account,
+            azure_endpoint,
             bigquery_project,
             bigquery_dataset,
             clickhouse_url,
@@ -193,6 +209,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             gcs_credentials_file,
             s3_bucket,
             s3_region,
+            azure_target(azure_container, azure_account, azure_endpoint),
             bigquery_project,
             bigquery_dataset,
             clickhouse_url,
@@ -715,6 +732,7 @@ fn dispatch_init(
     gcs_credentials_file: Option<String>,
     s3_bucket: Option<String>,
     s3_region: Option<String>,
+    azure: Option<init::InitAzureTarget>,
     bigquery_project: Option<String>,
     bigquery_dataset: Option<String>,
     clickhouse_url: Option<String>,
@@ -753,6 +771,7 @@ fn dispatch_init(
         clickhouse_user: Some(clickhouse_user),
         snowflake: snowflake.target()?,
         cdc_name_stem: None,
+        azure,
     };
     let filter = init::TableFilter { include, exclude };
     let tls_config = resolve_init_tls(tls, tls_ca)?;
@@ -1322,6 +1341,7 @@ mod init_tls_tests {
             vec![],
             None,
             false,
+            None,
             None,
             None,
             None,

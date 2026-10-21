@@ -438,15 +438,18 @@ Generate a config scaffold from a live database (connect + introspect)
 * `--include <GLOB>` — Whole-schema only: keep only tables/views matching these globs (`*`/`?`) — several after one flag (`--include orders users`) or the flag repeated; a table is kept if it matches any. No `--include` = keep all
 * `--exclude <GLOB>` — Whole-schema only: drop tables/views matching these globs (`*`/`?`) — several after one flag or the flag repeated; `--exclude` wins over `--include`
 * `-o`, `--output <OUTPUT>` — Write output to this file instead of stdout
-* `--discover` — Emit a machine-readable JSON discovery artifact instead of a YAML scaffold. Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes. Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` flags
+* `--discover` — Emit a machine-readable JSON discovery artifact instead of a YAML scaffold. Includes row estimates, size bytes, ranked cursor candidates, chunk candidates, and advisory notes. Mutually exclusive with the YAML-only `--gcs-bucket` / `--s3-bucket` / `--azure-container` flags
 * `--mode <MODE>` — Override the suggested extraction mode for every scaffolded export. `cdc` scaffolds a change-data-capture export (mode: cdc + a cdc: block with engine-specific stream params) instead of a batch query; on MySQL, and on PostgreSQL when every table is in `public`, over two or more tables it writes one batch recipe per table plus one `tables:` stream with `backfill: auto` (one export per table otherwise). Other values (full / incremental / chunked / time_window) just override the auto-suggested mode
 * `--gcs-bucket <NAME>` — Scaffold `destination: type: gcs` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--s3-bucket` and `--discover`
 * `--gcs-credentials-file <PATH>` — Optional path for `credentials_file:` on GCS scaffolds. Omit entirely to use ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` — no key in YAML
 * `--s3-bucket <NAME>` — Scaffold `destination: type: s3` with this bucket (each export gets `prefix: exports/<table>/`). Incompatible with `--gcs-bucket` and `--discover`
 * `--s3-region <REGION>` — Optional AWS region for S3 scaffolds (when using `--s3-bucket`)
+* `--azure-container <NAME>` — Scaffold `destination: type: azure` with this Blob container (each export gets `prefix: exports/<table>/`). Needs `--azure-account`; the config names the env var `AZURE_STORAGE_KEY` for the account key (or put `sas_token_env:` in its place), never the key itself. Incompatible with `--gcs-bucket`, `--s3-bucket` and `--discover`
+* `--azure-account <NAME>` — The storage account of `--azure-container` (`<account>.blob.core.windows.net`)
+* `--azure-endpoint <URL>` — An explicit Blob endpoint for `--azure-container`, e.g. Azurite's `http://127.0.0.1:10000/devstoreaccount1`; omitted, it is derived from the account
 * `--bigquery-project <PROJECT>` — Scaffold a `load:` block for this BigQuery project. With `--bigquery-dataset` the generated config carries the warehouse target, a per-table partition guess and the base+buffer layout, so `rivet load` and `rivet compact` work from it after a review. Needs `--gcs-bucket`: the load reads GCS only, so a local or S3 scaffold with a `load:` block is a config `rivet load` refuses
 * `--bigquery-dataset <DATASET>` — The dataset the load creates its tables in (with `--bigquery-project`)
-* `--clickhouse-url <URL>` — Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g. `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the export stages in (`--gcs-bucket` or `--s3-bucket`)
+* `--clickhouse-url <URL>` — Scaffold a `load:` block for this ClickHouse HTTP endpoint, e.g. `http://localhost:8123`. Needs `--clickhouse-database` and a bucket the export stages in (`--gcs-bucket`, `--s3-bucket` or `--azure-container`)
 * `--clickhouse-database <DATABASE>` — The ClickHouse database the load creates its tables in (with `--clickhouse-url`)
 * `--clickhouse-user <USER>` — The ClickHouse user the load authenticates as (with `--clickhouse-url`)
 

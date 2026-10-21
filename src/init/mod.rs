@@ -662,6 +662,17 @@ pub struct InitYamlDestination {
     /// The `[a-z0-9_]` stem of the `-o` file a CDC scaffold names its slot and `server_id` from, so
     /// two configs on one cluster never share them; `None` writes the default names (stdout).
     pub cdc_name_stem: Option<String>,
+    /// `--azure-container` / `--azure-account` / `--azure-endpoint`: an Azure Blob destination.
+    pub azure: Option<InitAzureTarget>,
+}
+
+/// The Azure Blob container a scaffold stages in, its storage account, and an explicit endpoint
+/// (Azurite's `http://127.0.0.1:10000/devstoreaccount1`); `None` derives it from the account.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InitAzureTarget {
+    pub container: String,
+    pub account: String,
+    pub endpoint: Option<String>,
 }
 
 /// The five values a Snowflake `load:` block needs — every one is required by the loader.
@@ -701,13 +712,23 @@ impl InitYamlDestination {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.gcs_bucket.is_some() && self.s3_bucket.is_some() {
+        let buckets = [
+            self.gcs_bucket.is_some(),
+            self.s3_bucket.is_some(),
+            self.azure.is_some(),
+        ];
+        if buckets.iter().filter(|b| **b).count() > 1 {
             crate::rivet_bail!(
                 crate::error::codes::CLI_OPTION_UNSUPPORTED,
-                "use at most one of --gcs-bucket and --s3-bucket"
+                "use at most one of --gcs-bucket, --s3-bucket and --azure-container"
             );
         }
         Ok(())
+    }
+
+    /// Whether the scaffold stages in a bucket or container rather than a local directory.
+    pub(crate) fn is_bucket(&self) -> bool {
+        self.gcs_bucket.is_some() || self.s3_bucket.is_some() || self.azure.is_some()
     }
 }
 
@@ -3000,6 +3021,7 @@ mod tests {
             clickhouse_user: None,
             snowflake: None,
             cdc_name_stem: None,
+            azure: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3157,6 +3179,7 @@ mod tests {
             clickhouse_user: None,
             snowflake: None,
             cdc_name_stem: None,
+            azure: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3191,6 +3214,7 @@ mod tests {
             clickhouse_user: None,
             snowflake: None,
             cdc_name_stem: None,
+            azure: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3230,6 +3254,7 @@ mod tests {
             clickhouse_user: None,
             snowflake: None,
             cdc_name_stem: None,
+            azure: None,
         };
         let yaml = yaml_scaffold::generate_config(
             &info,
@@ -3258,6 +3283,7 @@ mod tests {
             clickhouse_user: None,
             snowflake: None,
             cdc_name_stem: None,
+            azure: None,
         };
         let err = dest.validate().expect_err("conflict must be rejected");
         let msg = format!("{err}");
@@ -3265,6 +3291,125 @@ mod tests {
             msg.contains("--gcs-bucket") && msg.contains("--s3-bucket"),
             "expected conflict diagnostic, got: {msg}"
         );
+    }
+
+    /// `--azure-container` writes an Azure destination that names the container, the account and
+    /// the env var of the key, never a key, and the endpoint only when one was given.
+    #[test]
+    fn an_azure_scaffold_names_its_container_account_and_key_env_and_no_secret() {
+        let info = make_table(
+            2_000_000,
+            vec![col("id", "bigint", true), col("name", "text", false)],
+        );
+        let at = |endpoint: Option<&str>| InitYamlDestination {
+            azure: Some(InitAzureTarget {
+                container: "rivet-c".into(),
+                account: "acct".into(),
+                endpoint: endpoint.map(str::to_string),
+            }),
+            ..Default::default()
+        };
+        let scaffold = |dest: &InitYamlDestination| {
+            let yaml = yaml_scaffold::generate_config(
+                &info,
+                "postgresql://localhost/db",
+                &super::SourceProvenance::Inline,
+                dest,
+                None,
+                None,
+            )
+            .unwrap();
+            let cfg =
+                crate::config::Config::from_yaml(&yaml).unwrap_or_else(|e| panic!("{e:#}\n{yaml}"));
+            (cfg.exports[0].destination.clone(), yaml)
+        };
+        let (d, yaml) = scaffold(&at(Some("http://127.0.0.1:10000/devstoreaccount1")));
+        assert_eq!(
+            d.destination_type,
+            crate::config::DestinationType::Azure,
+            "{yaml}"
+        );
+        assert_eq!(
+            (
+                d.bucket.as_deref(),
+                d.prefix.as_deref(),
+                d.account_name.as_deref(),
+                d.account_key_env.as_deref(),
+                d.sas_token_env.as_deref(),
+                d.endpoint.as_deref(),
+            ),
+            (
+                Some("rivet-c"),
+                Some("exports/orders/"),
+                Some("acct"),
+                Some("AZURE_STORAGE_KEY"),
+                None,
+                Some("http://127.0.0.1:10000/devstoreaccount1"),
+            ),
+            "{yaml}"
+        );
+        assert!(!d.allow_anonymous, "{yaml}");
+        let (d, yaml) = scaffold(&at(None));
+        assert_eq!(d.endpoint, None, "derived from the account: {yaml}");
+    }
+
+    /// Each destination kind alone is a bucket scaffold; none is a local one.
+    #[test]
+    fn each_bucket_flag_alone_makes_a_bucket_scaffold() {
+        let azure = InitYamlDestination {
+            azure: Some(InitAzureTarget {
+                container: "c".into(),
+                account: "a".into(),
+                endpoint: None,
+            }),
+            ..Default::default()
+        };
+        let gcs = InitYamlDestination {
+            gcs_bucket: Some("g".into()),
+            ..Default::default()
+        };
+        let s3 = InitYamlDestination {
+            s3_bucket: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            [&azure, &gcs, &s3, &InitYamlDestination::default()].map(|d| d.is_bucket()),
+            [true, true, true, false]
+        );
+    }
+
+    #[test]
+    fn validate_refuses_azure_beside_another_bucket() {
+        let azure = Some(InitAzureTarget {
+            container: "c".into(),
+            account: "a".into(),
+            endpoint: None,
+        });
+        for dest in [
+            InitYamlDestination {
+                gcs_bucket: Some("g".into()),
+                azure: azure.clone(),
+                ..Default::default()
+            },
+            InitYamlDestination {
+                s3_bucket: Some("s".into()),
+                azure: azure.clone(),
+                ..Default::default()
+            },
+        ] {
+            let err = dest.validate().expect_err("two destinations");
+            assert_eq!(
+                crate::error::error_code(&err),
+                Some("RIVET_CLI_OPTION_UNSUPPORTED")
+            );
+            assert!(format!("{err}").contains("--azure-container"), "{err}");
+        }
+        InitYamlDestination {
+            azure,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
     }
 
     /// Two listings of one catalog in different orders scaffold one order.
