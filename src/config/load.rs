@@ -322,6 +322,15 @@ impl LoadTarget {
         matches!(self, LoadTarget::Bigquery { .. })
     }
 
+    /// Whether this warehouse names each job or statement rivet runs (a BigQuery job id, a
+    /// ClickHouse query id); the `snow` CLI rivet drives Snowflake through prints none.
+    pub(crate) fn names_jobs(&self) -> bool {
+        matches!(
+            self,
+            LoadTarget::Bigquery { .. } | LoadTarget::Clickhouse { .. }
+        )
+    }
+
     /// Whether a load into this warehouse can read an export staged on `dest`.
     pub(crate) fn reads_from(&self, dest: crate::config::DestinationType) -> bool {
         use crate::config::DestinationType;
@@ -1058,6 +1067,11 @@ mod partition_form_tests {
         assert_eq!(
             [bq.compacts(), sf.compacts(), ch.compacts()],
             [true, false, false]
+        );
+        assert_eq!(
+            [bq.names_jobs(), sf.names_jobs(), ch.names_jobs()],
+            [true, false, true],
+            "the snow CLI prints no query id"
         );
         assert_eq!(
             [

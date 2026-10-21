@@ -75,6 +75,7 @@ Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md
 ###### **Options:**
 
 * `--json-errors` — Output errors as {"error":"..."} JSON to stderr; useful for machine-readable orchestration
+* `--no-notify` — Send no notification (`notifications:`) from this process or the processes it starts; a scheduler alerts from the error object instead
 
 
 

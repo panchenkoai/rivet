@@ -75,6 +75,9 @@ fn load_report(json: bool, summary_output: Option<String>) -> load::result::Repo
 /// render it as plain text or JSON via the `--json-errors` global flag.
 pub fn dispatch(cli: Cli) -> Result<()> {
     validate_cli(&cli.command)?;
+    if cli.no_notify {
+        crate::notify::silence();
+    }
     match cli.command {
         Commands::Run(args) => dispatch_run(args),
         Commands::Check {

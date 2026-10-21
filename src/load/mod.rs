@@ -1154,8 +1154,12 @@ pub fn open_store(dest: &crate::config::DestinationConfig) -> Result<GcsStore> {
 /// The one place a resolved plan's [`LoadTarget`](plan::LoadTarget) maps to a
 /// concrete [`TargetLoader`] adapter — wiring partition / cluster / connection /
 /// run-id from the config. The count gate and cleanup are the driver's, so the
-/// adapter carries no `expected_rows`.
-pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader> {
+/// adapter carries no `expected_rows`. Every job it runs is recorded in `journal`.
+pub fn build_loader(
+    plan: &plan::LoadPlan,
+    run_id: &str,
+    journal: &result::JobJournal,
+) -> Box<dyn TargetLoader> {
     use plan::LoadTarget;
     let load = &plan.load;
     match &load.target {
@@ -1169,7 +1173,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             )
             .batched_by_footers(plan.destination.clone())
             .layout(plan.layout)
-            .renamed(plan.renames.clone()),
+            .renamed(plan.renames.clone())
+            .journaled(journal.clone()),
         ),
         LoadTarget::Snowflake {
             connection,
@@ -1211,7 +1216,8 @@ pub fn build_loader(plan: &plan::LoadPlan, run_id: &str) -> Box<dyn TargetLoader
             .ca_file(ca_file.clone())
             .cluster_by(plan.clustering.columns().to_vec())
             .partition_by(plan.partition.as_ref().map(|p| p.expr.clone()))
-            .cdc(plan.mode == plan::LoadMode::Cdc),
+            .cdc(plan.mode == plan::LoadMode::Cdc)
+            .journaled(journal.clone()),
         ),
     }
 }
@@ -1533,6 +1539,13 @@ pub(crate) mod tests {
             rows,
             ..Default::default()
         }
+    }
+
+    /// [`fake_loader`] whose `table` holds `rows` rows.
+    pub(crate) fn fake_loader_holding(table: &str, rows: u64) -> FakeLoader {
+        let f = fake_loader(0);
+        f.counts.borrow_mut().insert(table.to_string(), rows);
+        f
     }
 
     fn changelog_with(drift: ChangelogDrift) -> FakeLoader {

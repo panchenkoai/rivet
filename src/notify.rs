@@ -53,11 +53,29 @@ pub(crate) fn should_notify(triggers: &[NotifyEvent], summary: &RunSummary) -> b
     })
 }
 
+/// Whether `--no-notify` turned this process's notifications off.
+static SILENCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn every notification of this process off (`--no-notify`).
+pub fn silence() {
+    SILENCED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `--no-notify` turned this process's notifications off.
+pub fn silenced() -> bool {
+    SILENCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a notification of `summary` goes out: configured, triggered, and not silenced.
+fn goes_out(slack: &crate::config::SlackConfig, summary: &RunSummary, silenced: bool) -> bool {
+    should_notify(&slack.on, summary) && !silenced
+}
+
 pub fn maybe_send(config: Option<&NotificationsConfig>, summary: &RunSummary) {
     let Some(cfg) = config else { return };
     let Some(slack) = &cfg.slack else { return };
 
-    if !should_notify(&slack.on, summary) {
+    if !goes_out(slack, summary, silenced()) {
         return;
     }
 
@@ -118,6 +136,20 @@ mod tests {
         s.mode = "full".into();
         s.schema_changed = schema_changed;
         s.with_status(status)
+    }
+
+    /// `--no-notify` stops a notification its trigger would send, and only that.
+    #[test]
+    fn a_silenced_process_sends_no_triggered_notification() {
+        let slack = SlackConfig {
+            webhook_url: Some("http://127.0.0.1:1/noop".into()),
+            webhook_url_env: None,
+            on: vec![NotifyEvent::Failure],
+        };
+        let failed = stub_summary("failed", None);
+        assert!(goes_out(&slack, &failed, false));
+        assert!(!goes_out(&slack, &failed, true));
+        assert!(!goes_out(&slack, &stub_summary("success", None), false));
     }
 
     #[test]
