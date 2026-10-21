@@ -1,5 +1,5 @@
 diff --git a/src/source/cdc/checkpoint_identity.rs b/src/source/cdc/checkpoint_identity.rs
-index 767fd0ff..0b925d31 100644
+index fa327f50..31063390 100644
 --- a/src/source/cdc/checkpoint_identity.rs
 +++ b/src/source/cdc/checkpoint_identity.rs
 @@ -4,15 +4,9 @@
@@ -19,5 +19,5 @@ index 767fd0ff..0b925d31 100644
 +     then re-snapshot the tables (`mode: full`): snapshotting first leaves the changes in \
 +     between in neither.";
  
- /// What a resume may do given the checkpoint's recorded identity and the server's.
- #[derive(Debug, PartialEq, Eq)]
+ /// A refusal of `code` whose text is `why`.
+ fn refusal(code: crate::error::Code, why: impl Into<String>) -> anyhow::Error {

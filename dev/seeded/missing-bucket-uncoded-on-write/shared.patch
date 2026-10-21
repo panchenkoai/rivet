@@ -1,10 +1,14 @@
+diff --git a/src/destination/cloud.rs b/src/destination/cloud.rs
+index bb96ea79..a0612201 100644
 --- a/src/destination/cloud.rs
 +++ b/src/destination/cloud.rs
-@@ -397,10 +397,8 @@
+@@ -405,12 +405,8 @@ impl<B: CloudBackend> CloudDestination<B> {
  impl<B: CloudBackend> CloudDestination<B> {
-     /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the write failed with a kind the backend reports an absent container by and the bucket itself is absent; any other error unchanged.
+     /// `err` as `RIVET_DEST_CONTAINER_NOT_FOUND` when the operation failed with a kind the backend reports an absent container by and the bucket itself is absent now (it may have gone since it last answered); any other error unchanged.
      fn absent_container_or(&self, err: anyhow::Error) -> anyhow::Error {
--        match write_error_may_mean_absent_container::<B>(&err).then(|| self.require_container()) {
+-        match write_error_may_mean_absent_container::<B>(&err)
+-            .then(|| self.refuse_an_absent_container())
+-        {
 -            Some(Err(absent)) => absent,
 -            _ => err,
 -        }

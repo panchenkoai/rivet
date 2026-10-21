@@ -191,13 +191,50 @@ def verify_seeded_recall(led: Ledger, enabled: bool) -> None:
     """Seeded-defect recall (dev/seeded): every known bug class re-introduced must turn its catching cells red."""
     if not enabled:
         led.skipped("-", "harness", "seeded_recall", "-",
-                    "seeded-defect recall: opt-in (--with-seeded-recall or RIVET_ORACLE_SEEDED_RECALL=1)")
+                    "seeded-defect recall: not run (--with-seeded-recall, on in release-oracle-full); "
+                    "this run is a reduced gate and cannot support a tag")
         return
     import yaml
 
     from dev.seeded import recall as seeded
 
     seeded.recall(led, seeded.parse_manifest(yaml.safe_load(seeded.MANIFEST.read_text())))
+
+
+def gate_kind(ns: argparse.Namespace) -> str:
+    """`release-oracle-full` only for a whole-scope run that gave nothing up: seeded recall on, a clean build, no escape, no bless; else `release-oracle`."""
+    from .core import FULL_GATE, REDUCED_GATE
+    reduced = (ns.engines or ns.versions or ns.no_cloud or ns.latest_only or ns.no_clean or ns.fast_clean
+               or ns.bless_local or ns.bless_cdc or ns.without_prev_release_comparison
+               or ns.without_replica_topologies or not ns.with_seeded_recall)
+    return REDUCED_GATE if reduced else FULL_GATE
+
+
+def _gate_kind_self_test() -> None:
+    """Only `make release-oracle-full`'s arguments make a full-gate verdict; each escape, a missing recall or a narrowed scope makes it reduced."""
+    import re
+
+    from .core import FULL_GATE, REDUCED_GATE
+    recipe = re.search(r"^release-oracle-full:.*?(?=^\S)", (ROOT / "Makefile").read_text(), re.M | re.S)
+    assert recipe, "the Makefile has no release-oracle-full target"
+    call = re.search(r"-m dev\.release_oracle (.*?)\$\(ARGS\)", recipe.group(0))
+    assert call, "release-oracle-full does not run the gate"
+    argv = call.group(1).split()
+    saved = {k: os.environ.pop(k, None) for k in ("RIVET_ORACLE_SEEDED_RECALL", "RIVET_ORACLE_LATEST_ONLY",
+                                                   regression._ESCAPE_ENV, scenarios._REPLICA_ESCAPE_ENV)}
+    try:
+        assert gate_kind(parse_args(argv)) == FULL_GATE, f"`make release-oracle-full` runs {argv}: not a full gate"
+        assert gate_kind(parse_args([])) == REDUCED_GATE, "a run without seeded recall is a full gate"
+        for extra in (["--no-cloud"], ["--no-clean"], ["--fast-clean"], ["--latest-only"], ["--engines", "postgres"],
+                      ["--without-prev-release-comparison"], ["--without-replica-topologies"], ["--bless-cdc"]):
+            assert gate_kind(parse_args([*argv, *extra])) == REDUCED_GATE, f"{extra} still reads as a full gate"
+        bare = re.search(r"^release-oracle:.*?\n\t(.*)", (ROOT / "Makefile").read_text(), re.M)
+        assert bare and "--without-prev-release-comparison" in bare.group(1), "the bare gate gives nothing up"
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+    print("self-test ok: only release-oracle-full's arguments (seeded recall on, nothing given up) make a full-gate verdict")
 
 
 def _gate_modules() -> list[object]:
@@ -270,6 +307,10 @@ def _verdict_scope_self_test() -> None:
     assert rc == 0 and wrote == "" and "RELEASE-READY" not in said and "PARTIAL RUN" in said, (rc, said, wrote)
     rc, said, wrote = report(green, full=True)
     assert rc == 0 and '"verdict": "RELEASE-READY"' in wrote and "RELEASE-READY" in said, (rc, said, wrote)
+    import json as _json
+    line = _json.loads(wrote.splitlines()[-1])
+    head = run(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).stdout.strip()
+    assert line["sha"] == head and line["gate"] == core.REDUCED_GATE and isinstance(line["dirty"], bool), line
 
     infra = Ledger(colour=False)
     infra.passed("-", "-", "s", "-", "a graded cell")
@@ -429,6 +470,7 @@ def _stage_table_self_test() -> None:
         assert not shared, f"a stage that measures against the previous release shares its wave: {shared}"
         assert table[-1].name == "live modules" and [s.name for s in cut[-1]] == ["live modules"], \
             "live modules runs last and alone: it runs what no stage before it ran"
+        assert "release hygiene" in {s.name for s in table}, "cargo audit and docgen --check are gate stages"
         first = next(s for s in table if s.name == "release build path")
         assert not [s for s in table[:table.index(first)] if CARGO in s.needs | s.uses and s.name != "clean tree"], \
             "the release build path reads the committed lock before any other cargo stage"
@@ -462,6 +504,8 @@ def _stages_self_test() -> None:
     assert STAGES_RUN["verify_a"] == 2, "re-recording must not wrap the wrapper"
     _raising_stage_self_test()
     _verdict_scope_self_test()
+    _gate_kind_self_test()
+    release_path.hygiene_self_test()
     doc = {
         "preflights": [{"id": "a", "status": "test"}, {"id": "off", "status": "gap"}],
         "infra": [{"id": "undriven", "status": "test"}],
@@ -965,7 +1009,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--with-seeded-recall", action="store_true", default=env_flag("RIVET_ORACLE_SEEDED_RECALL"),
         help="also run the seeded-defect recall stage (dev/seeded): re-introduce each known bug class "
              "as a source patch in a scratch tree, build it, and require its catching cells to go red. "
-             "Slow (one build per seed), so opt-in; `make seeded-recall` runs it alone.")
+             "On in `make release-oracle-full` (a run without it is a reduced gate); `make seeded-recall` runs it alone.")
     ap.add_argument("--no-cloud", action="store_true", help="local stage only (skip BigQuery)")
     ap.add_argument("--keep", action="store_true", help="leave engine containers up (debug)")
     ap.add_argument(
@@ -1137,6 +1181,7 @@ def gate_stages(ns: argparse.Namespace) -> list[Stage]:
     table = [
         # FIRST: it reads the committed lock, which any later cargo command reconciles.
         Stage("release build path", lambda led: release_path.verify_release_build_path(led), frozenset({CARGO})),
+        Stage("release hygiene", lambda led: release_path.verify_release_hygiene(led), frozenset({CARGO})),
         serial("state migrations", lambda led: scenarios.verify_state_migrations(led)),
         serial("network faults", lambda led: scenarios.verify_network_faults(led)),
         serial("tls required", lambda led: scenarios.verify_tls_required(led)),
@@ -1662,6 +1707,8 @@ def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("BLESS_CDC", "1" if ns.bless_cdc else "0")
 
     record_stage_runs(_gate_modules())
+    from .core import tree_identity
+    tree = tree_identity()
     led = Ledger()
     work = Path(tempfile.mkdtemp(prefix="rivet-oracle-"))
     os.environ["WORK"] = str(work)
@@ -1756,7 +1803,7 @@ def main(argv: list[str] | None = None) -> int:
             # A bless run returns before most stages on purpose (run_scenarios), so it cannot grade the matrix.
             if not (ns.bless_local or ns.bless_cdc):
                 led.close_matrix_rows()
-        rc = led.report(full=full and not (ns.bless_local or ns.bless_cdc))
+        rc = led.report(full=full and not (ns.bless_local or ns.bless_cdc), gate=gate_kind(ns), tree=tree)
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is
         # derived from the rows and is literally true ("every non-skipped cell is

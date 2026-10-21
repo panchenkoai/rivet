@@ -6,7 +6,7 @@ regenerates the Homebrew formula. Everything this module does happens BEFORE
 that point, so every check here is a gate on an immutable artifact: once the tag
 is pushed, a bad tag can only be fixed by a new patch release.
 
-Preconditions the script enforces, in order (unchanged from the bash):
+Preconditions the script enforces, in order (1-5 unchanged from the bash):
 
 1. `Cargo.toml` has a parseable `version`.
 2. `--tag`, when given, looks like `vX.Y.Z` AND matches that version.
@@ -16,6 +16,11 @@ Preconditions the script enforces, in order (unchanged from the bash):
    tag is already public).
 4. The tag does not already exist locally.
 5. The worktree is clean (tracked files only — see the notes below).
+6. The gate record (`dev/release-oracle/timings.jsonl`, or `--gate-record FILE`
+   copied from the machine that ran the gate) holds a `release-oracle-full` run
+   of exactly HEAD's commit, on a clean tree, and the latest such run says
+   RELEASE-READY. A reduced run (`make release-oracle`, an escape, a narrowed
+   scope, no seeded recall) is never enough.
 
 WHAT THIS SCRIPT DOES **NOT** CHECK (reported, not invented):
 
@@ -43,6 +48,7 @@ Usage mirrors the bash exactly:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -58,19 +64,25 @@ ROOT = shell.ROOT
 CARGO_TOML = ROOT / "Cargo.toml"
 CHANGELOG = ROOT / "CHANGELOG.md"
 
-USAGE = """Usage: python3 -m dev.pytools.release [--dry-run] [--push] [--tag vX.Y.Z] [--message TEXT]
+USAGE = """Usage: python3 -m dev.pytools.release [--dry-run] [--push] [--tag vX.Y.Z] [--message TEXT] [--gate-record FILE]
 
 Options:
   --dry-run     Validate only; do not create or push a tag
   --push        Push the tag to origin after creating it
   --tag vX.Y.Z  Override tag (default: v<version from Cargo.toml>)
   --message     Annotated tag message (default: vX.Y.Z: <CHANGELOG subtitle>)
+  --gate-record The gate's verdict lines (default: dev/release-oracle/timings.jsonl)
+  --self-test   Check the gate-record precondition on fixtures; tags nothing
   -h, --help    Show this help"""
 
 # The bash hard-codes this owner in the "watch:" line even though the Homebrew
 # generator derives owner/repo from Cargo.toml. Kept verbatim so the transcript
 # diffs clean; flagged rather than silently "improved".
 ACTIONS_URL = "https://github.com/panchenkoai/rivet/actions/workflows/release.yml"
+#: Where `make release-oracle-full` appends its verdict line (dev/release_oracle/core.py TIMINGS_HISTORY).
+GATE_RECORD = ROOT / "dev" / "release-oracle" / "timings.jsonl"
+#: The only gate kind whose green verdict supports a tag (dev/release_oracle/core.py FULL_GATE).
+FULL_GATE = "release-oracle-full"
 
 
 class _Usage(Exception):
@@ -85,6 +97,7 @@ class Args:
     push: bool = False
     tag_override: str = ""
     message: str = ""
+    gate_record: str = ""
 
 
 def parse_args(argv: list[str]) -> Args:
@@ -116,6 +129,12 @@ def parse_args(argv: list[str]) -> Args:
             if not value:
                 raise _Usage()
             a.message = value
+            i += 2
+        elif arg == "--gate-record":
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+            if not value:
+                raise _Usage()
+            a.gate_record = value
             i += 2
         elif arg in ("-h", "--help"):
             raise _Usage()
@@ -205,6 +224,68 @@ def changelog_subtitle(version: str, changelog: Path = CHANGELOG) -> str:
     return ""
 
 
+# ── the gate's verdict ─────────────────────────────────────────────────────────
+def gate_refusal(sha: str, record: Path) -> str | None:
+    """Why `sha` may not be tagged by the gate record, or None when its latest full-gate run is RELEASE-READY on a clean tree."""
+    if not record.is_file():
+        return f"no gate record at {record}"
+    runs, reduced = [], 0
+    for line in record.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("sha") != sha:
+            continue
+        if rec.get("gate") == FULL_GATE:
+            runs.append(rec)
+        else:
+            reduced += 1
+    if not runs:
+        also = f" ({reduced} reduced run(s) of it, which cannot support a tag)" if reduced else ""
+        return f"no {FULL_GATE} run of {sha[:12]} in {record}{also}"
+    last = runs[-1]
+    if last.get("dirty") is not False:
+        return f"the latest {FULL_GATE} run of {sha[:12]} ({last.get('at')}) graded a tree with uncommitted changes"
+    if last.get("verdict") != "RELEASE-READY":
+        return f"the latest {FULL_GATE} run of {sha[:12]} ({last.get('at')}) says {last.get('verdict')}"
+    return None
+
+
+def self_test() -> int:
+    """The gate-record precondition on fixture lines: only the latest clean full-gate green run of this exact commit passes."""
+    import tempfile
+
+    sha, other = "a" * 40, "b" * 40
+
+    def rec(**kw) -> str:
+        base = {"at": "t", "sha": sha, "gate": FULL_GATE, "dirty": False, "verdict": "RELEASE-READY"}
+        return json.dumps({**base, **kw})
+
+    cases = [
+        ([], "no gate record"),
+        ([rec(sha=other)], "no release-oracle-full run"),
+        ([rec(sha=sha[:8])], "no release-oracle-full run"),
+        ([rec(gate="release-oracle")], "1 reduced run(s)"),
+        ([rec(verdict="NOT RELEASABLE")], "says NOT RELEASABLE"),
+        ([rec(verdict="NOT GRADED")], "says NOT GRADED"),
+        ([rec(dirty=True)], "uncommitted changes"),
+        ([rec(dirty=None)], "uncommitted changes"),
+        ([rec(), rec(verdict="NOT RELEASABLE")], "says NOT RELEASABLE"),
+        (["not json", rec()], None),
+        ([rec(verdict="NOT RELEASABLE"), rec(), rec(gate="release-oracle", verdict="NOT RELEASABLE")], None),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        for i, (lines, want) in enumerate(cases):
+            path = Path(d) / f"{i}.jsonl"
+            if lines:
+                path.write_text("\n".join(lines) + "\n")
+            got = gate_refusal(sha, path)
+            assert (got is None) if want is None else (got is not None and want in got), (i, lines, got)
+    print(f"self-test ok: release gate record — {len(cases)} cases, only a clean green full-gate run of this commit tags")
+    return 0
+
+
 # ── git ────────────────────────────────────────────────────────────────────────
 def _git(*args: str) -> shell.Proc:
     return shell.run(["git", "-C", str(ROOT), *args])
@@ -231,6 +312,8 @@ def worktree_dirty() -> bool:
 
 # ── main ───────────────────────────────────────────────────────────────────────
 def main_cli(argv: list[str] | None = None) -> int:
+    if list(sys.argv[1:] if argv is None else argv) == ["--self-test"]:
+        return self_test()
     try:
         args = parse_args(list(sys.argv[1:] if argv is None else argv))
     except _Usage:
@@ -278,7 +361,16 @@ def main_cli(argv: list[str] | None = None) -> int:
             "error: working tree is not clean — commit or stash before tagging"
         )
 
-    head = _git("rev-parse", "--short", "HEAD").check("git rev-parse HEAD").stdout.strip()
+    sha = _git("rev-parse", "HEAD").check("git rev-parse HEAD").stdout.strip()
+    record = Path(args.gate_record) if args.gate_record else GATE_RECORD
+    why = gate_refusal(sha, record)
+    if why:
+        raise shell.Fail(
+            f"error: {why}",
+            hint="run `make release-oracle-full` on this commit and tag it once the gate says RELEASE-READY; "
+                 "pass --gate-record FILE when the gate ran on another machine",
+        )
+    head = sha[:8]
     branch = (
         _git("rev-parse", "--abbrev-ref", "HEAD")
         .check("git rev-parse --abbrev-ref HEAD")
@@ -295,6 +387,7 @@ def main_cli(argv: list[str] | None = None) -> int:
   tag:     {tag}
   version: {version}
   commit:  {head} ({branch})
+  gate:    {FULL_GATE} RELEASE-READY ({record})
   message: {message}
   push:    {"yes" if args.push else "no"}
   CI:      .github/workflows/release.yml (on tag push)"""

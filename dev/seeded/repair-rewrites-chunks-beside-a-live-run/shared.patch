@@ -1,13 +1,17 @@
 diff --git a/src/pipeline/repair_cmd.rs b/src/pipeline/repair_cmd.rs
-index c74eefb6..9158eb34 100644
+index b95bcadc..9c391ffd 100644
 --- a/src/pipeline/repair_cmd.rs
 +++ b/src/pipeline/repair_cmd.rs
-@@ -159,8 +159,6 @@ fn execute_repair(
+@@ -179,12 +179,6 @@ fn execute_repair(
      // Without it we can re-export the data but cannot point the recorded state
      // at the fresh count, so `reconcile → repair → reconcile` could never
      // converge (audit finding #7).
--    let _run_lease =
--        super::chunked::claim_export_progress(state, &plan.export_name, "repair its chunks")?;
+-    let _run_lease = super::chunked::claim_export_progress(
+-        state,
+-        &plan.export_name,
+-        &plan.source.state_key(),
+-        "repair its chunks",
+-    )?;
      let run_id = state.claim(plan.progress_key())?.latest_chunk_run()?;
  
      // One summary across the whole repair (matches the original single

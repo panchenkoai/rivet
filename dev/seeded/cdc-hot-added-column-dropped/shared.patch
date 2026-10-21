@@ -1,5 +1,5 @@
 diff --git a/src/pipeline/cdc/sink.rs b/src/pipeline/cdc/sink.rs
-index c66d2ee7..ecc111bd 100644
+index ec5a360f..e33d42e1 100644
 --- a/src/pipeline/cdc/sink.rs
 +++ b/src/pipeline/cdc/sink.rs
 @@ -593,8 +593,7 @@ pub(crate) fn run_to_files(
@@ -18,6 +18,6 @@ index c66d2ee7..ecc111bd 100644
          let tables: Vec<String> = sinks.iter().map(|s| s.out.table.clone()).collect();
 -        if let crate::source::cdc::RowImage::Partial { why } = stream.row_image(&tables) {
 +        if let (true, crate::source::cdc::RowImage::Partial { why }) = (false, stream.row_image(&tables)) {
-             crate::rivet_bail!(
-                 crate::error::codes::SOURCE_CDC_SCHEMA_CHANGED,
-                 "{} cdc: {why} — a column was added to a captured table while the run was open, \
+             return Err(super::partial_image_refusal(run.engine, &why));
+         }
+         if !hit_max
