@@ -1599,6 +1599,26 @@ pub mod codes {
         "RIVET_STATE_FILE_CORRUPT",
         "move the state file aside (rivet rebuilds it; cursors and skip-ledgers start fresh), or restore it from a backup",
     );
+    /// `rivet state copy` found no state in the SQLite file it reads.
+    pub const STATE_COPY_SOURCE_EMPTY: Code = usage(
+        "RIVET_STATE_COPY_SOURCE_EMPTY",
+        "name the config whose `.rivet_state.db` holds the state, or its `RIVET_STATE_URL=sqlite:<path>`",
+    );
+    /// `rivet state copy` was given no PostgreSQL state to copy into.
+    pub const STATE_COPY_TARGET_MISSING: Code = usage(
+        "RIVET_STATE_COPY_TARGET_MISSING",
+        "pass `--to postgresql://…`, or set RIVET_STATE_URL to the PostgreSQL state",
+    );
+    /// `rivet state copy` found state rows in the PostgreSQL state it would copy into.
+    pub const STATE_COPY_TARGET_NOT_EMPTY: Code = refusal(
+        "RIVET_STATE_COPY_TARGET_NOT_EMPTY",
+        "copy into a PostgreSQL database (or schema) that holds no rivet state",
+    );
+    /// A table copied by `rivet state copy` holds another row count than its source.
+    pub const STATE_COPY_COUNT_MISMATCH: Code = integrity(
+        "RIVET_STATE_COPY_COUNT_MISMATCH",
+        "nothing was committed; keep using the SQLite state and report the table the message names",
+    );
     /// Another rivet process holds the state migration lock.
     pub const STATE_MIGRATION_LOCKED: Code = environment(
         "RIVET_STATE_MIGRATION_LOCKED",
@@ -1814,6 +1834,10 @@ pub mod codes {
         PLAN_CHUNK_KEY_UNUSABLE,
         STATE_BACKEND_FAILED,
         STATE_FILE_CORRUPT,
+        STATE_COPY_SOURCE_EMPTY,
+        STATE_COPY_TARGET_MISSING,
+        STATE_COPY_TARGET_NOT_EMPTY,
+        STATE_COPY_COUNT_MISMATCH,
         STATE_MIGRATION_LOCKED,
         INTERNAL_DEST_INVARIANT,
         INTERNAL_STATE_INVARIANT,

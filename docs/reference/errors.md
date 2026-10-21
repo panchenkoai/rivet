@@ -212,6 +212,10 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_PLAN_CHUNK_KEY_UNUSABLE` | usage | 1 | set `chunk_column:` (integer) or `chunk_by_key:` (a single-column NOT NULL unique key of a supported type), add such an index, or use `mode: full` |
 | `RIVET_STATE_BACKEND_FAILED` | environment | 2 if transient, else 1 | check the state database (the SQLite file, or the `RIVET_STATE_URL` server and the role's rights), then run again |
 | `RIVET_STATE_FILE_CORRUPT` | environment | 2 if transient, else 1 | move the state file aside (rivet rebuilds it; cursors and skip-ledgers start fresh), or restore it from a backup |
+| `RIVET_STATE_COPY_SOURCE_EMPTY` | usage | 1 | name the config whose `.rivet_state.db` holds the state, or its `RIVET_STATE_URL=sqlite:<path>` |
+| `RIVET_STATE_COPY_TARGET_MISSING` | usage | 1 | pass `--to postgresql://…`, or set RIVET_STATE_URL to the PostgreSQL state |
+| `RIVET_STATE_COPY_TARGET_NOT_EMPTY` | refusal | 5 | copy into a PostgreSQL database (or schema) that holds no rivet state |
+| `RIVET_STATE_COPY_COUNT_MISMATCH` | integrity | 3 | nothing was committed; keep using the SQLite state and report the table the message names |
 | `RIVET_STATE_MIGRATION_LOCKED` | environment | 2 if transient, else 1 | wait for the other rivet process migrating this state database to finish, then run again |
 | `RIVET_INTERNAL_DEST_INVARIANT` | internal | 6 | a destination invariant did not hold — a bug; report it with the message |
 | `RIVET_INTERNAL_STATE_INVARIANT` | internal | 6 | a state-store invariant did not hold — a bug; report it with the message |

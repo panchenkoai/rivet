@@ -291,6 +291,10 @@ FIELD_REPLAY_CARRIER_BIN  ?= $(PREV_RELEASE_DIR)/carrier/rivet-$(FIELD_REPLAY_CA
 # when the previous release writes this tree's schema. Missing is a FAIL in each of them.
 MIGRATION_CARRIER_TAG     ?= v0.31.0
 MIGRATION_CARRIER_BIN     ?= $(PREV_RELEASE_DIR)/field/rivet-$(MIGRATION_CARRIER_TAG)-$(shell uname -m | sed 's/arm64/aarch64/')-apple-darwin/rivet
+# The release whose state `rivet state copy` must carry to PostgreSQL: 0.30.0 (state v31), the one a
+# client moves from. PINNED like the carriers above.
+STATE_COPY_FROM_TAG       ?= v0.30.0
+STATE_COPY_FROM_BIN       ?= $(PREV_RELEASE_DIR)/field/rivet-$(STATE_COPY_FROM_TAG)-$(shell uname -m | sed 's/arm64/aarch64/')-apple-darwin/rivet
 
 GATE_ENV = \
   PYTHONUNBUFFERED=1 \
@@ -310,6 +314,7 @@ GATE_ENV = \
   RIVET_GATE_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_FIELD_REPLAY_BIN='$(FIELD_REPLAY_CARRIER_BIN)' \
   RIVET_MIGRATION_CARRIER_BIN='$(MIGRATION_CARRIER_BIN)' \
+  RIVET_STATE_COPY_FROM_BIN='$(STATE_COPY_FROM_BIN)' \
   RIVET_TEST_STATE_URL='$(RIVET_GATE_STATE_URL)' \
   RIVET_SWEEP_STATE_CONTAINER='$(RIVET_SWEEP_STATE_CONTAINER)' \
   RIVET_CONC_SRC_CONTAINER='$(RIVET_CONC_SRC_CONTAINER)' \
@@ -347,6 +352,12 @@ release-oracle-prev-bin:  ## Download the PREVIOUS release binary (the regressio
 	 tar xzf $(PREV_RELEASE_DIR)/field/rivet-$(MIGRATION_CARRIER_TAG)-aarch64-apple-darwin.tar.gz -C $(PREV_RELEASE_DIR)/field; \
 	fi
 	@echo "  migration carrier: $$($(MIGRATION_CARRIER_BIN) --version)"
+	@if [ ! -x "$(STATE_COPY_FROM_BIN)" ]; then \
+	 mkdir -p $(PREV_RELEASE_DIR)/field; \
+	 gh release download $(STATE_COPY_FROM_TAG) --pattern "*aarch64-apple-darwin*" -D $(PREV_RELEASE_DIR)/field --clobber; \
+	 tar xzf $(PREV_RELEASE_DIR)/field/rivet-$(STATE_COPY_FROM_TAG)-aarch64-apple-darwin.tar.gz -C $(PREV_RELEASE_DIR)/field; \
+	fi
+	@echo "  state-copy source release: $$($(STATE_COPY_FROM_BIN) --version)"
 
 release-oracle-full: release-oracle-prev-bin sweep-test-db sweep-test-cloud  ## Release gate with the WHOLE environment against the local dev stand. This is the one a release is judged by.
 	@# The gate grades `target/release/rivet`. A stale one grades yesterday's

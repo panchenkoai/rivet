@@ -391,7 +391,12 @@ fn pg_rows(c: &mut postgres::Client, tbl: &str) -> Vec<(i64, i64)> {
 }
 
 fn batch_into_clickhouse(rig: Rig, db: &Db) -> Rig {
-    rig.dest_gcs(BUCKET, &unique_name("chload"), FAKE_GCS_ENDPOINT)
+    batch_into_clickhouse_at(rig, db, &unique_name("chload"))
+}
+
+/// [`batch_into_clickhouse`], staged under `prefix` of the bucket.
+fn batch_into_clickhouse_at(rig: Rig, db: &Db, prefix: &str) -> Rig {
+    rig.dest_gcs(BUCKET, prefix, FAKE_GCS_ENDPOINT)
         .top_line(&format!(
             "load: {{ target: clickhouse, url: \"{CLICKHOUSE_HTTP_URL}\", database: {}, \
              user: {CLICKHOUSE_USER}, password_env: {PASSWORD_ENV}, pk: [id] }}",
@@ -2697,6 +2702,107 @@ fn load_and_compact_report_each_selected_table_as_the_warehouse_holds_it() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
         assert!(err.contains(&format!("[{code}]")), "{args:?}: {err}");
+    }
+}
+
+/// The digest of a ClickHouse load, held to what ClickHouse itself logged: every query id in
+/// `warehouse_job_ids` is a query `system.query_log` finished, the rows those inserts wrote are
+/// `rows_inserted`, and `files` / `runs` are the Parquet parts and runs staged in the bucket.
+/// ClickHouse bills nothing and reports no DML, so those keys are `null`, never 0.
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + postgres"]
+fn a_clickhouse_load_digest_is_what_clickhouse_logged_for_its_queries() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let (tbl, _t, mut c) = pg_batch_seeded("rivet_ch_digest", 7);
+    let db = Db::new("rivet_chtest");
+    let prefix = unique_name("chdigest");
+    let rig = batch_into_clickhouse_at(Rig::pg_batch(&tbl).mode("full"), &db, &prefix);
+    rig.run_ok();
+    let parts = fake_gcs_object_names(BUCKET, &prefix)
+        .iter()
+        .filter(|n| n.ends_with(".parquet"))
+        .count();
+    let logged = |ids: &[String], what: &str| -> String {
+        ch("SYSTEM FLUSH LOGS");
+        let list = ids
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        ch(&format!(
+            "SELECT {what} FROM system.query_log WHERE type = 'QueryFinish' AND query_id IN ({list}) FORMAT TSV"
+        ))
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for cycle in 1..=2 {
+        let (doc, code, err) = result_document(&rig, &["load", "--json"], CLICKHOUSE_PASSWORD);
+        assert_eq!(code, 0, "cycle {cycle}: {err}");
+        let entry = &doc["per_table"][0];
+        assert_eq!(entry["status"], "loaded", "cycle {cycle}: {entry}");
+        let ids: Vec<String> = entry["warehouse_job_ids"]
+            .as_array()
+            .expect("ClickHouse names its queries")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert!(!ids.is_empty(), "cycle {cycle}: {entry}");
+        assert_eq!(
+            logged(&ids, "count(DISTINCT query_id)"),
+            ids.len().to_string(),
+            "cycle {cycle}: every id is a query ClickHouse finished: {entry}"
+        );
+        assert_eq!(
+            logged(
+                &ids,
+                "sum(written_rows) FILTER (WHERE query_kind = 'Insert')"
+            ),
+            entry["rows_inserted"].to_string(),
+            "cycle {cycle}: the inserts wrote what the digest says: {entry}"
+        );
+        assert_eq!(entry["rows_inserted"], entry["rows"]);
+        let target = entry["target"]
+            .as_str()
+            .expect("the loader's name for the table");
+        assert!(entry["buffer"].is_null(), "a load reads no buffer: {entry}");
+        let held = clickhouse_rows(&format!(
+            "SELECT id, v FROM {target} ORDER BY id FORMAT TSV"
+        ));
+        assert_eq!(
+            entry["rows"],
+            serde_json::json!(held.len()),
+            "cycle {cycle}"
+        );
+        assert_eq!(
+            held,
+            pg_rows(&mut c, &tbl),
+            "cycle {cycle}: the table the entry names holds the source's values"
+        );
+        assert_eq!(
+            entry["files"],
+            serde_json::json!(parts),
+            "cycle {cycle}: {entry}"
+        );
+        assert_eq!(entry["runs"], 1, "cycle {cycle}: {entry}");
+        for key in [
+            "rows_updated",
+            "rows_deleted",
+            "rows_merged",
+            "base_rows_after",
+            "bytes_processed",
+            "bytes_billed",
+        ] {
+            assert!(
+                entry[key].is_null(),
+                "cycle {cycle}: {key} is unknown here: {entry}"
+            );
+        }
+        assert!(
+            ids.iter().all(|id| !seen.contains(id)),
+            "cycle {cycle}: a load names only its own queries"
+        );
+        seen.extend(ids);
     }
 }
 /// One `(key, v)` table named `tbl` on a source, with its own key column name.

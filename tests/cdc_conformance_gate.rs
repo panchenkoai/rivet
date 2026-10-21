@@ -450,6 +450,8 @@ fn derived_capture_marker_set_is_pinned() {
         "run_rivet(",
         "run_rivet_args_bounded(",
         "run_rivet_args_bounded_env(",
+        // `run_rivet_as` — another release's binary, graded like this tree's runs.
+        "run_rivet_as(",
         "run_rivet_bounded(",
         "run_rivet_env(",
         "run_rivet_export(",
@@ -897,7 +899,9 @@ fn oracle_class_census_is_pinned() {
 // the base back through `bq`.
 // 2026-10-16: +1 independent - a CDC child killed after its snapshot leg; the leg's parts on disk are
 // compared with the source table's `count(*)` and with the parent's failed entry.
-const PIN_INDEPENDENT: usize = 116; // ratchet-pin: cdc-census-independent min
+// 2026-10-20: +1 independent - the load and compact digest of a base-and-buffer CDC table, every job read
+// back through the bq CLI (bq show -j, bq ls -j --parent_job_id) and the base counted through bq.
+const PIN_INDEPENDENT: usize = 117; // ratchet-pin: cdc-census-independent min
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.
