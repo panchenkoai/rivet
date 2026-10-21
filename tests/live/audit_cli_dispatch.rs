@@ -192,3 +192,33 @@ fn apply_pool_writes_only_the_export_on_stdout() {
         "`apply --pool` wrote {foreign} line(s) of its own into a stdout export"
     );
 }
+
+/// A run of `lossy-x` beside a live holder of the run lease of `lossy x`, an export whose name
+/// differs only where a file name cannot spell it: the run delivers (through 0.32.1 both leases
+/// were one file, `.lease-chunk-run-lossy-x-…`, and the run was refused RIVET_STATE_RUN_IN_PROGRESS).
+#[test]
+#[ignore = "live: postgres"]
+fn a_run_beside_the_lease_of_an_export_whose_name_reads_alike_delivers() {
+    require_alive(LiveService::Postgres);
+    let table = seed_pg_numeric_table(5);
+    let rig = Rig::pg_batch(table.name())
+        .query(&format!("SELECT id, name FROM {}", table.name()))
+        .export_named("lossy-x");
+    let cfg = rig.config_path().display().to_string();
+    let source = rivet::config::Config::load(&cfg)
+        .expect("the rig's config")
+        .source
+        .state_key();
+    let sibling = rivet::pipeline::run_lease_key("lossy x", &source);
+    assert_ne!(sibling, rig.lease_key(), "two keys that read alike");
+    let state = match rig.state_url(&[]) {
+        Some(url) => rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url)),
+        None => rivet::state::StateStore::open(&cfg),
+    }
+    .expect("the rig's state");
+    let _held = state
+        .try_load_lease(&sibling)
+        .expect("take the lease")
+        .expect("the cell holds the run lease of `lossy x`");
+    rig.run_ok();
+}

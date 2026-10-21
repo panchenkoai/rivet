@@ -320,9 +320,25 @@ fn holder_is_dead_here(holder: &str, host: &str) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// The sidecar an SQLite-state lease locks: beside the DB file, one per table.
+/// The longest readable part of a lease file name; the hash after it keeps the name one per key.
+const LEASE_TOKEN_CHARS: usize = 64;
+
+/// A file-name token of the lease `key`: a readable part (lossy: `orders#1` and `orders-1` read
+/// alike) and a hash of the raw key, so two keys never share one lease file.
+fn lease_file_token(key: &str) -> String {
+    let readable: String = crate::manifest::file_token(key)
+        .chars()
+        .take(LEASE_TOKEN_CHARS)
+        .collect();
+    format!(
+        "{readable}-{:016x}",
+        xxhash_rust::xxh3::xxh3_64(key.as_bytes())
+    )
+}
+
+/// The sidecar an SQLite-state lease locks: beside the DB file, one per lease key.
 fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
-    let token = crate::manifest::file_token(key);
+    let token = lease_file_token(key);
     if db.to_string_lossy() == ":memory:" {
         return std::env::temp_dir().join(format!("rivet-{}-{token}.lease", std::process::id()));
     }
@@ -690,7 +706,14 @@ mod lease_path_tests {
         );
         assert_eq!(
             beside,
-            std::path::Path::new("/tmp/rivet-x/.rivet_state.db.lease-p.d.orders")
+            std::path::Path::new("/tmp/rivet-x/.rivet_state.db").with_file_name(format!(
+                ".rivet_state.db.lease-{}",
+                lease_file_token("p.d.orders")
+            ))
+        );
+        assert!(
+            beside.to_string_lossy().contains(".lease-p.d.orders-"),
+            "the name stays readable: {beside:?}"
         );
         let mem = lease_path(std::path::Path::new(":memory:"), "p.d.orders");
         assert!(mem.starts_with(std::env::temp_dir()), "{mem:?}");
@@ -699,5 +722,51 @@ mod lease_path_tests {
                 .contains(&std::process::id().to_string()),
             "an in-memory store leases per process: {mem:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_file_tests {
+    use super::*;
+
+    /// Keys a lossy token reads alike get two lease files, and two stores holding them do not
+    /// refuse each other; one key is one file whatever its length.
+    #[test]
+    fn keys_that_read_alike_get_their_own_lease_file() {
+        let pairs = [
+            ("orders#1", "orders-1"),
+            ("orders x", "orders-x"),
+            ("заказы", "товары"), // allow-cyrillic
+            (
+                "chunk-run:a b@00000000000000ff",
+                "chunk-run:a-b@00000000000000ff",
+            ),
+        ];
+        let db = std::path::Path::new("/tmp/rivet-x/.rivet_state.db");
+        for (a, b) in pairs {
+            assert_eq!(
+                crate::manifest::file_token(a),
+                crate::manifest::file_token(b),
+                "the pair collides under the lossy token: {a} / {b}"
+            );
+            assert_ne!(lease_path(db, a), lease_path(db, b), "{a} / {b}");
+        }
+        assert_eq!(lease_path(db, "orders#1"), lease_path(db, "orders#1"));
+        let long = "x".repeat(500);
+        let name = lease_path(db, &long);
+        assert!(name.file_name().unwrap().len() < 120, "{name:?}");
+        assert_ne!(name, lease_path(db, &"x".repeat(501)));
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("rivet.yaml").to_str().unwrap()).unwrap();
+        for (a, b) in pairs {
+            let held = store.try_load_lease(a).unwrap().expect("the first key");
+            assert!(
+                store.try_load_lease(b).unwrap().is_some(),
+                "a key that reads alike is another lease: {a} / {b}"
+            );
+            assert!(store.try_load_lease(a).unwrap().is_none(), "{a} is held");
+            drop(held);
+        }
     }
 }
