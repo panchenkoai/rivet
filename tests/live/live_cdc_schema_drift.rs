@@ -584,7 +584,18 @@ fn pg_cdc_a_column_added_while_a_run_is_open_lands_every_value() {
 fn mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code() {
     let _serial = cross_process_serial("mssql_cdc");
     let mut scn = CdcScenario::mssql_with("hot_add_ms", "id BIGINT PRIMARY KEY, v INT", |r, _| {
-        r.cdc("rollover: 1").cdc("max_events: 1000000")
+        r.cdc("until_current: true")
+            .cdc("rollover: 1")
+            .cdc("max_events: 1000000")
+            .a_failed_run_may_leave(
+                &[
+                    Leftover::OrphanPart,
+                    Leftover::FileLog,
+                    Leftover::CdcFlush,
+                    Leftover::CdcCheckpoint,
+                ],
+                "the stop comes at the end of the drain: the parts it committed before the column was added stay, and the checkpoint follows them",
+            )
     });
     let table = scn.table.clone();
     let (out, said) = run_while_a_column_is_added(
@@ -598,7 +609,7 @@ fn mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code() {
         "a refusal, not a clean end:\n{said}"
     );
     assert!(
-        said.contains("[RIVET_SOURCE_CDC_SCHEMA_CHANGED]") && said.contains("`c`"),
-        "the stop names its code and the column:\n{said}"
+        said.contains("[RIVET_SOURCE_CDC_SCHEMA_CHANGED]") && said.contains(&table),
+        "the stop names its code and the table:\n{said}"
     );
 }

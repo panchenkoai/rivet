@@ -925,6 +925,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_TRUNCATED",
         "re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
+    /// A captured table gained a column the stream it is read from cannot carry (SQL Server's capture instance).
+    pub const SOURCE_CDC_SCHEMA_CHANGED: Code = refusal(
+        "RIVET_SOURCE_CDC_SCHEMA_CHANGED",
+        "SQL Server: create a capture instance that covers the new column (sp_cdc_enable_table with a new @capture_instance), point `capture_instance:` at it, and re-baseline the table; the values written before it exist only in the table",
+    );
     pub const SOURCE_CDC_UNDECODABLE: Code = refusal(
         "RIVET_SOURCE_CDC_UNDECODABLE",
         "re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
@@ -1655,6 +1660,7 @@ pub mod codes {
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
         SOURCE_CDC_TRUNCATED,
+        SOURCE_CDC_SCHEMA_CHANGED,
         SOURCE_CDC_UNDECODABLE,
         SOURCE_CDC_CELL_UNSUPPORTED,
         SOURCE_CDC_PREREQUISITE,
