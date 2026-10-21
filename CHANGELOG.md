@@ -2,6 +2,277 @@
 
 ## Unreleased
 
+## 0.32.2 — 2026-10-22
+
+**Upgrading from 0.32.1 — read these first:**
+
+- **State migration v37 → v38** (the load spec keyed by export, table and source). The first run
+  of 0.32.2 migrates the state and leaves the v37 copy beside it; 0.32.1 refuses a v38 state
+  (`RIVET_STATE_SCHEMA_NEWER`), so the way back is that copy (`docs/reference/state.md`, "Rolling
+  back an upgrade").
+- **A run now waits for a held lease** for up to `--lock-wait` seconds (default **600**, also
+  `RIVET_LOCK_WAIT`) instead of refusing at once; when the wait runs out it stops with the new
+  `RIVET_STATE_LOCK_TIMEOUT`, exit 2. Pass `--lock-wait 0` to keep the immediate refusal.
+- **New refusals:**
+  - two configs on one CDC checkpoint: `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`, exit 5, before a change
+    is read (a checkpoint 0.32.1 wrote is claimed by the first run of 0.32.2 that reads it);
+  - `rivet init` over a CDC checkpoint or destination another config names: `RIVET_INIT_CDC_NAME_TAKEN`,
+    exit 5, nothing written;
+  - `rivet load` / `rivet compact` without a `load:` block: `RIVET_LOAD_BLOCK_MISSING`, exit 1 (was
+    uncoded);
+  - a whole-table pass over a base-and-buffer base that still holds uncompacted changes:
+    `RIVET_LOAD_BUFFER_NOT_COMPACTED`.
+- **`rivet init --mode cdc -o <file>` names the slot, `server_id`, checkpoint and destination after
+  the file** (`-o rivet.yaml` -> `./cdc/rivet_<table>.ckpt`, `./output/rivet/<table>_cdc/`). Existing
+  configs are read as before.
+- **The SQLite lease file is named by a hash of its key**; until 0.34.0 a run also holds the 0.32.1
+  name, so a 0.32.1 run still going when 0.32.2 starts the same export is refused as before.
+- **PostgreSQL CDC:** the first 0.32.2 run of a stream 0.32.1 left with its slot past its checkpoint
+  takes the slot's position once (a warning names both); a slot another reader advanced is refused
+  `RIVET_SOURCE_CDC_LOG_GAP` as in every 0.32.x.
+
+- **A first CDC load into a BigQuery base-and-buffer table reported nothing loaded.** The load landed
+  the baseline in the base, but its `per_table[]` entry (`--json`, `--summary-output`) and its
+  `CDC LOAD OK` line counted only the stream leg: `rows: 0`, `target: <table>__changes`, "no changes
+  buffered" for a 6000-row baseline (0.32.0 and 0.32.1). **Now** `rows` is both legs' rows, `target`
+  is the base when a baseline landed, `buffer` names the change log when the same load also
+  appended changes (ADR-0039 D3, amended), and the line says what the baseline landed and where.
+  **What to do:** nothing; a scheduler that read `target` of a CDC load as the change log now gets
+  the base on a cycle that landed a baseline.
+
+- **Harness / release process: a tag could be cut on a commit the full gate never graded, with seeded
+  recall, `cargo audit` and the generated docs outside the gate.** Seeded-defect recall was opt-in, so
+  24 seed patches had stopped applying to main unseen. **Now** `make release-oracle-full` runs the
+  recall (a MISSED or STALE seed fails the gate), `cargo audit` and `docgen --check` are gate stages,
+  the gate records its verdict with the full commit, its kind and whether the tree was clean at its
+  start, and `dev/pytools/release.py` refuses to tag a commit without a clean RELEASE-READY
+  `release-oracle-full` run of exactly that commit. The 24 patches are re-cut, and the offline
+  self-test fails a PR whose seed no longer applies. **What to do:** release from a commit the full
+  gate passed; pass `--gate-record FILE` when the gate ran on another machine.
+- **Harness: the rig oracle read rivet's ledger from the first schema that held a table of its name.**
+  A schema an older test left in the stand's PostgreSQL state (`rivet_wayback_nocreate`) came first
+  for `file_log`, so every cell graded on that state read `file_log records 0 of this run's N declared
+  part(s)` (the pool-ledger and state-ledger reds). **Now** the oracle resolves each table through the
+  state connection's `search_path`, as rivet does, and the seeded recall's runs use its scratch state
+  DB under every state knob, never the shared one. **What to do:** nothing.
+
+- **`rivet init` scaffolded GCS and S3 destinations but not Azure.** **Now** `--azure-container <name>
+  --azure-account <name>` writes `destination: type: azure` with the same `prefix: exports/<table>/`
+  (`cdc/` for a CDC stream), `account_name:` and `account_key_env: AZURE_STORAGE_KEY`, never a key;
+  `--azure-endpoint <url>` adds `endpoint:` (Azurite). It excludes `--gcs-bucket`, `--s3-bucket`
+  (`RIVET_CLI_OPTION_UNSUPPORTED` / a clap conflict, as between those two) and `--discover`, and it is
+  a bucket `--clickhouse-url` can stage in. **What to do:** nothing; set `AZURE_STORAGE_KEY` (or swap in
+  `sas_token_env:`) before the first run.
+
+- **Two CDC configs written by `rivet init -o` into one directory shared one checkpoint and one
+  destination.** Through 0.32.1 `init --mode cdc` named the checkpoint after the table or schema
+  (`./cdc/<name>.ckpt`) and the CDC destination `cdc/` / `./output/cdc/` (per table `<t>_cdc/`)
+  whatever `-o` said, so a second config of the same source, written beside the first, resumed the
+  first one's position: each stream skipped what the other had read, exit 0. **Now** `init -o
+  <stem>.yaml` names the checkpoint `./cdc/<stem>_<name>.ckpt` and the destination
+  `<stem>/cdc/` / `./output/<stem>/cdc/` (per table `exports/<stem>/<t>_cdc/`), and refuses
+  `RIVET_INIT_CDC_NAME_TAKEN`, exit 5, writing nothing, when the checkpoint already exists or another
+  config in the directory names the same checkpoint or destination. A run records which config and
+  export own its checkpoint (`<checkpoint>.owner`) and refuses a checkpoint another config still
+  reads, `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`, exit 5, before it reads a change. A checkpoint written
+  before 0.32.2 has no owner record and is claimed by the first run that reads it; one whose owner no
+  longer names it is claimed too. **What to do:** nothing for one config per checkpoint; for two
+  configs on one checkpoint, give one of them a checkpoint and destination of its own and re-baseline it.
+
+- **Two exports whose names differ only in characters a file name cannot hold shared one run lease
+  on a SQLite state.** Through 0.32.1 the lease file was named by a lossy token of its key, so
+  `orders#1` and `orders-1` (or `orders x` and `orders-x`, or two Cyrillic names) locked one file, and
+  with `--parallel-exports` one of them was refused `RIVET_STATE_RUN_IN_PROGRESS` beside no live run of
+  its own. **Now** the file name carries a hash of the whole key after the readable part
+  (`.rivet_state.db.lease-<token>-<hash>`). A PostgreSQL state was not affected. Until 0.34.0 a run
+  also holds the 0.32.1 name of the file, shared, so a 0.32.1 run still going when the upgraded
+  binary starts the same export is refused as before; that second take is removed in 0.34.0.
+  **What to do:** nothing.
+
+- **Fixed: the upgrade from 0.32.1 no longer stops a PostgreSQL CDC stream with a false log gap.**
+  0.32.1 released a trailing span of uncaptured transactions by advancing its slot without saving the
+  checkpoint, so its slot could sit past its checkpoint. The 0.32.2 guard against another reader of
+  the slot (#649) read that as changes consumed by someone else and refused the first upgraded run
+  `RIVET_SOURCE_CDC_LOG_GAP`, exit 5, with a re-baseline remedy, although nothing was lost. **Now** a
+  checkpoint without the `confirmed_first` mark that every 0.32.2 checkpoint carries (one an older
+  release wrote) is moved to the slot's position once, with a warning naming both positions, and
+  rewritten in the new form; from then on a slot past the checkpoint is refused as before. 0.32.1
+  still reads a checkpoint 0.32.2 wrote. **What to do:** nothing.
+
+- **A SQLite state write could still be refused `database is locked` beside a busy sibling.** 0.32.1
+  made the writers of one state file in one process take turns, but a writer that waited longer than
+  its patience for a turn (a slow or descheduled holder) left the queue for SQLite's own busy wait,
+  where a sibling committing back to back took the lock in every gap again: refused after the busy
+  timeout, exit 1 (seen once under CI load). **Now** a writer that ran out of patience keeps its
+  place: no later writer of the process is served before it has written. **What to do:** nothing.
+
+- **A column added to a captured table while a CDC run was open lost its values, exit 0.** A
+  continuous run (`until_current: false`) froze its schema when it opened, so a hot `ALTER TABLE …
+  ADD COLUMN` left the new column out of every change the run read after it, and the run acked them
+  (#644; PostgreSQL, MySQL, SQL Server). **Now** the first change that names the new column closes
+  the table's part under the old schema, the table's columns are read again and judged by
+  `on_schema_drift` (`fail` stops before the change is acknowledged), and the run continues in a
+  new part with the column and its values; `rivet load` takes both schemas into one change log.
+  SQL Server's capture instance cannot carry a column added after it was created, so a run that
+  sees its table outgrow the instance now stops with `RIVET_SOURCE_CDC_PREREQUISITE`, the refusal a
+  run opening on that instance already met, instead of ending clean. **What to do:** on SQL Server,
+  re-enable the table with the full column list and re-baseline it; elsewhere nothing.
+
+- **`rivet load` and `rivet compact` on a config without a `load:` block stopped with no code.**
+  Through 0.32.1 they exited 1 with `config has no top-level \`load:\` block` and no `RIVET_*` code, so a
+  scheduler could not tell the config mistake from any other failure. **Now** the stop is
+  `RIVET_LOAD_BLOCK_MISSING` (usage, exit 1), raised by one function both commands call. **What to
+  do:** nothing; add a top-level `load:` block to load or compact.
+
+- **Two `rivet init` runs over one MongoDB database could list its collections in different orders.**
+  `listCollections` has no order, and the SQL engines' listings followed each server's collation (SQL
+  Server's is case-insensitive). **Now** every engine's listing goes through one ordering in rivet (byte
+  order of the name), so the scaffold is the same on every run; on SQL Server a schema with mixed-case
+  names may list its exports in a different order than 0.32.1 did. **What to do:** nothing.
+- **The MongoDB reference said BigQuery loads `document` as `BYTES`.** Through `rivet load` it
+  lands as `JSON` (only a schema-less autoload gives `BYTES`). `docs/reference/init.md` now names Oracle
+  among the engines `rivet init` reads. **What to do:** nothing.
+
+- **A second run of an export was refused at once while the first held its run lease.** Through 0.32.1
+  two triggers of one schedule made one of them a failed task (`RIVET_STATE_RUN_IN_PROGRESS`; a load
+  beside a load or compact, `RIVET_LOAD_TABLE_BUSY`). **Now** the run lease and a load's table lease
+  are waited on for up to `--lock-wait <seconds>` (a global flag, or `RIVET_LOCK_WAIT`, default **600**, passed on to process
+  children), with a log line naming the lease and its holder (pid and host on a PostgreSQL state); when
+  the wait runs out the command stops with the new `RIVET_STATE_LOCK_TIMEOUT`, exit 2. `--lock-wait 0`
+  keeps the immediate refusal. The staging cleanup still skips a busy prefix and never waits (ADR-0039
+  D7). **What to do:** nothing; pass `--lock-wait 0` where a busy export must fail at once.
+
+- **Behind ProxySQL every chunk sent its MySQL session SETs again, some of them expressions.** Through
+  0.32.1 each read of a chunked export sent `SET time_zone`, `SET SESSION sql_mode = REPLACE(@@sql_mode, ..)`
+  and `max_execution_time` before it and `@@global.*` resets after it; ProxySQL cannot parse the
+  expressions, logs `Unable to parse unknown SET query`, and locks the session to its hostgroup. The
+  values were already right on 0.32.x (measured through a default-config ProxySQL in front of a +03:00
+  server: every TIMESTAMP and DATETIME equal to the server's UTC read, single and parallel-4; an off-UTC
+  session is refused since 0.32.1). **Now** rivet sets the session by literal SETs only, once per pooled
+  connection (`sql_mode` is the server's without `NO_BACKSLASH_ESCAPES`, read once with `SHOW GLOBAL
+  VARIABLES`), and reads no `@@` variable on a reading session, so ProxySQL keeps multiplexing it and
+  replays the tracked variables on whichever backend it picks; a later export with another
+  `statement_timeout_s` sends that one literal again. **What to do:** nothing.
+
+- **A SQLite state could only reach PostgreSQL by hand.** Through 0.32.1 the only way to move a config to
+  a shared PostgreSQL state was a hand-written table copy; pointing `RIVET_STATE_URL` at an empty
+  database started every export over and left the load journal behind. **Now** `rivet state copy -c
+  <config> [--to postgresql://…]` copies every table of the config's SQLite state into an empty
+  PostgreSQL state in one transaction, checks each table's row count before the commit, and only
+  reads the SQLite file (a state of an older release, v31 of 0.30.0 included, is migrated on an
+  in-memory copy). The next run continues its cursors and CDC streams, and `rivet load` keeps the
+  tables earlier loads wrote. A target holding state is refused (`RIVET_STATE_COPY_TARGET_NOT_EMPTY`,
+  exit 5). A CDC `cdc.checkpoint` file is not part of the state: it stays where the config names it,
+  and the copy prints its path. **What to do:** to move a config, stop its runs, run `rivet state copy`,
+  then set `RIVET_STATE_URL` for every command of it.
+
+- **A scheduler could not turn rivet's own notifications off.** Through 0.32.1 a config's
+  `notifications:` (an inline `webhook_url:` included) fired on every failed run, so a scheduler that
+  alerts through its own channel sent each alert twice. **Now** the global flag `--no-notify` sends no
+  notification from the process, and is passed on to every process child `--parallel-export-processes`
+  starts (ADR-0039 D9). Every global flag is now either passed on to the children or declared
+  parent-only, checked against the clap definition. **What to do:** nothing; a scheduler integration
+  passes `--no-notify`.
+
+- **The `rivet load` / `rivet compact` document said how many rows, not what the warehouse did with
+  them or what it cost.** **Now** each `per_table[]` entry also carries `target` (the object the command wrote, named exactly as
+  its loader addressed it: a load's table or `__changes` log, a compact's base) and `buffer` (the buffer a
+  compact read), `rows_inserted`, `rows_updated`,
+  `rows_deleted`, `rows_merged`, `base_rows_after`, `files`, `runs`, `warehouse_job_ids`,
+  `bytes_processed` and `bytes_billed` (ADR-0039 D3). Every count is what the warehouse or the ledger
+  returned: a compact's inserted / updated / deleted rows are its BigQuery MERGE jobs' `dmlStats` (a
+  script's from its child jobs), the bytes are the jobs' `totalBytesProcessed` / `totalBytesBilled`, the
+  job ids are BigQuery job ids or ClickHouse query ids, `files` / `runs` are what the load consumed from
+  the ledger. A value nobody returned is `null`, never 0: the bytes on ClickHouse and Snowflake, the
+  job ids on Snowflake, a load's updates and deletes, the deletes of a compact under `load.delete_flag`
+  (BigQuery counts a flagged delete as an update). The only added read is one `jobs.list` per compact
+  script (metadata, not billed). **What to do:** nothing; the keys are new.
+
+- **A whole-table pass replaced an existing base-and-buffer base, and every row only the base held was lost.**
+  Under `load.layout: base_buffer` (BigQuery), an incremental run with no cursor to resume from (the first
+  run after `rivet state reset`, a lost state DB) and a CDC re-baseline (the remedy every CDC data-loss
+  refusal prints) landed their whole pass OVER the base, exit 0: rows the source had since deleted, the
+  tombstones, and any history copied into the base were gone (measured 3334 -> 2178 and 16681 -> 10772
+  rows). 0.32.1 and earlier. **Now** the pass over an existing base is appended to `<table>__changes` and
+  `rivet compact` merges it by key: a row the pass does not hold stays in the base. After a CDC
+  re-baseline, a live base row the new baseline does not hold is flagged `__is_deleted = TRUE` (the
+  baseline read the whole table after the stream's anchor, so the source no longer has it); a base
+  without the delete flag keeps such rows as they are. Only an absent base is still created from the
+  pass. A buffer that still holds older changes is refused (`RIVET_LOAD_BUFFER_NOT_COMPACTED`) before the
+  pass joins it. **What to do:** nothing; a base replaced by 0.32.1 can be restored with BigQuery time
+  travel within 7 days.
+
+- **Two TLS advisories in the dependency tree.** `rustls-webpki` 0.103.15 could accept a distrusted
+  intermediate (RUSTSEC-2026-0382) and `webpki-roots` 1.0.9 bundled roots that trusted the distrusted
+  emSign intermediates (RUSTSEC-2026-0381); both reach rivet through `reqwest` (object stores, BigQuery,
+  ClickHouse). **Now** they are 0.103.16 and 1.0.10; nothing else in the lock moved. **What to do:**
+  nothing.
+
+- **`rivet load` refused every table on a host without the source's variable.** Since the load spec
+  became keyed by source (state v38, not released), the load read that key from the config's source,
+  which does not resolve where `url_env:` is unset; a load task that runs without the source credential
+  (the common shape, and every `rivet init` config) found no spec and stopped with
+  `RIVET_LOAD_SPEC_MISSING`, exit 5. **Now** a load whose source does not resolve reads the one source
+  that recorded a spec of the export and table on this state; when several did, it is refused with
+  `RIVET_LOAD_SPEC_SOURCE_UNRESOLVED` (exit 1) instead of guessing. **What to do:** nothing; with
+  several configs of one export name on one state, give `rivet load` the source's variable too.
+
+- **`rivet load` and `rivet compact` told a scheduler what happened to each table only in prose.** Through
+  0.32.1 a per-table outcome was a `LOAD OK` / `COMPACT SKIP` line, and both commands always took every
+  table of the config. **Now** both take `--export <name>` and `--table <table>` to work on a subset, and
+  `--json` (stdout) / `--summary-output <file>` print one object with `run_id` and `per_table[]`: each
+  table's `export`, `table`, `status` (`loaded` / `compacted`, `skipped`, `failed`), `skip_reason`
+  (`up_to_date`; `no_buffer`, `full_load`, `warehouse_never_compacts`, `log_view`), `rows` and, for a
+  failed table, the error object (`code`, `kind`, `class`, `exit_code`, `retryable`, `action`, `message`;
+  ADR-0039 D1/D3). Under `--json` the result lines go to stderr. A name the config does not load is
+  refused, `RIVET_CLI_EXPORT_UNKNOWN` or the new `RIVET_CLI_TABLE_UNKNOWN`, exit 1. Two detail lines of
+  `rivet load` (`run(s) produced no files`, `gc-orphans: removed`) moved from stdout to stderr.
+  **What to do:** nothing; a scheduler can read the object instead of the lines.
+
+- **Configs of one export name on one shared state loaded by each other's key.** The load spec
+  (`export_load_spec`: columns and the key `rivet init` recorded) was one row per export name, so
+  on a PostgreSQL state shared by configs reading different databases the last writer won: a
+  `query:` export loaded by another source's key and failed `RIVET_LOAD_KEY_COLUMN_INVALID`, or
+  keyed its dedup by the wrong column (0.32.1 and earlier). **Now** the spec is keyed by export
+  name, table and source (state schema v38); a spec written before v38 stays the spec of any
+  source of that name until the source records its own. **What to do:** nothing; the first run of
+  this release migrates the state and leaves the v37 copy for the way back
+  (`docs/reference/state.md`, "Rolling back an upgrade").
+
+- **Two CDC configs `rivet init` wrote for one cluster named the same slot and `server_id`.**
+  Every PostgreSQL scaffold named its slot `rivet_<table>` and every MySQL one `server_id: 4271`,
+  so a second config (staging beside production) read the first one's stream (0.32.1 and
+  earlier). **Now** `init --mode cdc -o <file>` names them after the file (`-o staging.yaml` ->
+  slot `rivet_staging_public_cdc`, a `server_id` from a stable hash of the stem in 1000000 to
+  1999999); a scaffold printed to stdout keeps the old names and marks them one per cluster.
+  **What to do:** nothing for new configs; give an existing second config its own slot and
+  `server_id` by hand.
+
+- **A file error whose path read like a network word was retried as transient.** The retry
+  classifier scanned the whole error text, paths included, so an unwritable `--summary-output`
+  under a directory whose name contained `dns` (a temp dir such as `.tmprDnsA7`), `reset` or
+  `broken pipe` exited 2 (retry) instead of 1 (0.32.1 and earlier). **Now** the kind of an
+  `io::Error` in the chain decides first (a missing or unwritable path is permanent, a dropped
+  connection transient), and the text is read only when no kind applies. **What to do:** nothing.
+
+- **A PostgreSQL CDC export whose slot another config consumed continued past the lost changes.**
+  Two configs of one cluster with the same `slot:` read in turn: the second took the changes the
+  first had not read, and the first one's next run continued from the slot with exit 0, the
+  changes between gone from its output (0.32.1 and earlier). **Now** rivet records its checkpoint
+  before every advance of the slot it makes (the empty-span release included), and a run whose
+  slot was confirmed past its checkpoint is refused `RIVET_SOURCE_CDC_LOG_GAP`, exit 5, naming the
+  other reader. **What to do:** give every config its own slot, checkpoint and state (see "Copying
+  a CDC config" in `docs/reference/cdc.md`), then re-baseline the stream the refusal names.
+
+- **A SQLite state could only live beside the config.** `RIVET_STATE_URL` took only a PostgreSQL
+  URL, so a deployment whose config directory is read-only, or that keeps several configs' state
+  in one place, had no way to point rivet at a SQLite file (0.32.1 and earlier). **Now**
+  `RIVET_STATE_URL=sqlite:<path>` names the SQLite file for every command, `init` included; a
+  relative path is anchored to the config's directory. A move that would leave the state beside
+  the config behind (it holds cursors or runs, the new file none) is refused
+  `RIVET_STATE_URL_LEAVES_STATE_BEHIND`, exit 5. **What to do:** to move a state, copy it with
+  every run stopped (`sqlite3 .rivet_state.db ".backup <new path>"`), then set the variable.
+
 ## 0.32.1 — 2026-10-19
 
 **Upgrading from 0.32.0 — read these first:**
