@@ -413,6 +413,11 @@ pub(crate) mod tests {
             ("rivet_load_orders_2", Some(0), None),
         ]);
         orders.consumed(3, 2, 1200);
+        let payments = journal_of(&[
+            ("rivet_load_payments_1", Some(0), None),
+            ("rivet_load_payments_2", Some(0), None),
+        ]);
+        payments.consumed(4, 3, 6040);
         let doc = CommandResult {
             run_id: "20261006T101900.456-load".into(),
             per_table: vec![
@@ -426,6 +431,17 @@ pub(crate) mod tests {
                         "proj.analytics.orders__changes",
                     ))),
                     &orders,
+                ),
+                table_result(
+                    "payments_cdc",
+                    "payments",
+                    &at("proj.analytics.payments", None),
+                    "loaded",
+                    &Ok(TableDone::Work(Work {
+                        buffer: Some("proj.analytics.payments__changes".into()),
+                        ..Work::loaded(6040, "proj.analytics.payments")
+                    })),
+                    &payments,
                 ),
                 table_result(
                     "countries",
