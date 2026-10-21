@@ -492,6 +492,44 @@ seeds:
       oracle:
         na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
 
+  - name: pg-upgrade-false-log-gap
+    class: "a PostgreSQL stream an older release left with its slot past its checkpoint (that release released a trailing empty span by advancing the slot without saving the checkpoint) is refused RIVET_SOURCE_CDC_LOG_GAP as consumed by another reader on its first upgraded run, exit 5, nothing lost"
+    history: "0.32.2, 2026-10-21: found by #664's upgrade cell on the released v0.32.1 (1 in 3 beside parallel cells); forced by a captured change followed by an uncaptured transaction, run twice on 0.32.1: red 3/3 on main ff104292"
+    scope: source
+    engines:
+      postgres:
+        patch: pg-upgrade-false-log-gap/postgres.patch
+        cells:
+          - an_upgraded_stream_whose_old_release_advanced_its_slot_past_the_checkpoint_continues
+          - "lib:an_older_releases_checkpoint_behind_its_slot_is_adopted_once_then_the_guard_is_strict"
+      mysql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mssql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mongo:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      oracle:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+  - name: pg-foreign-advance-adopted
+    class: "the upgrade adoption also takes the slot's position over a checkpoint this release wrote, so a slot another reader advanced is continued from, exit 0, the changes between lost"
+    history: "0.32.2, 2026-10-21: the guard the upgrade adoption must not weaken (#649)"
+    scope: source
+    engines:
+      postgres:
+        patch: pg-foreign-advance-adopted/postgres.patch
+        cells:
+          - a_slot_another_config_advanced_is_refused_instead_of_losing_its_changes
+          - an_upgraded_stream_whose_old_release_advanced_its_slot_past_the_checkpoint_continues
+          - "lib:an_older_releases_checkpoint_behind_its_slot_is_adopted_once_then_the_guard_is_strict"
+      mysql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mssql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mongo:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      oracle:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+
   - name: load-spec-last-writer-of-one-name
     class: "the by-name load spec is one row per export name, so on a state shared by configs of one name reading different sources the last `rivet init` (or run) decides every config's load key"
     history: "client simulation on 0.32.0 (D3) and owner decision 2026-10-18 (v38 approved); measured on main 34ec3d30 with five configs on one PostgreSQL state: the second config's load refused RIVET_LOAD_KEY_COLUMN_INVALID keyed by the fifth one's `code`"
