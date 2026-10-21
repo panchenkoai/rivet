@@ -92,6 +92,8 @@ pub(crate) struct BigQueryApi {
     endpoint: String,
     http: reqwest::blocking::Client,
     auth: Auth,
+    /// Where every finished job is recorded, with what BigQuery reported of it.
+    journal: crate::load::result::JobJournal,
 }
 
 impl std::fmt::Debug for BigQueryApi {
@@ -151,7 +153,14 @@ impl BigQueryApi {
                 .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string()),
             auth: Auth::resolve(&http)?,
             http,
+            journal: Default::default(),
         })
+    }
+
+    /// Record every job this client finishes in `journal`.
+    pub(crate) fn journaled(mut self, journal: crate::load::result::JobJournal) -> Self {
+        self.journal = journal;
+        self
     }
 
     /// A client whose jobs write `dataset`, so a job it has to fetch by id is polled in
@@ -295,12 +304,64 @@ impl BigQueryApi {
     /// Take an inserted job to a terminal state. A short statement often
     /// completes inside the insert call, so the body already in hand is graded
     /// before a poll is spent.
+    ///
+    /// Every terminal job is recorded in the journal, a failed one too: it may have been billed.
     fn settle(&self, job: Value) -> Result<JobRef> {
         let job_ref = parse_job_reference(&job, &self.project)?;
-        match job_outcome(&job) {
-            JobOutcome::Done => Ok(job_ref),
+        let terminal = match job_outcome(&job) {
+            JobOutcome::Running => self.await_terminal(&job_ref, JOB_POLL_DEADLINE)?,
+            JobOutcome::Done | JobOutcome::Failed(_) => job,
+        };
+        let mut record = warehouse_job(&job_ref.job_id, &terminal);
+        if record.dml.is_none() && is_script(&terminal) {
+            record.dml = self.child_dml(&job_ref);
+        }
+        self.journal.record(record);
+        match job_outcome(&terminal) {
             JobOutcome::Failed(detail) => Err(job_failed(&job_ref.job_id, &detail)),
-            JobOutcome::Running => self.await_job(&job_ref, JOB_POLL_DEADLINE).map(|_| job_ref),
+            JobOutcome::Done | JobOutcome::Running => Ok(job_ref),
+        }
+    }
+
+    /// The summed `dmlStats` of a script's child jobs (`jobs.list?parentJobId=`), or `None`
+    /// when no child reported any or the list could not be read: a script reports none itself.
+    fn child_dml(&self, parent: &JobRef) -> Option<crate::load::result::DmlCounts> {
+        let mut total: Option<crate::load::result::DmlCounts> = None;
+        let mut page: Option<String> = None;
+        loop {
+            let url = format!(
+                "{}/bigquery/v2/projects/{}/jobs?parentJobId={}&projection=full&maxResults=1000{}",
+                self.endpoint,
+                parent.project,
+                parent.job_id,
+                page.as_deref()
+                    .map(|t| format!("&pageToken={t}"))
+                    .unwrap_or_default()
+            );
+            let listed = match self.get_json(&url, "jobs.list") {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "BigQuery jobs.list of script {} failed ({e:#}); its row counts are unknown",
+                        parent.job_id
+                    );
+                    return None;
+                }
+            };
+            for child in listed
+                .get("jobs")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+            {
+                if let Some(d) = dml_stats(child) {
+                    total = Some(total.unwrap_or_default().plus(d));
+                }
+            }
+            match listed.get("nextPageToken").and_then(Value::as_str) {
+                Some(t) if !t.is_empty() => page = Some(t.to_string()),
+                _ => return total,
+            }
         }
     }
 
@@ -391,15 +452,24 @@ impl BigQueryApi {
     /// drive the expiry in milliseconds; every caller passes [`JOB_POLL_DEADLINE`].
     /// The check sits in the `Running` arm, so a job that is already terminal is
     /// never refused for being slow to answer.
+    #[cfg(test)]
     fn await_job(&self, job_ref: &JobRef, budget: Duration) -> Result<String> {
+        let job = self.await_terminal(job_ref, budget)?;
+        match job_outcome(&job) {
+            JobOutcome::Failed(detail) => Err(job_failed(&job_ref.job_id, &detail)),
+            JobOutcome::Done | JobOutcome::Running => Ok(job_ref.job_id.clone()),
+        }
+    }
+
+    /// The job's resource once it is DONE or failed, polled within `budget`.
+    fn await_terminal(&self, job_ref: &JobRef, budget: Duration) -> Result<Value> {
         let url = self.job_url(job_ref);
         let started = std::time::Instant::now();
         for attempt in 0.. {
             std::thread::sleep(poll_interval(attempt));
             let job = self.get_json(&url, "jobs.get")?;
             match job_outcome(&job) {
-                JobOutcome::Done => return Ok(job_ref.job_id.clone()),
-                JobOutcome::Failed(detail) => return Err(job_failed(&job_ref.job_id, &detail)),
+                JobOutcome::Done | JobOutcome::Failed(_) => return Ok(job),
                 JobOutcome::Running if started.elapsed() > budget => {
                     return Err(crate::load::JobWaitTimeout::bigquery(
                         &job_ref.job_id,
@@ -781,6 +851,46 @@ pub(crate) fn parse_job_reference(job: &Value, fallback_project: &str) -> Result
             .and_then(Value::as_str)
             .map(str::to_string),
     })
+}
+
+/// A terminal job as the journal keeps it: its id, the bytes it processed and billed, and
+/// its `dmlStats` (BigQuery sends each count as a string; an absent count is 0).
+pub(crate) fn warehouse_job(job_id: &str, job: &Value) -> crate::load::result::WarehouseJob {
+    let query = job.get("statistics").and_then(|s| s.get("query"));
+    let number = |key: &str| query.and_then(|q| q.get(key)).and_then(json_u64);
+    crate::load::result::WarehouseJob {
+        id: job_id.to_string(),
+        bytes_processed: number("totalBytesProcessed"),
+        bytes_billed: number("totalBytesBilled"),
+        dml: dml_stats(job),
+    }
+}
+
+/// `statistics.query.dmlStats` of a job, or `None` when it reports none.
+fn dml_stats(job: &Value) -> Option<crate::load::result::DmlCounts> {
+    let dml = job.get("statistics")?.get("query")?.get("dmlStats")?;
+    let count = |key: &str| dml.get(key).and_then(json_u64).unwrap_or(0);
+    Some(crate::load::result::DmlCounts {
+        inserted: count("insertedRowCount"),
+        updated: count("updatedRowCount"),
+        deleted: count("deletedRowCount"),
+    })
+}
+
+/// Whether the job is a multi-statement script, whose DML is reported by its children.
+fn is_script(job: &Value) -> bool {
+    job.get("statistics")
+        .and_then(|s| s.get("query"))
+        .and_then(|q| q.get("statementType"))
+        .and_then(Value::as_str)
+        == Some("SCRIPT")
+}
+
+/// A count BigQuery sends as a decimal string (or, from a stand, a number).
+fn json_u64(v: &Value) -> Option<u64> {
+    v.as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| v.as_u64())
 }
 
 /// Where a polled job stands.
@@ -1230,6 +1340,7 @@ mod tests {
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
+            journal: Default::default(),
         };
         assert_eq!(
             api(Some("EU"), Some("d")).fetch_location().as_deref(),
@@ -1565,6 +1676,7 @@ mod tests {
             endpoint: format!("http://{addr}"),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
+            journal: Default::default(),
         };
         let job_ref = JobRef {
             project: "p".into(),
@@ -1632,6 +1744,7 @@ mod tests {
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
+            journal: Default::default(),
         };
         let with_loc = api.query_results_url(&JobRef {
             project: "p".into(),
@@ -1663,6 +1776,7 @@ mod tests {
             endpoint: "https://e".into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("t".into())),
+            journal: Default::default(),
         };
         let url = api.job_url(&JobRef {
             project: "other".into(),
@@ -1688,6 +1802,7 @@ mod tests {
             endpoint: DEFAULT_ENDPOINT.into(),
             http: reqwest::blocking::Client::new(),
             auth: Auth::Static(Zeroizing::new("ya29.SECRET-TOKEN".into())),
+            journal: Default::default(),
         };
         let rendered = format!("{api:?}");
         assert!(!rendered.contains("SECRET"), "{rendered}");
@@ -1997,6 +2112,174 @@ mod tests {
     fn code_and_exit(e: &anyhow::Error) -> (Option<&'static str>, i32) {
         (crate::error::error_code(e), crate::error::classify_exit(e))
     }
+
+    /// Every job the client finishes is journaled with what BigQuery reported of it: the
+    /// bytes it processed and billed, its `dmlStats`, a script's DML summed over its child
+    /// jobs (every page of `jobs.list`), and a failed job too, which may have been billed.
+    #[test]
+    fn every_finished_job_is_journaled_with_what_bigquery_reported() {
+        use crate::load::result::{DmlCounts, JobJournal, WarehouseJob};
+        use stand::{Stand, json};
+        let job = |id: &str, state: &str, statistics: &str| {
+            json(
+                200,
+                &format!(
+                    r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"{state}"}},"statistics":{statistics}}}"#
+                ),
+            )
+        };
+        let stand = Stand::start(move |seen, nth| {
+            let sql = seen.body["configuration"]["query"]["query"]
+                .as_str()
+                .unwrap_or("");
+            let id = seen.body["jobReference"]["jobId"]
+                .as_str()
+                .unwrap_or("none");
+            match (seen.method.as_str(), seen.path.as_str()) {
+                ("POST", _) if sql.contains("MERGE") => job(
+                    id,
+                    "DONE",
+                    r#"{"query":{"totalBytesProcessed":"100","totalBytesBilled":"10485760","dmlStats":{"insertedRowCount":"2","updatedRowCount":"3"}}}"#,
+                ),
+                ("POST", _) if sql.contains("SCRIPT") => job(
+                    id,
+                    "DONE",
+                    r#"{"numChildJobs":"3","query":{"statementType":"SCRIPT","totalBytesProcessed":"50","totalBytesBilled":"60"}}"#,
+                ),
+                ("POST", _) if sql.contains("BROKEN") => json(
+                    200,
+                    &format!(
+                        r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"DONE","errorResult":{{"message":"no"}}}},"statistics":{{"query":{{"totalBytesBilled":"7"}}}}}}"#
+                    ),
+                ),
+                ("POST", _) => job("slow", "RUNNING", "{}"),
+                ("GET", "/bigquery/v2/projects/p/jobs") => match nth {
+                    0 => json(
+                        200,
+                        r#"{"jobs":[{"statistics":{"query":{"dmlStats":{"insertedRowCount":"1","deletedRowCount":"4"}}}},{"statistics":{"query":{}}}],"nextPageToken":"t2"}"#,
+                    ),
+                    _ => json(
+                        200,
+                        r#"{"jobs":[{"statistics":{"query":{"dmlStats":{"updatedRowCount":"5"}}}}]}"#,
+                    ),
+                },
+                ("GET", "/bigquery/v2/projects/p/jobs/slow") => job(
+                    "slow",
+                    "DONE",
+                    r#"{"query":{"totalBytesProcessed":"9","totalBytesBilled":"0"}}"#,
+                ),
+                _ => json(404, "{}"),
+            }
+        });
+        let journal = JobJournal::new(true);
+        let api = stand.api().journaled(journal.clone());
+        let merge = api.run_query("MERGE t", &labels()).unwrap();
+        let script = api.run_query("SCRIPT", &labels()).unwrap();
+        api.run_query("SELECT polled", &labels()).unwrap();
+        api.run_query("BROKEN", &labels()).unwrap_err();
+        let dml = |inserted, updated, deleted| {
+            Some(DmlCounts {
+                inserted,
+                updated,
+                deleted,
+            })
+        };
+        let jobs = journal.jobs();
+        assert_eq!(
+            jobs[..3],
+            [
+                WarehouseJob {
+                    id: merge,
+                    bytes_processed: Some(100),
+                    bytes_billed: Some(10_485_760),
+                    dml: dml(2, 3, 0),
+                },
+                WarehouseJob {
+                    id: script,
+                    bytes_processed: Some(50),
+                    bytes_billed: Some(60),
+                    dml: dml(1, 5, 4),
+                },
+                WarehouseJob {
+                    id: "slow".into(),
+                    bytes_processed: Some(9),
+                    bytes_billed: Some(0),
+                    dml: None,
+                },
+            ]
+        );
+        assert_eq!(
+            (jobs.len(), jobs[3].bytes_billed, jobs[3].bytes_processed),
+            (4, Some(7), None),
+            "a failed job is journaled too: it may have been billed"
+        );
+        assert_eq!(
+            stand.asked("/jobs/slow"),
+            1,
+            "the poll's answer is the one journaled"
+        );
+    }
+
+    /// A script whose children cannot be listed reports unknown DML, not zero, and its job still counts.
+    #[test]
+    fn a_script_whose_children_cannot_be_listed_reports_unknown_dml() {
+        use crate::load::result::JobJournal;
+        use stand::{Stand, json};
+        let stand = Stand::start(move |seen, _| match seen.method.as_str() {
+            "POST" => json(
+                200,
+                r#"{"jobReference":{"projectId":"p","jobId":"s1"},"status":{"state":"DONE"},"statistics":{"query":{"statementType":"SCRIPT","totalBytesBilled":"1"}}}"#,
+            ),
+            _ => json(403, r#"{"error":{"message":"Access Denied: jobs.list"}}"#),
+        });
+        let journal = JobJournal::new(true);
+        stand
+            .api()
+            .journaled(journal.clone())
+            .run_query("SCRIPT", &labels())
+            .unwrap();
+        let jobs = journal.jobs();
+        assert_eq!(
+            (jobs.len(), jobs[0].dml, jobs[0].bytes_billed),
+            (1, None, Some(1))
+        );
+    }
+
+    /// An empty `nextPageToken` ends the child list: it is not a page to ask for.
+    #[test]
+    fn an_empty_page_token_ends_the_child_list() {
+        use crate::load::result::{DmlCounts, JobJournal};
+        use stand::{Stand, json};
+        let stand = Stand::start(move |seen, nth| match (seen.method.as_str(), nth) {
+            ("POST", _) => json(
+                200,
+                r#"{"jobReference":{"projectId":"p","jobId":"s1"},"status":{"state":"DONE"},"statistics":{"query":{"statementType":"SCRIPT"}}}"#,
+            ),
+            (_, 0) => json(
+                200,
+                r#"{"jobs":[{"statistics":{"query":{"dmlStats":{"insertedRowCount":"1"}}}}],"nextPageToken":""}"#,
+            ),
+            _ => json(
+                200,
+                r#"{"jobs":[{"statistics":{"query":{"dmlStats":{"insertedRowCount":"100"}}}}]}"#,
+            ),
+        });
+        let journal = JobJournal::new(true);
+        stand
+            .api()
+            .journaled(journal.clone())
+            .run_query("SCRIPT", &labels())
+            .unwrap();
+        assert_eq!(
+            journal.jobs()[0].dml,
+            Some(DmlCounts {
+                inserted: 1,
+                updated: 0,
+                deleted: 0
+            })
+        );
+        assert_eq!(stand.asked("/jobs"), 2, "one insert, one list page");
+    }
 }
 
 /// A scripted BigQuery endpoint on a loopback port: every request is recorded and answered by the script.
@@ -2074,6 +2357,7 @@ pub(crate) mod stand {
                 endpoint: self.endpoint.clone(),
                 http: reqwest::blocking::Client::new(),
                 auth: Auth::Static(Zeroizing::new("stand-token".into())),
+                journal: Default::default(),
             }
         }
 

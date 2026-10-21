@@ -4,9 +4,21 @@
     {
       "export": "orders_cdc",
       "table": "orders",
+      "target": "analytics.orders",
+      "buffer": null,
       "status": "skipped",
       "skip_reason": "warehouse_never_compacts",
       "rows": 0,
+      "rows_inserted": null,
+      "rows_updated": null,
+      "rows_deleted": null,
+      "rows_merged": null,
+      "base_rows_after": null,
+      "files": null,
+      "runs": null,
+      "warehouse_job_ids": [],
+      "bytes_processed": null,
+      "bytes_billed": null,
       "error": null
     }
   ]
