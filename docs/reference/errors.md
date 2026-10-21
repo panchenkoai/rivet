@@ -50,7 +50,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
 | `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
-| `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` | refusal | 5 | give the export a `cdc.checkpoint` of its own, then re-baseline it |
+| `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` | refusal | 5 | give the export a `cdc.checkpoint` of its own and keep the shared file, the other export's position; with `cdc.initial: snapshot` its first run re-reads every table |
 | `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or re-baseline the stream: delete it, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
 | `RIVET_SOURCE_CDC_LOG_GAP` | refusal | 5 | restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
 | `RIVET_SOURCE_CDC_TRUNCATED` | refusal | 5 | re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
@@ -203,7 +203,6 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_DEST_CREDENTIALS_INVALID` | environment | 2 if transient, else 1 | issue the destination a fresh, complete credential (a new SAS, service-account key or `gcloud auth application-default login`) |
 | `RIVET_DEST_PREFIX_MODE_MISMATCH` | refusal | 5 | give the export its own destination prefix; a batch and a CDC export must not share one |
 | `RIVET_DEST_IO_RUNTIME_UNAVAILABLE` | environment | 2 if transient, else 1 | raise the process's thread and open-file limits, or lower the export parallelism, then run again |
-| `RIVET_INIT_CDC_NAME_TAKEN` | refusal | 5 | write the config under another `-o` name, or move the other config aside |
 | `RIVET_INIT_CONFIG_EXISTS` | refusal | 5 | move the existing config aside, or write elsewhere with `-o <new-path>` |
 | `RIVET_INIT_TABLE_NOT_FOUND` | usage | 1 | correct `--table` (and `--schema`), or grant the user SELECT on the table |
 | `RIVET_INIT_NO_TABLES` | usage | 1 | point `--schema` at a schema the user can read, and loosen `--include` / `--exclude` |
@@ -214,6 +213,10 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_PLAN_CHUNK_KEY_UNUSABLE` | usage | 1 | set `chunk_column:` (integer) or `chunk_by_key:` (a single-column NOT NULL unique key of a supported type), add such an index, or use `mode: full` |
 | `RIVET_STATE_BACKEND_FAILED` | environment | 2 if transient, else 1 | check the state database (the SQLite file, or the `RIVET_STATE_URL` server and the role's rights), then run again |
 | `RIVET_STATE_FILE_CORRUPT` | environment | 2 if transient, else 1 | move the state file aside (rivet rebuilds it; cursors and skip-ledgers start fresh), or restore it from a backup |
+| `RIVET_STATE_COPY_SOURCE_EMPTY` | usage | 1 | name the config whose `.rivet_state.db` holds the state, or its `RIVET_STATE_URL=sqlite:<path>` |
+| `RIVET_STATE_COPY_TARGET_MISSING` | usage | 1 | pass `--to postgresql://…`, or set RIVET_STATE_URL to the PostgreSQL state |
+| `RIVET_STATE_COPY_TARGET_NOT_EMPTY` | refusal | 5 | copy into a PostgreSQL database (or schema) that holds no rivet state |
+| `RIVET_STATE_COPY_COUNT_MISMATCH` | integrity | 3 | nothing was committed; keep using the SQLite state and report the table the message names |
 | `RIVET_STATE_MIGRATION_LOCKED` | environment | 2 if transient, else 1 | wait for the other rivet process migrating this state database to finish, then run again |
 | `RIVET_INTERNAL_DEST_INVARIANT` | internal | 6 | a destination invariant did not hold — a bug; report it with the message |
 | `RIVET_INTERNAL_STATE_INVARIANT` | internal | 6 | a state-store invariant did not hold — a bug; report it with the message |
