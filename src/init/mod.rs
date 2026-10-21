@@ -1025,19 +1025,6 @@ fn refuse_cdc_names_taken(path: &str, text: &str) -> Result<()> {
         )
     };
     let ours = cdc_places(&mine, dir);
-    for (export, ckpt, _) in &ours {
-        if let Some(c) = ckpt.as_ref().filter(|c| c.exists()) {
-            let owner = crate::source::cdc::checkpoint_identity::owner_of(c).map_or_else(
-                || "a stream of an earlier config".to_string(),
-                |o| format!("export '{}' of '{}'", o.export, o.config),
-            );
-            return Err(taken(format!(
-                "export '{export}' would keep its CDC position in '{}', which already exists: \
-                 the checkpoint of {owner}",
-                c.display()
-            )));
-        }
-    }
     let siblings = std::fs::read_dir(dir).into_iter().flatten().flatten();
     for entry in siblings {
         let other = entry.path();
@@ -1065,6 +1052,25 @@ fn refuse_cdc_names_taken(path: &str, text: &str) -> Result<()> {
                     )));
                 }
             }
+        }
+    }
+    for (export, ckpt, _) in &ours {
+        if let Some(c) = ckpt.as_ref().filter(|c| c.exists()) {
+            let owner = crate::source::cdc::checkpoint_identity::owner_of(c).map_or_else(
+                || "a stream of an earlier config".to_string(),
+                |o| {
+                    let gone = match std::path::Path::new(&o.config).exists() {
+                        true => "",
+                        false => ", moved or deleted since",
+                    };
+                    format!("export '{}' of '{}'{gone}", o.export, o.config)
+                },
+            );
+            return Err(taken(format!(
+                "export '{export}' would keep its CDC position in '{}', which already exists: \
+                 the checkpoint of {owner}",
+                c.display()
+            )));
         }
     }
     Ok(())

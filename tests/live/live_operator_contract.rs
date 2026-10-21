@@ -1190,7 +1190,10 @@ fn a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres() {
     a_checkpoint_another_config_reads_is_refused(CdcScenario::pg_with(
         "oc_ckshare",
         "id BIGINT PRIMARY KEY, v BIGINT",
-        |r, _| r.cdc("initial: snapshot").relative_checkpoint("cdc.ckpt"),
+        |r, _| {
+            let ckpt = r.checkpoint();
+            r.cdc("initial: snapshot").checkpoint_path(ckpt)
+        },
     ));
 }
 

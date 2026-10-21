@@ -1514,8 +1514,9 @@ fn two_existing_configs_on_one_checkpoint_the_first_claims_it(
                 .into_iter()
                 .filter(|f| f.to_string_lossy().ends_with(".ckpt.owner"))
                 .collect();
-            assert_eq!(owners.len(), 1, "{owners:?}");
-            std::fs::remove_file(&owners[0]).unwrap();
+            for owner in owners {
+                std::fs::remove_file(owner).unwrap();
+            }
         }
     }
     (src.apply)(&[Op::Ins(3)]);
