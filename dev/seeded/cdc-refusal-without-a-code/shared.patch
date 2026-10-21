@@ -1,5 +1,5 @@
 diff --git a/src/source/cdc/checkpoint_identity.rs b/src/source/cdc/checkpoint_identity.rs
-index fa327f50..fc7b7d6a 100644
+index fa327f50..74d738d1 100644
 --- a/src/source/cdc/checkpoint_identity.rs
 +++ b/src/source/cdc/checkpoint_identity.rs
 @@ -16,7 +16,8 @@ pub(crate) const RECOVER: &str = "Re-baseline the stream in one run: delete the
@@ -8,7 +8,7 @@ index fa327f50..fc7b7d6a 100644
  fn refusal(code: crate::error::Code, why: impl Into<String>) -> anyhow::Error {
 -    anyhow::Error::new(crate::error::CodedError::new(code, why))
 +    let _ = code;
-+    anyhow::anyhow!(why)
++    anyhow::anyhow!(why.into())
  }
  
  /// Refuse a checkpoint that cannot be resumed from (unreadable, of another shape, or gone under a baseline): `SOURCE_CDC_CHECKPOINT_INVALID`, exit 5.
