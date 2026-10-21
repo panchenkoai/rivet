@@ -23,6 +23,8 @@ pub(crate) struct Work {
     pub rows: u64,
     /// The object a load wrote, as its loader named it; `None` keeps the table's [`Address`].
     pub wrote: Option<String>,
+    /// The change log a load appended to besides its target (a CDC baseline and its changes); `None` keeps the table's [`Address`].
+    pub buffer: Option<String>,
     pub rows_inserted: Option<u64>,
     pub rows_updated: Option<u64>,
     pub rows_deleted: Option<u64>,
@@ -52,6 +54,7 @@ impl Work {
         Work {
             rows,
             wrote: None,
+            buffer: None,
             rows_inserted: dml.map(|d| d.inserted),
             rows_updated: dml.map(|d| d.updated),
             rows_deleted: dml.filter(|_| !flagged).map(|d| d.deleted),
@@ -212,7 +215,10 @@ pub(crate) fn table_result(
         export: export.to_string(),
         table: table.to_string(),
         target: work.wrote.clone().unwrap_or_else(|| address.target.clone()),
-        buffer: address.buffer.clone().filter(|_| status != "skipped"),
+        buffer: work
+            .buffer
+            .clone()
+            .or_else(|| address.buffer.clone().filter(|_| status != "skipped")),
         status,
         skip_reason,
         rows: work.rows,
@@ -407,6 +413,11 @@ pub(crate) mod tests {
             ("rivet_load_orders_2", Some(0), None),
         ]);
         orders.consumed(3, 2, 1200);
+        let payments = journal_of(&[
+            ("rivet_load_payments_1", Some(0), None),
+            ("rivet_load_payments_2", Some(0), None),
+        ]);
+        payments.consumed(4, 3, 6040);
         let doc = CommandResult {
             run_id: "20261006T101900.456-load".into(),
             per_table: vec![
@@ -420,6 +431,17 @@ pub(crate) mod tests {
                         "proj.analytics.orders__changes",
                     ))),
                     &orders,
+                ),
+                table_result(
+                    "payments_cdc",
+                    "payments",
+                    &at("proj.analytics.payments", None),
+                    "loaded",
+                    &Ok(TableDone::Work(Work {
+                        buffer: Some("proj.analytics.payments__changes".into()),
+                        ..Work::loaded(6040, "proj.analytics.payments")
+                    })),
+                    &payments,
                 ),
                 table_result(
                     "countries",

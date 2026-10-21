@@ -1,0 +1,20 @@
+diff --git a/src/load/orchestrate.rs b/src/load/orchestrate.rs
+index 02240973..96724ea6 100644
+--- a/src/load/orchestrate.rs
++++ b/src/load/orchestrate.rs
+@@ -1577,13 +1577,8 @@ fn load_one_cdc_base(
+ /// target when a baseline landed there, with the change log as its buffer when the stream also
+ /// appended to it; the change log alone otherwise.
+ fn cdc_work(report: &load::CdcLoadReport) -> Work {
+-    match &report.baseline {
+-        Some(base) => Work {
+-            buffer: (report.rows_appended > 0).then(|| report.changes_table.clone()),
+-            ..Work::loaded(base.rows_loaded + report.rows_appended, &base.target_table)
+-        },
+-        None => Work::loaded(report.rows_appended, &report.changes_table),
+-    }
++    let _ = &report.baseline;
++    Work::loaded(report.rows_appended, &report.changes_table)
+ }
+ 
+ /// Whose the append's names are once this load's own whole-table leg has landed the table.

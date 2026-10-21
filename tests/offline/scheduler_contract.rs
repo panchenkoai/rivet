@@ -564,7 +564,7 @@ fn check_xcom(v: &Value, at: &str) -> Check {
         format!("{at}: target names the object of a load or compact unit, null for a run unit")
     })?;
     require(of_table || v["buffer"].is_null(), || {
-        format!("{at}: only a compact unit reads a buffer")
+        format!("{at}: only a load or compact unit names a buffer")
     })?;
     require(!of_table || v["stop_reason"].is_null(), || {
         format!("{at}: only a run unit has a stop_reason")

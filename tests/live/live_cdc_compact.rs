@@ -1171,6 +1171,17 @@ fn a_bigquery_load_and_compact_digest_is_what_bq_reads_back() {
     let load = digest_of(&scn.rig, "load");
     assert_eq!(load["status"], "loaded", "{load}");
     assert_eq!(load["rows_inserted"], 5, "{load}");
+    assert_eq!(
+        load["rows"], 5,
+        "the baseline rows are the load's rows: {load}"
+    );
+    assert!(
+        load["target"]
+            .as_str()
+            .is_some_and(|t| t.ends_with(&format!(".{table}"))),
+        "a load that landed the baseline names the base: {load}"
+    );
+    assert!(load["buffer"].is_null(), "no change was buffered: {load}");
     assert_eq!(bq.read_bq_count(&table), "5");
     let count = |fqtn: &str| -> String {
         bq.read_bq_rows(&format!("SELECT COUNT(*) AS n FROM `{fqtn}`"))[0]["n"]
