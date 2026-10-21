@@ -423,16 +423,22 @@ integers.
 The two-column blob (`_id` + `document`) loads into any warehouse, but two things
 are worth knowing before you write the `MERGE`.
 
-### `document` is JSON — but BigQuery loads it as `BYTES`
+### `document` is JSON — `rivet load` lands it as `JSON` on BigQuery
 
-Rivet tags the `document` column with the Arrow `arrow.json` extension. Snowflake
-and a direct `PARSE_JSON` pick this up, but **BigQuery's Parquet loader does not
-recognise the extension** — the column lands as `BYTES`, not `JSON`. Convert on
-read (verified against a live BigQuery load):
+Rivet tags the `document` column with the Arrow `arrow.json` extension. `rivet load`
+declares each column's BigQuery type in its `LOAD DATA` statement, so `document`
+lands as a native `JSON` column (`rivet check --target bigquery` reports it as
+`JSON`, autoload `BYTES`). A load that does NOT declare the schema (`bq load` or a
+schema-less `LOAD DATA` over the same Parquet) lets BigQuery's Parquet autoloader
+read the extension, and the column lands as `BYTES`; convert it on read:
 
 ```sql
-PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document))   -- BigQuery
+PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document))   -- BigQuery, autoloaded only
 ```
+
+The `MERGE` examples below are written for an autoloaded `BYTES` column; over a
+table `rivet load` wrote, use `document` where they say
+`PARSE_JSON(SAFE_CONVERT_BYTES_TO_STRING(document))`.
 
 Snowflake autoloads `document` as `TEXT`, so `PARSE_JSON(document)` is direct —
 see `rivet check --target snowflake`.
