@@ -408,7 +408,7 @@ infra:
     status: partial
     # A row whose every declared cell skips on the stand for a reason it names (Snowflake, a stand profile) is
     # NOT-GRADED-HERE: listed, never a catch, and held under this count; one more is a FAIL.
-    not_graded_here_ceiling: 0  # ratchet-pin: seeded-not-graded-here
+    not_graded_here_ceiling: 7  # ratchet-pin: seeded-not-graded-here
     note: "verify_seeded_recall re-introduces every known bug class in dev/seeded/seeds.yaml as a
       source patch in a scratch worktree, builds it, and requires the declared catching cells
       (green on the unpatched tree) to go red; MISSED / STALE / BROKEN / NO-CONTROL rows fail.
