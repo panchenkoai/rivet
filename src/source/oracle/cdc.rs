@@ -2384,6 +2384,15 @@ mod error_code_tests {
         let long = unmineable("O", &"T".repeat(MAX_MINED_NAME + 1), &id, 19).unwrap();
         assert!(long.contains("over 30 bytes"), "{long}");
         assert!(unmineable("O", &"T".repeat(MAX_MINED_NAME), &id, 19).is_none());
+        // The owner and each column name meet the same limit, at it and one byte over.
+        assert!(unmineable(&"O".repeat(MAX_MINED_NAME), "T", &id, 19).is_none());
+        let owner = unmineable(&"O".repeat(MAX_MINED_NAME + 1), "T", &id, 19).unwrap();
+        assert!(owner.contains("over 30 bytes"), "{owner}");
+        let at = "C".repeat(MAX_MINED_NAME);
+        assert!(unmineable("O", "T", &[col(&at, "NUMBER")], 19).is_none());
+        let over = "C".repeat(MAX_MINED_NAME + 1);
+        let named = unmineable("O", "T", &[col(&over, "NUMBER")], 19).unwrap();
+        assert!(named.contains("a name LogMiner cannot address"), "{named}");
         let wide: Vec<CatalogColumn> = (0..=MAX_COLUMNS)
             .map(|i| col(&format!("C{i}"), "NUMBER"))
             .collect();
