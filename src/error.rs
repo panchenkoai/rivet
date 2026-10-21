@@ -884,6 +884,11 @@ pub mod codes {
         "RIVET_STATE_CHUNK_RUN_SUPERSEDED",
         "`rivet state reset-chunks -c <config> --export <name>` abandons the run; the next run starts a fresh pass",
     );
+    /// A lease another live rivet process holds was still held when `--lock-wait` ran out.
+    pub const STATE_LOCK_TIMEOUT: Code = busy(
+        "RIVET_STATE_LOCK_TIMEOUT",
+        "the other process still holds it: retry once it ends, or give `--lock-wait` more seconds",
+    );
     /// A command that rewrites an export's stored progress met a live run of that export.
     pub const STATE_RUN_IN_PROGRESS: Code = busy(
         "RIVET_STATE_RUN_IN_PROGRESS",
@@ -1218,6 +1223,11 @@ pub mod codes {
     );
 
     /// `rivet load` cannot resolve the config's source, and several sources recorded a spec of the export on this state.
+    /// `rivet load` or `rivet compact` on a config with no top-level `load:` block.
+    pub const LOAD_BLOCK_MISSING: Code = usage(
+        "RIVET_LOAD_BLOCK_MISSING",
+        "add a top-level `load: { target, ... }` block naming the warehouse, or run `rivet run` alone",
+    );
     pub const LOAD_SPEC_SOURCE_UNRESOLVED: Code = usage(
         "RIVET_LOAD_SPEC_SOURCE_UNRESOLVED",
         "set the source's variable (`url_env:` / `password_env:`) for `rivet load` as for `rivet run`",
@@ -1702,6 +1712,7 @@ pub mod codes {
         STATE_CHUNK_RUN_SUPERSEDED,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
+        STATE_LOCK_TIMEOUT,
         STATE_CHUNK_CHECKPOINT_GONE,
         STATE_CHUNK_PLAN_CHANGED,
         STATE_CHUNK_WINDOWS_BROKEN,
@@ -1758,6 +1769,7 @@ pub mod codes {
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
+        LOAD_BLOCK_MISSING,
         LOAD_SPEC_SOURCE_UNRESOLVED,
         CLI_EXPORT_UNKNOWN,
         CLI_TABLE_UNKNOWN,
@@ -2168,6 +2180,7 @@ mod tests {
             busy.iter().map(|c| c.id).collect::<Vec<_>>(),
             [
                 "RIVET_STATE_RUN_IN_PROGRESS",
+                "RIVET_STATE_LOCK_TIMEOUT",
                 "RIVET_STATE_LEASE_LOST",
                 "RIVET_LOAD_TABLE_BUSY"
             ]

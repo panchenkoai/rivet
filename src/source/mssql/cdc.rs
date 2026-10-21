@@ -141,9 +141,10 @@ pub(crate) fn row_image_verdict(rows: &[String]) -> crate::source::cdc::RowImage
     }
     RowImage::Partial {
         why: format!(
-            "the capture instance(s) for {} were enabled with a PARTIAL @captured_column_list, so \
-             every change event is missing the columns that were left out — the rows would be \
-             recorded as NULL rather than as absent. Re-enable the table with the full column \
+            "the capture instance(s) for {} do not carry every column of their table (a column \
+             added after the instance was created, or a PARTIAL @captured_column_list), so every \
+             change event is missing those columns — the rows would be recorded as NULL rather \
+             than as absent. Re-enable the table with the full column \
              list (omit @captured_column_list) and re-run",
             short.join(", ")
         ),

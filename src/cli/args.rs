@@ -37,6 +37,15 @@ pub struct Cli {
     /// Send no notification (`notifications:`) from this process or the processes it starts; a scheduler alerts from the error object instead
     #[arg(long, global = true)]
     pub no_notify: bool,
+    /// Wait up to SECONDS for an export's run lease or a table's load lease another live rivet process holds, then stop with RIVET_STATE_LOCK_TIMEOUT (exit 2); 0 stops at once
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = 600,
+        env = "RIVET_LOCK_WAIT"
+    )]
+    pub lock_wait: u64,
 }
 
 /// Parse argv into [`Cli`]. When a config-taking subcommand (the documented

@@ -1,6 +1,6 @@
 # `rivet init` — config scaffolding
 
-`rivet init` connects to PostgreSQL, MySQL, SQL Server, or MongoDB, introspects tables (collections on MongoDB), and prints a **YAML scaffold** you can save and edit before running `rivet check` / `rivet run`.
+`rivet init` connects to PostgreSQL, MySQL, SQL Server, Oracle, or MongoDB, introspects tables (collections on MongoDB), and prints a **YAML scaffold** you can save and edit before running `rivet check` / `rivet run`.
 
 Generated configs use `url_env: DATABASE_URL` so secrets are not embedded in the file. Set `DATABASE_URL` (or switch to `url:` / structured credentials) before running exports.
 

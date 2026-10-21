@@ -76,6 +76,9 @@ Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md
 
 * `--json-errors` — Output errors as {"error":"..."} JSON to stderr; useful for machine-readable orchestration
 * `--no-notify` — Send no notification (`notifications:`) from this process or the processes it starts; a scheduler alerts from the error object instead
+* `--lock-wait <SECONDS>` — Wait up to SECONDS for an export's run lease or a table's load lease another live rivet process holds, then stop with RIVET_STATE_LOCK_TIMEOUT (exit 2); 0 stops at once
+
+  Default value: `600`
 
 
 

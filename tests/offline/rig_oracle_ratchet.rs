@@ -45,7 +45,9 @@ const NO_ORACLE_CEILING: usize = 21; // ratchet-pin: no-oracle-opt-outs
 // 43 -> 44 (2026-10-15): a refusal met by one parallel worker near the end of the key range (a_refusal_in_one_worker_exits_as_with_one_worker_*): the other workers' pages and chunks were written first, and their parts, file_log rows and observed schema stay.
 // 44 -> 45 (2026-10-16): the same refusal met by one chunk of a CHECKPOINTED export (a_refusal_in_a_checkpointed_chunk_exits_by_code_and_so_does_its_resume_*): the chunks read before it were written and checkpointed, so their parts, file_log rows, chunk tasks and observed schema stay for the --resume the cell then runs.
 // 45 -> 46 (2026-10-16): a Snowflake full load whose COPY fails on a corrupted part (snowflake_full_load_that_fails_keeps_the_last_table_*): the load reached the warehouse write (the staging table), so its load_run row is `failed`, which the ledger counts as ownership by design.
-const FAILED_RUN_LEFTOVER_CEILING: usize = 46; // ratchet-pin: failed-run-leftover-declarations
+// 2026-10-21: +1 - the SQL Server hot ADD COLUMN stop (#644) comes at the end of a drain whose parts were
+// committed before the column was added; they and the checkpoint stay, as on every mid-drain CDC stop.
+const FAILED_RUN_LEFTOVER_CEILING: usize = 47; // ratchet-pin: failed-run-leftover-declarations
 
 /// Entries of `KNOWN_PRODUCT_DEFECTS` (tests/common/refusal.rs): product defects every failed run may show.
 // 2 -> 1 (2026-10-08): a run that fails before its first write leaves the prefix alone, so a failed manifest before a write is a failure, no longer an excuse.
