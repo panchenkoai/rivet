@@ -814,9 +814,18 @@ tables) always name every image column, so rivet maps values by NAME: a
 `DROP COLUMN` or `RENAME` landing between runs captures correctly, and an
 equal-arity `DROP a` + `ADD c` leaves `c` NULL for the older images rather than
 filling it with a neighbour's value (unless the dropped column sat at `c`'s
-position, which looks exactly like a rename and is read as one). A column ADDED while a run is open is not in
-that run's schema, so its values for that run's window are dropped — [re-baseline](cdc-failure-modes.md#the-shape-of-every-recovery)
-the stream after an `ADD COLUMN` if those values matter. MySQL's binlog carries
+position, which looks exactly like a rename and is read as one). A column ADDED while a run is open
+(a continuous run, `until_current: false`) shows up in the first change that carries it: the run
+closes the table's part under the old schema, reads the table's columns again, judges the change by
+`on_schema_drift` (`fail` stops the run there, before the change is acknowledged), and continues in
+a new part with the new column, so none of its values is dropped. One run's parts then carry two
+schemas; `rivet load` takes both into one change log (a part without the column reads it as
+NULL). A bounded run (`until_current: true`, the default) resolves its schema after its read
+bound, so it never meets such a change. SQL Server is the exception: a capture instance carries
+the columns it was created with, so a column added after it never reaches the change table; a run
+that sees its table outgrow the instance stops with `RIVET_SOURCE_CDC_SCHEMA_CHANGED` (exit 5)
+instead of ending clean — create a capture instance that covers the column and re-baseline the
+table. MySQL's binlog carries
 names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+),
 which rivet requires (see [MySQL — the binlog grants](#mysql--the-binlog-grants)), so MySQL behaves the
 same. rivet never maps a binlog image by position: a server at `MINIMAL` is

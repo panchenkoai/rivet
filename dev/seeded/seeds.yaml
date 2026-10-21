@@ -17,6 +17,23 @@
 
 seeds:
 
+  - name: cdc-hot-added-column-dropped
+    class: "a column added to a captured table while a CDC run is open is not in the run's schema: its values are dropped and acked, exit 0 (SQL Server: the run ends clean over a column its capture instance never carried)"
+    history: "issue #644, a DBA's question on 2026-10-19; RED on main 2026-10-21 (the rig oracle: source column `c` is absent from the delivered parquet, PostgreSQL, MySQL and SQL Server)"
+    scope: source
+    patch: cdc-hot-added-column-dropped/shared.patch
+    engines:
+      postgres:
+        cells: [pg_cdc_a_column_added_while_a_run_is_open_lands_every_value, "lib:a_column_added_while_the_run_is_open_continues_in_a_new_part_with_its_values"]
+      mysql:
+        cells: [mysql_cdc_a_column_added_while_a_run_is_open_lands_every_value, a_column_added_while_a_mysql_cdc_run_is_open_loads_into_clickhouse_with_every_value]
+      mssql:
+        cells: [mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code]
+      mongo:
+        na: "a MongoDB change stream lands the whole document in one `document` column; a new field is a value, not a column"
+      oracle:
+        na: "Oracle CDC is a bounded drain to the SCN current at open and refuses `until_current: false`; the run resolves its schema after that bound, so no change it reads predates it"
+
   - name: incremental-plan-replay-answered
     class: "`rivet apply` treats an incremental plan (`mode: incremental`, `keyset_incremental`) as a point-in-time snapshot: a replay after its first exit-0 apply answers \"already applied\", so every row that arrived since is never delivered with exit 0, and the plan is refused past 24 h"
     history: "found 2026-10-16 on PR #616 CI (run 38911927276): the first F3 replay answer keyed on plan_id alone; `incremental_keyset_apply_rotates_run_id_across_repeated_applies` read COUNT(*) source 150, delivered 100; owner decision (PR #616 comment 6219074059): an incremental plan is a reusable description"

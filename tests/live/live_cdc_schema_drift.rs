@@ -433,7 +433,7 @@ const HOT_PAUSE: &str = "cdc_after_parts_before_ack:20000";
 /// Pin and baseline rows 1-2, then a CONTINUOUS run reads row 3 under the old schema and parks
 /// after its part; meanwhile the table gains `c` and rows 4-5 carry values in it. Returns what the
 /// open run said and its exit.
-fn run_while_a_column_is_added(
+pub(crate) fn run_while_a_column_is_added(
     scn: &mut CdcScenario,
     exec: &dyn Fn(&str),
     add_column: &str,
