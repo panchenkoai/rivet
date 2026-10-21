@@ -103,6 +103,58 @@ pub(crate) struct SinkConfig<'a> {
     /// own byte counter). A shared Arc so the caller reads the total after the
     /// drain. `Default` = a throwaway counter (unit sinks / tests that ignore it).
     pub read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// A captured table's columns as the source holds them NOW, judged by `on_schema_drift`:
+    /// asked when a change names a column the run's schema lacks. `None` stops the run there.
+    pub reschema: Option<Reschema<'a>>,
+}
+
+/// Re-resolve one captured table's columns (and gate them by `on_schema_drift`) mid-run.
+pub(crate) type Reschema<'a> = Box<dyn FnMut(&str) -> Result<Vec<TypeMapping>> + 'a>;
+
+/// The columns `ev` names that `columns` does not have and that are not in `gone` (names the
+/// table's catalog no longer has): a column added to the table after the run resolved its schema,
+/// or the old name of a renamed or dropped one, which only the catalog tells apart.
+fn columns_the_schema_lacks(
+    columns: &[TypeMapping],
+    gone: &std::collections::HashSet<String>,
+    ev: &ChangeEvent,
+) -> Vec<String> {
+    let mut lacking: Vec<String> = Vec::new();
+    for name in ev
+        .image_names
+        .iter()
+        .chain(ev.before_names.iter())
+        .flat_map(|n| n.iter())
+    {
+        if !columns.iter().any(|c| &c.column_name == name)
+            && !gone.contains(name)
+            && !lacking.contains(name)
+        {
+            lacking.push(name.clone());
+        }
+    }
+    lacking
+}
+
+/// What to do with the names a change carries that the run's schema lacks, given the table's
+/// columns as the catalog holds them now (`fresh`, `None` when they cannot be read again): the
+/// names the catalog has are new columns, to continue with in a new part; the rest are names the
+/// table no longer has. An image of another arity than the schema with nothing to read the catalog
+/// from cannot be placed, and is a stop.
+fn place_lacking(
+    lacking: &[String],
+    fresh: Option<&[TypeMapping]>,
+    schema_arity: usize,
+    image_arity: usize,
+) -> std::result::Result<(Vec<String>, Vec<String>), ()> {
+    match fresh {
+        Some(fresh) => Ok(lacking
+            .iter()
+            .cloned()
+            .partition(|n| fresh.iter().any(|c| &c.column_name == n))),
+        None if image_arity == schema_arity => Ok((Vec::new(), lacking.to_vec())),
+        None => Err(()),
+    }
 }
 
 /// When to roll a part: at a transaction boundary, once the buffer reaches the row
@@ -139,6 +191,8 @@ struct TableSink<'a> {
     manifested_parts: usize,
     /// The open transaction's moved-in keys, which order a statement's key moves.
     moved: partition_guard::MovedIn,
+    /// Names a change carried that the table's catalog no longer has (renamed or dropped).
+    gone: std::collections::HashSet<String>,
 }
 
 /// The facts one sink run shares across every table and every roll: who it is, how it writes, where it records.
@@ -424,6 +478,7 @@ pub(crate) fn run_to_files(
     // agree only until one of them is edited.
     let run_token = file_token(&cfg.run_id);
     let read_bytes = std::sync::Arc::clone(&cfg.read_bytes);
+    let mut reschema = cfg.reschema;
     let mut sinks: Vec<TableSink<'_>> = cfg
         .outputs
         .into_iter()
@@ -436,6 +491,7 @@ pub(crate) fn run_to_files(
             column_sums: std::collections::BTreeMap::new(),
             manifested_parts: 0,
             moved: Default::default(),
+            gone: Default::default(),
         })
         .collect();
 
@@ -524,13 +580,65 @@ pub(crate) fn run_to_files(
                 // exactly those streams — unbounded overshoot. An uncaptured event
                 // simply skips the block, which also drops its deferred poison, as
                 // the `continue` used to.
-                if let Some(sink) = sinks
-                    .iter_mut()
-                    .find(|s| table_matches(cfg.engine, &s.out.table, &ev.schema, &ev.table))
+                if let Some(at) = sinks
+                    .iter()
+                    .position(|s| table_matches(cfg.engine, &s.out.table, &ev.schema, &ev.table))
                 {
                     // Confirmed routed to a captured table → surface any deferred
                     // decode error (uncaptured tables' poison never applies).
                     ev.raise_poison()?;
+                    // A name the run's schema lacks is a column added while the run is open, or
+                    // the old name of a renamed or dropped one; the catalog, read again, tells
+                    // which. A new column closes everything buffered so far under the old schema
+                    // (the checkpoint stays on the last commit) and the table continues in a new
+                    // part with its columns as the source holds them now: dropping its values was
+                    // #644. An old name is left to `image_cell`, which maps a rename by position.
+                    let lacking =
+                        columns_the_schema_lacks(&sinks[at].out.columns, &sinks[at].gone, &ev);
+                    if !lacking.is_empty() {
+                        let table = sinks[at].out.table.clone();
+                        let fresh = match reschema.as_mut() {
+                            Some(re) => Some(re(&table)?),
+                            None => None,
+                        };
+                        let image_arity = ev.image_names.as_ref().map_or(0, |n| n.len());
+                        let Ok((added, gone)) = place_lacking(
+                            &lacking,
+                            fresh.as_deref(),
+                            sinks[at].out.columns.len(),
+                            image_arity,
+                        ) else {
+                            crate::rivet_bail!(
+                                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
+                                "cdc: table `{table}` gained column(s) {} while the run was open, and \
+                                 its catalog could not be read again, so their values cannot be typed",
+                                lacking.join(", ")
+                            );
+                        };
+                        if !gone.is_empty() {
+                            log::warn!(
+                                "cdc: table `{table}`: change(s) carry column(s) {} the table no \
+                                 longer has (renamed or dropped while the run read them)",
+                                gone.join(", ")
+                            );
+                            sinks[at].gone.extend(gone);
+                        }
+                        if let (false, Some(fresh)) = (added.is_empty(), fresh) {
+                            roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
+                            total_rows = 0;
+                            total_bytes.reset();
+                            log::warn!(
+                                "cdc: table `{table}` gained column(s) {} while the run was open: \
+                                 its earlier changes are in a part without them, the rest continue \
+                                 in a new part with them",
+                                added.join(", ")
+                            );
+                            sinks[at].out.columns = fresh;
+                            sinks[at].schema = None;
+                            sinks[at].gone.clear();
+                        }
+                    }
+                    let sink = &mut sinks[at];
                     // DECODED payload for the bytes-read metric (comparable with the batch
                     // path's figure): one source event, however many rows it is written as.
                     read_bytes.fetch_add(
@@ -599,6 +707,13 @@ pub(crate) fn run_to_files(
             if drain_is_complete(hit_max, yielded_this_pass) {
                 break;
             }
+        }
+        // A stream that names its image at open (SQL Server's capture instance) cannot carry a
+        // column added while the run was open: asked again here, a table it no longer covers
+        // whole stops the run by code instead of ending clean over values it never read.
+        let tables: Vec<String> = sinks.iter().map(|s| s.out.table.clone()).collect();
+        if let crate::source::cdc::RowImage::Partial { why } = stream.row_image(&tables) {
+            return Err(super::partial_image_refusal(run.engine, &why));
         }
         if !hit_max
             && !unacked_commit
@@ -2973,6 +3088,7 @@ mod tests {
             // The unit sinks write to a tempdir with no database behind them.
             state: None,
             read_bytes: Default::default(),
+            reschema: None,
         }
     }
 
@@ -3936,6 +4052,7 @@ mod tests {
             // The unit sinks write to a tempdir with no database behind them.
             state: None,
             read_bytes: Default::default(),
+            reschema: None,
         }
     }
 
@@ -4088,6 +4205,163 @@ mod tests {
                 partial_write_risk: false,
             }
         }
+    }
+
+    /// A change naming a column the run's schema lacks closes the part under the old schema and
+    /// continues in a new one with the column re-resolved, its value kept; with nothing to
+    /// re-resolve it from, the run stops by code instead of dropping the value (#644).
+    #[test]
+    fn a_column_added_while_the_run_is_open_continues_in_a_new_part_with_its_values() {
+        use arrow::array::{Array, StringArray};
+        let with_c = |id: i64, c: &str| {
+            let mut e = insert(id);
+            e.after = Some(vec![
+                RivetValue::Int(id),
+                RivetValue::Bytes(c.as_bytes().to_vec()),
+            ]);
+            e.image_names = Some(std::sync::Arc::from(vec!["v".to_string(), "c".to_string()]));
+            e
+        };
+        let mut grown = int_col();
+        grown.push(TypeMapping {
+            column_name: "c".into(),
+            source_native_type: "varchar".into(),
+            rivet_type: crate::types::RivetType::String,
+            arrow_type: Some(DataType::Utf8),
+            ..int_col().remove(0)
+        });
+        let events = || VecDeque::from(vec![insert(1), with_c(2, "two"), with_c(3, "three")]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: events(),
+            acked: Vec::new(),
+        };
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut config = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        let (fresh, counter) = (grown.clone(), std::rc::Rc::clone(&asked));
+        config.reschema = Some(Box::new(move |table: &str| {
+            assert_eq!(table, "t");
+            counter.set(counter.get() + 1);
+            Ok(fresh.clone())
+        }));
+        let (manifests, r) = run_to_files(&mut stream, config);
+        r.unwrap();
+        assert_eq!(asked.get(), 1, "asked once, when the column first appears");
+        assert_eq!((manifests[0].part_count, manifests[0].row_count), (2, 3));
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "parquet"))
+            .collect();
+        files.sort();
+        let schemas_and_c: Vec<(bool, Vec<String>)> = files
+            .iter()
+            .map(|path| {
+                let b = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                    std::fs::File::open(path).unwrap(),
+                )
+                .unwrap()
+                .build()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+                match b.schema().index_of("c") {
+                    Ok(i) => {
+                        let c = b
+                            .column(i)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap()
+                            .clone();
+                        (true, (0..c.len()).map(|r| c.value(r).to_string()).collect())
+                    }
+                    Err(_) => (false, Vec::new()),
+                }
+            })
+            .collect();
+        assert_eq!(
+            schemas_and_c,
+            vec![(false, vec![]), (true, vec!["two".into(), "three".into()])]
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let mut stream = FakeStream {
+            events: events(),
+            acked: Vec::new(),
+        };
+        let (manifests, r) = run_to_files(
+            &mut stream,
+            cfg(dest.as_ref(), &cols, FormatType::Parquet, 100),
+        );
+        let err = r.expect_err("no re-resolve: a stop, not a dropped value");
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_SOURCE_INVARIANT", 6);
+        assert!(format!("{err:#}").contains("gained column(s) c"), "{err:#}");
+        assert_eq!(
+            (manifests[0].row_count, stream.acked.len()),
+            (0, 0),
+            "nothing is acknowledged past the change the run could not place"
+        );
+    }
+
+    #[test]
+    fn a_name_the_catalog_holds_is_a_new_column_and_one_it_lacks_is_gone() {
+        let mut fresh = int_col();
+        fresh[0].column_name = "c".into();
+        let lacking = vec!["c".to_string(), "old".to_string()];
+        assert_eq!(
+            place_lacking(&lacking, Some(&fresh), 1, 2),
+            Ok((vec!["c".to_string()], vec!["old".to_string()]))
+        );
+        assert_eq!(
+            place_lacking(&lacking, Some(&int_col()), 1, 2),
+            Ok((Vec::new(), lacking.clone())),
+            "a catalog that names neither: both are gone"
+        );
+        assert_eq!(
+            place_lacking(&lacking, None, 2, 2),
+            Ok((Vec::new(), lacking.clone())),
+            "no catalog, the same arity: names only, left to the positional map"
+        );
+        assert_eq!(place_lacking(&lacking, None, 1, 2), Err(()));
+    }
+
+    #[test]
+    fn a_name_the_table_no_longer_has_is_asked_of_the_catalog_once() {
+        let with_b = |id: i64| {
+            let mut e = insert(id);
+            e.after = Some(vec![RivetValue::Int(id), RivetValue::Int(7)]);
+            e.image_names = Some(std::sync::Arc::from(vec!["v".to_string(), "b".to_string()]));
+            e
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = local_dest(&dir);
+        let cols = int_col();
+        let mut stream = FakeStream {
+            events: VecDeque::from(vec![with_b(1), with_b(2), with_b(3)]),
+            acked: Vec::new(),
+        };
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut config = cfg(dest.as_ref(), &cols, FormatType::Parquet, 100);
+        let counter = std::rc::Rc::clone(&asked);
+        config.reschema = Some(Box::new(move |_: &str| {
+            counter.set(counter.get() + 1);
+            Ok(int_col())
+        }));
+        let (manifests, r) = run_to_files(&mut stream, config);
+        r.unwrap();
+        assert_eq!(
+            asked.get(),
+            1,
+            "the gone name is remembered, not asked again per change"
+        );
+        assert_eq!((manifests[0].part_count, manifests[0].row_count), (1, 3));
+        let vs: Vec<i64> = part_rows(dir.path()).into_iter().map(|r| r.1).collect();
+        assert_eq!(vs, vec![1, 2, 3]);
     }
 
     /// `(file, v, __op, __pos, __seq)` of every row of every parquet part under `dir`, in file order.
