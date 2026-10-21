@@ -452,7 +452,7 @@ seeds:
         patch: lease-file-named-by-a-lossy-token/sqlite-state.patch
         cells:
           - "lib:keys_that_read_alike_get_their_own_lease_file"
-          - a_run_beside_the_lease_of_an_export_whose_name_reads_alike_delivers
+          - a_run_beside_a_live_export_whose_name_reads_alike_delivers
       postgres-state:
         na: "a PostgreSQL-state lease is a row keyed by the raw key (state_lease.lease_key), never a file name"
 

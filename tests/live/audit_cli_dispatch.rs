@@ -193,32 +193,45 @@ fn apply_pool_writes_only_the_export_on_stdout() {
     );
 }
 
-/// A run of `lossy-x` beside a live holder of the run lease of `lossy x`, an export whose name
-/// differs only where a file name cannot spell it: the run delivers (through 0.32.1 both leases
-/// were one file, `.lease-chunk-run-lossy-x-…`, and the run was refused RIVET_STATE_RUN_IN_PROGRESS).
+/// A run of `lossy-x` beside a live run of `lossy x`, an export whose name differs only where a
+/// file name cannot spell it, paused while it holds its run lease: the run delivers (through 0.32.1
+/// both leases were one file, `.lease-chunk-run-lossy-x-…`, and it was refused
+/// RIVET_STATE_RUN_IN_PROGRESS beside no live run of its own).
 #[test]
 #[ignore = "live: postgres"]
-fn a_run_beside_the_lease_of_an_export_whose_name_reads_alike_delivers() {
+fn a_run_beside_a_live_export_whose_name_reads_alike_delivers() {
     require_alive(LiveService::Postgres);
     let table = seed_pg_numeric_table(5);
+    let query = format!("SELECT id, name FROM {}", table.name());
     let rig = Rig::pg_batch(table.name())
-        .query(&format!("SELECT id, name FROM {}", table.name()))
-        .export_named("lossy-x");
-    let cfg = rig.config_path().display().to_string();
-    let source = rivet::config::Config::load(&cfg)
-        .expect("the rig's config")
-        .source
-        .state_key();
-    let sibling = rivet::pipeline::run_lease_key("lossy x", &source);
-    assert_ne!(sibling, rig.lease_key(), "two keys that read alike");
-    let state = match rig.state_url(&[]) {
-        Some(url) => rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url)),
-        None => rivet::state::StateStore::open(&cfg),
+        .query(&query)
+        .export_named("lossy-x")
+        .also_export("lossy x", &query);
+    let scratch = tempfile::tempdir().unwrap();
+    let paused = scratch.path().join("paused");
+    let mut sibling = rig.spawn_args_env(
+        &["--export", "lossy x"],
+        &[
+            ("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:8000"),
+            ("RIVET_TEST_PAUSE_MARKER", paused.to_str().unwrap()),
+        ],
+    );
+    let waited = std::time::Instant::now();
+    while !paused.exists() {
+        assert!(
+            waited.elapsed().as_secs() < 60,
+            "the sibling run never reached its read"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    .expect("the rig's state");
-    let _held = state
-        .try_load_lease(&sibling)
-        .expect("take the lease")
-        .expect("the cell holds the run lease of `lossy x`");
-    rig.run_ok();
+    let mine = rig.cli(&["run", "--export", "lossy-x"]);
+    let said = String::from_utf8_lossy(&mine.stderr).into_owned();
+    assert!(
+        sibling.wait().unwrap().success(),
+        "the paused sibling delivers"
+    );
+    assert!(
+        mine.status.success(),
+        "the run beside a sibling that reads alike:\n{said}"
+    );
 }
