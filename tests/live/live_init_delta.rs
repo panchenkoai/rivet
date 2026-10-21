@@ -1270,6 +1270,292 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
 }
 
+/// Distinct `id`s of every part under `dir`, at any depth (the baseline sits in `snapshot/`).
+fn ids_under(dir: &std::path::Path) -> std::collections::BTreeSet<i64> {
+    let mut ids: std::collections::BTreeSet<i64> = ids_in(dir).into_iter().collect();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        if entry.path().is_dir() {
+            ids.extend(ids_under(&entry.path()));
+        }
+    }
+    ids
+}
+
+/// The local `path:` a single-table scaffold writes to, resolved against its directory.
+fn scaffolded_path(dir: &std::path::Path, generated: &str) -> std::path::PathBuf {
+    let raw = generated
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("path:"))
+        .expect("a local scaffold names its path");
+    dir.join(
+        raw.split('#')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .trim_matches('"'),
+    )
+}
+
+/// Two configs `rivet init -o` writes for one table into one directory, the second pointed at
+/// another place, run in turns with changes between: each destination must hold every source
+/// row. Through 0.32.1 both named one checkpoint, so each stream resumed where the other had
+/// stopped and skipped what it read, exit 0.
+fn two_init_configs_in_one_dir_each_deliver_every_row((src, _guard, extra): TwoConfigSource) {
+    (src.apply)(&[Op::Ins(1), Op::Ins(2), Op::Ins(3)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let scaffold = |file: &str| {
+        let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+        args.extend(src.init_args.iter().map(String::as_str));
+        args.extend(extra);
+        args.extend(["--output", file]);
+        rivet_ok_in(dir.path(), &args, &[]);
+        std::fs::read_to_string(dir.path().join(file)).unwrap()
+    };
+    let a = scaffold("a.yaml");
+    let b = scaffold("b.yaml").replace("path: ./output/", "path: ./prod-output/");
+    std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
+    let _slots: Vec<Slot> = [&a, &b]
+        .iter()
+        .filter(|g| g.contains("slot:"))
+        .map(|g| Slot::new(scaffolded_slot(g)))
+        .collect();
+    let run = |cfg: &str| {
+        rivet_ok_in(dir.path(), &["run", "-c", cfg], &db);
+    };
+    run("a.yaml");
+    (src.apply)(&[Op::Ins(4), Op::Ins(5)]);
+    run("a.yaml");
+    (src.apply)(&[Op::Ins(6), Op::Ins(7)]);
+    run("b.yaml");
+    (src.apply)(&[Op::Ins(8)]);
+    run("a.yaml");
+    run("b.yaml");
+    let every: std::collections::BTreeSet<i64> = (1..=8).collect();
+    for (name, generated) in [("a.yaml", &a), ("b.yaml", &b)] {
+        let place = scaffolded_path(dir.path(), generated);
+        assert_eq!(
+            ids_under(&place),
+            every,
+            "{name} delivered to {} only part of the source (a:\n{a}\nb:\n{b})",
+            place.display()
+        );
+    }
+}
+
+/// A CDC table `id BIGINT, name` on one engine's CDC service, its writer, and what drops it.
+type TwoConfigSource = (CdcSource, Box<dyn std::any::Any>, &'static [&'static str]);
+
+fn two_configs_mysql() -> TwoConfigSource {
+    use mysql::prelude::Queryable as _;
+    let table = unique_name("two_init_my");
+    let pool = mysql::Pool::new(MYSQL_CDC_URL).expect("mysql-cdc");
+    pool.get_conn()
+        .unwrap()
+        .query_drop(format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL)"
+        ))
+        .unwrap();
+    let guard = MysqlCdcTable(table.clone());
+    let t = table.clone();
+    let src = CdcSource {
+        url: MYSQL_CDC_URL.into(),
+        init_args: vec!["--table".into(), table],
+        apply: Box::new(move |ops| {
+            let mut c = pool.get_conn().unwrap();
+            for op in ops {
+                c.query_drop(op_sql(&t, *op)).unwrap();
+            }
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(guard), &[])
+}
+
+fn two_configs_postgres() -> TwoConfigSource {
+    let table = unique_name("two_init_pg");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect");
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name TEXT NOT NULL)"
+    ))
+    .unwrap();
+    let guard = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
+    let t = table.clone();
+    let src = CdcSource {
+        url: POSTGRES_CDC_URL.into(),
+        init_args: vec!["--table".into(), table],
+        apply: Box::new(move |ops| {
+            let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).unwrap();
+            for op in ops {
+                c.batch_execute(&op_sql(&t, *op)).unwrap();
+            }
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(guard), &[])
+}
+
+fn two_configs_mssql() -> TwoConfigSource {
+    let table = unique_name("two_init_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id BIGINT PRIMARY KEY, name NVARCHAR(64) NOT NULL)"
+    ));
+    let guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    enable_cdc(&table, &ci);
+    let t = format!("dbo.{table}");
+    let captured = std::cell::Cell::new(0i64);
+    let src = CdcSource {
+        url: MSSQL_CDC_URL.into(),
+        init_args: vec!["--table".into(), t.clone()],
+        apply: Box::new(move |ops| {
+            for op in ops {
+                mssql_cdc_exec(&op_sql(&t, *op));
+            }
+            captured.set(captured.get() + ops.len() as i64);
+            wait_for_capture(&ci, captured.get());
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(guard), &[])
+}
+
+#[cfg(feature = "oracle")]
+fn two_configs_oracle() -> TwoConfigSource {
+    let t = crate::live_cdc_oracledb::cdc_table(
+        "two_init_ora",
+        "id NUMBER(18) PRIMARY KEY, name VARCHAR2(64) NOT NULL",
+    );
+    let name = t.name().to_string();
+    let src = CdcSource {
+        url: ORACLE_CDC_URL.into(),
+        init_args: vec!["--table".into(), name.clone()],
+        apply: Box::new(move |ops| {
+            for op in ops {
+                ora_exec(&op_sql(&name, *op));
+            }
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(t), &["--schema", "RIVET"])
+}
+
+/// A second config written as a copy of the first (the 0.32.1 scaffold: one checkpoint, the
+/// destination pointed elsewhere) is refused by code on every run, before it reads a change,
+/// while the first keeps delivering; the remedy the refusal names, a config `rivet init -o`
+/// writes for it, delivers every source row.
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out(
+    (src, _guard, extra): TwoConfigSource,
+) {
+    (src.apply)(&[Op::Ins(1), Op::Ins(2), Op::Ins(3)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let scaffold = |file: &str| {
+        let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+        args.extend(src.init_args.iter().map(String::as_str));
+        args.extend(extra);
+        args.extend(["--output", file]);
+        rivet_ok_in(dir.path(), &args, &[]);
+        std::fs::read_to_string(dir.path().join(file)).unwrap()
+    };
+    let a = scaffold("a.yaml");
+    let _slot_a = a.contains("slot:").then(|| Slot::new(scaffolded_slot(&a)));
+    let copy = a.replace("path: ./output/", "path: ./prod-output/");
+    std::fs::write(dir.path().join("b.yaml"), &copy).unwrap();
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    (src.apply)(&[Op::Ins(4), Op::Ins(5)]);
+    for attempt in 1..=2 {
+        let out = run_rivet_in_dir(dir.path(), &["run", "-c", "b.yaml"], &db);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(5), "attempt {attempt}:\n{said}");
+        assert!(
+            said.contains("RIVET_SOURCE_CDC_CHECKPOINT_SHARED") && said.contains("a.yaml"),
+            "attempt {attempt}:\n{said}"
+        );
+        assert!(
+            !dir.path().join("prod-output").exists(),
+            "a refused run wrote nothing"
+        );
+        rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    }
+    std::fs::remove_file(dir.path().join("b.yaml")).unwrap();
+    let b = scaffold("b.yaml").replace("path: ./output/", "path: ./prod-output/");
+    std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
+    let _slot_b = b.contains("slot:").then(|| Slot::new(scaffolded_slot(&b)));
+    rivet_ok_in(dir.path(), &["run", "-c", "b.yaml"], &db);
+    (src.apply)(&[Op::Ins(6)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "b.yaml"], &db);
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    let every: std::collections::BTreeSet<i64> = (1..=6).collect();
+    for (name, generated) in [("a.yaml", &a), ("b.yaml", &b)] {
+        let place = scaffolded_path(dir.path(), generated);
+        assert_eq!(ids_under(&place), every, "{name} at {}", place.display());
+    }
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn two_init_configs_in_one_dir_each_deliver_every_row_mysql() {
+    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_mysql());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn two_init_configs_in_one_dir_each_deliver_every_row_postgres() {
+    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_postgres());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn two_init_configs_in_one_dir_each_deliver_every_row_mssql() {
+    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_mssql());
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn two_init_configs_in_one_dir_each_deliver_every_row_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_oracle());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql() {
+    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_mysql());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres() {
+    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_postgres());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql() {
+    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_mssql());
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_oracle());
+}
+
 /// The `server_id:` a MySQL CDC scaffold names.
 fn scaffolded_server_id(generated: &str) -> String {
     generated

@@ -1,0 +1,17 @@
+diff --git a/src/init/yaml_scaffold.rs b/src/init/yaml_scaffold.rs
+index afdef981..85c80f44 100644
+--- a/src/init/yaml_scaffold.rs
++++ b/src/init/yaml_scaffold.rs
+@@ -485,10 +485,8 @@ fn stem_dir(stem: Option<&str>, dir: &str) -> String {
+ 
+ /// `name` prefixed with the `-o` stem (`<stem>_<name>`), so two configs never name one checkpoint.
+ fn stemmed(stem: Option<&str>, name: &str) -> String {
+-    match stem {
+-        Some(s) => format!("{s}_{name}"),
+-        None => name.to_string(),
+-    }
++    let _ = stem;
++    name.to_string()
+ }
+ 
+ /// The per-export path segment of `mode`: [`export_segment`], with `_cdc` for a CDC export.

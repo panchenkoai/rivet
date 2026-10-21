@@ -85,6 +85,13 @@ scenarios:
     mssql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+  - id: refusal_source_cdc_checkpoint_shared
+    what: "RIVET_SOURCE_CDC_CHECKPOINT_SHARED: a second config written as a copy of the first (one checkpoint, the destination pointed elsewhere) is refused by code on every run before it reads a change while the first keeps delivering; the remedy it names (a config `rivet init -o` writes for it) delivers every source row"
+    postgres: { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres }
+    mysql:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql }
+    mssql:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql }
+    mongo:    { na: "the claim is the checkpoint file's and runs before any source is opened, the same code for every engine; the four SQL cells and lib:a_checkpoint_another_config_still_reads_is_refused_on_every_attempt carry it (a MongoDB part keeps its key inside the document, which the walk's id oracle does not read)" }
+    oracle:   { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle }
   - id: refusal_source_session_time_zone_not_applied
     what: "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: a MySQL session still off UTC after rivet's `SET time_zone` (a proxy answered it without forwarding); a direct connection delivers, the same run again through the proxy refuses"
     mysql:    { test: a_session_time_zone_the_proxy_dropped_is_refused_before_a_row_is_read }

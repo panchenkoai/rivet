@@ -1562,6 +1562,38 @@ seeds:
         na: "a MongoDB change stream has no server-side slot or replica id; its position is the config's own checkpoint"
       oracle:
         na: "LogMiner keeps no server-side object per reader; the position is the config's own checkpoint"
+  - name: init-cdc-checkpoint-shared-by-name
+    class: "two CDC configs `rivet init -o` writes for one table into one directory name one checkpoint, so each stream resumes where the other stopped and skips what it read, exit 0"
+    history: "0.32.2, owner decision 2026-10-21: `-o a.yaml` and `-o b.yaml` both wrote `checkpoint: ./cdc/<table>.ckpt` and `./output/<table>_cdc/`; fixed by stem-derived names and RIVET_INIT_CDC_NAME_TAKEN"
+    scope: source
+    patch: init-cdc-checkpoint-shared-by-name/shared.patch
+    engines:
+      postgres:
+        cells: [two_init_configs_in_one_dir_each_deliver_every_row_postgres]
+      mysql:
+        cells: [two_init_configs_in_one_dir_each_deliver_every_row_mysql]
+      mssql:
+        cells: [two_init_configs_in_one_dir_each_deliver_every_row_mssql]
+      mongo:
+        cells: ["lib:a_cdc_scaffold_names_its_checkpoint_and_destination_after_the_output_file"]
+      oracle:
+        cells: [two_init_configs_in_one_dir_each_deliver_every_row_oracle]
+  - name: cdc-checkpoint-read-by-two-configs
+    class: "a CDC run continues from a checkpoint another config still reads, so two streams on one position each skip the changes the other read, exit 0"
+    history: "0.32.2, owner decision 2026-10-21 (\"forbid a shared checkpoint\"): a run recorded no owner of its checkpoint; fixed by `checkpoint_identity::claim_checkpoint` and RIVET_SOURCE_CDC_CHECKPOINT_SHARED"
+    scope: source
+    patch: cdc-checkpoint-read-by-two-configs/shared.patch
+    engines:
+      postgres:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres]
+      mysql:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql]
+      mssql:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql]
+      mongo:
+        cells: ["lib:a_checkpoint_another_config_still_reads_is_refused_on_every_attempt"]
+      oracle:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle]
   - name: io-error-classified-by-its-path-text
     class: "an `io::Error` (a missing directory, a read-only file) is retried as transient because a path in its message contains a network word (`dns`, `reset`), so a permanent stop exits 2"
     history: "0.32.2, 2026-10-20: #639's mutation shard baseline failed `an_unwritable_aggregate_path_is_refused_by_code` with exit 2 for 1 because its temp dir was named `.tmprDnsA7`; RED on main c1cf6a92 with a directory named `dns`"
