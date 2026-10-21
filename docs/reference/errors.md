@@ -137,6 +137,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_INTERNAL_VALUE_CONVERTER` | internal | 6 | a value changed between the source and the written part — a bug; report it with the column's type |
 | `RIVET_INTERNAL_SPILL` | internal | 6 | the CDC spill log is inconsistent — a bug or a damaged spill directory; report it and re-run |
 | `RIVET_INTERNAL_TYPE_BUILDER` | internal | 6 | a column builder got a type it cannot build — a bug; report it with the column's type |
+| `RIVET_LOAD_BLOCK_MISSING` | usage | 1 | add a top-level `load: { target, ... }` block naming the warehouse, or run `rivet run` alone |
 | `RIVET_LOAD_SPEC_SOURCE_UNRESOLVED` | usage | 1 | set the source's variable (`url_env:` / `password_env:`) for `rivet load` as for `rivet run` |
 | `RIVET_CLI_EXPORT_UNKNOWN` | usage | 1 | pass `--export` a name declared under `exports:` in this config |
 | `RIVET_CLI_TABLE_UNKNOWN` | usage | 1 | pass `--table` a warehouse table this config loads, as the message lists |

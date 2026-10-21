@@ -3029,3 +3029,39 @@ fn a_v37_state_the_previous_release_wrote_loads_after_the_v38_migration() {
         "the load keyed by the key the v37 init recorded"
     );
 }
+
+/// A column added while a MySQL CDC run is open: the run's parts carry two schemas, and the
+/// ClickHouse load takes both into one change log, so the view holds every value of the new
+/// column, read back over ClickHouse's own HTTP client (#644).
+#[test]
+#[ignore = "live: requires clickhouse + fake-gcs + mysql-cdc"]
+fn a_column_added_while_a_mysql_cdc_run_is_open_loads_into_clickhouse_with_every_value() {
+    require_alive(LiveService::ClickHouse);
+    require_alive(LiveService::FakeGcs);
+    ensure_gcs_bucket(BUCKET);
+    let db = Db::new("rivet_chtest");
+    let mut scn = CdcScenario::mysql_with("hot_add_ch", "id BIGINT PRIMARY KEY, v INT", |r, _| {
+        into_clickhouse(r, &db)
+            .cdc("rollover: 1")
+            .cdc("max_events: 1000000")
+    });
+    let table = scn.table.clone();
+    let exec = |q: &str| conn().query_drop(q).expect(q);
+    let (out, said) = crate::live_cdc_schema_drift::run_while_a_column_is_added(
+        &mut scn,
+        &exec,
+        &format!("ALTER TABLE {table} ADD COLUMN c VARCHAR(16)"),
+    );
+    assert!(out.status.success(), "the open run ends clean:\n{said}");
+    scn.rig
+        .replace_cdc_line("until_current", "until_current: true");
+    load(&scn.rig);
+    assert_eq!(
+        ch(&format!(
+            "SELECT id, c FROM {}.{table} ORDER BY id FORMAT TSV",
+            db.0
+        )),
+        "1\t\\N\n2\t\\N\n3\t\\N\n4\tfour\n5\tfive",
+        "every value of the added column is in the view"
+    );
+}

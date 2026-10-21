@@ -1223,6 +1223,11 @@ pub mod codes {
     );
 
     /// `rivet load` cannot resolve the config's source, and several sources recorded a spec of the export on this state.
+    /// `rivet load` or `rivet compact` on a config with no top-level `load:` block.
+    pub const LOAD_BLOCK_MISSING: Code = usage(
+        "RIVET_LOAD_BLOCK_MISSING",
+        "add a top-level `load: { target, ... }` block naming the warehouse, or run `rivet run` alone",
+    );
     pub const LOAD_SPEC_SOURCE_UNRESOLVED: Code = usage(
         "RIVET_LOAD_SPEC_SOURCE_UNRESOLVED",
         "set the source's variable (`url_env:` / `password_env:`) for `rivet load` as for `rivet run`",
@@ -1764,6 +1769,7 @@ pub mod codes {
         INTERNAL_VALUE_CONVERTER,
         INTERNAL_SPILL,
         INTERNAL_TYPE_BUILDER,
+        LOAD_BLOCK_MISSING,
         LOAD_SPEC_SOURCE_UNRESOLVED,
         CLI_EXPORT_UNKNOWN,
         CLI_TABLE_UNKNOWN,
