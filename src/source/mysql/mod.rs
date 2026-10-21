@@ -553,6 +553,27 @@ struct SessionPlan {
 }
 
 impl SessionPlan {
+    /// The `max_execution_time` connection `id` still holds, or `None` when it must be set from
+    /// scratch: always on a pool that resets a session it is handed back.
+    fn given(&self, id: u32) -> Option<u64> {
+        if !self.keeps_session {
+            return None;
+        }
+        self.given
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .copied()
+    }
+
+    /// Record that connection `id` was given `max_exec_ms`.
+    fn record(&self, id: u32, max_exec_ms: u64) {
+        self.given
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, max_exec_ms);
+    }
+
     /// The server defaults, read on `conn` the first time they are asked for.
     fn defaults(&self, conn: &mut mysql::PooledConn) -> Result<ServerDefaults> {
         if let Some(d) = self.defaults.get() {
@@ -632,24 +653,12 @@ impl<'a> MysqlSessionGuard<'a> {
     ) -> Result<Self> {
         let defaults = plan.defaults(conn)?;
         let id = conn.connection_id();
-        let given = match plan.keeps_session {
-            true => plan
-                .given
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&id)
-                .copied(),
-            false => None,
-        };
-        let sets = session_sets(&defaults, given, max_exec_ms);
+        let sets = session_sets(&defaults, plan.given(id), max_exec_ms);
         for set in &sets {
             conn.query_drop(set)?;
         }
         if !sets.is_empty() {
-            plan.given
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id, max_exec_ms.unwrap_or(defaults.max_exec_ms));
+            plan.record(id, max_exec_ms.unwrap_or(defaults.max_exec_ms));
         }
         let offset_s: i64 = conn.query_first(SESSION_OFFSET)?.unwrap_or(0);
         if offset_s != 0 {
@@ -695,6 +704,42 @@ mod session_set_tests {
         assert!(session_sets(&defaults(), Some(0), None).is_empty());
         for sql in session_sets(&defaults(), None, Some(1)) {
             assert!(!sql.contains('@'), "a literal, never an expression: {sql}");
+        }
+    }
+
+    /// The driver's options read no `@@` at the handshake: no socket lookup, and a packet size
+    /// given rather than asked for, exactly 64 MiB.
+    #[test]
+    fn the_session_options_ask_the_server_for_no_variable() {
+        let opts = Opts::from(session_opts(OptsBuilder::new()));
+        assert!(!opts.get_prefer_socket());
+        assert_eq!(opts.get_max_allowed_packet(), Some(64 * 1024 * 1024));
+        assert_eq!(CLIENT_MAX_ALLOWED_PACKET, 67_108_864);
+    }
+
+    /// A source over rivet's own pool keeps each connection's settings, so a reused connection
+    /// is not set again; over a pool that resets sessions every checkout is set from scratch.
+    #[test]
+    fn only_a_pool_that_keeps_sessions_skips_the_sets_on_a_reused_connection() {
+        let pool = || {
+            let lazy = PoolOpts::default()
+                .with_constraints(PoolConstraints::new(0, 1).expect("valid pool constraints"));
+            Pool::new(
+                OptsBuilder::new()
+                    .ip_or_hostname(Some("127.0.0.1"))
+                    .tcp_port(1)
+                    .pool_opts(lazy),
+            )
+            .expect("a pool with no minimum dials nothing")
+        };
+        for keeps in [true, false] {
+            let source = MysqlSource::with_kind(pool(), keeps, MysqlProxyKind::Direct);
+            let plan = &source.session;
+            assert_eq!(plan.keeps_session, keeps);
+            assert_eq!(plan.given(7), None, "a new connection is set");
+            plan.record(7, 300_000);
+            let again = session_sets(&defaults(), plan.given(7), Some(300_000));
+            assert_eq!(again.is_empty(), keeps, "keeps_session={keeps}: {again:?}");
         }
     }
 
