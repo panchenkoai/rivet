@@ -819,6 +819,10 @@ mod lock_wait_tests {
         let took = started.elapsed();
         crate::error::assert_coded(&err, "RIVET_STATE_LOCK_TIMEOUT", 2);
         assert!(
+            format!("{err:#}").contains("held by another rivet process on this host"),
+            "{err:#}"
+        );
+        assert!(
             took >= Duration::from_millis(1150) && took < Duration::from_millis(1800),
             "waited {took:?} for a 1.2 s wait"
         );
