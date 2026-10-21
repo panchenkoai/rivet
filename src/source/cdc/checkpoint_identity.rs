@@ -263,7 +263,9 @@ mod owner_tests {
         let a = config(dir.path(), "a.yaml", "orders_cdc", "./cdc/new/a.ckpt");
         let ckpt = dir.path().join("cdc/new/a.ckpt");
         claim_checkpoint(&ckpt, &a, "orders_cdc").unwrap();
-        assert!(owner_path(&ckpt).exists());
+        let owner = owner_of(&ckpt).expect("the owner record");
+        assert_eq!(owner.export, "orders_cdc");
+        assert!(owner.config.ends_with("a.yaml"), "{owner:?}");
     }
 
     #[test]
