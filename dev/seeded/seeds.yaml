@@ -443,6 +443,19 @@ seeds:
       postgres-state:
         na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
 
+  - name: sqlite-overdue-writer-loses-its-place
+    class: "a SQLite state writer that ran out of the turn queue's patience while a sibling of the same process held a turn leaves the queue for SQLite's busy wait, where the sibling committing back to back wins every gap, so the write is refused `database is locked` after the busy timeout"
+    history: "0.32.2, 2026-10-21: #638's regression test failed on the unmutated baseline of #660's mutants shard 2 under CI load (`starved: 0: database is locked after 10.16s`); forced on devbox with a sibling holding each turn twice the test patience: red 3/3 on main c5bdcde0 (refused after 15.0-15.5 s)"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-overdue-writer-loses-its-place/sqlite-state.patch
+        cells:
+          - "lib:a_replan_beside_a_writer_slower_than_the_turn_patience_gets_its_turn"
+          - "lib:turns_are_served_in_the_order_they_were_asked_and_a_late_one_gives_up"
+      postgres-state:
+        na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
+
   - name: load-spec-last-writer-of-one-name
     class: "the by-name load spec is one row per export name, so on a state shared by configs of one name reading different sources the last `rivet init` (or run) decides every config's load key"
     history: "client simulation on 0.32.0 (D3) and owner decision 2026-10-18 (v38 approved); measured on main 34ec3d30 with five configs on one PostgreSQL state: the second config's load refused RIVET_LOAD_KEY_COLUMN_INVALID keyed by the fifth one's `code`"

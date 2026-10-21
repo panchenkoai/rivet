@@ -7,7 +7,9 @@
 //! 10 s busy timeout, with 530 000 writes in between (the `replan` cell, 1 in 1000 on CI). Chunk
 //! workers, the run lease keeper and a run's own store are such siblings in one process. A turn
 //! is held from `BEGIN IMMEDIATE` to `COMMIT` (or around one autocommit write); another process
-//! still meets the file lock and SQLite's busy wait.
+//! still meets the file lock and SQLite's busy wait. A writer that ran out of patience while a turn
+//! was held keeps its place: no later writer of this process gets a turn before it has written, so
+//! its busy wait meets only the slow holder, never a sibling that commits back to back.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -22,11 +24,13 @@ pub(super) const PATIENCE: Duration = Duration::from_millis(super::SQLITE_BUSY_T
 #[cfg(test)]
 pub(super) const PATIENCE: Duration = Duration::from_millis(50);
 
-/// One file's queue: the waiting tickets in order and whether a turn is taken.
+/// One file's queue: the waiting tickets in order, whether a turn is taken, and the ticket that
+/// ran out of patience and is in SQLite's busy wait ahead of every other.
 #[derive(Default)]
 struct Queue {
     waiting: VecDeque<u64>,
     taken: bool,
+    overdue: Option<u64>,
     next: u64,
 }
 
@@ -36,15 +40,23 @@ struct Turns {
     freed: Condvar,
 }
 
-/// A turn at one file's write lock; dropping it hands the lock to the next ticket.
-pub(super) struct Turn(Arc<Turns>);
+/// A turn at one file's write lock, or the place of a writer that ran out of patience (`overdue`);
+/// dropping it hands the lock to the next ticket.
+pub(super) struct Turn {
+    turns: Arc<Turns>,
+    overdue: Option<u64>,
+}
 
 impl Drop for Turn {
     fn drop(&mut self) {
-        let mut q = self.0.queue.lock().unwrap_or_else(|p| p.into_inner());
-        q.taken = false;
+        let mut q = self.turns.queue.lock().unwrap_or_else(|p| p.into_inner());
+        match self.overdue {
+            Some(me) if q.overdue == Some(me) => q.overdue = None,
+            Some(_) => {}
+            None => q.taken = false,
+        }
         drop(q);
-        self.0.freed.notify_all();
+        self.turns.freed.notify_all();
     }
 }
 
@@ -60,8 +72,10 @@ fn turns_of(db: &Path) -> Arc<Turns> {
         .clone()
 }
 
-/// Wait for this process's turn at `db`'s write lock, at most `patience`; `None` past it (or for
-/// an in-memory store), when the caller goes on to SQLite's own busy wait and its verdict.
+/// Wait for this process's turn at `db`'s write lock, at most `patience`. Past it the caller goes
+/// on to SQLite's own busy wait and its verdict, holding its place (no later writer of this
+/// process is served before it) unless another overdue writer holds that place already (`None`,
+/// also for an in-memory store).
 pub(super) fn take(db: &Path, patience: Duration) -> Option<Turn> {
     if db.as_os_str() == ":memory:" {
         return None;
@@ -73,18 +87,28 @@ pub(super) fn take(db: &Path, patience: Duration) -> Option<Turn> {
     q.next += 1;
     q.waiting.push_back(me);
     loop {
-        if !q.taken && q.waiting.front() == Some(&me) {
+        if !q.taken && q.overdue.is_none() && q.waiting.front() == Some(&me) {
             q.waiting.pop_front();
             q.taken = true;
             drop(q);
-            return Some(Turn(turns));
+            return Some(Turn {
+                turns,
+                overdue: None,
+            });
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             q.waiting.retain(|t| *t != me);
+            let place = q.overdue.is_none().then(|| {
+                q.overdue = Some(me);
+                me
+            });
             drop(q);
             turns.freed.notify_all();
-            return None;
+            return place.map(|me| Turn {
+                turns,
+                overdue: Some(me),
+            });
         }
         q = turns
             .freed
@@ -120,11 +144,18 @@ mod tests {
             })
             .collect();
         std::thread::sleep(Duration::from_millis(50));
+        let late = take(&db, Duration::from_millis(30)).expect("the late one keeps its place");
         assert!(
             take(&db, Duration::from_millis(30)).is_none(),
-            "taken: the late one gives up"
+            "one place is kept, a second overdue writer has none"
         );
         drop(first);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "no waiter is served while the overdue one has not written"
+        );
+        drop(late);
         for w in waiters {
             w.join().unwrap();
         }
