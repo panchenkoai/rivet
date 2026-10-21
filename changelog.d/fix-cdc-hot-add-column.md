@@ -6,6 +6,6 @@
   `on_schema_drift` (`fail` stops before the change is acknowledged), and the run continues in a
   new part with the column and its values; `rivet load` takes both schemas into one change log.
   SQL Server's capture instance cannot carry a column added after it was created, so a run that
-  sees its table outgrow the instance now stops with the new code `RIVET_SOURCE_CDC_SCHEMA_CHANGED`
-  (exit 5) instead of ending clean. **What to do:** on SQL Server, create a capture instance that
-  covers the column and re-baseline the table; elsewhere nothing.
+  sees its table outgrow the instance now stops with `RIVET_SOURCE_CDC_PREREQUISITE`, the refusal a
+  run opening on that instance already met, instead of ending clean. **What to do:** on SQL Server,
+  re-enable the table with the full column list and re-baseline it; elsewhere nothing.

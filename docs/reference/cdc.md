@@ -823,9 +823,9 @@ schemas; `rivet load` takes both into one change log (a part without the column 
 NULL). A bounded run (`until_current: true`, the default) resolves its schema after its read
 bound, so it never meets such a change. SQL Server is the exception: a capture instance carries
 the columns it was created with, so a column added after it never reaches the change table; a run
-that sees its table outgrow the instance stops with `RIVET_SOURCE_CDC_SCHEMA_CHANGED` (exit 5)
-instead of ending clean — create a capture instance that covers the column and re-baseline the
-table. MySQL's binlog carries
+that sees its table outgrow the instance stops with `RIVET_SOURCE_CDC_PREREQUISITE`, the refusal a
+run opening on that instance meets, instead of ending clean — re-enable the table with the full
+column list, then re-baseline it. MySQL's binlog carries
 names only when the server runs with **`binlog_row_metadata=FULL`** (8.0.1+),
 which rivet requires (see [MySQL — the binlog grants](#mysql--the-binlog-grants)), so MySQL behaves the
 same. rivet never maps a binlog image by position: a server at `MINIMAL` is

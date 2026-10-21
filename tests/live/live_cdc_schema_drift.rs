@@ -605,13 +605,14 @@ fn mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code() {
     );
     assert_eq!(
         out.status.code(),
-        Some(5),
+        Some(1),
         "a refusal, not a clean end:\n{said}"
     );
     assert!(
-        said.contains("[RIVET_SOURCE_CDC_SCHEMA_CHANGED]")
+        said.contains("[RIVET_SOURCE_CDC_PREREQUISITE]")
             && said.contains(&table)
-            && said.contains("sp_cdc_enable_table"),
+            && said.contains("a column added after the instance was created")
+            && said.contains("Re-enable the table with the full column"),
         "the stop names its code, the table and the remedy:\n{said}"
     );
     // The remedy as printed: a capture instance that covers `c`, pointed at, then a re-baseline.

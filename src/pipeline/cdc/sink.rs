@@ -609,7 +609,7 @@ pub(crate) fn run_to_files(
                             image_arity,
                         ) else {
                             crate::rivet_bail!(
-                                crate::error::codes::SOURCE_CDC_SCHEMA_CHANGED,
+                                crate::error::codes::INTERNAL_SOURCE_INVARIANT,
                                 "cdc: table `{table}` gained column(s) {} while the run was open, and \
                                  its catalog could not be read again, so their values cannot be typed",
                                 lacking.join(", ")
@@ -713,16 +713,7 @@ pub(crate) fn run_to_files(
         // whole stops the run by code instead of ending clean over values it never read.
         let tables: Vec<String> = sinks.iter().map(|s| s.out.table.clone()).collect();
         if let crate::source::cdc::RowImage::Partial { why } = stream.row_image(&tables) {
-            crate::rivet_bail!(
-                crate::error::codes::SOURCE_CDC_SCHEMA_CHANGED,
-                "{} cdc: {why} — a column was added to a captured table while the run was open, \
-                 and the stream it is read from does not carry its values. Create a capture \
-                 instance that covers it (EXEC sys.sp_cdc_enable_table with a new \
-                 @capture_instance), point `capture_instance:` at it, and re-baseline the table: \
-                 delete the checkpoint, move the export's files aside, delete its `cdc_snapshot` \
-                 rows, give it `cdc.initial: snapshot`, then re-run",
-                run.engine.label()
-            );
+            return Err(super::partial_image_refusal(run.engine, &why));
         }
         if !hit_max
             && !unacked_commit
@@ -4308,7 +4299,7 @@ mod tests {
             cfg(dest.as_ref(), &cols, FormatType::Parquet, 100),
         );
         let err = r.expect_err("no re-resolve: a stop, not a dropped value");
-        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_SCHEMA_CHANGED", 5);
+        crate::error::assert_coded(&err, "RIVET_INTERNAL_SOURCE_INVARIANT", 6);
         assert!(format!("{err:#}").contains("gained column(s) c"), "{err:#}");
         assert_eq!(
             (manifests[0].row_count, stream.acked.len()),
