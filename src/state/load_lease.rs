@@ -293,6 +293,15 @@ fn lease_ttl_s() -> u64 {
         .unwrap_or(30)
 }
 
+/// A holder id (`host:pid:nonce`) as a sentence names it.
+fn holder_text(holder: &str) -> String {
+    let mut parts = holder.splitn(3, ':');
+    match (parts.next(), parts.next()) {
+        (Some(host), Some(pid)) => format!("pid {pid} on host {host}"),
+        _ => format!("`{holder}`"),
+    }
+}
+
 /// This host's name, the part of a holder id that says where its pid lives.
 fn host_name() -> String {
     let mut buf = [0u8; 256];
@@ -331,7 +340,96 @@ fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
     db.with_file_name(name)
 }
 
+/// How long a take of a lease another live process holds waits, in seconds (`--lock-wait`); 0 answers at once.
+static LOCK_WAIT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set how long this process waits for a lease another live process holds (`--lock-wait`).
+pub fn set_lock_wait(seconds: u64) {
+    LOCK_WAIT_S.store(seconds, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long this process waits for a lease another live process holds, in seconds.
+pub fn lock_wait_s() -> u64 {
+    LOCK_WAIT_S.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How often a waiting take says again that it is waiting.
+const WAIT_NOTE_EVERY: Duration = Duration::from_secs(60);
+
+/// Whether a waiting take says again that it waits: the first time, then once per `every`.
+fn note_due(noted: Option<Instant>, every: Duration) -> bool {
+    noted.is_none_or(|at| at.elapsed() >= every)
+}
+
+/// The longest pause between two attempts of a waiting take.
+const WAIT_POLL: Duration = Duration::from_secs(1);
+
 impl StateStore {
+    /// Take `key`, trying again while another live process holds it for up to `--lock-wait`:
+    /// `None` at once when the wait is 0 (the caller's own refusal), the lease once it is free, and
+    /// `RIVET_STATE_LOCK_TIMEOUT` when the wait ran out. `what` names the lease and its holder.
+    pub fn take_lease_waiting(
+        &self,
+        key: &str,
+        what: &dyn Fn() -> String,
+    ) -> Result<Option<LoadLease<'_>>> {
+        self.take_lease_waiting_for(key, Duration::from_secs(lock_wait_s()), what)
+    }
+
+    /// [`StateStore::take_lease_waiting`] for up to `wait`.
+    fn take_lease_waiting_for(
+        &self,
+        key: &str,
+        wait: Duration,
+        what: &dyn Fn() -> String,
+    ) -> Result<Option<LoadLease<'_>>> {
+        let started = Instant::now();
+        let mut noted: Option<Instant> = None;
+        loop {
+            if let Some(lease) = self.try_load_lease(key)? {
+                return Ok(Some(lease));
+            }
+            if wait.is_zero() {
+                return Ok(None);
+            }
+            let waited = started.elapsed();
+            if waited >= wait {
+                crate::rivet_bail!(
+                    crate::error::codes::STATE_LOCK_TIMEOUT,
+                    "{}, held by {}, was still held after {} s (`--lock-wait {}`); nothing was \
+                     done. Retry once it ends, or give `--lock-wait` more seconds",
+                    what(),
+                    self.lease_holder(key)?,
+                    waited.as_secs(),
+                    wait.as_secs()
+                );
+            }
+            if note_due(noted, WAIT_NOTE_EVERY) {
+                log::warn!(
+                    "{} is held by {}: waiting up to {} s for it (`--lock-wait`)",
+                    what(),
+                    self.lease_holder(key)?,
+                    wait.as_secs()
+                );
+                noted = Some(Instant::now());
+            }
+            std::thread::sleep(WAIT_POLL.min(wait - waited));
+        }
+    }
+
+    /// Who holds `key`, as far as the state records: a PostgreSQL holder names its host and pid.
+    fn lease_holder(&self, key: &str) -> Result<String> {
+        if let StateRef::Sqlite(_) = &self.state_ref {
+            return Ok("another rivet process on this host".to_string());
+        }
+        let holder = self.query_opt(
+            "SELECT holder FROM state_lease WHERE lease_key = ?1",
+            &[key.into()],
+            |r| r.text(0),
+        )?;
+        Ok(holder.map_or_else(|| "another rivet process".to_string(), |h| holder_text(&h)))
+    }
+
     /// Try to take the load lease for `key` (the target table); `None` when
     /// another process holds it.
     pub fn try_load_lease(&self, key: &str) -> Result<Option<LoadLease<'_>>> {
@@ -699,5 +797,50 @@ mod lease_path_tests {
                 .contains(&std::process::id().to_string()),
             "an in-memory store leases per process: {mem:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::*;
+
+    /// A waiting take of a held lease stops by code once `wait` ran out, not before and not a
+    /// poll later; free, it takes the lease at once.
+    #[test]
+    fn a_waiting_take_times_out_by_code_when_the_wait_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("rivet.yaml").to_str().unwrap()).unwrap();
+        let held = store.try_load_lease("t").unwrap().expect("the first take");
+        let started = Instant::now();
+        let err = store
+            .take_lease_waiting_for("t", Duration::from_millis(1200), &|| "lease t".into())
+            .map(|_| ())
+            .unwrap_err();
+        let took = started.elapsed();
+        crate::error::assert_coded(&err, "RIVET_STATE_LOCK_TIMEOUT", 2);
+        assert!(
+            format!("{err:#}").contains("held by another rivet process on this host"),
+            "{err:#}"
+        );
+        assert!(
+            took >= Duration::from_millis(1150) && took < Duration::from_millis(1800),
+            "waited {took:?} for a 1.2 s wait"
+        );
+        drop(held);
+        assert!(
+            store
+                .take_lease_waiting_for("t", Duration::from_secs(5), &|| "lease t".into())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_wait_note_is_due_first_and_then_once_per_period() {
+        let every = Duration::from_secs(60);
+        assert!(note_due(None, every));
+        assert!(!note_due(Some(Instant::now()), every));
+        let long_ago = Instant::now() - Duration::from_secs(61);
+        assert!(note_due(Some(long_ago), every));
     }
 }

@@ -337,6 +337,10 @@ exclude_re = [
     "delete match arm \"postgres\" in introspect_all",
     "delete match arm \"mysql\" in introspect_all",
     "delete match arm \"mssql\" in introspect_all",
+    # The MongoDB arm opens a live connection too; live-guarded by
+    # init_mongo_schema_wide_lists_collections_in_rivets_order (deleting the arm makes a mongodb://
+    # init reach the dispatch's `unreachable!`).
+    "delete match arm \"mongo\" in introspect_all",
     # The Oracle arms of init's live-only engine dispatch open a real connection, so
     # they are unkillable offline; each is live-guarded and was RED-proven by renaming
     # the arm: introspect_all by init_oracle_schema_wide_discovers_seeded_table, the

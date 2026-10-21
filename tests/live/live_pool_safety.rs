@@ -623,3 +623,228 @@ fn a_server_in_another_time_zone_reads_its_timestamps_as_utc_when_the_set_is_hon
     rig.run_ok();
     assert_eq!(exported_t(&rig), "2026-01-01T09:00:00.000000Z");
 }
+
+// ─── 0.32.2 item 10: literal SETs, once per connection, through a multiplexing ProxySQL ───
+
+/// The stand's ProxySQL admin, through `docker exec` (its `admin` user answers on loopback only).
+fn proxysql_admin(sql: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args([
+            "exec",
+            "rivet-proxysql-1",
+            "mysql",
+            "-h127.0.0.1",
+            "-P6032",
+            "-uadmin",
+            "-padmin",
+            "-N",
+            "-B",
+            "-e",
+            sql,
+        ])
+        .output()
+        .expect("docker exec the ProxySQL admin");
+    assert!(
+        out.status.success(),
+        "ProxySQL admin: {}\n{sql}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The URL through the default-config ProxySQL to `mysql-tz` (+03:00): user `rivet_tz`, routed to
+/// hostgroup 7, which holds at most two backend connections, so parallel readers share them.
+fn tz_behind_a_multiplexing_proxysql() -> &'static str {
+    let mut root = mysql::Pool::new(MYSQL_TZ_URL.replace("rivet:rivet@", "root:rivet@").as_str())
+        .expect("mysql-tz as root")
+        .get_conn()
+        .expect("mysql-tz conn");
+    mysql::prelude::Queryable::query_drop(
+        &mut root,
+        "CREATE USER IF NOT EXISTS 'rivet_tz'@'%' IDENTIFIED WITH mysql_native_password BY 'rivet'; \
+         GRANT ALL ON rivet.* TO 'rivet_tz'@'%'",
+    )
+    .expect("the proxied user");
+    proxysql_admin(
+        "REPLACE INTO mysql_servers (hostgroup_id, hostname, port, max_connections) \
+           VALUES (7, 'mysql-tz', 3306, 2); \
+         REPLACE INTO mysql_users (username, password, default_hostgroup, max_connections, \
+           active, transaction_persistent) VALUES ('rivet_tz', 'rivet', 7, 100, 1, 1); \
+         LOAD MYSQL SERVERS TO RUNTIME; LOAD MYSQL USERS TO RUNTIME;",
+    );
+    "mysql://rivet_tz:rivet@127.0.0.1:6033/rivet"
+}
+
+/// `(count, digest)` of every statement `rivet_tz` sent, read from ProxySQL's digest table.
+fn rivet_tz_digests() -> Vec<(u64, String)> {
+    proxysql_admin(
+        "SELECT count_star, digest_text FROM stats_mysql_query_digest WHERE username = 'rivet_tz'",
+    )
+    .lines()
+    .filter_map(|l| l.split_once('\t'))
+    .map(|(n, d)| (n.parse().unwrap(), d.to_string()))
+    .collect()
+}
+
+/// One ProxySQL global counter.
+fn proxysql_global(name: &str) -> u64 {
+    proxysql_admin(&format!(
+        "SELECT variable_value FROM stats_mysql_global WHERE variable_name = '{name}'"
+    ))
+    .trim()
+    .parse()
+    .expect("a counter")
+}
+
+/// `(id, ts, dt)` of the table, read straight from the server in a UTC session (no proxy, no rivet).
+fn tz_rows_in_utc(tbl: &str) -> Vec<(i64, String, String)> {
+    let mut c = mysql::Pool::new(MYSQL_TZ_URL).unwrap().get_conn().unwrap();
+    mysql::prelude::Queryable::query_drop(&mut c, "SET time_zone = '+00:00'").unwrap();
+    mysql::prelude::Queryable::query(
+        &mut c,
+        format!(
+            "SELECT id, DATE_FORMAT(ts, '%Y-%m-%dT%H:%i:%s'), DATE_FORMAT(dt, '%Y-%m-%dT%H:%i:%s') \
+             FROM {tbl} ORDER BY id"
+        ),
+    )
+    .unwrap()
+}
+
+/// `(id, ts, dt)` of the exported CSV parts, each instant cut to the second.
+fn exported_tz_rows(dir: &std::path::Path) -> Vec<(i64, String, String)> {
+    let mut rows: Vec<(i64, String, String)> = files_under(dir)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "csv"))
+        .flat_map(|p| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .map(|l| {
+                    let f: Vec<&str> = l.split(',').collect();
+                    (
+                        f[0].parse().unwrap(),
+                        f[1][..19].to_string(),
+                        f[2][..19].to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Through a ProxySQL that multiplexes (default config, two backend connections for four parallel
+/// readers) in front of a `+03:00` server: rivet sets its session by literal SETs, once per
+/// connection, ProxySQL replays them on whichever backend it picks, and every TIMESTAMP and
+/// DATETIME equals the server's own UTC read, single and parallel-4; `max_execution_time` still
+/// stops a long statement. 0.32.1 sent `REPLACE(@@sql_mode, ..)` and `@@global.*` resets on every
+/// chunk, which ProxySQL cannot parse and answers by locking the session to its hostgroup.
+#[test]
+#[ignore = "live: requires docker compose --profile pool proxysql + --profile tz mysql-tz"]
+fn through_a_multiplexing_proxysql_the_session_is_set_once_per_connection_by_literals() {
+    require_alive(LiveService::ProxySql);
+    require_alive(LiveService::MysqlTz);
+    let url = tz_behind_a_multiplexing_proxysql();
+    let mut c = mysql::Pool::new(MYSQL_TZ_URL).unwrap().get_conn().unwrap();
+    let tbl = unique_name("rivet_tz_mux");
+    mysql::prelude::Queryable::query_drop(
+        &mut c,
+        format!(
+            "SET time_zone = '+00:00'; SET SESSION cte_max_recursion_depth = 5000; \
+             CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, ts TIMESTAMP NULL, dt DATETIME NULL); \
+             INSERT INTO {tbl} WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s \
+             WHERE n < 2000) SELECT n, TIMESTAMP('2026-01-01 09:00:00') + INTERVAL n SECOND, \
+             TIMESTAMP('2026-01-01 09:00:00') + INTERVAL n SECOND FROM s"
+        ),
+    )
+    .unwrap();
+    let _t = TzTable(tbl.clone());
+    let source = tz_rows_in_utc(&tbl);
+    assert_eq!(source.len(), 2000);
+    let digests_before = rivet_tz_digests();
+    let clients_before = proxysql_global("Client_Connections_created");
+    let pushed_before = proxysql_global("MyHGM_myconnpoll_push");
+    let chunked = |rig: Rig| {
+        rig.mode("chunked")
+            .export_line("chunk_column: id")
+            .export_line("chunk_size: 100")
+            .export_line("parallel: 4")
+    };
+    for (shape, rig) in [
+        (
+            "single",
+            Rig::mysql_batch(&tbl).source_url(url).with_format("csv"),
+        ),
+        (
+            "parallel-4",
+            chunked(Rig::mysql_batch(&tbl).source_url(url).with_format("csv")),
+        ),
+    ] {
+        rig.run_ok();
+        assert_eq!(
+            exported_tz_rows(&rig.out_dir()),
+            source,
+            "{shape}: every value is the source's"
+        );
+    }
+
+    let clients = proxysql_global("Client_Connections_created") - clients_before;
+    let before = |d: &str| {
+        digests_before
+            .iter()
+            .find(|(_, x)| x == d)
+            .map_or(0, |(n, _)| *n)
+    };
+    let sets: Vec<(u64, String)> = rivet_tz_digests()
+        .into_iter()
+        .map(|(n, d)| (n - before(&d), d))
+        .filter(|(n, d)| *n > 0 && d.starts_with("SET"))
+        .collect();
+    for (_, d) in &sets {
+        assert!(!d.contains('@'), "a literal SET, never an expression: {d}");
+    }
+    // Rivet's own three, by the text it sends (another client of this user, such as a reader
+    // of the destination, spells its SETs its own way).
+    let ours = |d: &str| {
+        [
+            "SET time_zone = ",
+            "SET SESSION sql_mode = ",
+            "SET SESSION max_execution_time = ",
+        ]
+        .iter()
+        .any(|p| d.starts_with(p))
+    };
+    let sets: Vec<&(u64, String)> = sets.iter().filter(|(_, d)| ours(d)).collect();
+    assert_eq!(sets.len(), 3, "the session is set: {sets:?}");
+    for (n, d) in sets {
+        assert!(
+            *n <= clients && *n < 21,
+            "`{d}` sent {n} times over {clients} client connections and 21 chunked reads: once per connection, not per chunk"
+        );
+    }
+    let handed_back = proxysql_global("MyHGM_myconnpoll_push") - pushed_before;
+    assert!(
+        handed_back >= 20,
+        "{handed_back} backend connections handed back to ProxySQL's pool over 20 chunk reads: a \
+         session pinned to its backend (multiplexing off) hands none back until it ends"
+    );
+
+    // The statement budget still holds through the multiplexed session.
+    let slow = Rig::mysql_batch(&tbl)
+        .source_url(url)
+        .with_format("csv")
+        .query(&format!(
+            "SELECT a.id FROM {tbl} a, {tbl} b, {tbl} c WHERE a.id + b.id + c.id < 0"
+        ))
+        .export_line("tuning: {statement_timeout_s: 1, max_retries: 0}");
+    let started = std::time::Instant::now();
+    let out = slow.run_args_env(&[], &[]);
+    assert_refused(&out, Refused::by_code("RIVET_SOURCE_STATEMENT_TIMEOUT", 1));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "stopped by its 1 s budget, not by the end of a cross join: {:?}",
+        started.elapsed()
+    );
+}

@@ -447,6 +447,18 @@ fn table_load_prefix(base_uri: &str, table: &str) -> Result<String> {
     ))
 }
 
+/// The config's top-level `load:` block, or `RIVET_LOAD_BLOCK_MISSING` (exit 1) when it has none.
+fn load_block(cfg: &crate::config::Config) -> Result<crate::config::load::LoadSection> {
+    match cfg.load.clone() {
+        Some(load) => Ok(load),
+        None => crate::rivet_bail!(
+            crate::error::codes::LOAD_BLOCK_MISSING,
+            "config has no top-level `load:` block — add `load: {{ target, ... }}` to load into a \
+             warehouse"
+        ),
+    }
+}
+
 pub fn plan_loads(config_path: &str, selection: &Selection) -> Result<Vec<LoadPlan>> {
     // `Config::load`, not a raw `from_yaml`: it resolves `${VAR}`/`--param`
     // placeholders exactly as the `rivet check` child did. The old code parsed
@@ -463,9 +475,7 @@ pub fn plan_loads(config_path: &str, selection: &Selection) -> Result<Vec<LoadPl
     selection.check(&cfg)?;
 
     // The `load:` target from the same config, shared by every export.
-    let load = cfg.load.clone().context(
-        "config has no top-level `load:` block — add `load: { target, ... }` to load into a warehouse",
-    )?;
+    let load = load_block(&cfg)?;
 
     let target = crate::types::target::ExportTarget::parse(load.target.name())
         .with_context(|| format!("unknown load target `{}`", load.target.name()))?;
@@ -1032,10 +1042,7 @@ pub fn retype_plan(
         .iter()
         .find(|e| e.name == plan.export_name)
         .with_context(|| format!("export `{}` not found in config", plan.export_name))?;
-    let load = cfg
-        .load
-        .clone()
-        .context("config has no top-level `load:` block")?;
+    let load = load_block(cfg)?;
     let mappings = spec.columns.iter().map(|c| c.to_mapping()).collect();
     let report = crate::preflight::type_report::report_from_mappings(
         export,
@@ -2490,9 +2497,9 @@ load:
              exports:\n  - name: a\n    table: t\n    mode: full\n    format: parquet\n    \
              destination:\n      type: gcs\n      bucket: b\n      prefix: p/\n"
         ));
-        let err = plan_loads(&path, &Selection::default())
-            .unwrap_err()
-            .to_string();
+        let err = plan_loads(&path, &Selection::default()).unwrap_err();
+        crate::error::assert_coded(&err, "RIVET_LOAD_BLOCK_MISSING", 1);
+        let err = err.to_string();
         assert!(
             err.contains("no top-level `load:` block"),
             "the config gate must answer first, before the source is dialled: {err}"
