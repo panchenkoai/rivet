@@ -1113,7 +1113,8 @@ fn corrupt_checkpoint_is_refused_by_code(s: CdcScenario, delete_alone: Then) {
 /// A second config of the same stream (the 0.32.1 `init -o` pair: its own export, destination
 /// and slot, one checkpoint) has read the checkpoint first; this export's run is refused
 /// `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` on every attempt before it reads a change. A checkpoint
-/// of its own delivers the source; deleting the shared file leaves the refusal.
+/// of its own delivers the source, and so does deleting the other config (this one replaces it);
+/// deleting the shared file leaves the refusal.
 fn a_checkpoint_another_config_reads_is_refused(mut s: CdcScenario) {
     s.insert(1);
     s.settle();
@@ -1145,6 +1146,7 @@ fn a_checkpoint_another_config_reads_is_refused(mut s: CdcScenario) {
         "{other}"
     );
     std::fs::write(dir.join("other.yaml"), &other).unwrap();
+    let other_cfg = dir.join("other.yaml");
     let first = run_rivet_in_dir(&dir, &["run", "--config", "other.yaml"], &[]);
     assert!(
         first.status.success(),
@@ -1165,6 +1167,11 @@ fn a_checkpoint_another_config_reads_is_refused(mut s: CdcScenario) {
                 move |r| {
                     r.own_checkpoint(own);
                 },
+            ),
+            Remedy::new(
+                "delete or rename that config",
+                Then::DeliversTheSource,
+                move |_| std::fs::remove_file(&other_cfg).expect("the other config goes"),
             ),
             deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(
                 "RIVET_SOURCE_CDC_CHECKPOINT_SHARED",

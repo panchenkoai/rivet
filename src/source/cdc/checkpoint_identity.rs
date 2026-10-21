@@ -129,7 +129,9 @@ pub(crate) fn claim_checkpoint(
                  config file) and keep this file: it is the other export's position. Give it \
                  `cdc.initial: snapshot` if it has none, so its first run on the new \
                  checkpoint re-reads every table, and move any file it wrote before out of its \
-                 destination first: those may miss the changes the other stream read",
+                 destination first: those may miss the changes the other stream read. If this \
+                 config replaces that one (an edited copy of it), delete or rename that config, \
+                 or point its `cdc.checkpoint` elsewhere, and run this one again",
                 ckpt.display(),
                 owner.export,
                 owner.config,

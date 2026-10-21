@@ -131,6 +131,15 @@ keeps `rivet_<table>` and `server_id: 4271` and says beside each that it is one 
 CDC export of a table is named `<table>_cdc` and writes to `exports/<table>_cdc/`, beside the
 batch export of the table, never inside it.
 
+The checkpoint and the CDC destination are named after the file too (since 0.32.2): `-o
+rivet.yaml` writes `checkpoint: ./cdc/rivet_<table>.ckpt` (`./cdc/rivet_<schema>_cdc.ckpt` for a
+whole-schema stream) and the destination `./output/rivet/<table>_cdc/` (`exports/rivet/<table>_cdc/`
+in a bucket, `rivet/cdc/` / `./output/rivet/cdc/` for a whole-schema stream). init refuses
+`RIVET_INIT_CDC_NAME_TAKEN` (exit 5), writing nothing, when that checkpoint already exists or another
+config in the directory names the same checkpoint or destination: write the config under another
+`-o` name. A run records which config and export own a checkpoint (`<checkpoint>.owner`) and refuses
+`RIVET_SOURCE_CDC_CHECKPOINT_SHARED` (exit 5) for another config while the owner still names it.
+
 ## Flags (summary)
 
 | Flag | Required | Description |
