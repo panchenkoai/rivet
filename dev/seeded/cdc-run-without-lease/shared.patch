@@ -1,10 +1,12 @@
+diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+index 77ec5447..220f5d6d 100644
 --- a/src/pipeline/job.rs
 +++ b/src/pipeline/job.rs
-@@ -1775,13 +1775,6 @@
+@@ -1843,13 +1843,6 @@ fn run_export_job_inner(
          }
          // The export's run lease for the whole stream, as a batch run holds it: a second
          // run beside a live one is refused before it opens the source or writes anything.
--        let _run_lease = match cdc_run_lease(state, &export.name) {
+-        let _run_lease = match cdc_run_lease(state, &export.name, &config.source.state_key()) {
 -            Ok(lease) => lease,
 -            Err(e) => {
 -                let summary = synthetic_failed_summary(&export.name, &e);

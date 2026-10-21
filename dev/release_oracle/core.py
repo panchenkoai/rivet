@@ -46,6 +46,10 @@ from typing import Iterable, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
+#: The gate kind whose green verdict may support a tag: `make release-oracle-full`, nothing given up.
+FULL_GATE = "release-oracle-full"
+#: Every other run that writes a verdict line (the bare `make release-oracle`, a run with an escape).
+REDUCED_GATE = "release-oracle"
 
 
 class Status(str, Enum):
@@ -342,8 +346,8 @@ class Ledger:
         """The run's verdict, derived from the rows: a product FAIL outranks an ungraded cell."""
         return "NOT RELEASABLE" if self.red else "NOT GRADED" if self.ungraded_cells else "RELEASE-READY"
 
-    def report(self, *, full: bool = False) -> int:
-        """Print the table and the verdict; only a `full` gate run records a timings line and may say RELEASE-READY."""
+    def report(self, *, full: bool = False, gate: str = REDUCED_GATE, tree: tuple[str, bool] | None = None) -> int:
+        """Print the table and the verdict; only a `full` gate run records a timings line (naming `gate`) and may say RELEASE-READY."""
         self.record_evidence()
         print()
         self.phase("Release Oracle result")
@@ -418,7 +422,7 @@ class Ledger:
                 TIMINGS_HISTORY, timed, self._spans, verdict,
                 sum(c.status is Status.PASS for c in self.cells),
                 sum(c.status is Status.FAIL for c in self.cells),
-                self._phase_load,
+                self._phase_load, gate=gate, tree=tree,
             )
         known = [c for c in self.cells if c.status is Status.KNOWN]
         if known:
@@ -446,21 +450,33 @@ def first_error(text: str) -> str:
     return next((ln for ln in lines if re.match(r"(?i)(error\b|\[RIVET_|.*\berror:)", ln)), lines[-1] if lines else "")
 
 
-#: One JSON line per full gate run (gitignored): where the wall-clock went, so a slow run is compared, not guessed.
+#: One JSON line per full gate run (gitignored): where the wall-clock went, and the verdict `dev/pytools/release.py` reads.
 TIMINGS_HISTORY = ROOT / "dev" / "release-oracle" / "timings.jsonl"
 
 
+def tree_identity() -> tuple[str, bool]:
+    """HEAD's full commit and whether tracked files differ from it: taken at the gate's start, before the gate writes its own evidence."""
+    sha = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                         capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no"],
+                           capture_output=True, text=True).stdout.strip() != ""
+    return sha, dirty
+
+
 def record_timings(path: Path, phases: list[tuple[str, float]], spans: list[tuple[str, float]],
-                   verdict: str, passed: int, failed: int, loads: dict[str, tuple[float, float]] | None = None) -> dict:
-    """Append this run's phase and span timings, and each phase's 1-minute load average at its start and end, to `path`; print the phase deltas against the previous run."""
+                   verdict: str, passed: int, failed: int, loads: dict[str, tuple[float, float]] | None = None,
+                   gate: str = REDUCED_GATE, tree: tuple[str, bool] | None = None) -> dict:
+    """Append this run's verdict (full commit, gate kind, dirty tree), phase and span timings and load averages to `path`; print the phase deltas against the previous run."""
     import datetime as _dt
     import json as _json
 
-    head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
-                          capture_output=True, text=True).stdout.strip()
+    sha, dirty = tree or tree_identity()
     rec = {
         "at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
-        "commit": head,
+        "commit": sha[:8],
+        "sha": sha,
+        "gate": gate,
+        "dirty": dirty,
         "verdict": verdict,
         "passed": passed,
         "failed": failed,

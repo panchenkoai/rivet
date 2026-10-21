@@ -183,12 +183,12 @@ fn an_incremental_load_starts_a_table_then_a_change_log(e: SqlEngine) {
     let said: Vec<String> = (0..2)
         .map(|_| {
             let out = rig.cli(&["compact"]);
-            format!(
+            without_log_stamps(&format!(
                 "exit {:?}\n{}{}",
                 out.status.code(),
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
-            )
+            ))
         })
         .collect();
     assert_eq!(said[0], said[1], "the second attempt answers as the first");

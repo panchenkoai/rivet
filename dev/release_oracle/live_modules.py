@@ -49,17 +49,22 @@ def derived_filter(modules: list[str], ran_modules: set[str], ran_tests: set[str
     return left, expr
 
 
+def live_modules_env(state: str) -> tuple[dict[str, str], tuple[str, dict[str, str]] | None]:
+    """The env this stage gives every Rig cell under the gate's Postgres state `state` (or ""), and the leg a self-skip naming RIVET_GATE_STATE_URL runs again under; seeded recall runs its cells in the same."""
+    # A warehouse project and bucket for the cloud tests, a Postgres state URL for the ones that share
+    # one, and NO ambient RIVET_STATE_URL, which would move every SQLite-reading test onto Postgres
+    # (the batch_resume lesson).
+    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "RIVET_TEST_STATE_URL": state}
+    # A test that grades the Postgres state alone says so by its self-skip; it runs again on the gate's.
+    again = ("RIVET_GATE_STATE_URL", {"RIVET_STATE_URL": state, "RIVET_GATE_STATE_URL": state}) if state.startswith("postgres") else None
+    return env, again
+
+
 def verify_live_modules(led: Ledger) -> None:
     """Run every live_suite module and test no dedicated cell ran; one ledger row per test."""
     left, expr = derived_filter(live_suite_modules(), set(RAN_LIVE_MODULES), set(RAN_LIVE_TESTS))
     excl = [n for n in exclusive_tests() if n not in RAN_LIVE_TESTS]
-    # The environment the Rig cells get: a warehouse project and bucket for the cloud tests,
-    # a Postgres state URL for the ones that share one — and NO ambient RIVET_STATE_URL, which
-    # would move every SQLite-reading test onto Postgres (the batch_resume lesson).
-    state = os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_GATE_STATE_URL") or ""
-    env = {"RIVET_STATE_URL": "", "RIVET_GATE_STATE_URL": "", "RIVET_TEST_STATE_URL": state}
-    # A test that grades the Postgres state alone says so by its self-skip; it runs again on the gate's.
-    again = ("RIVET_GATE_STATE_URL", {"RIVET_STATE_URL": state, "RIVET_GATE_STATE_URL": state}) if state.startswith("postgres") else None
+    env, again = live_modules_env(os.environ.get("RIVET_CDC_STATE_URL") or os.environ.get("RIVET_GATE_STATE_URL") or "")
     _run_live_modules(led, "live", "live modules",
                       f"every other live_suite module ({len(left)}), derived from tests/live_suite.rs",
                       left, env=env, again=again,

@@ -1,16 +1,42 @@
 diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+index 77ec5447..049f9ed7 100644
 --- a/src/pipeline/job.rs
 +++ b/src/pipeline/job.rs
-@@ -1106,9 +1106,9 @@
+@@ -1126,15 +1126,15 @@ fn ledger_begin_run(
  ) -> Result<()> {
      let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
      let started_at = chrono::Utc::now().to_rfc3339();
 -    state
--        .begin_run(run_id, &plan.export_name, &prefix, &started_at)
+-        .begin_run_under_lease(
+-            run_id,
+-            &plan.export_name,
+-            &plan.source.state_key(),
+-            &prefix,
+-            &started_at,
+-        )
 -        .map_err(|e| state_not_writable(&plan.export_name, &e))?;
-+    if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
++    if let Err(e) = state.begin_run_under_lease(
++        run_id,
++        &plan.export_name,
++        &plan.source.state_key(),
++        &prefix,
++        &started_at,
++    ) {
 +        log::warn!("{:#}", state_not_writable(&plan.export_name, &e));
 +    }
      super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);
      Ok(())
  }
+diff --git a/src/state/load_lease.rs b/src/state/load_lease.rs
+index d15931b6..4e76b97c 100644
+--- a/src/state/load_lease.rs
++++ b/src/state/load_lease.rs
+@@ -363,7 +363,7 @@ fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
+ /// descriptor holds a lock that excludes it.
+ fn flocked(path: &std::path::Path, how: libc::c_int) -> Result<Option<std::fs::File>> {
+     use std::os::unix::io::AsRawFd;
+-    let file = std::fs::File::create(path)?;
++    let file = std::fs::File::create(path).or_else(|_| std::fs::File::open(path))?;
+     if unsafe { libc::flock(file.as_raw_fd(), how | libc::LOCK_NB) } == 0 {
+         return Ok(Some(file));
+     }

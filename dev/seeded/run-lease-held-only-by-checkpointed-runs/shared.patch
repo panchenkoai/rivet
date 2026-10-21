@@ -1,17 +1,17 @@
 diff --git a/src/pipeline/chunked/mod.rs b/src/pipeline/chunked/mod.rs
-index 469571d1..a7253f52 100644
+index 180d8f7c..44557139 100644
 --- a/src/pipeline/chunked/mod.rs
 +++ b/src/pipeline/chunked/mod.rs
-@@ -417,6 +417,12 @@ pub(crate) fn claim_run<'s>(
-     plan: &ResolvedRunPlan,
+@@ -455,6 +455,12 @@ pub(crate) fn claim_run<'s>(
  ) -> Result<crate::state::LoadLease<'s>> {
      let export = &plan.export_name;
+     let source = plan.source.state_key();
 +    if !plan.strategy.is_resumable() {
-+        let own = format!("{}:{}", run_lease_key(export), std::process::id());
++        let own = format!("{}:{}", run_lease_key(export, &source), std::process::id());
 +        if let Some(lease) = state.try_load_lease(&own)? {
 +            return Ok(lease);
 +        }
 +    }
-     if let Some(lease) = try_run_lease(state, export)? {
+     if let Some(lease) = try_run_lease(state, export, &source)? {
          return Ok(lease);
      }
