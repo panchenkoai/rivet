@@ -136,8 +136,11 @@ _TS_RE = re.compile(rb"[0-9]{8}_[0-9]{6}(?:_[0-9]{3}(?:_[0-9]+_[0-9a-f]{16})?)?"
 # original instead of overwriting it. Anchored to `_chunk<N>_` so it can only
 # match this construction, never an arbitrary hex-looking path segment.
 _CHUNK_NONCE_RE = re.compile(rb"(_chunk[0-9]+)_[0-9a-f]{16}\b")
-#: The SQLite run-lease sidecar names the export's source by a hash, which depends on the stand's URL.
-_LEASE_SOURCE_RE = re.compile(rb"(\.lease-chunk-run-[^/]*)-[0-9a-f]{16}$")
+#: The SQLite run-lease sidecar names the export's source by a hash, which depends on the stand's URL,
+#: and ends in a hash of the whole lease key, which depends on it too.
+_LEASE_SOURCE_RE = re.compile(rb"(\.lease-chunk-run-[^/]*)-[0-9a-f]{16}-[0-9a-f]{16}$")
+#: The 0.32.1 name of the same lease (the lossy token alone), held beside it until 0.34.0.
+_LEGACY_LEASE_SOURCE_RE = re.compile(rb"(\.lease-chunk-run-[^/]*)-[0-9a-f]{16}$")
 
 
 def normalize_bytes(data: bytes) -> bytes:
@@ -160,9 +163,12 @@ def normalize_bytes(data: bytes) -> bytes:
         # UNterminated last line is still a line, and `sed` still processed it.
         lines.pop()
     out = [
-        _LEASE_SOURCE_RE.sub(
+        _LEGACY_LEASE_SOURCE_RE.sub(
             rb"\1-<SOURCE>",
-            _CHUNK_NONCE_RE.sub(rb"\1", _TS_RE.sub(b"<TS>", _RUNID_RE.sub(b"<RUNID>", ln))),
+            _LEASE_SOURCE_RE.sub(
+                rb"\1-<SOURCE>-<KEY>",
+                _CHUNK_NONCE_RE.sub(rb"\1", _TS_RE.sub(b"<TS>", _RUNID_RE.sub(b"<RUNID>", ln))),
+            ),
         )
         for ln in lines
     ]
