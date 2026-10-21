@@ -23,6 +23,8 @@ pub(crate) struct Work {
     pub rows: u64,
     /// The object a load wrote, as its loader named it; `None` keeps the table's [`Address`].
     pub wrote: Option<String>,
+    /// The change log a load appended to besides its target (a CDC baseline and its changes); `None` keeps the table's [`Address`].
+    pub buffer: Option<String>,
     pub rows_inserted: Option<u64>,
     pub rows_updated: Option<u64>,
     pub rows_deleted: Option<u64>,
@@ -52,6 +54,7 @@ impl Work {
         Work {
             rows,
             wrote: None,
+            buffer: None,
             rows_inserted: dml.map(|d| d.inserted),
             rows_updated: dml.map(|d| d.updated),
             rows_deleted: dml.filter(|_| !flagged).map(|d| d.deleted),
@@ -212,7 +215,10 @@ pub(crate) fn table_result(
         export: export.to_string(),
         table: table.to_string(),
         target: work.wrote.clone().unwrap_or_else(|| address.target.clone()),
-        buffer: address.buffer.clone().filter(|_| status != "skipped"),
+        buffer: work
+            .buffer
+            .clone()
+            .or_else(|| address.buffer.clone().filter(|_| status != "skipped")),
         status,
         skip_reason,
         rows: work.rows,

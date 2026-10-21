@@ -1,0 +1,160 @@
+diff --git a/src/load/orchestrate.rs b/src/load/orchestrate.rs
+index 9a97ccc6..a450fc36 100644
+--- a/src/load/orchestrate.rs
++++ b/src/load/orchestrate.rs
+@@ -174,10 +174,7 @@ pub fn run_loads(args: LoadArgs) -> Result<()> {
+                                     plan.table,
+                                     cdc_ok_line(&report)
+                                 ));
+-                                Ok(TableDone::Work(Work::loaded(
+-                                    report.rows_appended,
+-                                    &report.changes_table,
+-                                )))
++                                Ok(TableDone::Work(cdc_work(&report)))
+                             }
+                             None => {
+                                 say(format!("CDC LOAD SKIP [{}]: up to date", plan.table));
+@@ -1456,6 +1453,7 @@ fn load_one_cdc_base(
+             // Rows this cycle landed, per leg then the buffer; summed for the ledger.
+             let mut landed: Vec<u64> = Vec::new();
+             let mut report: Option<load::CdcLoadReport> = None;
++            let mut baseline_leg: Option<load::LoadReport> = None;
+             let (baseline, superseded) =
+                 load::before_write(load::reconcile::latest_baseline_generation(baseline))?;
+             for id in &superseded {
+@@ -1512,6 +1510,7 @@ fn load_one_cdc_base(
+                     .collect();
+                 legs.landed(&ids, r.rows_loaded);
+                 landed.push(r.rows_loaded);
++                baseline_leg = Some(r);
+             }
+             let stream = buffered;
+             let stream_uris = if stream.is_empty() {
+@@ -1559,19 +1558,28 @@ fn load_one_cdc_base(
+             if rebaseline {
+                 flag_what_the_baseline_no_longer_holds(plan, loader, pk)?;
+             }
+-            let report = report.unwrap_or_else(|| load::CdcLoadReport {
++            let mut report = report.unwrap_or_else(|| load::CdcLoadReport {
+                 rows_appended: 0,
+                 changes_table: loader.fqtn(&format!("{}__changes", plan.table)),
+                 target: loader.fqtn(&plan.table),
+                 target_kind: load::ChangelogTarget::Base,
+                 source_cleaned: false,
++                baseline: None,
+             });
++            report.baseline = baseline_leg;
+             Ok((landed.iter().sum(), report))
+         },
+         |inputs, report| eprintln!("{}", cdc_done_line(&inputs.integrity, report)),
+     )
+ }
+ 
++/// What a CDC load reports for its table (ADR-0039 D3): the rows both legs landed; the base as its
++/// target when a baseline landed there, with the change log as its buffer when the stream also
++/// appended to it; the change log alone otherwise.
++fn cdc_work(report: &load::CdcLoadReport) -> Work {
++    Work::loaded(report.rows_appended, &report.changes_table)
++}
++
+ /// Whose the append's names are once this load's own whole-table leg has landed the table.
+ fn ownership_after_leg(legs_landed: usize, before: load::Ownership) -> load::Ownership {
+     match legs_landed {
+@@ -1583,6 +1591,17 @@ fn ownership_after_leg(legs_landed: usize, before: load::Ownership) -> load::Own
+ /// The one-line `CDC LOAD OK` verdict: what landed where and what the operator
+ /// does next — never a struct dump. The report says which target it produced.
+ fn cdc_ok_line(report: &load::CdcLoadReport) -> String {
++    let leg = report.baseline.as_ref().map_or(String::new(), |b| {
++        format!(
++            "baseline: {} row(s) landed in `{}`; ",
++            b.rows_loaded, b.target_table
++        )
++    });
++    format!("{leg}{}", cdc_stream_line(report))
++}
++
++/// The stream leg's part of [`cdc_ok_line`].
++fn cdc_stream_line(report: &load::CdcLoadReport) -> String {
+     let cleaned = cleaned_suffix(report.source_cleaned);
+     match report.target_kind {
+         load::ChangelogTarget::Base if report.rows_appended == 0 => format!(
+@@ -3223,6 +3242,47 @@ mod load_ledger_tests {
+         Cycle::observed(err, &writes, state, &format!("db.{}", plan.table))
+     }
+ 
++    /// A first base-and-buffer load reports the baseline it landed: its rows, and the base as
++    /// what it wrote (the provider saw `rows: 0`, `target: <t>__changes` for a 6000-row baseline).
++    #[test]
++    fn a_first_cdc_load_reports_the_baseline_it_landed_in_the_base() {
++        let dir = tempfile::tempdir().unwrap();
++        let state = StateStore::open_in_memory().unwrap();
++        let plan = base_plan(&dir, "first_base");
++        stage_run(&dir, "r-base", "full");
++        let mut job = cdc_job(&dir, &state, &plan);
++        job.loader = Box::new(load::tests::fake_loader(1));
++        let report = load_one_cdc_base(job, &["id".to_string()], false, Some(&state))
++            .unwrap()
++            .expect("the baseline loads");
++        let work = cdc_work(&report);
++        assert_eq!(
++            (work.rows, work.wrote.as_deref(), work.buffer.as_deref()),
++            (1, Some("db.first_base"), None)
++        );
++        assert!(cdc_ok_line(&report).starts_with("baseline: 1 row(s) landed in `db.first_base`"));
++    }
++
++    /// A load whose baseline landed in the base and whose stream buffered changes reports both legs' rows.
++    #[test]
++    fn a_cdc_load_of_a_baseline_and_changes_reports_both_legs() {
++        let dir = tempfile::tempdir().unwrap();
++        let state = StateStore::open_in_memory().unwrap();
++        let plan = base_plan(&dir, "both_legs");
++        stage_run(&dir, "r-base", "full");
++        stage_run(&dir, "r-cdc", "cdc");
++        let mut job = cdc_job(&dir, &state, &plan);
++        job.loader = Box::new(load::tests::fake_loader(1));
++        let report = load_one_cdc_base(job, &["id".to_string()], false, Some(&state))
++            .unwrap()
++            .expect("both legs load");
++        let work = cdc_work(&report);
++        assert_eq!(
++            (work.rows, work.wrote.as_deref(), work.buffer.as_deref()),
++            (2, Some("db.both_legs"), Some("db.both_legs__changes"))
++        );
++    }
++
+     /// Stage a successful baseline leg that exported no rows and wrote no part.
+     fn stage_empty_baseline(dir: &tempfile::TempDir, run: &str) {
+         let mut m = super::live_only_decisions::success_manifest(run, "unused.parquet");
+@@ -5906,6 +5966,7 @@ mod live_only_decisions {
+             target: "p.d.orders".into(),
+             target_kind: load::ChangelogTarget::View,
+             source_cleaned: false,
++            baseline: None,
+         };
+         assert_eq!(
+             cdc_done_line(&inputs.integrity, &appended),
+@@ -6106,6 +6167,7 @@ mod load_message_tests {
+             target: "p.d.orders".into(),
+             target_kind: load::ChangelogTarget::View,
+             source_cleaned: true,
++            baseline: None,
+         });
+         assert_eq!(
+             delta.summary(),
+@@ -6119,6 +6181,7 @@ mod load_message_tests {
+             target: "p.d.orders".into(),
+             target_kind: load::ChangelogTarget::Base,
+             source_cleaned: false,
++            baseline: None,
+         });
+         assert_eq!(
+             buffered.summary(),
+@@ -6196,6 +6259,7 @@ mod overwritten_delta_tests {
+                 target: "p.d.t".into(),
+                 target_kind: crate::load::ChangelogTarget::View,
+                 source_cleaned: false,
++                baseline: None,
+             });
+         assert_eq!((table.rows(), log.rows()), (7, 40));
+         assert_eq!((table.wrote(), log.wrote()), ("p.d.t", "p.d.t__changes"));

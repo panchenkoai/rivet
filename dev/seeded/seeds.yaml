@@ -3314,3 +3314,24 @@ seeds:
         na: "the session SETs are MySQL's: MongoDB has no session variables"
       oracle:
         na: "the session SETs are MySQL source code; an Oracle read goes through another source and sends none of them"
+
+  - name: cdc-load-reports-the-stream-leg-only
+    class: "a CDC base-and-buffer load reports only its stream leg in `per_table[]`: a first load that landed the baseline in the base says `rows: 0`, `target: <table>__changes` and `no changes buffered`"
+    history: "2026-10-21 - found by the Airflow provider on MySQL CDC -> BigQuery base_buffer: a 6000-row baseline landed in the base and the load's document said rows 0, target the change log"
+    scope: source
+    patch: cdc-load-reports-the-stream-leg-only/shared.patch
+    engines:
+      postgres:
+        na: "engine-agnostic: the per_table entry is built from the load's own report (src/load/orchestrate.rs cdc_work), after the manifests are read; no source or engine type reaches it, so every CDC engine runs the same code; graded once by the lib cells. The live BigQuery cell a_bigquery_load_and_compact_digest_is_what_bq_reads_back asserts it where BigQuery credentials exist"
+      mysql:
+        na: "engine-agnostic: the per_table entry is built from the load's own report (src/load/orchestrate.rs cdc_work), after the manifests are read; no source or engine type reaches it, so every CDC engine runs the same code; graded once by the lib cells. The live BigQuery cell a_bigquery_load_and_compact_digest_is_what_bq_reads_back asserts it where BigQuery credentials exist"
+      mssql:
+        na: "engine-agnostic: the per_table entry is built from the load's own report (src/load/orchestrate.rs cdc_work), after the manifests are read; no source or engine type reaches it, so every CDC engine runs the same code; graded once by the lib cells. The live BigQuery cell a_bigquery_load_and_compact_digest_is_what_bq_reads_back asserts it where BigQuery credentials exist"
+      mongo:
+        na: "engine-agnostic: the per_table entry is built from the load's own report (src/load/orchestrate.rs cdc_work), after the manifests are read; no source or engine type reaches it, so every CDC engine runs the same code; graded once by the lib cells. The live BigQuery cell a_bigquery_load_and_compact_digest_is_what_bq_reads_back asserts it where BigQuery credentials exist"
+      oracle:
+        na: "engine-agnostic: the per_table entry is built from the load's own report (src/load/orchestrate.rs cdc_work), after the manifests are read; no source or engine type reaches it, so every CDC engine runs the same code; graded once by the lib cells. The live BigQuery cell a_bigquery_load_and_compact_digest_is_what_bq_reads_back asserts it where BigQuery credentials exist"
+      lib:
+        cells:
+        - lib:a_first_cdc_load_reports_the_baseline_it_landed_in_the_base
+        - lib:a_cdc_load_of_a_baseline_and_changes_reports_both_legs
