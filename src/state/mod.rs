@@ -15,7 +15,7 @@ mod load_lease;
 // needs one that outlives the call that took it. Every other holder infers the type.
 pub(crate) use cdc_snapshot_store::joins_capture;
 pub use cursor::{Accepted, Landing, ProgressClaim, ProgressKey};
-pub use load_lease::LoadLease;
+pub use load_lease::{LoadLease, lock_wait_s, set_lock_wait};
 mod load_spec_store;
 mod metrics;
 mod migrations;

@@ -201,6 +201,18 @@ impl Rig {
         self.rerender_all_materializations()
     }
 
+    /// Replace the first `cdc:` line starting with `prefix` over the same config path — a second
+    /// run that changes how the stream drains (`until_current`, `max_events`). Panics if none matches.
+    pub fn replace_cdc_line(&mut self, prefix: &str, new_line: &str) -> PathBuf {
+        let slot = self
+            .cdc_lines
+            .iter_mut()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("replace_cdc_line: no cdc line starts with {prefix:?}"));
+        *slot = new_line.to_string();
+        self.rerender_all_materializations()
+    }
+
     /// Replace the first TOP-level line starting with `prefix` (a `load:` section, say)
     /// over the same config path — for a second stage that changes what the warehouse
     /// side declares about an export already written. Panics if no line matches.

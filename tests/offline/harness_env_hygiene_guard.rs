@@ -202,6 +202,7 @@ const PRODUCT_ENV_SURFACE: &[&str] = &[
     // ratchet-pin: product-env-surface strings
     "src/bin/rivet-mcp.rs clap env DATABASE_URL",
     "src/bin/seed/main.rs env::var CONFIRM_ENV",
+    "src/cli/args.rs clap env RIVET_LOCK_WAIT",
     "src/cli/args.rs clap env RIVET_RUN_ID",
     "src/cli/params.rs env::var &var",
     "src/config/resolve.rs env::var var_name",

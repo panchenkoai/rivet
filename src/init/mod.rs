@@ -1522,7 +1522,10 @@ fn introspect_all(
             // One connection for the whole scan — a fresh client per table
             // would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
             let mut client = postgres::connect(source_url, tls)?;
-            let names = retain_filtered(postgres::list_tables(&mut client, sch)?, filter);
+            let names = retain_filtered(
+                catalog_order(postgres::list_tables(&mut client, sch)?),
+                filter,
+            );
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 if let Some(mut info) = scan_step(postgres::introspect(&mut client, sch, &n))? {
@@ -1557,7 +1560,7 @@ fn introspect_all(
             // One pooled connection for the whole scan — a fresh Pool per
             // table would mean N+1 TCP+auth(+TLS) handshakes on large schemas.
             let mut conn = mysql::connect(source_url, tls)?;
-            let names = retain_filtered(mysql::list_tables(&mut conn, &db)?, filter);
+            let names = retain_filtered(catalog_order(mysql::list_tables(&mut conn, &db)?), filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 // MySQL was the one arm WITHOUT the vanished-table tolerance: a
@@ -1578,7 +1581,7 @@ fn introspect_all(
             // One connection for the whole scan — `MssqlSource` owns its runtime
             // and block_on's each query, so reusing it avoids N+1 TLS logins.
             let mut conn = mssql::connect(source_url, tls)?;
-            let names = retain_filtered(mssql::list_tables(&mut conn, sch)?, filter);
+            let names = retain_filtered(catalog_order(mssql::list_tables(&mut conn, sch)?), filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 if let Some(mut info) = scan_step(mssql::introspect(&mut conn, sch, &n))? {
@@ -1592,7 +1595,7 @@ fn introspect_all(
         "oracle" => {
             let mut conn = oracle::connect(source_url, tls)?;
             let owner = oracle::resolve_schema(&mut conn, schema)?;
-            let mut names = oracle::list_tables(&mut conn, &owner)?;
+            let mut names = catalog_order(oracle::list_tables(&mut conn, &owner)?);
             names.retain(|n| filter.matches_folded(n));
             let mut out = Vec::with_capacity(names.len());
             for n in names {
@@ -1605,7 +1608,7 @@ fn introspect_all(
         "mongo" => {
             reject_mongo_schema(schema)?;
             let conn = mongo::connect(source_url, tls)?;
-            let names = retain_filtered(mongo::list_tables(&conn)?, filter);
+            let names = retain_filtered(catalog_order(mongo::list_tables(&conn)?), filter);
             let mut out = Vec::with_capacity(names.len());
             for n in names {
                 out.push(mongo::introspect(&conn, &n)?);
@@ -1614,6 +1617,14 @@ fn introspect_all(
         }
         _ => unreachable!(),
     }
+}
+
+/// The tables a catalog listed, in rivet's own order (byte order of the name): a catalog's order
+/// is its collation's (SQL Server's is case-insensitive) or none at all (MongoDB's
+/// `listCollections`), and the scaffold must not differ between two inits of one database.
+fn catalog_order(mut names: Vec<String>) -> Vec<String> {
+    names.sort_unstable();
+    names
 }
 
 /// Keep only the discovered table names the `--include` / `--exclude` globs
@@ -3254,6 +3265,20 @@ mod tests {
             msg.contains("--gcs-bucket") && msg.contains("--s3-bucket"),
             "expected conflict diagnostic, got: {msg}"
         );
+    }
+
+    /// Two listings of one catalog in different orders scaffold one order.
+    #[test]
+    fn a_catalog_listing_is_ordered_by_rivet_whatever_order_it_came_in() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let want = names(&["Orders", "audit", "orders", "users"]);
+        for listed in [
+            names(&["users", "orders", "audit", "Orders"]),
+            names(&["audit", "Orders", "users", "orders"]),
+            names(&["orders", "users", "Orders", "audit"]),
+        ] {
+            assert_eq!(catalog_order(listed), want);
+        }
     }
 
     #[test]
