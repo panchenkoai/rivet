@@ -382,3 +382,147 @@ fn a_slot_another_config_advanced_is_refused_instead_of_losing_its_changes() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A PostgreSQL stream the released previous version (`RIVET_PREV_RELEASE_BIN`) left with its
+/// slot past its checkpoint: a change-free transaction on another table between its runs made it
+/// release the empty span by advancing the slot before saving the checkpoint (fixed in #649).
+/// This binary's first run takes the slot's position once (a warning names both), delivers, and
+/// writes the checkpoint in its own form; a later advance by a real foreign reader is refused
+/// RIVET_SOURCE_CDC_LOG_GAP on every run (main: refused on the first upgraded run already).
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc + RIVET_PREV_RELEASE_BIN"]
+fn an_upgraded_stream_whose_old_release_advanced_its_slot_past_the_checkpoint_continues() {
+    let tbl = unique_name("rivet_pg_upgrade");
+    let other = unique_name("rivet_pg_upgrade_other");
+    let slot = unique_name("rivet_upgrade_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT); \
+         CREATE TABLE {other} (id BIGINT PRIMARY KEY)"
+    ))
+    .expect("tables");
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let _o = PgTable::adopt_on(POSTGRES_CDC_URL, other.clone());
+    let ckpts = tempfile::tempdir().unwrap();
+    let ckpt = ckpts.path().join("cdc.ckpt");
+    let rig = Rig::pg_cdc(&tbl, &slot).checkpoint_path(ckpt.clone());
+    let Some(old) = rig.as_previous_release() else {
+        return;
+    };
+    old.run_ok();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 1)"))
+        .unwrap();
+    old.run_ok();
+    // A captured change followed by a transaction the stream does not capture: the run that
+    // yields the change acks it, and the next one releases the trailing empty span by advancing
+    // the slot without saving the checkpoint (measured on the released 0.32.1).
+    c.batch_execute(&format!(
+        "INSERT INTO {tbl} VALUES (10, 10); INSERT INTO {other} VALUES (1)"
+    ))
+    .unwrap();
+    old.run_ok();
+    old.run_ok();
+    let lsn = |c: &mut postgres::Client| -> (String, String) {
+        let slot_at: String = c
+            .query_one(
+                "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .unwrap()
+            .get(0);
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+        (slot_at, saved["lsn"].as_str().unwrap().to_string())
+    };
+    let (slot_at, saved) = lsn(&mut c);
+    assert_ne!(
+        slot_at, saved,
+        "fixture: the old release left its slot past its checkpoint"
+    );
+
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 2)"))
+        .unwrap();
+    let out = rig.run_args(&[]);
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        out.status.success(),
+        "the first upgraded run continues:\n{said}"
+    );
+    assert!(
+        said.contains(&format!("is confirmed at {slot_at}, past {saved}")),
+        "one warning names both positions:\n{said}"
+    );
+    let rewritten: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    assert_eq!(rewritten["confirmed_first"], true, "{rewritten}");
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (3, 3)"))
+        .unwrap();
+    rig.run_ok();
+
+    // A real foreign reader now: refused, on every run.
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (4, 4)"))
+        .unwrap();
+    c.execute(
+        "SELECT pg_replication_slot_advance($1, pg_current_wal_lsn())",
+        &[&slot],
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let out = rig.run_args(&[]);
+        assert_refused(&out, Refused::by_code("RIVET_SOURCE_CDC_LOG_GAP", 5));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("another reader consumed"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The way back: a checkpoint this binary wrote (marked `confirmed_first`) is read by the
+/// released previous version (`RIVET_PREV_RELEASE_BIN`), which continues the stream from it into the
+/// same destination: the rig oracle grades that destination against the source.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc + RIVET_PREV_RELEASE_BIN"]
+fn the_previous_release_reads_a_checkpoint_this_one_wrote() {
+    let tbl = unique_name("rivet_pg_wayback");
+    let slot = unique_name("rivet_wayback_slot");
+    let _slot = Slot::new(slot.clone());
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("pg");
+    c.batch_execute(&format!(
+        "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v BIGINT)"
+    ))
+    .expect("table");
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, tbl.clone());
+    let ckpts = tempfile::tempdir().unwrap();
+    let ckpt = ckpts.path().join("cdc.ckpt");
+    let out = tempfile::tempdir().unwrap();
+    let rig = Rig::pg_cdc(&tbl, &slot)
+        .checkpoint_path(ckpt.clone())
+        .dest_path(out.path().join("new"));
+    rig.run_ok();
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (1, 1)"))
+        .unwrap();
+    rig.run_ok();
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ckpt).unwrap()).unwrap();
+    assert_eq!(written["confirmed_first"], true, "{written}");
+    // The previous release on a state of its own (it cannot open this one's newer schema).
+    let back = tempfile::tempdir().unwrap();
+    let Some(old) = Rig::pg_cdc(&tbl, &slot)
+        .checkpoint_path(ckpt.clone())
+        .config_dir(back.path().to_path_buf())
+        .dest_path(out.path().join("new"))
+        .as_previous_release()
+    else {
+        return;
+    };
+    c.batch_execute(&format!("INSERT INTO {tbl} VALUES (2, 2)"))
+        .unwrap();
+    let ran = old.run_args(&[]);
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}
