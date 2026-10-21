@@ -1270,13 +1270,32 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
 }
 
-/// The 0.30.0 release whose v31 state `rivet state copy` must carry (RIVET_STATE_COPY_FROM_BIN).
+/// The older release whose state `rivet state copy` carries: 0.30.0 (`RIVET_STATE_COPY_FROM_BIN`,
+/// state v31, what a client moves from; the gate sets it), else the pinned older-schema release
+/// (`RIVET_MIGRATION_CARRIER_BIN`). The cell says which one it ran, so a green on the carrier is
+/// not read as the 0.30.0 proof.
 fn release_0_30() -> Option<String> {
-    let bin = std::env::var("RIVET_STATE_COPY_FROM_BIN").ok();
-    if bin.is_none() {
-        skip_live("RIVET_STATE_COPY_FROM_BIN unset: no 0.30.0 binary to write a v31 state");
+    let bin = ["RIVET_STATE_COPY_FROM_BIN", "RIVET_MIGRATION_CARRIER_BIN"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().map(|bin| (*var, bin)));
+    match bin {
+        Some((var, bin)) => {
+            let version = std::process::Command::new(&bin)
+                .arg("--version")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            eprintln!("state copy from {version} ({var})");
+            Some(bin)
+        }
+        None => {
+            skip_live(
+                "RIVET_STATE_COPY_FROM_BIN and RIVET_MIGRATION_CARRIER_BIN unset: no older release \
+                 to write the state to copy",
+            );
+            None
+        }
     }
-    bin
 }
 
 /// `bin` (another release) with `args`, asserting it exited 0; what it said.
@@ -1340,9 +1359,11 @@ fn a_0_30_cdc_state_copied_to_postgres_continues_its_stream_and_owns_its_tables(
         &[],
     );
     // 0.30.0's scaffold captures changes only; the stream takes its baseline by `initial: snapshot`.
-    let generated = std::fs::read_to_string(cfg)
-        .expect("generated config")
-        .replacen("    cdc:\n", "    cdc:\n      initial: snapshot\n", 1);
+    let generated = std::fs::read_to_string(cfg).expect("generated config");
+    let generated = match generated.contains("initial:") {
+        true => generated,
+        false => generated.replacen("    cdc:\n", "    cdc:\n      initial: snapshot\n", 1),
+    };
     std::fs::write(cfg, &generated).expect("the config with its baseline");
     let export = scaffolded_export(&generated);
     let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));

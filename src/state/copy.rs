@@ -461,6 +461,39 @@ mod tests {
             );
             assert_eq!(crate::error::classify_exit(&err), 1);
         }
+        let unset = at(None, Some("sqlite:app.db")).unwrap_err();
+        assert!(
+            format!("{unset:#}").contains("needs the PostgreSQL state to copy into"),
+            "a SQLite RIVET_STATE_URL is no target, said as such: {unset:#}"
+        );
+    }
+
+    /// `RIVET_STATE_URL` is read from the process environment (checked in a child of this test).
+    #[test]
+    fn the_state_url_is_read_from_the_environment() {
+        const CHILD: &str = "RIVET_TEST_STATE_URL_VAR_CHILD";
+        if std::env::var(CHILD).is_ok() {
+            assert_eq!(
+                super::super::state_url_var().as_deref(),
+                Some("postgresql://u@h/db")
+            );
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "state::copy::tests::the_state_url_is_read_from_the_environment",
+            ])
+            .env(CHILD, "1")
+            .env("RIVET_STATE_URL", "postgresql://u@h/db")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A file with no cursor and no run is not a state to copy, refused before any connection.
