@@ -631,7 +631,11 @@ pub(super) fn take_table_lease<'a>(
     state: Option<&'a StateStore>,
     target_fqtn: &str,
 ) -> Result<Option<crate::state::LoadLease<'a>>> {
-    match state.map(|s| s.try_load_lease(target_fqtn)).transpose()? {
+    let what = || format!("the table lease of `{target_fqtn}`");
+    match state
+        .map(|s| s.take_lease_waiting(target_fqtn, &what))
+        .transpose()?
+    {
         Some(None) => crate::rivet_bail!(
             crate::error::codes::LOAD_TABLE_BUSY,
             "{}",
