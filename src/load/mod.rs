@@ -78,6 +78,8 @@ pub struct CdcLoadReport {
     /// [`LoadReport::source_cleaned`] so the report + logs reflect it for CDC/
     /// incremental too, instead of discarding it.
     pub source_cleaned: bool,
+    /// The baseline leg this load landed in the base (base-and-buffer layout), before the buffer append.
+    pub baseline: Option<LoadReport>,
 }
 
 /// What `CdcLoadReport::target` is: the dedup view of the changelog + view layout,
@@ -797,6 +799,7 @@ fn append_and_view(
         target: loader.fqtn(table),
         target_kind: ChangelogTarget::View,
         source_cleaned,
+        baseline: None,
     })
 }
 
@@ -1024,6 +1027,7 @@ pub fn run_load_buffer(
         target: loader.fqtn(table),
         target_kind: ChangelogTarget::Base,
         source_cleaned,
+        baseline: None,
     })
 }
 
