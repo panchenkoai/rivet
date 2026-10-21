@@ -1475,6 +1475,195 @@ fn two_init_configs_in_one_dir_each_deliver_every_row_oracle() {
     two_init_configs_in_one_dir_each_deliver_every_row(two_configs_oracle());
 }
 
+/// The older release whose state `rivet state copy` carries: 0.30.0 (`RIVET_STATE_COPY_FROM_BIN`,
+/// state v31, what a client moves from; the gate sets it), else the pinned older-schema release
+/// (`RIVET_MIGRATION_CARRIER_BIN`). The cell says which one it ran, so a green on the carrier is
+/// not read as the 0.30.0 proof.
+fn release_0_30() -> Option<String> {
+    let bin = ["RIVET_STATE_COPY_FROM_BIN", "RIVET_MIGRATION_CARRIER_BIN"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().map(|bin| (*var, bin)));
+    match bin {
+        Some((var, bin)) => {
+            let version = std::process::Command::new(&bin)
+                .arg("--version")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            eprintln!("state copy from {version} ({var})");
+            Some(bin)
+        }
+        None => {
+            skip_live(
+                "RIVET_STATE_COPY_FROM_BIN and RIVET_MIGRATION_CARRIER_BIN unset: no older release \
+                 to write the state to copy",
+            );
+            None
+        }
+    }
+}
+
+/// `bin` (another release) with `args`, asserting it exited 0; what it said.
+fn release_ok(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> String {
+    let out = run_rivet_as(bin, args, envs);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{bin} {:?} failed:\n{said}", args[0]);
+    said
+}
+
+/// A MySQL CDC stream into BigQuery that 0.30.0 ran (a v31 state with cursors, a load journal
+/// with compact rows, a `cdc.checkpoint` file beside the config) is copied by `rivet state
+/// copy` into an empty PostgreSQL state. Through that state the next two cycles continue the
+/// stream from its checkpoint (the buffer holds exactly the four new changes, no re-snapshot),
+/// `rivet load` takes the tables 0.30.0 wrote as its own, and the base equals the source; the
+/// SQLite file is left byte for byte as it was. A second copy into the now-filled state is refused.
+#[test]
+#[ignore = "live: requires mysql-cdc + BigQuery creds + postgres-state + RIVET_STATE_COPY_FROM_BIN"]
+fn a_0_30_cdc_state_copied_to_postgres_continues_its_stream_and_owns_its_tables() {
+    use mysql::prelude::Queryable as _;
+    let Some(old) = release_0_30() else { return };
+    let Some(bq) = BqLive::from_env("state_copy_my") else {
+        return;
+    };
+    let table = unique_name("state_copy_my");
+    let pool = mysql::Pool::new(MYSQL_CDC_URL).expect("mysql-cdc");
+    let exec = |sql: &str| pool.get_conn().unwrap().query_drop(sql).unwrap();
+    exec(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL)"
+    ));
+    let _t = MysqlCdcTable(table.clone());
+    for op in seed_ops() {
+        exec(&op_sql(&table, op));
+    }
+    let dir = tempfile::tempdir().expect("config dir");
+    let cfg_path = dir.path().join("rivet.yaml");
+    let cfg = cfg_path.to_str().unwrap();
+    release_ok(
+        &old,
+        &[
+            "init",
+            "--source",
+            MYSQL_CDC_URL,
+            "--table",
+            &table,
+            "--mode",
+            "cdc",
+            "--bigquery-project",
+            &bq.project,
+            "--bigquery-dataset",
+            &bq.dataset,
+            "--gcs-bucket",
+            &bq.bucket,
+            "--output",
+            cfg,
+        ],
+        &[],
+    );
+    // 0.30.0's scaffold captures changes only; the stream takes its baseline by `initial: snapshot`.
+    let generated = std::fs::read_to_string(cfg).expect("generated config");
+    let generated = match generated.contains("initial:") {
+        true => generated,
+        false => generated.replacen("    cdc:\n", "    cdc:\n      initial: snapshot\n", 1),
+    };
+    std::fs::write(cfg, &generated).expect("the config with its baseline");
+    let export = scaffolded_export(&generated);
+    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let base = export.trim_end_matches("_cdc").to_string();
+    let changes = format!("{base}__changes");
+    let _bq_guard = bq.cleanup(&[&base, &changes]);
+    let db = [("DATABASE_URL", MYSQL_CDC_URL)];
+
+    // 0.30.0's life: baseline, a cycle of changes, a compaction.
+    for step in ["run", "load"] {
+        release_ok(&old, &[step, "-c", cfg], &db);
+    }
+    for op in change_ops() {
+        exec(&op_sql(&table, op));
+    }
+    for step in ["run", "load", "compact"] {
+        release_ok(&old, &[step, "-c", cfg], &db);
+    }
+    let sqlite = dir.path().join(".rivet_state.db");
+    let checkpoint = generated
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("checkpoint:"))
+        .map(|c| {
+            dir.path()
+                .join(c.split('#').next().unwrap_or(c).trim().trim_matches('"'))
+        })
+        .expect("init writes a checkpoint for a MySQL stream");
+    assert!(
+        checkpoint.exists(),
+        "0.30.0 left its checkpoint at {}",
+        checkpoint.display()
+    );
+    let sqlite_before = std::fs::read(&sqlite).expect("the v31 state");
+
+    // The copy, and the refusal of a second one into the state it filled.
+    let target = ScratchStateSchema::new("rivet_state_copy");
+    let url = target.url();
+    let said = rivet_ok(&["state", "copy", "-c", cfg, "--to", &url], &[]);
+    assert!(
+        said.contains(&format!(
+            "/cdc/{}",
+            checkpoint.file_name().unwrap().to_string_lossy()
+        )),
+        "the copy names where the checkpoint stays:\n{said}"
+    );
+    let again = run_rivet_env(&["state", "copy", "-c", cfg, "--to", &url], &[]);
+    let refused = String::from_utf8_lossy(&again.stderr);
+    assert_eq!(again.status.code(), Some(5), "{refused}");
+    assert!(
+        refused.contains("[RIVET_STATE_COPY_TARGET_NOT_EMPTY]"),
+        "{refused}"
+    );
+    assert_eq!(
+        std::fs::read(&sqlite).expect("the v31 state"),
+        sqlite_before,
+        "the SQLite state is only read"
+    );
+
+    // Two cycles through the PostgreSQL state.
+    let pg = [
+        ("DATABASE_URL", MYSQL_CDC_URL),
+        ("RIVET_STATE_URL", url.as_str()),
+    ];
+    exec(&format!(
+        "INSERT INTO {table} (id, name) VALUES (14, 'r14'), (15, 'r15')"
+    ));
+    exec(&format!("UPDATE {table} SET name = 'again' WHERE id = 1"));
+    exec(&format!("DELETE FROM {table} WHERE id = 4"));
+    rivet_ok(&["run", "-c", cfg], &pg);
+    let loaded = rivet_ok(&["load", "-c", cfg], &pg);
+    assert!(!loaded.contains("RIVET_LOAD_TARGET_NOT_RIVETS"), "{loaded}");
+    assert_eq!(
+        bq.read_bq_count(&changes),
+        "4",
+        "the stream continued from its checkpoint: the four new changes, no re-snapshot"
+    );
+    rivet_ok(&["compact", "-c", cfg], &pg);
+    for cycle in ["after the copy", "next cycle"] {
+        let rows = bq.read_bq_rows(&format!(
+            "SELECT COUNTIF(NOT __is_deleted) AS live, COUNTIF(id = 1 AND name = 'again') AS updated, \
+             COUNTIF(id IN (3, 4) AND __is_deleted) AS gone FROM `{}.{}.{base}`",
+            bq.project, bq.dataset
+        ));
+        let got = |k: &str| rows[0][k].as_str().map(str::to_string);
+        assert_eq!(
+            (got("live"), got("updated"), got("gone")),
+            (Some("13".into()), Some("1".into()), Some("2".into())),
+            "{cycle}: the base equals the source: {rows:?}"
+        );
+        rivet_ok(&["run", "-c", cfg], &pg);
+        rivet_ok(&["load", "-c", cfg], &pg);
+        rivet_ok(&["compact", "-c", cfg], &pg);
+    }
+}
+
 /// The `server_id:` a MySQL CDC scaffold names.
 fn scaffolded_server_id(generated: &str) -> String {
     generated
@@ -1541,4 +1730,63 @@ fn two_cdc_configs_of_one_cluster_name_their_own_stream_objects() {
         scaffolded_server_id(&prod),
         "two configs of one server get two replica ids"
     );
+}
+
+/// A copy into a PostgreSQL state that already holds state rows (the same SQLite state copied a
+/// second time) is refused by code, on every attempt, before a row is written; a schema of its
+/// own, the refusal's remedy, takes the copy.
+#[test]
+#[ignore = "live: requires postgres + postgres-state"]
+fn a_state_copy_into_a_state_with_rows_is_refused_and_walked_out() {
+    let tbl = unique_name("rivet_copy_src");
+    pg_connect()
+        .batch_execute(&format!(
+            "CREATE TABLE {tbl} (id BIGINT PRIMARY KEY, v TEXT); \
+             INSERT INTO {tbl} SELECT g, 'v' || g FROM generate_series(1, 20) g"
+        ))
+        .unwrap();
+    let _t = PgTable::adopt(tbl.clone());
+    let mut rig = Rig::pg_batch(&tbl);
+    rig.run_ok();
+    let filled = ScratchStateSchema::new("rivet_copy_filled");
+    let fresh = ScratchStateSchema::new("rivet_copy_fresh");
+    let (filled_url, fresh_url) = (filled.url(), fresh.url());
+    let first = rig.cli(&["state", "copy", "--to", &filled_url]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let want = Refused::by_code("RIVET_STATE_COPY_TARGET_NOT_EMPTY", 5);
+    rig.refuses_twice_and_walks_out(
+        &["state", "copy", "--to", &filled_url],
+        &[],
+        want,
+        vec![
+            Remedy::wrong(
+                "copies again into the same state",
+                Then::Refuses(want),
+                |_| {},
+            ),
+            Remedy::new(
+                "Copy into a database (or schema) of its own",
+                Then::DeliversTheSource,
+                |_| {},
+            )
+            .rerun_as(&["state", "copy", "--to", &fresh_url]),
+        ],
+    );
+    let runs = |state: &ScratchStateSchema| -> i64 {
+        state
+            .client()
+            .query_one("SELECT COUNT(*) FROM run_status", &[])
+            .unwrap()
+            .get(0)
+    };
+    assert_eq!(
+        runs(&fresh),
+        runs(&filled),
+        "the remedy copied the same state"
+    );
+    assert!(runs(&fresh) > 0, "the copied state holds the run");
 }
