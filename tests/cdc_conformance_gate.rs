@@ -450,6 +450,8 @@ fn derived_capture_marker_set_is_pinned() {
         "run_rivet(",
         "run_rivet_args_bounded(",
         "run_rivet_args_bounded_env(",
+        // `run_rivet_as` — another release's binary, graded like this tree's runs.
+        "run_rivet_as(",
         "run_rivet_bounded(",
         "run_rivet_env(",
         "run_rivet_export(",
