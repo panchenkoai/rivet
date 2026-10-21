@@ -294,7 +294,12 @@ def without_table(text: str, table: str) -> str:
     import yaml
 
     cfg = yaml.safe_load(text)
-    cfg["exports"] = [x for x in cfg["exports"] if table not in (x.get("name"), x.get("table"))]
+    def reads(x: dict) -> bool:
+        # 0.32.1's init names a per-table CDC export `<table>_cdc` and its `table:` may be schema-qualified.
+        leaf = str(x.get("table") or "").rsplit(".", 1)[-1]
+        return table in (x.get("name"), x.get("table"), f"{table}_cdc") or leaf == table
+
+    cfg["exports"] = [x for x in cfg["exports"] if not reads(x)]
     for x in cfg["exports"]:
         if isinstance(x.get("tables"), list):
             x["tables"] = [t for t in x["tables"] if t != table]
@@ -640,7 +645,8 @@ def _touched(c: int) -> list[int]:
 
 def _of(parts: list[str], table: str, snapshot: bool | None = None) -> list[str]:
     """The parts of `table` (its snapshot leg only, its stream only, or both)."""
-    mine = re.compile(rf"/(?:[^/]*[._])?{re.escape(table.lower())}/")
+    # A table's own directory, or the sibling `<table>_cdc/` that 0.32.1's init gives a per-table CDC export.
+    mine = re.compile(rf"/(?:[^/]*[._])?{re.escape(table.lower())}(?:_cdc)?/")
     return [p for p in parts if mine.search(p.lower()) and (snapshot is None or ("/snapshot/" in p) == snapshot)]
 
 
