@@ -609,7 +609,185 @@ fn mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code() {
         "a refusal, not a clean end:\n{said}"
     );
     assert!(
-        said.contains("[RIVET_SOURCE_CDC_SCHEMA_CHANGED]") && said.contains(&table),
-        "the stop names its code and the table:\n{said}"
+        said.contains("[RIVET_SOURCE_CDC_SCHEMA_CHANGED]")
+            && said.contains(&table)
+            && said.contains("sp_cdc_enable_table"),
+        "the stop names its code, the table and the remedy:\n{said}"
+    );
+    // The remedy as printed: a capture instance that covers `c`, pointed at, then a re-baseline.
+    let ci2 = format!("{}_c", scn.table);
+    enable_cdc(&table, &ci2);
+    let _second = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci2.clone(),
+    };
+    scn.rig
+        .replace_cdc_line("capture_instance", &format!("capture_instance: {ci2}"));
+    scn.rig
+        .replace_cdc_line("until_current", "until_current: true");
+    scn.rig
+        .replace_cdc_line("max_events", "max_events: 1000000");
+    follow_rebaseline_remedy(&mut scn.rig, false);
+    let c: Vec<String> = read_all_parts(&scn.rig.out_dir().join("snapshot"))
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column_by_name("c")
+                .expect("the re-baseline carries `c`")
+                .clone();
+            (0..b.num_rows())
+                .filter(|i| !col.is_null(*i))
+                .map(|i| arrow::util::display::array_value_to_string(&col, i).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut c = c;
+    c.sort();
+    assert_eq!(
+        c,
+        ["five", "four"],
+        "the remedy delivers every value of `c`"
+    );
+}
+
+/// DROP `b` and ADD `c` in one statement while the run is open: the image keeps the schema's
+/// arity under a new name, which `image_cell` alone would read as a rename of `b`. The catalog,
+/// read again, says `c` is new: its values land under `c`, never under `b`.
+fn equal_arity_drop_and_add(mut scn: CdcScenario, exec: &dyn Fn(&str)) {
+    let table = scn.table.clone();
+    let (out, said) = run_while_a_column_is_added(
+        &mut scn,
+        exec,
+        &format!("ALTER TABLE {table} DROP COLUMN b, ADD COLUMN c VARCHAR(16)"),
+    );
+    assert!(out.status.success(), "the open run ends clean:\n{said}");
+    let mut under_b = Vec::new();
+    let mut under_c = Vec::new();
+    for batch in read_all_parts(&scn.rig.out_dir()) {
+        for (name, into) in [("b", &mut under_b), ("c", &mut under_c)] {
+            if let Some(col) = batch.column_by_name(name) {
+                for i in (0..batch.num_rows()).filter(|i| !col.is_null(*i)) {
+                    into.push(arrow::util::display::array_value_to_string(col, i).unwrap());
+                }
+            }
+        }
+    }
+    under_c.sort();
+    assert_eq!(
+        under_c,
+        ["five", "four"],
+        "c's values land under c:\n{said}"
+    );
+    assert!(
+        under_b.is_empty(),
+        "nothing lands under the dropped b: {under_b:?}"
+    );
+}
+
+fn equal_arity_shape(r: Rig) -> Rig {
+    r.cdc("rollover: 1").cdc("max_events: 1000000")
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql-cdc (binlog_row_metadata=FULL)"]
+fn mysql_cdc_a_drop_and_add_at_one_arity_while_a_run_is_open_lands_under_the_new_name() {
+    let scn = CdcScenario::mysql_with(
+        "hot_swap_my",
+        "id BIGINT PRIMARY KEY, v INT, b VARCHAR(16)",
+        |r, _| equal_arity_shape(r),
+    );
+    let exec = |q: &str| {
+        mysql::Pool::new(MYSQL_CDC_URL)
+            .and_then(|p| p.get_conn())
+            .expect("connect mysql-cdc")
+            .query_drop(q)
+            .expect(q)
+    };
+    equal_arity_drop_and_add(scn, &exec);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres-cdc (wal_level=logical)"]
+fn pg_cdc_a_drop_and_add_at_one_arity_while_a_run_is_open_lands_under_the_new_name() {
+    let scn = CdcScenario::pg_with(
+        "hot_swap_pg",
+        "id BIGINT PRIMARY KEY, v INT, b VARCHAR(16)",
+        |r, _| equal_arity_shape(r),
+    );
+    let exec = |q: &str| {
+        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls)
+            .expect("connect postgres-cdc")
+            .batch_execute(q)
+            .expect(q)
+    };
+    equal_arity_drop_and_add(scn, &exec);
+}
+
+/// MongoDB's form of a hot ADD COLUMN: documents written while the run is open carry a field
+/// the earlier ones lack. The change lands the whole document in `document`, so the field is in
+/// it, not dropped.
+#[test]
+#[ignore = "live: requires docker compose mongo replica set"]
+fn mongo_cdc_a_field_added_while_a_run_is_open_is_in_the_document() {
+    require_alive(LiveService::Mongo);
+    let db = unique_name("hot_field");
+    let m = MongoTest::connect(27018, &db);
+    let _guard = MongoDbGuard {
+        port: 27018,
+        db: db.clone(),
+    };
+    m.drop_collection("t");
+    let mut rig = Rig::mongo_cdc("t")
+        .source_url(&MongoTest::url(27018, &db))
+        .cdc("rollover: 1")
+        .cdc("max_events: 1000000");
+    m.insert_many("t", vec![mongodb::bson::doc! { "_id": 1, "v": 1 }]);
+    rig.run_ok();
+    m.insert_many("t", vec![mongodb::bson::doc! { "_id": 2, "v": 2 }]);
+    rig.replace_cdc_line("until_current", "until_current: false");
+    rig.replace_cdc_line("max_events", "max_events: 2");
+    let marker = rig.out_dir().join("..").join("hot-field.paused");
+    let marker_env = marker.display().to_string();
+    let child = rig.spawn_args_env(
+        &[],
+        &[
+            ("RIVET_TEST_PAUSE_AT", HOT_PAUSE),
+            ("RIVET_TEST_PAUSE_MARKER", &marker_env),
+        ],
+    );
+    let opened = std::time::Instant::now();
+    while !marker.is_file() {
+        assert!(
+            opened.elapsed() < std::time::Duration::from_secs(120),
+            "the open run never parked after its first part"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    m.insert_many(
+        "t",
+        vec![mongodb::bson::doc! { "_id": 3, "v": 3, "c": "three" }],
+    );
+    let out = child.wait_with_output().expect("reap the open run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let docs: Vec<String> = read_all_parts(&rig.out_dir())
+        .iter()
+        .flat_map(|b| {
+            let d = b
+                .column_by_name("document")
+                .expect("the document column")
+                .clone();
+            (0..b.num_rows())
+                .map(|i| arrow::util::display::array_value_to_string(&d, i).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        docs.iter()
+            .any(|d| d.contains("\"c\"") && d.contains("three")),
+        "the new field is in the document: {docs:?}"
     );
 }

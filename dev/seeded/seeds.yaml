@@ -24,15 +24,15 @@ seeds:
     patch: cdc-hot-added-column-dropped/shared.patch
     engines:
       postgres:
-        cells: [pg_cdc_a_column_added_while_a_run_is_open_lands_every_value, "lib:a_column_added_while_the_run_is_open_continues_in_a_new_part_with_its_values"]
+        cells: [pg_cdc_a_column_added_while_a_run_is_open_lands_every_value, pg_cdc_a_drop_and_add_at_one_arity_while_a_run_is_open_lands_under_the_new_name, "lib:a_column_added_while_the_run_is_open_continues_in_a_new_part_with_its_values"]
       mysql:
-        cells: [mysql_cdc_a_column_added_while_a_run_is_open_lands_every_value, a_column_added_while_a_mysql_cdc_run_is_open_loads_into_clickhouse_with_every_value]
+        cells: [mysql_cdc_a_column_added_while_a_run_is_open_lands_every_value, a_column_added_while_a_mysql_cdc_run_is_open_loads_into_clickhouse_with_every_value, mysql_cdc_a_drop_and_add_at_one_arity_while_a_run_is_open_lands_under_the_new_name]
       mssql:
         cells: [mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code]
       mongo:
-        na: "a MongoDB change stream lands the whole document in one `document` column; a new field is a value, not a column"
+        na: "a MongoDB change lands the whole document in its one `document` column, so a field added while the run is open is a value in it, never a column the run lacks (mongo_cdc_a_field_added_while_a_run_is_open_is_in_the_document, live_cdc_schema_drift.rs)"
       oracle:
-        na: "Oracle CDC is a bounded drain to the SCN current at open and refuses `until_current: false`; the run resolves its schema after that bound, so no change it reads predates it"
+        na: "Oracle CDC only drains to the SCN current at open (`until_current: false` is refused) and resolves its schema after it, so a run never reads a change written after its schema; an ADD COLUMN inside the window is refused before any write as RIVET_SOURCE_CDC_UNDECODABLE (oracle_cdc_a_change_older_than_an_alter_is_refused_by_code), and one between runs is delivered with its values (oracle_cdc_picks_up_a_column_added_between_runs)"
 
   - name: incremental-plan-replay-answered
     class: "`rivet apply` treats an incremental plan (`mode: incremental`, `keyset_incremental`) as a point-in-time snapshot: a replay after its first exit-0 apply answers \"already applied\", so every row that arrived since is never delivered with exit 0, and the plan is refused past 24 h"

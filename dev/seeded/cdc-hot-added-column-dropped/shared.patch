@@ -1,17 +1,169 @@
 diff --git a/src/pipeline/cdc/sink.rs b/src/pipeline/cdc/sink.rs
-index 238e61a6..a1dd75e5 100644
+index 238e61a6..ecc111bd 100644
 --- a/src/pipeline/cdc/sink.rs
 +++ b/src/pipeline/cdc/sink.rs
-@@ -561,7 +561,7 @@ pub(crate) fn run_to_files(
-                     // checkpoint stays on the last commit), and the table continues in a new part
-                     // with its columns as the source holds them now. Dropping the column's values
-                     // here was #644.
+@@ -111,24 +111,52 @@ pub(crate) struct SinkConfig<'a> {
+ /// Re-resolve one captured table's columns (and gate them by `on_schema_drift`) mid-run.
+ pub(crate) type Reschema<'a> = Box<dyn FnMut(&str) -> Result<Vec<TypeMapping>> + 'a>;
+ 
+-/// The columns `ev` names that `columns` does not have, in an image of another arity: a column
+-/// added to the table after the run resolved its schema. An image of the schema's own arity is
+-/// [`image_cell`]'s rename case and is left to it.
+-fn columns_the_schema_lacks(columns: &[TypeMapping], ev: &ChangeEvent) -> Vec<String> {
++/// The columns `ev` names that `columns` does not have and that are not in `gone` (names the
++/// table's catalog no longer has): a column added to the table after the run resolved its schema,
++/// or the old name of a renamed or dropped one, which only the catalog tells apart.
++fn columns_the_schema_lacks(
++    columns: &[TypeMapping],
++    gone: &std::collections::HashSet<String>,
++    ev: &ChangeEvent,
++) -> Vec<String> {
+     let mut lacking: Vec<String> = Vec::new();
+-    for names in ev.image_names.iter().chain(ev.before_names.iter()) {
+-        if names.len() == columns.len() {
+-            continue;
+-        }
+-        for name in names.iter() {
+-            if !columns.iter().any(|c| &c.column_name == name) && !lacking.contains(name) {
+-                lacking.push(name.clone());
+-            }
++    for name in ev
++        .image_names
++        .iter()
++        .chain(ev.before_names.iter())
++        .flat_map(|n| n.iter())
++    {
++        if !columns.iter().any(|c| &c.column_name == name)
++            && !gone.contains(name)
++            && !lacking.contains(name)
++        {
++            lacking.push(name.clone());
+         }
+     }
+     lacking
+ }
+ 
++/// What to do with the names a change carries that the run's schema lacks, given the table's
++/// columns as the catalog holds them now (`fresh`, `None` when they cannot be read again): the
++/// names the catalog has are new columns, to continue with in a new part; the rest are names the
++/// table no longer has. An image of another arity than the schema with nothing to read the catalog
++/// from cannot be placed, and is a stop.
++fn place_lacking(
++    lacking: &[String],
++    fresh: Option<&[TypeMapping]>,
++    schema_arity: usize,
++    image_arity: usize,
++) -> std::result::Result<(Vec<String>, Vec<String>), ()> {
++    match fresh {
++        Some(fresh) => Ok(lacking
++            .iter()
++            .cloned()
++            .partition(|n| fresh.iter().any(|c| &c.column_name == n))),
++        None if image_arity == schema_arity => Ok((Vec::new(), lacking.to_vec())),
++        None => Err(()),
++    }
++}
++
+ /// When to roll a part: at a transaction boundary, once the buffer reaches the row
+ /// count OR the memory budget. Pure — unit-tested without a stream or destination.
+ struct RolloverPolicy {
+@@ -163,6 +191,8 @@ struct TableSink<'a> {
+     manifested_parts: usize,
+     /// The open transaction's moved-in keys, which order a statement's key moves.
+     moved: partition_guard::MovedIn,
++    /// Names a change carried that the table's catalog no longer has (renamed or dropped).
++    gone: std::collections::HashSet<String>,
+ }
+ 
+ /// The facts one sink run shares across every table and every roll: who it is, how it writes, where it records.
+@@ -461,6 +491,7 @@ pub(crate) fn run_to_files(
+             column_sums: std::collections::BTreeMap::new(),
+             manifested_parts: 0,
+             moved: Default::default(),
++            gone: Default::default(),
+         })
+         .collect();
+ 
+@@ -556,38 +587,55 @@ pub(crate) fn run_to_files(
+                     // Confirmed routed to a captured table → surface any deferred
+                     // decode error (uncaptured tables' poison never applies).
+                     ev.raise_poison()?;
+-                    // A column the run's schema lacks was added to the table while the run is
+-                    // open: everything buffered so far is closed under the old schema (the
+-                    // checkpoint stays on the last commit), and the table continues in a new part
+-                    // with its columns as the source holds them now. Dropping the column's values
+-                    // here was #644.
 -                    let lacking = columns_the_schema_lacks(&sinks[at].out.columns, &ev);
++                    // A name the run's schema lacks is a column added while the run is open, or
++                    // the old name of a renamed or dropped one; the catalog, read again, tells
++                    // which. A new column closes everything buffered so far under the old schema
++                    // (the checkpoint stays on the last commit) and the table continues in a new
++                    // part with its columns as the source holds them now: dropping its values was
++                    // #644. An old name is left to `image_cell`, which maps a rename by position.
 +                    let lacking: Vec<String> = Vec::new();
                      if !lacking.is_empty() {
-                         roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
-                         total_rows = 0;
-@@ -663,7 +663,7 @@ pub(crate) fn run_to_files(
+-                        roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
+-                        total_rows = 0;
+-                        total_bytes.reset();
+                         let table = sinks[at].out.table.clone();
+                         let fresh = match reschema.as_mut() {
+-                            Some(re) => re(&table)?,
+-                            None => sinks[at].out.columns.clone(),
++                            Some(re) => Some(re(&table)?),
++                            None => None,
+                         };
+-                        let still = columns_the_schema_lacks(&fresh, &ev);
+-                        if !still.is_empty() {
++                        let image_arity = ev.image_names.as_ref().map_or(0, |n| n.len());
++                        let Ok((added, gone)) = place_lacking(
++                            &lacking,
++                            fresh.as_deref(),
++                            sinks[at].out.columns.len(),
++                            image_arity,
++                        ) else {
+                             crate::rivet_bail!(
+                                 crate::error::codes::SOURCE_CDC_SCHEMA_CHANGED,
+                                 "cdc: table `{table}` gained column(s) {} while the run was open, and \
+-                                 its catalog does not describe them, so their values cannot be typed",
+-                                still.join(", ")
++                                 its catalog could not be read again, so their values cannot be typed",
++                                lacking.join(", ")
++                            );
++                        };
++                        if !gone.is_empty() {
++                            log::warn!(
++                                "cdc: table `{table}`: change(s) carry column(s) {} the table no \
++                                 longer has (renamed or dropped while the run read them)",
++                                gone.join(", ")
++                            );
++                            sinks[at].gone.extend(gone);
++                        }
++                        if let (false, Some(fresh)) = (added.is_empty(), fresh) {
++                            roll_all(&mut sinks, stream, &run, &last_commit, &mut unacked_commit)?;
++                            total_rows = 0;
++                            total_bytes.reset();
++                            log::warn!(
++                                "cdc: table `{table}` gained column(s) {} while the run was open: \
++                                 its earlier changes are in a part without them, the rest continue \
++                                 in a new part with them",
++                                added.join(", ")
+                             );
++                            sinks[at].out.columns = fresh;
++                            sinks[at].schema = None;
++                            sinks[at].gone.clear();
+                         }
+-                        log::warn!(
+-                            "cdc: table `{table}` gained column(s) {} while the run was open: its \
+-                             earlier changes are in a part without them, the rest continue in a new \
+-                             part with them",
+-                            lacking.join(", ")
+-                        );
+-                        sinks[at].out.columns = fresh;
+-                        sinks[at].schema = None;
+                     }
+                     let sink = &mut sinks[at];
+                     // DECODED payload for the bytes-read metric (comparable with the batch
+@@ -663,11 +711,15 @@ pub(crate) fn run_to_files(
          // column added while the run was open: asked again here, a table it no longer covers
          // whole stops the run by code instead of ending clean over values it never read.
          let tables: Vec<String> = sinks.iter().map(|s| s.out.table.clone()).collect();
@@ -20,3 +172,24 @@ index 238e61a6..a1dd75e5 100644
              crate::rivet_bail!(
                  crate::error::codes::SOURCE_CDC_SCHEMA_CHANGED,
                  "{} cdc: {why} — a column was added to a captured table while the run was open, \
+-                 and the stream it is read from does not carry its values",
++                 and the stream it is read from does not carry its values. Create a capture \
++                 instance that covers it (EXEC sys.sp_cdc_enable_table with a new \
++                 @capture_instance), point `capture_instance:` at it, and re-baseline the table: \
++                 delete the checkpoint, move the export's files aside, delete its `cdc_snapshot` \
++                 rows, give it `cdc.initial: snapshot`, then re-run",
+                 run.engine.label()
+             );
+         }
+@@ -4258,8 +4310,9 @@ mod tests {
+         crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_SCHEMA_CHANGED", 5);
+         assert!(format!("{err:#}").contains("gained column(s) c"), "{err:#}");
+         assert_eq!(
+-            manifests[0].row_count, 1,
+-            "the change before it is kept in its own part"
++            (manifests[0].row_count, stream.acked.len()),
++            (0, 0),
++            "nothing is acknowledged past the change the run could not place"
+         );
+     }
+ 
