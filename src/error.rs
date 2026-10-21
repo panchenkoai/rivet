@@ -915,7 +915,7 @@ pub mod codes {
     /// A CDC export's checkpoint is the one another config's export still reads.
     pub const SOURCE_CDC_CHECKPOINT_SHARED: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_SHARED",
-        "give the export a `cdc.checkpoint` of its own, then re-baseline it",
+        "give the export a `cdc.checkpoint` of its own and keep the shared file, the other export's position; with `cdc.initial: snapshot` its first run re-reads every table",
     );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
@@ -1554,12 +1554,7 @@ pub mod codes {
         "RIVET_DEST_IO_RUNTIME_UNAVAILABLE",
         "raise the process's thread and open-file limits, or lower the export parallelism, then run again",
     );
-    /// `rivet init -o` met a config at the output path.
-    /// `rivet init` would name a CDC checkpoint or destination another stream already uses.
-    pub const INIT_CDC_NAME_TAKEN: Code = refusal(
-        "RIVET_INIT_CDC_NAME_TAKEN",
-        "write the config under another `-o` name, or move the other config aside",
-    );
+    /// `rivet init -o` met a config at the output path, or a CDC checkpoint or destination another config names.
     pub const INIT_CONFIG_EXISTS: Code = refusal(
         "RIVET_INIT_CONFIG_EXISTS",
         "move the existing config aside, or write elsewhere with `-o <new-path>`",
@@ -1815,7 +1810,6 @@ pub mod codes {
         DEST_CREDENTIALS_INVALID,
         DEST_PREFIX_MODE_MISMATCH,
         DEST_IO_RUNTIME_UNAVAILABLE,
-        INIT_CDC_NAME_TAKEN,
         INIT_CONFIG_EXISTS,
         INIT_TABLE_NOT_FOUND,
         INIT_NO_TABLES,

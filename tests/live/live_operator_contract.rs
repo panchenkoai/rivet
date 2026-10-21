@@ -1110,6 +1110,119 @@ fn corrupt_checkpoint_is_refused_by_code(s: CdcScenario, delete_alone: Then) {
     );
 }
 
+/// A second config of the same stream (the 0.32.1 `init -o` pair: its own export, destination
+/// and slot, one checkpoint) has read the checkpoint first; this export's run is refused
+/// `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` on every attempt before it reads a change. A checkpoint
+/// of its own delivers the source; deleting the shared file leaves the refusal.
+fn a_checkpoint_another_config_reads_is_refused(mut s: CdcScenario) {
+    s.insert(1);
+    s.settle();
+    let config = s.rig.config_path();
+    let dir = config.parent().expect("the rig's directory").to_path_buf();
+    let mine = std::fs::read_to_string(&config).expect("the rendered config");
+    let name = s.rig.export_name().to_string();
+    let out = s.rig.out_dir().display().to_string();
+    let mut other = mine
+        .replace(
+            &format!("- name: {name}\n"),
+            &format!("- name: {name}_other\n"),
+        )
+        .replace(
+            &format!("path: \"{out}\""),
+            &format!("path: \"{out}_other\""),
+        );
+    let _slot = mine.split("slot: ").nth(1).map(|rest| {
+        let slot = rest
+            .split([',', '}', '\n', ' '])
+            .next()
+            .expect("the config names its slot")
+            .to_string();
+        other = other.replace(&format!("slot: {slot}"), &format!("slot: {slot}_other"));
+        Slot::new(format!("{slot}_other"))
+    });
+    assert!(
+        other.contains("_other\n") && other.contains(&format!("{out}_other")),
+        "{other}"
+    );
+    std::fs::write(dir.join("other.yaml"), &other).unwrap();
+    let first = run_rivet_in_dir(&dir, &["run", "--config", "other.yaml"], &[]);
+    assert!(
+        first.status.success(),
+        "the other config reads first:\n{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    s.insert(2);
+    s.settle();
+    let own = dir.join("own.ckpt");
+    s.rig.refuses_twice_and_walks_out(
+        &["run"],
+        &[],
+        Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5),
+        vec![
+            Remedy::new(
+                "Give this export a `cdc.checkpoint` of its own",
+                Then::DeliversTheSource,
+                move |r| {
+                    r.own_checkpoint(own);
+                },
+            ),
+            deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(
+                "RIVET_SOURCE_CDC_CHECKPOINT_SHARED",
+                5,
+            ))),
+        ],
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql() {
+    a_checkpoint_another_config_reads_is_refused(CdcScenario::mysql_with(
+        "oc_ckshare",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+        |r, _| r.cdc("initial: snapshot"),
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres() {
+    a_checkpoint_another_config_reads_is_refused(CdcScenario::pg_with(
+        "oc_ckshare",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+        |r, _| r.cdc("initial: snapshot").relative_checkpoint("cdc.ckpt"),
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql (CDC)"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    a_checkpoint_another_config_reads_is_refused(CdcScenario::mssql_with(
+        "oc_ckshare",
+        "id BIGINT PRIMARY KEY, v BIGINT",
+        |r, _| r.cdc("initial: snapshot"),
+    ));
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo-rs"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mongo() {
+    a_checkpoint_another_config_reads_is_refused(CdcScenario::mongo_with("oc_ckshare", |r, _| {
+        r.cdc("initial: snapshot")
+    }));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle (LogMiner)"]
+fn a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    a_checkpoint_another_config_reads_is_refused(CdcScenario::oracle_with("oc_ckshare", |r, _| {
+        r.cdc("initial: snapshot")
+    }));
+}
+
 /// RESULTS 17 (PostgreSQL): a slot dropped under a baselined stream is refused as `RIVET_SOURCE_CDC_LOG_GAP` (exit 5); the re-baseline delivers the source.
 fn pg_dropped_slot_is_refused_by_code(after_a_changes_run: bool) {
     let slot = unique_name("oc_slotgone_slot");

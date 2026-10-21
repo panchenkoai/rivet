@@ -86,11 +86,11 @@ scenarios:
     mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
   - id: refusal_source_cdc_checkpoint_shared
-    what: "RIVET_SOURCE_CDC_CHECKPOINT_SHARED: a second config written as a copy of the first (one checkpoint, the destination pointed elsewhere) is refused by code on every run before it reads a change while the first keeps delivering; the remedy it names (a config `rivet init -o` writes for it) delivers every source row"
+    what: "RIVET_SOURCE_CDC_CHECKPOINT_SHARED: a second config written as a copy of the first (one checkpoint, the destination pointed elsewhere) is refused by code on every run before it reads a change while the first keeps delivering; a checkpoint of its own delivers the source, and deleting the shared file alone leaves the refusal"
     postgres: { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres }
     mysql:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql }
     mssql:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql }
-    mongo:    { na: "the claim is the checkpoint file's and runs before any source is opened, the same code for every engine; the four SQL cells and lib:a_checkpoint_another_config_still_reads_is_refused_on_every_attempt carry it (a MongoDB part keeps its key inside the document, which the walk's id oracle does not read)" }
+    mongo:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mongo }
     oracle:   { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle }
   - id: refusal_source_session_time_zone_not_applied
     what: "RIVET_SOURCE_SESSION_TIME_ZONE_NOT_APPLIED: a MySQL session still off UTC after rivet's `SET time_zone` (a proxy answered it without forwarding); a direct connection delivers, the same run again through the proxy refuses"
@@ -1141,8 +1141,8 @@ scenarios:
     oracle:   { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
 
   - id: refusal_init_config_exists
-    what: "RIVET_INIT_CONFIG_EXISTS: `rivet init -o <path>` over a config already at the path; the scaffold is written only beside it (`-o <new-path>`) or after the old one is moved aside"
-    postgres: { gap: "asserted by its code offline (init: init_stops_carry_their_codes); the walk needs an init cell: refuse twice, move the config aside, `-o <new-path>` as the second remedy, and one wrong remedy" }
+    what: "RIVET_INIT_CONFIG_EXISTS: `rivet init -o <path>` over a config already at the path, or a CDC scaffold whose checkpoint exists or whose checkpoint or destination another config in the directory names; the scaffold is written only beside it (`-o <new-path>`) or after the old one is moved aside"
+    postgres: { gap: "asserted by its code offline (init: init_stops_carry_their_codes, a_scaffold_naming_another_streams_checkpoint_or_destination_is_refused); the walk needs an init cell: refuse twice, move the config aside, `-o <new-path>` as the second remedy, and one wrong remedy" }
     mysql:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }
     mssql:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }
     mongo:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the postgres column carries the row" }

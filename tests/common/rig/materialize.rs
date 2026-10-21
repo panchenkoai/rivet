@@ -132,6 +132,12 @@ impl Rig {
         self.rerender_all_materializations()
     }
 
+    /// Move the export to the checkpoint at `path`, over the same config path: the remedy that gives a stream a position of its own.
+    pub fn own_checkpoint(&mut self, path: PathBuf) -> PathBuf {
+        self.ckpt_override = Some(path);
+        self.rerender_all_materializations()
+    }
+
     pub fn amend_export_lines(&mut self, lines: &[&str]) -> PathBuf {
         for l in lines {
             self.extra_lines.push((*l).to_string());

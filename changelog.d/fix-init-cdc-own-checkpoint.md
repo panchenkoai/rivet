@@ -5,7 +5,7 @@
   first one's position: each stream skipped what the other had read, exit 0. **Now** `init -o
   <stem>.yaml` names the checkpoint `./cdc/<stem>_<name>.ckpt` and the destination
   `<stem>/cdc/` / `./output/<stem>/cdc/` (per table `exports/<stem>/<t>_cdc/`), and refuses
-  `RIVET_INIT_CDC_NAME_TAKEN`, exit 5, writing nothing, when the checkpoint already exists or another
+  `RIVET_INIT_CONFIG_EXISTS`, exit 5, writing nothing, when the checkpoint already exists or another
   config in the directory names the same checkpoint or destination. A run records which config and
   export own its checkpoint (`<checkpoint>.owner`) and refuses a checkpoint another config still
   reads, `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`, exit 5, before it reads a change. A checkpoint written

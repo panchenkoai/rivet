@@ -109,7 +109,10 @@ pub(crate) fn claim_checkpoint(
                  it; export '{}' of config '{}' would continue from where that one stopped, and \
                  each stream would skip the changes the other read. Nothing was read. Give this \
                  export a `cdc.checkpoint` of its own (`rivet init -o` names it after the \
-                 config file), then re-baseline it: {RECOVER}",
+                 config file) and keep this file: it is the other export's position. Give it \
+                 `cdc.initial: snapshot` if it has none, so its first run on the new \
+                 checkpoint re-reads every table, and move any file it wrote before out of its \
+                 destination first: those may miss the changes the other stream read",
                 ckpt.display(),
                 owner.export,
                 owner.config,

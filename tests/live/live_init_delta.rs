@@ -1270,17 +1270,6 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
 }
 
-/// Distinct `id`s of every part under `dir`, at any depth (the baseline sits in `snapshot/`).
-fn ids_under(dir: &std::path::Path) -> std::collections::BTreeSet<i64> {
-    let mut ids: std::collections::BTreeSet<i64> = ids_in(dir).into_iter().collect();
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        if entry.path().is_dir() {
-            ids.extend(ids_under(&entry.path()));
-        }
-    }
-    ids
-}
-
 /// The local `path:` a single-table scaffold writes to, resolved against its directory.
 fn scaffolded_path(dir: &std::path::Path, generated: &str) -> std::path::PathBuf {
     let raw = generated
@@ -1334,8 +1323,17 @@ fn two_init_configs_in_one_dir_each_deliver_every_row((src, _guard, extra): TwoC
     let every: std::collections::BTreeSet<i64> = (1..=8).collect();
     for (name, generated) in [("a.yaml", &a), ("b.yaml", &b)] {
         let place = scaffolded_path(dir.path(), generated);
+        let dirs: std::collections::BTreeSet<std::path::PathBuf> = files_under(&place)
+            .into_iter()
+            .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
+            .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
+            .collect();
+        let delivered: std::collections::BTreeSet<i64> = dirs
+            .iter()
+            .flat_map(|d| duckdb_dir_parquet_id_set(d))
+            .collect();
         assert_eq!(
-            ids_under(&place),
+            delivered,
             every,
             "{name} delivered to {} only part of the source (a:\n{a}\nb:\n{b})",
             place.display()
@@ -1451,59 +1449,6 @@ fn two_configs_oracle() -> TwoConfigSource {
     (src, Box::new(t), &["--schema", "RIVET"])
 }
 
-/// A second config written as a copy of the first (the 0.32.1 scaffold: one checkpoint, the
-/// destination pointed elsewhere) is refused by code on every run, before it reads a change,
-/// while the first keeps delivering; the remedy the refusal names, a config `rivet init -o`
-/// writes for it, delivers every source row.
-fn a_checkpoint_another_config_reads_is_refused_and_walked_out(
-    (src, _guard, extra): TwoConfigSource,
-) {
-    (src.apply)(&[Op::Ins(1), Op::Ins(2), Op::Ins(3)]);
-    let dir = tempfile::tempdir().expect("config dir");
-    let db = [("DATABASE_URL", src.url.as_str())];
-    let scaffold = |file: &str| {
-        let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
-        args.extend(src.init_args.iter().map(String::as_str));
-        args.extend(extra);
-        args.extend(["--output", file]);
-        rivet_ok_in(dir.path(), &args, &[]);
-        std::fs::read_to_string(dir.path().join(file)).unwrap()
-    };
-    let a = scaffold("a.yaml");
-    let _slot_a = a.contains("slot:").then(|| Slot::new(scaffolded_slot(&a)));
-    let copy = a.replace("path: ./output/", "path: ./prod-output/");
-    std::fs::write(dir.path().join("b.yaml"), &copy).unwrap();
-    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
-    (src.apply)(&[Op::Ins(4), Op::Ins(5)]);
-    for attempt in 1..=2 {
-        let out = run_rivet_in_dir(dir.path(), &["run", "-c", "b.yaml"], &db);
-        let said = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(5), "attempt {attempt}:\n{said}");
-        assert!(
-            said.contains("RIVET_SOURCE_CDC_CHECKPOINT_SHARED") && said.contains("a.yaml"),
-            "attempt {attempt}:\n{said}"
-        );
-        assert!(
-            !dir.path().join("prod-output").exists(),
-            "a refused run wrote nothing"
-        );
-        rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
-    }
-    std::fs::remove_file(dir.path().join("b.yaml")).unwrap();
-    let b = scaffold("b.yaml").replace("path: ./output/", "path: ./prod-output/");
-    std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
-    let _slot_b = b.contains("slot:").then(|| Slot::new(scaffolded_slot(&b)));
-    rivet_ok_in(dir.path(), &["run", "-c", "b.yaml"], &db);
-    (src.apply)(&[Op::Ins(6)]);
-    rivet_ok_in(dir.path(), &["run", "-c", "b.yaml"], &db);
-    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
-    let every: std::collections::BTreeSet<i64> = (1..=6).collect();
-    for (name, generated) in [("a.yaml", &a), ("b.yaml", &b)] {
-        let place = scaffolded_path(dir.path(), generated);
-        assert_eq!(ids_under(&place), every, "{name} at {}", place.display());
-    }
-}
-
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
 fn two_init_configs_in_one_dir_each_deliver_every_row_mysql() {
@@ -1528,32 +1473,6 @@ fn two_init_configs_in_one_dir_each_deliver_every_row_mssql() {
 fn two_init_configs_in_one_dir_each_deliver_every_row_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
     two_init_configs_in_one_dir_each_deliver_every_row(two_configs_oracle());
-}
-
-#[test]
-#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
-fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql() {
-    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_mysql());
-}
-
-#[test]
-#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
-fn a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres() {
-    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_postgres());
-}
-
-#[test]
-#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
-fn a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql() {
-    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_mssql());
-}
-
-#[cfg(feature = "oracle")]
-#[test]
-#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
-fn a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle() {
-    let _serial = cross_process_serial("oracle_cdc");
-    a_checkpoint_another_config_reads_is_refused_and_walked_out(two_configs_oracle());
 }
 
 /// The `server_id:` a MySQL CDC scaffold names.

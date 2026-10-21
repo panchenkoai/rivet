@@ -1036,7 +1036,7 @@ fn refuse_cdc_names_taken(path: &str, text: &str) -> Result<()> {
         .unwrap_or(std::path::Path::new("."));
     let taken = |what: String| {
         crate::error::coded(
-            crate::error::codes::INIT_CDC_NAME_TAKEN,
+            crate::error::codes::INIT_CONFIG_EXISTS,
             format!(
                 "init: {what}. Nothing was written. Write the config under another name (`-o \
                  <other>.yaml` names its checkpoint and destination after the file), or move the \
@@ -3767,7 +3767,7 @@ mod cdc_names_taken_tests {
             (shared_dest, "share its CDC destination"),
             (exists, "already exists"),
         ] {
-            crate::error::assert_coded(&err, "RIVET_INIT_CDC_NAME_TAKEN", 5);
+            crate::error::assert_coded(&err, "RIVET_INIT_CONFIG_EXISTS", 5);
             assert!(format!("{err:#}").contains(says), "{err:#}");
         }
     }
