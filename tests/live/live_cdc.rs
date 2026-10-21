@@ -8059,7 +8059,7 @@ impl Drop for OtherDb {
 }
 
 /// Every `id` in every Parquet part under `dir`, recursively, sorted.
-fn ids_under(dir: &std::path::Path) -> Vec<i64> {
+fn ids_read_all(dir: &std::path::Path) -> Vec<i64> {
     use arrow::array::{Array, Int64Array};
     let mut ids = Vec::new();
     for f in crate::common::files_under(dir) {
@@ -8117,7 +8117,7 @@ fn mysql_cdc_a_bare_name_captures_its_own_database_beside_a_same_named_table() {
     other.insert(&table, 103);
     rig.run_ok();
     assert_eq!(
-        ids_under(&rig.out_dir()),
+        ids_read_all(&rig.out_dir()),
         vec![1, 2, 3],
         "the baseline and the changes are the connection database's rows; the other database's never"
     );
@@ -8184,7 +8184,7 @@ fn mysql_cdc_an_init_config_runs_as_written_beside_a_same_named_table() {
         .unwrap();
     other.insert(&table, 102);
     run("second run");
-    assert_eq!(ids_under(&d.path().join("output")), vec![1, 2, 3]);
+    assert_eq!(ids_read_all(&d.path().join("output")), vec![1, 2, 3]);
 }
 
 /// #675 across the upgrade: a stream the previous release anchored and drained with a bare name
@@ -8225,7 +8225,7 @@ fn mysql_cdc_a_previous_release_stream_continues_beside_a_same_named_table() {
     other.insert(&table, 102);
     rig.run_ok();
     assert_eq!(
-        ids_under(&rig.out_dir()),
+        ids_read_all(&rig.out_dir()),
         vec![1, 2, 3, 4],
         "one baseline, every change once, nothing of the other database"
     );
@@ -8248,7 +8248,7 @@ fn mysql_cdc_a_bare_name_only_another_database_holds_is_still_captured() {
     other.insert(&table, 7);
     other.insert(&table, 8);
     rig.run_ok();
-    assert_eq!(ids_under(&rig.out_dir()), vec![7, 8]);
+    assert_eq!(ids_read_all(&rig.out_dir()), vec![7, 8]);
 }
 
 /// #675: a bare name and the other database's qualified twin in ONE stream would hand one event
