@@ -123,12 +123,36 @@ impl Rig {
         // loudly; the sanctioned mutations are amend_export_lines /
         // replace_export_line.
         self.write_guarded(&cfg, &self.render());
+        self.hand_over_checkpoint(&cfg);
         cfg
+    }
+
+    /// Rigs built around one checkpoint (`checkpoint_path`) are the successive configs of ONE
+    /// stream, each with its own destination: a later rig takes the checkpoint over from an
+    /// earlier rig's `rig.yaml`, as an operator who edits the config in place does. Never while
+    /// that rig has a run alive: two live configs on one checkpoint is the defect the claim
+    /// refuses, and a cell that wants them names another file and gets the product's refusal.
+    fn hand_over_checkpoint(&self, cfg: &std::path::Path) {
+        if self.mode != "cdc" || self.ckpt_override.is_none() {
+            return;
+        }
+        hand_over_checkpoint_record(&self.checkpoint(), cfg, super::invoke::has_live_child);
     }
 
     /// Append a `cdc:` entry over the same config path, for a second stage that gives the stream a knob it ran without.
     pub fn amend_cdc_line(&mut self, line: &str) -> PathBuf {
         self.cdc_lines.push(line.to_string());
+        self.rerender_all_materializations()
+    }
+
+    /// Move the export to the checkpoint at `path`, over the same config path: the remedy that gives a stream a position of its own.
+    pub fn own_checkpoint(&mut self, path: PathBuf) -> PathBuf {
+        self.ckpt_override = Some(path);
+        for l in self.cdc_lines.iter_mut() {
+            if l.starts_with("checkpoint:") {
+                *l = "__CKPT__".to_string();
+            }
+        }
         self.rerender_all_materializations()
     }
 
@@ -215,5 +239,73 @@ impl Rig {
     /// metrics without re-deriving the name it did not choose.
     pub fn export_name(&self) -> &str {
         &self.name
+    }
+}
+
+/// Remove the owner record of the checkpoint `ckpt` when it names another rig's `rig.yaml` than
+/// `mine`; panic when that rig has a run alive (`live`). Any other owner stays.
+fn hand_over_checkpoint_record(
+    ckpt: &std::path::Path,
+    mine: &std::path::Path,
+    live: impl Fn(&std::path::Path) -> bool,
+) -> bool {
+    let mut record = ckpt.as_os_str().to_os_string();
+    record.push(".owner");
+    let Ok(text) = std::fs::read_to_string(&record) else {
+        return false;
+    };
+    let owner: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let Some(theirs) = owner["config"].as_str().map(std::path::PathBuf::from) else {
+        return false;
+    };
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if theirs.file_name().is_none_or(|n| n != "rig.yaml") || canon(&theirs) == canon(mine) {
+        return false;
+    }
+    assert!(
+        !live(&theirs),
+        "two rigs on the checkpoint {} with a run of {} still alive: name the second config \
+         another file and expect RIVET_SOURCE_CDC_CHECKPOINT_SHARED",
+        ckpt.display(),
+        theirs.display()
+    );
+    std::fs::remove_file(&record).expect("hand the checkpoint over");
+    true
+}
+
+#[cfg(test)]
+mod hand_over_tests {
+    /// A claim by another rig's `rig.yaml` is handed over, never while that rig runs; a claim by
+    /// any other file, or by this rig, stays.
+    #[test]
+    fn only_another_rigs_claim_is_handed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("cdc.ckpt");
+        let record = dir.path().join("cdc.ckpt.owner");
+        let mine = dir.path().join("b/rig.yaml");
+        let claim = |config: &std::path::Path| {
+            std::fs::write(
+                &record,
+                serde_json::json!({"config": config.display().to_string(), "export": "e"})
+                    .to_string(),
+            )
+            .unwrap()
+        };
+        claim(&dir.path().join("a/rig.yaml"));
+        assert!(super::hand_over_checkpoint_record(&ckpt, &mine, |_| false));
+        assert!(!record.exists());
+        for kept in [dir.path().join("other.yaml"), mine.clone()] {
+            claim(&kept);
+            assert!(!super::hand_over_checkpoint_record(&ckpt, &mine, |_| false));
+            assert!(record.exists(), "{kept:?} keeps its claim");
+        }
+        claim(&dir.path().join("a/rig.yaml"));
+        let alive =
+            std::panic::catch_unwind(|| super::hand_over_checkpoint_record(&ckpt, &mine, |_| true));
+        assert!(
+            alive.is_err(),
+            "a live previous rig is never handed over from"
+        );
+        assert!(record.exists());
     }
 }

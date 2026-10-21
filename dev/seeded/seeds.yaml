@@ -460,6 +460,32 @@ seeds:
       postgres-state:
         na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
 
+  - name: lease-file-named-by-a-lossy-token
+    class: "a SQLite-state lease file is named by a lossy file token of its key, so two keys that read alike (`orders#1` / `orders-1`, two Cyrillic names) lock one file and a run is refused RIVET_STATE_RUN_IN_PROGRESS beside no live run of its own export"
+    history: "0.32.2 hand sweep block 0 (D1), 2026-10-21: with --parallel-exports one of two such exports was refused 8-9 of 10 runs (control 0/10); through 0.32.1"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: lease-file-named-by-a-lossy-token/sqlite-state.patch
+        cells:
+          - "lib:keys_that_read_alike_get_their_own_lease_file"
+          - a_run_beside_a_live_export_whose_name_reads_alike_delivers
+      postgres-state:
+        na: "a PostgreSQL-state lease is a row keyed by the raw key (state_lease.lease_key), never a file name"
+
+  - name: lease-upgrade-window-unguarded
+    class: "a run of the upgraded binary takes only the new lease file name, so a 0.32.1 run of the same export still holding the old name does not exclude it and both write"
+    history: "0.32.2, 2026-10-21: the D1 fix renamed the lease file; red on its first cut with a paused released 0.32.1 run beside it (this run exited 0)"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: lease-upgrade-window-unguarded/sqlite-state.patch
+        cells:
+          - "lib:a_holder_of_the_old_lease_name_and_this_release_exclude_each_other"
+          - a_run_beside_a_live_previous_release_run_of_the_export_is_refused
+      postgres-state:
+        na: "a PostgreSQL-state lease is a row keyed by the raw key, unchanged by the rename"
+
   - name: sqlite-overdue-writer-loses-its-place
     class: "a SQLite state writer that ran out of the turn queue's patience while a sibling of the same process held a turn leaves the queue for SQLite's busy wait, where the sibling committing back to back wins every gap, so the write is refused `database is locked` after the busy timeout"
     history: "0.32.2, 2026-10-21: #638's regression test failed on the unmutated baseline of #660's mutants shard 2 under CI load (`starved: 0: database is locked after 10.16s`); forced on devbox with a sibling holding each turn twice the test patience: red 3/3 on main c5bdcde0 (refused after 15.0-15.5 s)"
@@ -491,6 +517,44 @@ seeds:
         na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
       oracle:
         na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
+
+  - name: pg-upgrade-false-log-gap
+    class: "a PostgreSQL stream an older release left with its slot past its checkpoint (that release released a trailing empty span by advancing the slot without saving the checkpoint) is refused RIVET_SOURCE_CDC_LOG_GAP as consumed by another reader on its first upgraded run, exit 5, nothing lost"
+    history: "0.32.2, 2026-10-21: found by #664's upgrade cell on the released v0.32.1 (1 in 3 beside parallel cells); forced by a captured change followed by an uncaptured transaction, run twice on 0.32.1: red 3/3 on main ff104292"
+    scope: source
+    engines:
+      postgres:
+        patch: pg-upgrade-false-log-gap/postgres.patch
+        cells:
+          - an_upgraded_stream_whose_old_release_advanced_its_slot_past_the_checkpoint_continues
+          - "lib:an_older_releases_checkpoint_behind_its_slot_is_adopted_once_then_the_guard_is_strict"
+      mysql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mssql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mongo:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      oracle:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+  - name: pg-foreign-advance-adopted
+    class: "the upgrade adoption also takes the slot's position over a checkpoint this release wrote, so a slot another reader advanced is continued from, exit 0, the changes between lost"
+    history: "0.32.2, 2026-10-21: the guard the upgrade adoption must not weaken (#649)"
+    scope: source
+    engines:
+      postgres:
+        patch: pg-foreign-advance-adopted/postgres.patch
+        cells:
+          - a_slot_another_config_advanced_is_refused_instead_of_losing_its_changes
+          - an_upgraded_stream_whose_old_release_advanced_its_slot_past_the_checkpoint_continues
+          - "lib:an_older_releases_checkpoint_behind_its_slot_is_adopted_once_then_the_guard_is_strict"
+      mysql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mssql:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      mongo:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
+      oracle:
+        na: "the slot-ahead-of-checkpoint guard is PostgreSQL's: a binlog, a change table or the redo is not consumed by a reader"
 
   - name: load-spec-last-writer-of-one-name
     class: "the by-name load spec is one row per export name, so on a state shared by configs of one name reading different sources the last `rivet init` (or run) decides every config's load key"
@@ -1611,6 +1675,38 @@ seeds:
         na: "a MongoDB change stream has no server-side slot or replica id; its position is the config's own checkpoint"
       oracle:
         na: "LogMiner keeps no server-side object per reader; the position is the config's own checkpoint"
+  - name: init-cdc-checkpoint-shared-by-name
+    class: "two CDC configs `rivet init -o` writes for one table into one directory name one checkpoint, so each stream resumes where the other stopped and skips what it read, exit 0"
+    history: "0.32.2, owner decision 2026-10-21: `-o a.yaml` and `-o b.yaml` both wrote `checkpoint: ./cdc/<table>.ckpt` and `./output/<table>_cdc/`; fixed by stem-derived names and RIVET_INIT_CDC_NAME_TAKEN"
+    scope: source
+    patch: init-cdc-checkpoint-shared-by-name/shared.patch
+    engines:
+      postgres:
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_postgres]
+      mysql:
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_mysql]
+      mssql:
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_mssql]
+      mongo:
+        cells: ["lib:a_cdc_scaffold_names_its_checkpoint_and_destination_after_the_output_file"]
+      oracle:
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_oracle]
+  - name: cdc-checkpoint-read-by-two-configs
+    class: "a CDC run continues from a checkpoint another config still reads, so two streams on one position each skip the changes the other read, exit 0"
+    history: "0.32.2, owner decision 2026-10-21 (\"forbid a shared checkpoint\"): a run recorded no owner of its checkpoint; fixed by `checkpoint_identity::claim_checkpoint` and RIVET_SOURCE_CDC_CHECKPOINT_SHARED"
+    scope: source
+    patch: cdc-checkpoint-read-by-two-configs/shared.patch
+    engines:
+      postgres:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres]
+      mysql:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql]
+      mssql:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql]
+      mongo:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_mongo]
+      oracle:
+        cells: [a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle]
   - name: io-error-classified-by-its-path-text
     class: "an `io::Error` (a missing directory, a read-only file) is retried as transient because a path in its message contains a network word (`dns`, `reset`), so a permanent stop exits 2"
     history: "0.32.2, 2026-10-20: #639's mutation shard baseline failed `an_unwritable_aggregate_path_is_refused_by_code` with exit 2 for 1 because its temp dir was named `.tmprDnsA7`; RED on main c1cf6a92 with a directory named `dns`"

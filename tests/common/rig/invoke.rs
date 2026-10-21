@@ -376,6 +376,7 @@ impl Rig {
         if let Some(case) = case.as_mut() {
             case.ran_as(child.id());
         }
+        live_children(|live| live.push((canonical(&self.config_path()), child.id())));
         Spawned {
             rig: self,
             child,
@@ -653,6 +654,8 @@ impl Spawned<'_> {
 
     /// Grade the run once, by its exit.
     fn reaped(&mut self, status: std::process::ExitStatus) {
+        let pid = self.child.id();
+        live_children(|live| live.retain(|(_, p)| *p != pid));
         self.rig.absorb_product_config_writes();
         let envs: Vec<(&str, &str)> = self
             .envs
@@ -681,6 +684,8 @@ impl std::ops::DerefMut for Spawned<'_> {
 impl Drop for Spawned<'_> {
     /// A child dropped before anyone reaped it was never graded: say so.
     fn drop(&mut self) {
+        let pid = self.child.id();
+        live_children(|live| live.retain(|(_, p)| *p != pid));
         if self.case.is_some() && !std::thread::panicking() {
             crate::common::verify::log(
                 "SKIP",
@@ -689,4 +694,21 @@ impl Drop for Spawned<'_> {
             );
         }
     }
+}
+
+/// `path` canonical when it exists.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The spawned rivet children not yet reaped, by the config they run.
+fn live_children<T>(f: impl FnOnce(&mut Vec<(PathBuf, u32)>) -> T) -> T {
+    static LIVE: std::sync::Mutex<Vec<(PathBuf, u32)>> = std::sync::Mutex::new(Vec::new());
+    f(&mut LIVE.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+/// Whether a spawned child of the config at `cfg` has not been reaped yet.
+pub(super) fn has_live_child(cfg: &Path) -> bool {
+    let cfg = canonical(cfg);
+    live_children(|live| live.iter().any(|(c, _)| *c == cfg))
 }

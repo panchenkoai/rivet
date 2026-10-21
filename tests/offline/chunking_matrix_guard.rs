@@ -371,7 +371,9 @@ const MATRICES: &[(&str, usize)] = &[
     // (init config exists, destination prefix mode mismatch, mixed split generations, load spec
     // missing) each get a `refusal_*` row; asserted by their codes offline, not walked by a live cell yet.
     // 104 -> 103 (2026-10-15): the Oracle cell of corrupt_cursor_moved_forward is written with the fix.
-    ("docs/sabotage-matrix.yaml", 103),
+    // 103 -> 104 (2026-10-21): RIVET_INIT_CDC_NAME_TAKEN gets its `refusal_*` row; `rivet init` has no
+    // rig to walk it through, so a plain CLI cell walks it and the row stays a gap.
+    ("docs/sabotage-matrix.yaml", 104),
     // Pool-split — `apply --pool --split` per (strategy × source engine). Split is a
     // scheduler layer above the runners (each unit runs through chunked/keyset), so its
     // per-engine behaviour (boundary probe, crash-recovery, finding-2 exact-partition

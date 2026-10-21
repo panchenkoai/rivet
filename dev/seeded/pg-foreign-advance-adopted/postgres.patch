@@ -1,0 +1,13 @@
+diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
+index 7edcca19..9bc90643 100644
+--- a/src/source/postgres/cdc.rs
++++ b/src/source/postgres/cdc.rs
+@@ -1074,7 +1074,7 @@ enum OpenVerdict {
+ fn open_verdict(slot: &str, saved: &Position, own: &str, confirmed: Option<&str>) -> OpenVerdict {
+     let marked = saved.json().get(CONFIRMED_FIRST).and_then(|v| v.as_bool()) == Some(true);
+     match (slot_advanced_by_another(slot, own, confirmed), marked) {
+-        (Some(why), true) => OpenVerdict::Refuse(why),
++        (Some(_), true) => OpenVerdict::Adopt(confirmed.unwrap_or_default().to_string()),
+         (Some(_), false) => OpenVerdict::Adopt(confirmed.unwrap_or_default().to_string()),
+         (None, false) => OpenVerdict::Mark,
+         (None, true) => OpenVerdict::Keep,

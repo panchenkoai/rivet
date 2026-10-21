@@ -1850,6 +1850,12 @@ fn run_export_job_inner(
                 return (Err(e), summary);
             }
         };
+        // The checkpoint is this config's, before anything reads it: a second config on the
+        // same file would continue from where the first stopped.
+        if let Err(e) = super::cdc_job::claim_checkpoint(config_path, export) {
+            let summary = synthetic_failed_summary(&export.name, &e);
+            return (Err(e), summary);
+        }
         // `initial: snapshot`: anchor first, then each pending table's full
         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
         // own metric + journal), then the drain below. A failed snapshot fails

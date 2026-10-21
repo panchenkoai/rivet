@@ -85,6 +85,13 @@ scenarios:
     mssql:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     mongo:    { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
     oracle:   { na: "the refusal is the state URL's and does not depend on the source engine: the postgres row carries it" }
+  - id: refusal_source_cdc_checkpoint_shared
+    what: "RIVET_SOURCE_CDC_CHECKPOINT_SHARED: a second config written as a copy of the first (one checkpoint, the destination pointed elsewhere) is refused by code on every run before it reads a change while the first keeps delivering; a checkpoint of its own delivers the source, and deleting the shared file alone leaves the refusal"
+    postgres: { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_postgres }
+    mysql:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mysql }
+    mssql:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mssql }
+    mongo:    { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_mongo }
+    oracle:   { test: a_checkpoint_another_config_reads_is_refused_and_walked_out_oracle }
   - id: refusal_state_copy_target_not_empty
     what: "RIVET_STATE_COPY_TARGET_NOT_EMPTY: `rivet state copy` into a PostgreSQL state that already holds state rows (the second copy of one SQLite state), refused before any row is written"
     postgres: { test: a_state_copy_into_a_state_with_rows_is_refused_and_walked_out }
@@ -1148,6 +1155,13 @@ scenarios:
     mongo:    { gap: "asserted by its code offline (mongo: an_unseekable_id_span_and_an_undecodable_cursor_token_are_refused_by_code); the walk needs a collection seeded with two `_id` types under `page_size`: refuse twice, drop `page_size` and `parallel`, normalise `_id`, and one wrong remedy" }
     oracle:   { na: "a SQL keyset key is read and compared by its column type; the type-bracketed `$gt` seek is MongoDB's" }
 
+  - id: refusal_init_cdc_name_taken
+    what: "RIVET_INIT_CDC_NAME_TAKEN: `rivet init -o` for a CDC table whose checkpoint already exists (the config that wrote it moved aside) or whose checkpoint or destination another config in the directory names; refused twice writing nothing, `-o <other>.yaml` writes a scaffold that runs"
+    postgres: { na: "the refusal is the scaffold writer's and does not depend on the source engine: the mysql column carries the row" }
+    mysql:    { gap: "walked by the plain CLI cell init_over_a_taken_cdc_checkpoint_is_refused_twice_and_another_name_runs_mysql (init has no rig, so it cannot enter through refuses_twice_and_walks_out) and asserted offline by lib:a_scaffold_naming_another_streams_checkpoint_or_destination_is_refused" }
+    mssql:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the mysql column carries the row" }
+    mongo:    { na: "the refusal is the scaffold writer's and does not depend on the source engine: the mysql column carries the row" }
+    oracle:   { na: "the refusal is the scaffold writer's and does not depend on the source engine: the mysql column carries the row" }
   - id: refusal_init_config_exists
     what: "RIVET_INIT_CONFIG_EXISTS: `rivet init -o <path>` over a config already at the path; the scaffold is written only beside it (`-o <new-path>`) or after the old one is moved aside"
     postgres: { gap: "asserted by its code offline (init: init_stops_carry_their_codes); the walk needs an init cell: refuse twice, move the config aside, `-o <new-path>` as the second remedy, and one wrong remedy" }

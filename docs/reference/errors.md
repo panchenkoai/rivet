@@ -50,6 +50,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_SOURCE_STATEMENT_TIMEOUT` | environment | 2 if transient, else 1 | raise `tuning.statement_timeout_s`, or narrow the chunk |
 | `RIVET_SOURCE_CURSOR_FINER_THAN_MICROSECOND` | refusal | 5 | cursor on a column at microsecond precision or coarser, or cast the cursor to TIMESTAMP(6) in a curated query |
 | `RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT` | refusal | 5 | re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
+| `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` | refusal | 5 | give the export a `cdc.checkpoint` of its own and keep the shared file, the other export's position; with `cdc.initial: snapshot` its first run re-reads every table |
 | `RIVET_SOURCE_CDC_CHECKPOINT_INVALID` | refusal | 5 | restore the checkpoint file, or re-baseline the stream: delete it, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
 | `RIVET_SOURCE_CDC_LOG_GAP` | refusal | 5 | restore the missing log, or re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
 | `RIVET_SOURCE_CDC_TRUNCATED` | refusal | 5 | re-baseline the stream: delete the checkpoint (PostgreSQL: first advance the slot past the truncate), empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run |
@@ -204,6 +205,7 @@ Every failure rivet names carries a stable `RIVET_<FAMILY>_<NAME>` code: in `--j
 | `RIVET_DEST_CREDENTIALS_INVALID` | environment | 2 if transient, else 1 | issue the destination a fresh, complete credential (a new SAS, service-account key or `gcloud auth application-default login`) |
 | `RIVET_DEST_PREFIX_MODE_MISMATCH` | refusal | 5 | give the export its own destination prefix; a batch and a CDC export must not share one |
 | `RIVET_DEST_IO_RUNTIME_UNAVAILABLE` | environment | 2 if transient, else 1 | raise the process's thread and open-file limits, or lower the export parallelism, then run again |
+| `RIVET_INIT_CDC_NAME_TAKEN` | refusal | 5 | write the config under another `-o` name: the stem names its checkpoint and destination |
 | `RIVET_INIT_CONFIG_EXISTS` | refusal | 5 | move the existing config aside, or write elsewhere with `-o <new-path>` |
 | `RIVET_INIT_TABLE_NOT_FOUND` | usage | 1 | correct `--table` (and `--schema`), or grant the user SELECT on the table |
 | `RIVET_INIT_NO_TABLES` | usage | 1 | point `--schema` at a schema the user can read, and loosen `--include` / `--exclude` |

@@ -39,6 +39,114 @@ pub(crate) fn undecodable(why: String) -> anyhow::Error {
     refusal(crate::error::codes::SOURCE_CDC_UNDECODABLE, why)
 }
 
+/// The config and export a checkpoint belongs to, kept beside it as `<checkpoint>.owner`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CheckpointOwner {
+    pub(crate) config: String,
+    pub(crate) export: String,
+}
+
+/// The owner record beside the checkpoint at `ckpt`.
+pub(crate) fn owner_path(ckpt: &std::path::Path) -> std::path::PathBuf {
+    let mut name = ckpt.as_os_str().to_os_string();
+    name.push(".owner");
+    std::path::PathBuf::from(name)
+}
+
+/// `p` spelled one way whatever exists of it: its longest existing ancestor canonical (so
+/// `/var` and `/private/var` agree), the rest lexical without `.` or a trailing `/`.
+pub(crate) fn canonical_place(p: &std::path::Path) -> std::path::PathBuf {
+    let lexical: std::path::PathBuf = p.components().collect();
+    let mut head = lexical.as_path();
+    let mut tail = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(head) {
+            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(up), Some(name)) => {
+                tail.push(name.to_os_string());
+                head = up;
+            }
+            _ => return lexical,
+        }
+    }
+}
+
+/// The owner record beside the checkpoint at `ckpt`, when one was written and reads.
+pub(crate) fn owner_of(ckpt: &std::path::Path) -> Option<CheckpointOwner> {
+    let text = std::fs::read_to_string(owner_path(ckpt)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Whether export `export` of the config at `config` names the checkpoint `ckpt` (a config that
+/// cannot be read is taken to name it: refusing is the safe answer).
+fn still_names(config: &std::path::Path, export: &str, ckpt: &std::path::Path) -> bool {
+    if !config.exists() {
+        return false;
+    }
+    let Ok(cfg) = crate::config::Config::load(&config.display().to_string()) else {
+        return true;
+    };
+    let dir = config.parent().unwrap_or(std::path::Path::new("."));
+    let same = |p: &std::path::Path| canonical_place(p) == canonical_place(ckpt);
+    cfg.exports.iter().any(|e| {
+        e.name == export
+            && e.cdc
+                .as_ref()
+                .and_then(|c| c.checkpoint.as_deref())
+                .is_some_and(|raw| same(&super::resolve_checkpoint(raw, dir)))
+    })
+}
+
+/// Claim the checkpoint `ckpt` for export `export` of the config at `config`, refusing one that
+/// another config's export still reads (`SOURCE_CDC_CHECKPOINT_SHARED`, exit 5): two streams on
+/// one checkpoint each continue from where the other stopped, and skip what the other read. A
+/// checkpoint without an owner record (written before 0.32.2), or whose owner no longer names it
+/// (a config moved or edited), is claimed.
+pub(crate) fn claim_checkpoint(
+    ckpt: &std::path::Path,
+    config: &std::path::Path,
+    export: &str,
+) -> Result<()> {
+    let me = CheckpointOwner {
+        config: canonical_place(config).display().to_string(),
+        export: export.to_string(),
+    };
+    let record = owner_path(ckpt);
+    let held = owner_of(ckpt);
+    if let Some(owner) = &held {
+        if owner == &me {
+            return Ok(());
+        }
+        if still_names(std::path::Path::new(&owner.config), &owner.export, ckpt) {
+            crate::rivet_bail!(
+                crate::error::codes::SOURCE_CDC_CHECKPOINT_SHARED,
+                "cdc: checkpoint '{}' belongs to export '{}' of config '{}', which still reads \
+                 it; export '{}' of config '{}' would continue from where that one stopped, and \
+                 each stream would skip the changes the other read. Nothing was read. Give this \
+                 export a `cdc.checkpoint` of its own (`rivet init -o` names it after the \
+                 config file) and keep this file: it is the other export's position. Give it \
+                 `cdc.initial: snapshot` if it has none, so its first run on the new \
+                 checkpoint re-reads every table, and move any file it wrote before out of its \
+                 destination first: those may miss the changes the other stream read. If this \
+                 config replaces that one (an edited copy of it), delete or rename that config, \
+                 or point its `cdc.checkpoint` elsewhere, and run this one again",
+                ckpt.display(),
+                owner.export,
+                owner.config,
+                me.export,
+                me.config
+            );
+        }
+    }
+    if let Some(dir) = record.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&record, serde_json::to_vec(&me)?)?;
+    Ok(())
+}
+
 /// What a resume may do given the checkpoint's recorded identity and the server's.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IdentityVerdict {
@@ -123,5 +231,82 @@ mod tests {
                 format!("x cdc: {code} happened. {RECOVER}")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+
+    /// A config in `dir` whose export `export` reads `ckpt`.
+    fn config(dir: &std::path::Path, file: &str, export: &str, ckpt: &str) -> std::path::PathBuf {
+        let path = dir.join(file);
+        std::fs::write(
+            &path,
+            format!(
+                "source:\n  type: mysql\n  url: \"mysql://u:p@localhost/app\"\nexports:\n  - name: {export}\n    \
+                 table: orders\n    mode: cdc\n    format: parquet\n    cdc:\n      checkpoint: {ckpt}\n    \
+                 destination: {{ type: local, path: ./out_{export} }}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// A checkpoint is claimed by its first reader and refused to a second config's export on
+    /// every attempt while the first still names it; written before 0.32.2 (no owner record), or
+    /// left by a config that moved, it is claimed.
+    /// The owner record is written beside a checkpoint whose directory does not exist yet.
+    #[test]
+    fn a_first_claim_makes_the_checkpoint_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = config(dir.path(), "a.yaml", "orders_cdc", "./cdc/new/a.ckpt");
+        let ckpt = dir.path().join("cdc/new/a.ckpt");
+        claim_checkpoint(&ckpt, &a, "orders_cdc").unwrap();
+        let owner = owner_of(&ckpt).expect("the owner record");
+        assert_eq!(owner.export, "orders_cdc");
+        assert!(owner.config.ends_with("a.yaml"), "{owner:?}");
+    }
+
+    #[test]
+    fn a_checkpoint_another_config_still_reads_is_refused_on_every_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("cdc/shared.ckpt");
+        std::fs::create_dir_all(ckpt.parent().unwrap()).unwrap();
+        std::fs::write(&ckpt, r#"{"file":"bin.000001","pos":4}"#).unwrap();
+        let a = config(dir.path(), "a.yaml", "orders_cdc", "./cdc/shared.ckpt");
+        let b = config(dir.path(), "b.yaml", "orders_cdc", "./cdc/shared.ckpt");
+        claim_checkpoint(&ckpt, &a, "orders_cdc")
+            .expect("a checkpoint with no owner record is claimed");
+        let unwritten = dir.path().join("cdc/not_yet.ckpt");
+        config(dir.path(), "c.yaml", "orders_cdc", "./cdc/not_yet.ckpt");
+        config(dir.path(), "d.yaml", "orders_cdc", "./cdc/not_yet.ckpt");
+        claim_checkpoint(&unwritten, &dir.path().join("c.yaml"), "orders_cdc").unwrap();
+        let other_spelling = canonical_place(dir.path())
+            .join(".")
+            .join("cdc/not_yet.ckpt");
+        let err = claim_checkpoint(&other_spelling, &dir.path().join("d.yaml"), "orders_cdc")
+            .expect_err("a checkpoint not written yet is still the other config's");
+        crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5);
+        std::fs::remove_file(dir.path().join("d.yaml")).unwrap();
+        claim_checkpoint(&ckpt, &a, "orders_cdc").expect("its owner reads it again");
+        for _ in 0..2 {
+            let err = claim_checkpoint(&ckpt, &b, "orders_cdc").unwrap_err();
+            crate::error::assert_coded(&err, "RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5);
+            assert!(format!("{err:#}").contains("a.yaml"), "{err:#}");
+        }
+        // The first config moves its stream to a checkpoint of its own: the second may claim it.
+        config(dir.path(), "a.yaml", "orders_cdc", "./cdc/a.ckpt");
+        claim_checkpoint(&ckpt, &b, "orders_cdc").expect("a checkpoint its owner no longer names");
+        std::fs::remove_file(&b).unwrap();
+        claim_checkpoint(&ckpt, &a, "orders_cdc").expect("a checkpoint whose owner is gone");
+        let owner: CheckpointOwner =
+            serde_json::from_str(&std::fs::read_to_string(owner_path(&ckpt)).unwrap()).unwrap();
+        assert!(owner.config.ends_with("a.yaml"), "{owner:?}");
+        assert_eq!(
+            std::fs::read_to_string(&ckpt).unwrap(),
+            r#"{"file":"bin.000001","pos":4}"#,
+            "the position itself is never rewritten"
+        );
     }
 }

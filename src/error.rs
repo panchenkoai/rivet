@@ -917,6 +917,11 @@ pub mod codes {
         "RIVET_SOURCE_CDC_FOREIGN_CHECKPOINT",
         "re-baseline the stream: delete the checkpoint, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
     );
+    /// A CDC export's checkpoint is the one another config's export still reads.
+    pub const SOURCE_CDC_CHECKPOINT_SHARED: Code = refusal(
+        "RIVET_SOURCE_CDC_CHECKPOINT_SHARED",
+        "give the export a `cdc.checkpoint` of its own and keep the shared file, the other export's position; with `cdc.initial: snapshot` its first run re-reads every table",
+    );
     pub const SOURCE_CDC_CHECKPOINT_INVALID: Code = refusal(
         "RIVET_SOURCE_CDC_CHECKPOINT_INVALID",
         "restore the checkpoint file, or re-baseline the stream: delete it, empty the export's destination, clear its `cdc_snapshot` rows, give it `cdc.initial: snapshot`, then re-run",
@@ -1559,6 +1564,11 @@ pub mod codes {
         "RIVET_DEST_IO_RUNTIME_UNAVAILABLE",
         "raise the process's thread and open-file limits, or lower the export parallelism, then run again",
     );
+    /// `rivet init -o` would write a CDC checkpoint that exists, or a checkpoint or destination another config names.
+    pub const INIT_CDC_NAME_TAKEN: Code = refusal(
+        "RIVET_INIT_CDC_NAME_TAKEN",
+        "write the config under another `-o` name: the stem names its checkpoint and destination",
+    );
     /// `rivet init -o` met a config at the output path.
     pub const INIT_CONFIG_EXISTS: Code = refusal(
         "RIVET_INIT_CONFIG_EXISTS",
@@ -1682,6 +1692,7 @@ pub mod codes {
         SOURCE_STATEMENT_TIMEOUT,
         SOURCE_CURSOR_FINER_THAN_MICROSECOND,
         SOURCE_CDC_FOREIGN_CHECKPOINT,
+        SOURCE_CDC_CHECKPOINT_SHARED,
         SOURCE_CDC_CHECKPOINT_INVALID,
         SOURCE_CDC_LOG_GAP,
         SOURCE_CDC_TRUNCATED,
@@ -1836,6 +1847,7 @@ pub mod codes {
         DEST_CREDENTIALS_INVALID,
         DEST_PREFIX_MODE_MISMATCH,
         DEST_IO_RUNTIME_UNAVAILABLE,
+        INIT_CDC_NAME_TAKEN,
         INIT_CONFIG_EXISTS,
         INIT_TABLE_NOT_FOUND,
         INIT_NO_TABLES,
