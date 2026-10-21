@@ -188,7 +188,13 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
                     if not bad else "; ".join(bad)):
             return
         # A per-run prefix (init writes fixed ones) and the `load:` init never writes.
-        body = body.replace("prefix: exports/", f"prefix: {pfx}/exports/").replace("prefix: cdc/", f"prefix: {pfx}/cdc/")
+        from .upgrade_cdc_load import isolated
+
+        moved = isolated(body, pfx, None)
+        if moved is None:
+            _row(led, engine, "init", False, "a prefix init wrote stayed shared: " + body[:300])
+            return
+        body = moved
         body += f"\nload:\n  target: bigquery\n  project: {proj}\n  dataset: {dset}\n  pk: auto\n"
         cfg.write_text(body)
         gcp.bq_ensure_dataset(proj, dset)
