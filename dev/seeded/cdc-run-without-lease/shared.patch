@@ -1,5 +1,5 @@
 diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
-index 77ec5447..220f5d6d 100644
+index a4d33b1b..04c4542f 100644
 --- a/src/pipeline/job.rs
 +++ b/src/pipeline/job.rs
 @@ -1843,13 +1843,6 @@ fn run_export_job_inner(
@@ -13,6 +13,6 @@ index 77ec5447..220f5d6d 100644
 -                return (Err(e), summary);
 -            }
 -        };
-         // `initial: snapshot`: anchor first, then each pending table's full
-         // snapshot (a recursive `mode: full` run into `…/snapshot/`, with its
-         // own metric + journal), then the drain below. A failed snapshot fails
+         // The checkpoint is this config's, before anything reads it: a second config on the
+         // same file would continue from where the first stopped.
+         if let Err(e) = super::cdc_job::claim_checkpoint(config_path, export) {
