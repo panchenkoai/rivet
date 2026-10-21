@@ -403,8 +403,11 @@ NO_BASE = "the base table does not exist"
 
 
 def isolated(body: str, pfx: str, slot: str | None) -> str | None:
-    """init's config under the cell's own prefix and slot (init writes fixed ones, shared by the stand); None when one stayed."""
-    body = re.sub(r"prefix: (exports|cdc)/", rf"prefix: {pfx}/\1/", body)
+    """init's config under the cell's own prefix and slot (init writes fixed ones, shared by the stand); None when one stayed.
+
+    Every `prefix:` init writes moves under `pfx`, whatever it starts with: 0.32.2's init names a CDC
+    prefix after the `-o` stem (`exports/<stem>/<t>_cdc/`, `<stem>/cdc/`), older ones `exports/` and `cdc/`."""
+    body = re.sub(r"prefix: (?![\"']?" + re.escape(pfx) + r"/)([\"']?)", lambda m: f"prefix: {m.group(1)}{pfx}/", body)
     if slot:
         body = re.sub(r"slot: \S+", f"slot: {slot}", body)
     stayed = [ln for ln in body.splitlines() if "prefix:" in ln and pfx not in ln]
