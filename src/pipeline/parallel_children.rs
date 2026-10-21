@@ -675,6 +675,39 @@ mod forwarded_tests {
         );
         assert!(super::forwarded("--json-errors").is_empty());
     }
+
+    /// In a process of its own: the wait set by `--lock-wait` is read back and handed on, and
+    /// `--no-notify` only once this process is silenced.
+    #[test]
+    fn the_forwarded_globals_are_what_this_process_was_given() {
+        const MARK: &str = "rivet_forwarded_globals_child_marker";
+        if std::env::args().any(|a| a == MARK) {
+            crate::state::set_lock_wait(7);
+            assert_eq!(crate::state::lock_wait_s(), 7);
+            assert_eq!(super::forwarded_globals(), ["--lock-wait", "7"]);
+            crate::notify::silence();
+            assert_eq!(
+                super::forwarded_globals(),
+                ["--no-notify", "--lock-wait", "7"]
+            );
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pipeline::parallel_children::forwarded_tests::the_forwarded_globals_are_what_this_process_was_given",
+                "--skip",
+                MARK,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[cfg(test)]

@@ -356,6 +356,11 @@ pub fn lock_wait_s() -> u64 {
 /// How often a waiting take says again that it is waiting.
 const WAIT_NOTE_EVERY: Duration = Duration::from_secs(60);
 
+/// Whether a waiting take says again that it waits: the first time, then once per `every`.
+fn note_due(noted: Option<Instant>, every: Duration) -> bool {
+    noted.is_none_or(|at| at.elapsed() >= every)
+}
+
 /// The longest pause between two attempts of a waiting take.
 const WAIT_POLL: Duration = Duration::from_secs(1);
 
@@ -368,7 +373,16 @@ impl StateStore {
         key: &str,
         what: &dyn Fn() -> String,
     ) -> Result<Option<LoadLease<'_>>> {
-        let wait = Duration::from_secs(lock_wait_s());
+        self.take_lease_waiting_for(key, Duration::from_secs(lock_wait_s()), what)
+    }
+
+    /// [`StateStore::take_lease_waiting`] for up to `wait`.
+    fn take_lease_waiting_for(
+        &self,
+        key: &str,
+        wait: Duration,
+        what: &dyn Fn() -> String,
+    ) -> Result<Option<LoadLease<'_>>> {
         let started = Instant::now();
         let mut noted: Option<Instant> = None;
         loop {
@@ -390,7 +404,7 @@ impl StateStore {
                     wait.as_secs()
                 );
             }
-            if noted.is_none_or(|at| at.elapsed() >= WAIT_NOTE_EVERY) {
+            if note_due(noted, WAIT_NOTE_EVERY) {
                 log::warn!(
                     "{} is held by {}: waiting up to {} s for it (`--lock-wait`)",
                     what(),
@@ -783,5 +797,46 @@ mod lease_path_tests {
                 .contains(&std::process::id().to_string()),
             "an in-memory store leases per process: {mem:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lock_wait_tests {
+    use super::*;
+
+    /// A waiting take of a held lease stops by code once `wait` ran out, not before and not a
+    /// poll later; free, it takes the lease at once.
+    #[test]
+    fn a_waiting_take_times_out_by_code_when_the_wait_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("rivet.yaml").to_str().unwrap()).unwrap();
+        let held = store.try_load_lease("t").unwrap().expect("the first take");
+        let started = Instant::now();
+        let err = store
+            .take_lease_waiting_for("t", Duration::from_millis(1200), &|| "lease t".into())
+            .map(|_| ())
+            .unwrap_err();
+        let took = started.elapsed();
+        crate::error::assert_coded(&err, "RIVET_STATE_LOCK_TIMEOUT", 2);
+        assert!(
+            took >= Duration::from_millis(1150) && took < Duration::from_millis(1800),
+            "waited {took:?} for a 1.2 s wait"
+        );
+        drop(held);
+        assert!(
+            store
+                .take_lease_waiting_for("t", Duration::from_secs(5), &|| "lease t".into())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_wait_note_is_due_first_and_then_once_per_period() {
+        let every = Duration::from_secs(60);
+        assert!(note_due(None, every));
+        assert!(!note_due(Some(Instant::now()), every));
+        let long_ago = Instant::now() - Duration::from_secs(61);
+        assert!(note_due(Some(long_ago), every));
     }
 }
