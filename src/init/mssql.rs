@@ -144,6 +144,7 @@ pub(super) fn introspect(conn: &mut MssqlSource, schema: &str, table: &str) -> R
 
     Ok(TableInfo {
         cdc_capture_instance,
+        cdc_unmineable: None,
         density: None,
         schema: schema.to_string(),
         table: table.to_string(),

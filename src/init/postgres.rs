@@ -135,6 +135,7 @@ pub(super) fn introspect(client: &mut Client, schema: &str, table: &str) -> Resu
 
     Ok(TableInfo {
         cdc_capture_instance: None,
+        cdc_unmineable: None,
         density: None,
         schema: schema.to_string(),
         table: table.to_string(),

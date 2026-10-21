@@ -1527,6 +1527,83 @@ fn two_cdc_configs_of_one_cluster_name_their_own_stream_objects() {
     );
 }
 
+/// A CDC scaffold over tables the Oracle capture refuses (a BLOB column, a name past LogMiner's 30
+/// bytes, more than 300 columns) leaves each out with the capture's reason, keeps the table it can
+/// capture, and the config runs AS WRITTEN: through 0.32.1 init wrote a CDC export of each, and the
+/// first `rivet run` stopped `RIVET_SOURCE_CDC_TABLE_UNSUPPORTED`.
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the Oracle CDC stand"]
+fn an_oracle_cdc_scaffold_leaves_out_the_tables_the_capture_refuses_and_runs() {
+    let _serial = cross_process_serial("oracle_cdc");
+    let blob = crate::live_cdc_oracledb::cdc_table(
+        "init_ora_blob",
+        "id NUMBER(18) PRIMARY KEY, body BLOB",
+    );
+    let long = crate::live_cdc_oracledb::cdc_table(
+        "init_ora_a_name_longer_than_logminer_reads",
+        "id NUMBER(18) PRIMARY KEY",
+    );
+    let wide_cols: Vec<String> = (1..=300).map(|i| format!("c{i} NUMBER")).collect();
+    let wide = crate::live_cdc_oracledb::cdc_table(
+        "init_ora_wide",
+        &format!("id NUMBER(18) PRIMARY KEY, {}", wide_cols.join(", ")),
+    );
+    let ok = crate::live_cdc_oracledb::cdc_table(
+        "init_ora_ok",
+        "id NUMBER(18) PRIMARY KEY, name VARCHAR2(64) NOT NULL",
+    );
+    assert!(long.name().len() > 30, "{}", long.name());
+    for op in seed_ops() {
+        ora_exec(&op_sql(ok.name(), op));
+    }
+    let db = [("DATABASE_URL", ORACLE_CDC_URL)];
+    let dir = tempfile::tempdir().expect("config dir");
+    let out = run_rivet_in_dir(
+        dir.path(),
+        &[
+            "init",
+            "--source",
+            ORACLE_CDC_URL,
+            "--schema",
+            "RIVET",
+            "--include",
+            blob.name(),
+            long.name(),
+            wide.name(),
+            ok.name(),
+            "--mode",
+            "cdc",
+            "--output",
+            "rivet.yaml",
+        ],
+        &[],
+    );
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "{said}");
+    let generated = std::fs::read_to_string(dir.path().join("rivet.yaml")).unwrap();
+    for (t, why) in [
+        (&blob, "BODY BLOB"),
+        (&long, "over 30 bytes"),
+        (&wide, "301 columns"),
+    ] {
+        assert!(
+            generated.contains(&format!("# SKIPPED {}", t.name())) && generated.contains(why),
+            "{} is left out for `{why}`:\n{generated}",
+            t.name()
+        );
+        assert!(said.contains(t.name()), "stderr names {}: {said}", t.name());
+    }
+    rivet_ok_in(dir.path(), &["check", "-c", "rivet.yaml"], &db);
+    rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
+    let snap = dir
+        .path()
+        .join("output")
+        .join(scaffolded_export(&generated))
+        .join("snapshot");
+    assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
+}
+
 /// A copy into a PostgreSQL state that already holds state rows (the same SQLite state copied a
 /// second time) is refused by code, on every attempt, before a row is written; a schema of its
 /// own, the refusal's remedy, takes the copy.
