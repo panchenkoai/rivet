@@ -22,6 +22,7 @@ from pathlib import Path
 import yaml
 
 from dev.release_oracle.core import Ledger, isolate_state_db, nextest_filter, nextest_outcomes, self_skipped
+from dev.release_oracle.live_modules import live_modules_env
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -230,8 +231,8 @@ def restore(tree: Path, snap: dict[Path, bytes]) -> None:
         raise SystemExit(f"{tree} is not clean after restoring the snapshot — stop and inspect:\n{dirty}")
 
 
-#: Every knob the harness reads a Postgres state from: the scratch DB replaces each, so no seed run reaches the shared stand state.
-SCRATCH_STATE_VARS = ("RIVET_TEST_STATE_URL", "RIVET_GATE_STATE_URL", "RIVET_CDC_STATE_URL", "RIVET_CONC_STATE_URL")
+#: The knobs stages read the gate's own Postgres state from: the scratch DB replaces each, so no seed run reaches the shared stand state.
+SCRATCH_STATE_VARS = ("RIVET_CDC_STATE_URL", "RIVET_CONC_STATE_URL")
 
 
 class Cargo:
@@ -246,6 +247,10 @@ class Cargo:
         for k, v in list(env.items()):
             if k.endswith("_BIN") and v and not os.path.isabs(v):
                 env[k] = str(ROOT / v)
+        # Each cell runs in the env the gate's live-modules stage runs it in, with the scratch DB as the gate's state:
+        # a control is then the run the gate already grades.
+        stage_env, self.again = live_modules_env(state_url or "")
+        env.update(stage_env)
         if state_url:
             for var in SCRATCH_STATE_VARS:
                 env[var] = state_url
@@ -283,8 +288,26 @@ class Cargo:
                 "-E", nextest_filter([c.removeprefix(LIB) for c in cells])],
                cwd=self.tree, env={**self.env, "RIVET_SKIP_LOG": str(skip_log)})
         log.write_text(p.stdout)
-        self.skipped = {k.split("::")[-1]: why for k, why in self_skipped(skip_log).items()}
-        return cell_outcomes(p.stdout, self_skipped(skip_log), tuple(cells))
+        skipped = self_skipped(skip_log)
+        out = cell_outcomes(p.stdout, skipped, tuple(cells))
+        why = {k.split("::")[-1]: v for k, v in skipped.items()}
+        owed = [c for c in cells if self.again and out.get(c) == "SKIP" and self.again[0] in why.get(c.removeprefix(LIB), "")]
+        if owed:
+            # As the stage does: a self-skip naming the gate's state var runs again under it, and that leg is its verdict.
+            again_log = log.with_suffix(".again.skips")
+            again_log.write_text("")
+            q = sh(["cargo", "nextest", "run", "--manifest-path", str(self.tree / "Cargo.toml"),
+                    *self.binaries(owed), "--run-ignored", "all", "--no-fail-fast", "--retries", "0",
+                    "-E", nextest_filter([c.removeprefix(LIB) for c in owed])],
+                   cwd=self.tree, env={**self.env, **self.again[1], "RIVET_SKIP_LOG": str(again_log)})
+            log.with_suffix(".again.log").write_text(q.stdout)
+            second = self_skipped(again_log)
+            out.update(cell_outcomes(q.stdout, second, tuple(owed)))
+            for c in owed:
+                why.pop(c.removeprefix(LIB), None)
+            why.update({k.split("::")[-1]: v for k, v in second.items()})
+        self.skipped = why
+        return out
 
 
 def recompiled(build_out: str) -> bool:
@@ -508,6 +531,11 @@ def self_test() -> int:
         if saved is not None:
             os.environ["RIVET_GATE_STATE_URL"] = saved
     assert all(env[v].endswith("/scratch") for v in SCRATCH_STATE_VARS), {v: env.get(v) for v in SCRATCH_STATE_VARS}
+    cargo = Cargo(Path("/t"), Path("/b"), "postgresql://u:p@127.0.0.1:5433/scratch")
+    stage, again = live_modules_env("postgresql://u:p@127.0.0.1:5433/scratch")
+    assert {k: cargo.env.get(k) for k in stage} == stage and cargo.again == again, (
+        "recall's child env differs from the live-modules stage's", {k: cargo.env.get(k) for k in stage}, stage)
+    assert cargo.env["RIVET_GATE_STATE_URL"] == "", "a SQLite-reading cell runs on SQLite, as in the stage"
     assert env["RIVET_SELFTEST_CARRIER_BIN"] == str(ROOT / ".gate-baseline/field/rivet"), env["RIVET_SELFTEST_CARRIER_BIN"]
     assert env["RIVET_TEST_STATE_TOXI_URL"] == "postgresql://u:p@127.0.0.1:15433/scratch", env["RIVET_TEST_STATE_TOXI_URL"]
     stale = []
