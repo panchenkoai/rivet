@@ -1156,28 +1156,30 @@ fn a_checkpoint_another_config_reads_is_refused(mut s: CdcScenario) {
     s.insert(2);
     s.settle();
     let own = dir.join("own.ckpt");
+    let mut remedies = vec![Remedy::new(
+        "Give this export a `cdc.checkpoint` of its own",
+        Then::DeliversTheSource,
+        move |r| {
+            r.own_checkpoint(own);
+        },
+    )];
+    // The in-place remedy is for an edited copy of the other config: on PostgreSQL the other
+    // one reads its own slot here, so it is not this stream's copy and that remedy is not its.
+    if _slot.is_none() {
+        remedies.push(Remedy::new(
+            "delete or rename that config",
+            Then::DeliversTheSource,
+            move |_| std::fs::remove_file(&other_cfg).expect("the other config goes"),
+        ));
+    }
+    remedies.push(deletes_only_the_checkpoint(Then::Refuses(
+        Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5),
+    )));
     s.rig.refuses_twice_and_walks_out(
         &["run"],
         &[],
         Refused::by_code("RIVET_SOURCE_CDC_CHECKPOINT_SHARED", 5),
-        vec![
-            Remedy::new(
-                "Give this export a `cdc.checkpoint` of its own",
-                Then::DeliversTheSource,
-                move |r| {
-                    r.own_checkpoint(own);
-                },
-            ),
-            Remedy::new(
-                "delete or rename that config",
-                Then::DeliversTheSource,
-                move |_| std::fs::remove_file(&other_cfg).expect("the other config goes"),
-            ),
-            deletes_only_the_checkpoint(Then::Refuses(Refused::by_code(
-                "RIVET_SOURCE_CDC_CHECKPOINT_SHARED",
-                5,
-            ))),
-        ],
+        remedies,
     );
 }
 
