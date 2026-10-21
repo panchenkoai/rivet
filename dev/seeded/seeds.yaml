@@ -17,6 +17,23 @@
 
 seeds:
 
+  - name: cdc-hot-added-column-dropped
+    class: "a column added to a captured table while a CDC run is open is not in the run's schema: its values are dropped and acked, exit 0 (SQL Server: the run ends clean over a column its capture instance never carried)"
+    history: "issue #644, a DBA's question on 2026-10-19; RED on main 2026-10-21 (the rig oracle: source column `c` is absent from the delivered parquet, PostgreSQL, MySQL and SQL Server)"
+    scope: source
+    patch: cdc-hot-added-column-dropped/shared.patch
+    engines:
+      postgres:
+        cells: [pg_cdc_a_column_added_while_a_run_is_open_lands_every_value, pg_cdc_a_drop_and_add_at_one_arity_while_a_run_is_open_lands_under_the_new_name, "lib:a_column_added_while_the_run_is_open_continues_in_a_new_part_with_its_values"]
+      mysql:
+        cells: [mysql_cdc_a_column_added_while_a_run_is_open_lands_every_value, a_column_added_while_a_mysql_cdc_run_is_open_loads_into_clickhouse_with_every_value, mysql_cdc_a_drop_and_add_at_one_arity_while_a_run_is_open_lands_under_the_new_name]
+      mssql:
+        cells: [mssql_cdc_a_column_added_while_a_run_is_open_stops_by_code]
+      mongo:
+        na: "a MongoDB change lands the whole document in its one `document` column, so a field added while the run is open is a value in it, never a column the run lacks (mongo_cdc_a_field_added_while_a_run_is_open_is_in_the_document, live_cdc_schema_drift.rs)"
+      oracle:
+        na: "Oracle CDC only drains to the SCN current at open (`until_current: false` is refused) and resolves its schema after it, so a run never reads a change written after its schema; an ADD COLUMN inside the window is refused before any write as RIVET_SOURCE_CDC_UNDECODABLE (oracle_cdc_a_change_older_than_an_alter_is_refused_by_code), and one between runs is delivered with its values (oracle_cdc_picks_up_a_column_added_between_runs)"
+
   - name: incremental-plan-replay-answered
     class: "`rivet apply` treats an incremental plan (`mode: incremental`, `keyset_incremental`) as a point-in-time snapshot: a replay after its first exit-0 apply answers \"already applied\", so every row that arrived since is never delivered with exit 0, and the plan is refused past 24 h"
     history: "found 2026-10-16 on PR #616 CI (run 38911927276): the first F3 replay answer keyed on plan_id alone; `incremental_keyset_apply_rotates_run_id_across_repeated_applies` read COUNT(*) source 150, delivered 100; owner decision (PR #616 comment 6219074059): an incremental plan is a reusable description"
@@ -440,6 +457,19 @@ seeds:
       sqlite-state:
         patch: sqlite-writer-starved-by-a-sibling/sqlite-state.patch
         cells: ["lib:a_replan_beside_a_writer_that_never_lets_go_gets_its_turn"]
+      postgres-state:
+        na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
+
+  - name: sqlite-overdue-writer-loses-its-place
+    class: "a SQLite state writer that ran out of the turn queue's patience while a sibling of the same process held a turn leaves the queue for SQLite's busy wait, where the sibling committing back to back wins every gap, so the write is refused `database is locked` after the busy timeout"
+    history: "0.32.2, 2026-10-21: #638's regression test failed on the unmutated baseline of #660's mutants shard 2 under CI load (`starved: 0: database is locked after 10.16s`); forced on devbox with a sibling holding each turn twice the test patience: red 3/3 on main c5bdcde0 (refused after 15.0-15.5 s)"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: sqlite-overdue-writer-loses-its-place/sqlite-state.patch
+        cells:
+          - "lib:a_replan_beside_a_writer_slower_than_the_turn_patience_gets_its_turn"
+          - "lib:turns_are_served_in_the_order_they_were_asked_and_a_late_one_gives_up"
       postgres-state:
         na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
 
