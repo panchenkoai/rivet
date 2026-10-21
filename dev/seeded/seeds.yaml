@@ -1569,15 +1569,15 @@ seeds:
     patch: init-cdc-checkpoint-shared-by-name/shared.patch
     engines:
       postgres:
-        cells: [two_init_configs_in_one_dir_each_deliver_every_row_postgres]
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_postgres]
       mysql:
-        cells: [two_init_configs_in_one_dir_each_deliver_every_row_mysql]
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_mysql]
       mssql:
-        cells: [two_init_configs_in_one_dir_each_deliver_every_row_mssql]
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_mssql]
       mongo:
         cells: ["lib:a_cdc_scaffold_names_its_checkpoint_and_destination_after_the_output_file"]
       oracle:
-        cells: [two_init_configs_in_one_dir_each_deliver_every_row_oracle]
+        cells: [two_init_configs_in_one_dir_keep_their_streams_apart_oracle]
   - name: cdc-checkpoint-read-by-two-configs
     class: "a CDC run continues from a checkpoint another config still reads, so two streams on one position each skip the changes the other read, exit 0"
     history: "0.32.2, owner decision 2026-10-21 (\"forbid a shared checkpoint\"): a run recorded no owner of its checkpoint; fixed by `checkpoint_identity::claim_checkpoint` and RIVET_SOURCE_CDC_CHECKPOINT_SHARED"

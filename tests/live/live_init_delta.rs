@@ -1289,7 +1289,7 @@ fn scaffolded_path(dir: &std::path::Path, generated: &str) -> std::path::PathBuf
 /// another place, run in turns with changes between: each destination must hold every source
 /// row. Through 0.32.1 both named one checkpoint, so each stream resumed where the other had
 /// stopped and skipped what it read, exit 0.
-fn two_init_configs_in_one_dir_each_deliver_every_row((src, _guard, extra): TwoConfigSource) {
+fn two_init_configs_in_one_dir_keep_their_streams_apart((src, _guard, extra): TwoConfigSource) {
     (src.apply)(&[Op::Ins(1), Op::Ins(2), Op::Ins(3)]);
     let dir = tempfile::tempdir().expect("config dir");
     let db = [("DATABASE_URL", src.url.as_str())];
@@ -1328,10 +1328,8 @@ fn two_init_configs_in_one_dir_each_deliver_every_row((src, _guard, extra): TwoC
             .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
             .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
             .collect();
-        let delivered: std::collections::BTreeSet<i64> = dirs
-            .iter()
-            .flat_map(|d| duckdb_dir_parquet_id_set(d))
-            .collect();
+        let delivered: std::collections::BTreeSet<i64> =
+            dirs.iter().flat_map(|d| ids_in(d)).collect();
         assert_eq!(
             delivered,
             every,
@@ -1451,28 +1449,28 @@ fn two_configs_oracle() -> TwoConfigSource {
 
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
-fn two_init_configs_in_one_dir_each_deliver_every_row_mysql() {
-    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_mysql());
+fn two_init_configs_in_one_dir_keep_their_streams_apart_mysql() {
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_mysql());
 }
 
 #[test]
 #[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
-fn two_init_configs_in_one_dir_each_deliver_every_row_postgres() {
-    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_postgres());
+fn two_init_configs_in_one_dir_keep_their_streams_apart_postgres() {
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_postgres());
 }
 
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
-fn two_init_configs_in_one_dir_each_deliver_every_row_mssql() {
-    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_mssql());
+fn two_init_configs_in_one_dir_keep_their_streams_apart_mssql() {
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_mssql());
 }
 
 #[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires the oracle service with LogMiner prerequisites"]
-fn two_init_configs_in_one_dir_each_deliver_every_row_oracle() {
+fn two_init_configs_in_one_dir_keep_their_streams_apart_oracle() {
     let _serial = cross_process_serial("oracle_cdc");
-    two_init_configs_in_one_dir_each_deliver_every_row(two_configs_oracle());
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_oracle());
 }
 
 /// The older release whose state `rivet state copy` carries: 0.30.0 (`RIVET_STATE_COPY_FROM_BIN`,
