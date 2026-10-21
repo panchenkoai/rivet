@@ -4,6 +4,7 @@ use crate::error::Result;
 
 mod cdc_snapshot_store;
 mod checkpoint;
+pub mod copy;
 mod cursor;
 mod file_log;
 mod journal_store;
@@ -315,6 +316,11 @@ fn refuse_a_state_left_behind(beside: &std::path::Path, target: &std::path::Path
     )
 }
 
+/// The value of `RIVET_STATE_URL`, when it is set.
+pub(crate) fn state_url_var() -> Option<String> {
+    std::env::var("RIVET_STATE_URL").ok()
+}
+
 /// The PostgreSQL URL a `RIVET_STATE_URL` value names, `None` for an empty one (SQLite); any other value is refused, never replaced by SQLite.
 fn postgres_state_url(url: &str) -> Result<Option<&str>> {
     if url.is_empty() || url.starts_with("sqlite:") {
@@ -375,7 +381,7 @@ impl StateStore {
     ///
     /// `RIVET_STATE_URL` when it is set, else SQLite next to `config_path`.
     pub fn open(config_path: &str) -> Result<Self> {
-        if let Ok(url) = std::env::var("RIVET_STATE_URL") {
+        if let Some(url) = state_url_var() {
             if let Some(path) = sqlite_state_path(&url, config_path) {
                 refuse_a_state_left_behind(&config_dir_of(config_path).join(STATE_DB_NAME), &path)?;
                 return Self::open_at_path(&path);

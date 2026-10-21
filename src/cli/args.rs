@@ -747,6 +747,15 @@ pub enum StateAction {
         #[arg(long)]
         run_id: String,
     },
+    /// Copy this config's SQLite state into an empty PostgreSQL state: every table, in one
+    /// transaction, each table's row count checked; the SQLite file is only read
+    Copy {
+        #[arg(short, long)]
+        config: String,
+        /// The PostgreSQL state to copy into; defaults to RIVET_STATE_URL
+        #[arg(long, value_name = "URL")]
+        to: Option<String>,
+    },
     /// Shrink a SQLite state DB: rewrite it without the free pages deletes and migrations
     /// leave behind (takes the write lock while it runs; PostgreSQL state is left to autovacuum)
     Vacuum {

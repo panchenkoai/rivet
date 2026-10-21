@@ -1,0 +1,11 @@
+--- a/src/state/copy.rs
++++ b/src/state/copy.rs
+@@ -386,7 +386,7 @@ fn resume_sequences(
+     table: &str,
+     columns: &[&Column],
+ ) -> Result<()> {
+-    for c in columns {
++    for c in columns.iter().take(0) {
+         let seq: Option<String> = tx
+             .query_one(
+                 "SELECT pg_get_serial_sequence($1, $2)",

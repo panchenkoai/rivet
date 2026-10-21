@@ -159,6 +159,11 @@ fn graded(
 }
 
 /// `run_rivet` with extra environment variables (fault hooks, log levels).
+/// [`run_rivet_env`] with another release's binary, graded like this tree's runs, so a later run of this tree is graded against what it delivered.
+pub fn run_rivet_as(bin: &str, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    graded(args, envs, None, rivet_command_as(bin, args, envs))
+}
+
 pub fn run_rivet_env(args: &[&str], envs: &[(&str, &str)]) -> Output {
     graded(args, envs, None, rivet_command(args, envs))
 }
