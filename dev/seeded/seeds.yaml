@@ -456,6 +456,19 @@ seeds:
       postgres-state:
         na: "a PostgreSQL-state lease is a row keyed by the raw key (state_lease.lease_key), never a file name"
 
+  - name: lease-upgrade-window-unguarded
+    class: "a run of the upgraded binary takes only the new lease file name, so a 0.32.1 run of the same export still holding the old name does not exclude it and both write"
+    history: "0.32.2, 2026-10-21: the D1 fix renamed the lease file; red on its first cut with a paused released 0.32.1 run beside it (this run exited 0)"
+    scope: state
+    engines:
+      sqlite-state:
+        patch: lease-upgrade-window-unguarded/sqlite-state.patch
+        cells:
+          - "lib:a_holder_of_the_old_lease_name_and_this_release_exclude_each_other"
+          - a_run_beside_a_live_previous_release_run_of_the_export_is_refused
+      postgres-state:
+        na: "a PostgreSQL-state lease is a row keyed by the raw key, unchanged by the rename"
+
   - name: load-spec-last-writer-of-one-name
     class: "the by-name load spec is one row per export name, so on a state shared by configs of one name reading different sources the last `rivet init` (or run) decides every config's load key"
     history: "client simulation on 0.32.0 (D3) and owner decision 2026-10-18 (v38 approved); measured on main 34ec3d30 with five configs on one PostgreSQL state: the second config's load refused RIVET_LOAD_KEY_COLUMN_INVALID keyed by the fifth one's `code`"
