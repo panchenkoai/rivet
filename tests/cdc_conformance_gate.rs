@@ -901,7 +901,9 @@ fn oracle_class_census_is_pinned() {
 // compared with the source table's `count(*)` and with the parent's failed entry.
 // 2026-10-20: +1 independent - the load and compact digest of a base-and-buffer CDC table, every job read
 // back through the bq CLI (bq show -j, bq ls -j --parent_job_id) and the base counted through bq.
-const PIN_INDEPENDENT: usize = 117; // ratchet-pin: cdc-census-independent min
+// 2026-10-21: +2 independent - the PostgreSQL upgrade from a released 0.32.1 (slot and checkpoint
+// read through `confirmed_flush_lsn`) and its way back.
+const PIN_INDEPENDENT: usize = 119; // ratchet-pin: cdc-census-independent min
 // 2026-09-28, source connection ceilings: +3 shared codec — the run's captured row is the
 // fixture check; the oracle is the server's own connection counter.
 // 2026-09-29: +2 shared codec — the Oracle TRUNCATE refusal on re-run and the uncaptured-truncate cell.

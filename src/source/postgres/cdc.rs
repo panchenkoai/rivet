@@ -966,7 +966,7 @@ impl PgChangeStream {
     /// Save `lsn` as the export's checkpoint, the position rivet confirmed, when it has one.
     fn record_confirmed(&self, lsn: &str) -> Result<()> {
         match &self.checkpoint {
-            Some(ck) => Position::new(json!({ "lsn": lsn })).save(ck),
+            Some(ck) => confirmed_first(&Position::new(json!({ "lsn": lsn }))).save(ck),
             None => Ok(()),
         }
     }
@@ -994,13 +994,29 @@ impl PgChangeStream {
     }
 }
 
+/// The checkpoint key that says it was written by a release that saves the checkpoint before
+/// every slot advance (0.32.2 and later); a checkpoint without it may be behind its own slot.
+const CONFIRMED_FIRST: &str = "confirmed_first";
+
+/// `position` as a checkpoint this release writes: marked [`CONFIRMED_FIRST`].
+fn confirmed_first(position: &Position) -> Position {
+    let mut json = position.json().clone();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(CONFIRMED_FIRST.to_string(), json!(true));
+    }
+    Position::new(json)
+}
+
 /// Refuse a slot another reader advanced past the last position rivet confirmed for this export.
 ///
 /// rivet writes the checkpoint before it advances the slot (the sink's ack, the empty-span
 /// release), so its own slot is never past its checkpoint. A slot that is was consumed by another
 /// reader (a second config of this cluster sharing the slot name): the changes between the two
 /// positions went to it and are gone from this stream, which would otherwise continue past them
-/// with exit 0. Without a checkpoint there is no position to compare and nothing is refused.
+/// with exit 0. A checkpoint an older release wrote (no [`CONFIRMED_FIRST`]) may be behind the
+/// slot by that release's own empty-span release: its slot is adopted once, with a warning, and
+/// the checkpoint rewritten in this release's form, after which the comparison is strict. Without
+/// a checkpoint there is no position to compare and nothing is refused.
 fn refuse_a_slot_another_reader_advanced(
     client: &mut postgres::Client,
     slot: &str,
@@ -1009,12 +1025,15 @@ fn refuse_a_slot_another_reader_advanced(
     let Some(path) = checkpoint else {
         return Ok(());
     };
-    let Some(own) = Position::load(path)?.and_then(|p| {
-        p.json()
-            .get("lsn")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-    }) else {
+    let Some(saved) = Position::load(path)? else {
+        return Ok(());
+    };
+    let Some(own) = saved
+        .json()
+        .get("lsn")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
         return Ok(());
     };
     let confirmed: Option<String> = client
@@ -1023,10 +1042,52 @@ fn refuse_a_slot_another_reader_advanced(
             &[&slot],
         )?
         .get(0);
-    match slot_advanced_by_another(slot, &own, confirmed.as_deref()) {
-        Some(why) => Err(crate::source::cdc::checkpoint_identity::log_gap(why)),
-        None => Ok(()),
+    match open_verdict(slot, &saved, &own, confirmed.as_deref()) {
+        OpenVerdict::Refuse(why) => Err(crate::source::cdc::checkpoint_identity::log_gap(why)),
+        OpenVerdict::Adopt(at) => {
+            log::warn!(
+                "pg cdc: slot '{slot}' is confirmed at {at}, past {own}, the checkpoint an earlier \
+                 rivet wrote: that release advanced its slot over spans without a change before \
+                 it saved the checkpoint, so the slot's position is taken this once and the \
+                 checkpoint rewritten; from now on a slot past the checkpoint is refused"
+            );
+            adopted(&saved, &at).save(path)
+        }
+        OpenVerdict::Mark => confirmed_first(&saved).save(path),
+        OpenVerdict::Keep => Ok(()),
     }
+}
+
+/// What the open does with a reused slot and the checkpoint `saved` at `own`.
+#[derive(Debug, PartialEq)]
+enum OpenVerdict {
+    /// Another reader advanced the slot past a checkpoint this release wrote.
+    Refuse(String),
+    /// An older release's checkpoint behind its slot: take the slot's position, once.
+    Adopt(String),
+    /// An older release's checkpoint at or past its slot: rewrite it in this release's form.
+    Mark,
+    /// This release's checkpoint, the slot not past it.
+    Keep,
+}
+
+fn open_verdict(slot: &str, saved: &Position, own: &str, confirmed: Option<&str>) -> OpenVerdict {
+    let marked = saved.json().get(CONFIRMED_FIRST).and_then(|v| v.as_bool()) == Some(true);
+    match (slot_advanced_by_another(slot, own, confirmed), marked) {
+        (Some(why), true) => OpenVerdict::Refuse(why),
+        (Some(_), false) => OpenVerdict::Adopt(confirmed.unwrap_or_default().to_string()),
+        (None, false) => OpenVerdict::Mark,
+        (None, true) => OpenVerdict::Keep,
+    }
+}
+
+/// `saved` moved to the slot's position `lsn`, in this release's form.
+fn adopted(saved: &Position, lsn: &str) -> Position {
+    let mut json = saved.json().clone();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("lsn".to_string(), json!(lsn));
+    }
+    confirmed_first(&Position::new(json))
 }
 
 /// The refusal for a slot confirmed past `own`, the checkpoint's position; `None` when it is not.
@@ -1299,6 +1360,10 @@ impl ChangeStream for PgChangeStream {
 
     fn retention_warnings(&mut self) -> Vec<String> {
         crate::source::cdc::pg_retention_warnings_on(&mut self.client, &self.slot)
+    }
+
+    fn checkpoint_of(&self, position: &Position) -> Position {
+        confirmed_first(position)
     }
 
     fn engine(&self) -> crate::source::cdc::CdcEngine {
@@ -4185,6 +4250,43 @@ mod slot_creation_warning_tests {
 #[cfg(test)]
 mod foreign_advance_tests {
     use super::slot_advanced_by_another;
+
+    /// A checkpoint an older release wrote (no `confirmed_first`) behind its slot is adopted once
+    /// and rewritten; the rewritten one, and any this release writes, is strict: a slot past it is
+    /// refused, every time.
+    #[test]
+    fn an_older_releases_checkpoint_behind_its_slot_is_adopted_once_then_the_guard_is_strict() {
+        use super::{CONFIRMED_FIRST, OpenVerdict, adopted, confirmed_first, open_verdict};
+        use crate::source::cdc::Position;
+        use serde_json::json;
+        let old = Position::new(json!({ "lsn": "0/16B3000" }));
+        assert_eq!(
+            open_verdict("s", &old, "0/16B3000", Some("0/16B3780")),
+            OpenVerdict::Adopt("0/16B3780".to_string())
+        );
+        assert_eq!(
+            open_verdict("s", &old, "0/16B3000", Some("0/16B3000")),
+            OpenVerdict::Mark
+        );
+        let rewritten = adopted(&old, "0/16B3780");
+        assert_eq!(rewritten.json()["lsn"], "0/16B3780");
+        assert_eq!(rewritten.json()[CONFIRMED_FIRST], true);
+        assert_eq!(
+            open_verdict("s", &rewritten, "0/16B3780", Some("0/16B3780")),
+            OpenVerdict::Keep
+        );
+        for _ in 0..2 {
+            assert!(matches!(
+                open_verdict("s", &rewritten, "0/16B3780", Some("0/16B4000")),
+                OpenVerdict::Refuse(why) if why.contains("another reader consumed")
+            ));
+        }
+        let written_here = confirmed_first(&Position::new(json!({ "lsn": "0/1" })));
+        assert!(matches!(
+            open_verdict("s", &written_here, "0/1", Some("0/2")),
+            OpenVerdict::Refuse(_)
+        ));
+    }
 
     #[test]
     fn a_slot_confirmed_past_the_checkpoint_is_refused_and_one_at_or_before_it_reads() {

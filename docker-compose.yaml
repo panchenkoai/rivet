@@ -32,7 +32,9 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U rivet -d rivet_state"]
       interval: 5s
-      timeout: 3s
+      # 30 s, not 3: under slow IO (devbox, a whole live run) a 3 s probe timed out and marked
+      # the state server unhealthy while it was only slow (the :5433 finding, 2026-10-20).
+      timeout: 30s
       retries: 10
 
   # ---- Legacy Postgres versions (compatibility testing) ---------------------
