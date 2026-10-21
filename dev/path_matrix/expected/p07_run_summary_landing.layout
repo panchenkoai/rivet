@@ -5,6 +5,7 @@
 .rivet/runs/pa_audit_<RUNID>/summary.md
 .rivet_state.db
 .rivet_state.db.lease-chunk-run-pa_audit-<SOURCE>
+.rivet_state.db.lease-chunk-run-pa_audit-<SOURCE>-<KEY>
 out
 out/p07
 out/p07/_SUCCESS

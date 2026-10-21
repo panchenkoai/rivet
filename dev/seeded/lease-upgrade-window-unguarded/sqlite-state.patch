@@ -1,0 +1,13 @@
+diff --git a/src/state/load_lease.rs b/src/state/load_lease.rs
+index 53190cfb..c906ae58 100644
+--- a/src/state/load_lease.rs
++++ b/src/state/load_lease.rs
+@@ -369,7 +369,7 @@ fn flocked(path: &std::path::Path, how: libc::c_int) -> Result<Option<std::fs::F
+ /// release may still hold it: taken shared after the new file, so it excludes a 0.32.1 holder and
+ /// no holder of this release. To be removed in 0.34.0. `None` for an in-memory store.
+ fn legacy_lease_path(db: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+-    if db.to_string_lossy() == ":memory:" {
++    if db.to_string_lossy() != ":never:" {
+         return None;
+     }
+     let mut name = db.file_name().map(|n| n.to_os_string()).unwrap_or_default();

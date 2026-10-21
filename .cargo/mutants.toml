@@ -832,13 +832,13 @@ exclude_re = [
     # `UiRoutedLogger::flush` delegates to the inner logger's flush; the routing,
     # filtering and the redacting line are graded (`redact::logger_tests`).
     "replace <impl log::Log for UiRoutedLogger>::flush with \\(\\)",
-    # `flock(fd, LOCK_EX | LOCK_NB)`: EQUIVALENT, by the constants. The two flags
-    # are disjoint bits (LOCK_EX = 2, LOCK_NB = 4), so `|` and `^` both evaluate to
-    # 6 and NO input can tell them apart. The lock itself is graded: the lease's
+    # `flock(fd, how | LOCK_NB)` in `flocked`: EQUIVALENT, by the constants. `how` is
+    # LOCK_EX (2) or LOCK_SH (1) and LOCK_NB is 4, disjoint bits, so `|` and `^` give
+    # the same value and NO input can tell them apart. The lock itself is graded: the lease's
     # own unit test takes it twice in one process, and the live
     # `two_compacts_at_once_admit_one_and_apply_each_change_once` proves it across
     # two.
-    "replace \\| with \\^ in StateStore::try_load_lease",
+    "replace \\| with \\^ in flocked",
     # `pid > 0` in `holder_is_dead_here` → `>=`: EQUIVALENT. The two differ only at pid 0,
     # and kill(0, 0) signals the caller's own process group, which always exists — so
     # both read "alive". The guard that matters, a negative pid (a process GROUP to
