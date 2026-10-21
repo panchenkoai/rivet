@@ -24,13 +24,13 @@ pub(super) const PATIENCE: Duration = Duration::from_millis(super::SQLITE_BUSY_T
 #[cfg(test)]
 pub(super) const PATIENCE: Duration = Duration::from_millis(50);
 
-/// One file's queue: the waiting tickets in order, whether a turn is taken, and the ticket that
-/// ran out of patience and is in SQLite's busy wait ahead of every other.
+/// One file's queue: the waiting tickets in order, whether a turn is taken, and whether a writer
+/// that ran out of patience is in SQLite's busy wait ahead of every other.
 #[derive(Default)]
 struct Queue {
     waiting: VecDeque<u64>,
     taken: bool,
-    overdue: Option<u64>,
+    overdue: bool,
     next: u64,
 }
 
@@ -40,20 +40,19 @@ struct Turns {
     freed: Condvar,
 }
 
-/// A turn at one file's write lock, or the place of a writer that ran out of patience (`overdue`);
-/// dropping it hands the lock to the next ticket.
+/// A turn at one file's write lock, or the place of a writer that ran out of patience (`overdue`,
+/// of which there is at most one); dropping it hands the lock to the next ticket.
 pub(super) struct Turn {
     turns: Arc<Turns>,
-    overdue: Option<u64>,
+    overdue: bool,
 }
 
 impl Drop for Turn {
     fn drop(&mut self) {
         let mut q = self.turns.queue.lock().unwrap_or_else(|p| p.into_inner());
         match self.overdue {
-            Some(me) if q.overdue == Some(me) => q.overdue = None,
-            Some(_) => {}
-            None => q.taken = false,
+            true => q.overdue = false,
+            false => q.taken = false,
         }
         drop(q);
         self.turns.freed.notify_all();
@@ -87,28 +86,29 @@ pub(super) fn take(db: &Path, patience: Duration) -> Option<Turn> {
     q.next += 1;
     q.waiting.push_back(me);
     loop {
-        if !q.taken && q.overdue.is_none() && q.waiting.front() == Some(&me) {
+        if !q.taken && !q.overdue && q.waiting.front() == Some(&me) {
             q.waiting.pop_front();
             q.taken = true;
             drop(q);
             return Some(Turn {
                 turns,
-                overdue: None,
+                overdue: false,
             });
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             q.waiting.retain(|t| *t != me);
-            let place = q.overdue.is_none().then(|| {
-                q.overdue = Some(me);
-                me
-            });
+            let place = !q.overdue;
+            q.overdue = true;
             drop(q);
             turns.freed.notify_all();
-            return place.map(|me| Turn {
-                turns,
-                overdue: Some(me),
-            });
+            return match place {
+                true => Some(Turn {
+                    turns,
+                    overdue: true,
+                }),
+                false => None,
+            };
         }
         q = turns
             .freed
