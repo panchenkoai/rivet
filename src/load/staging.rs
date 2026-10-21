@@ -354,7 +354,7 @@ pub(super) fn maybe_gc_orphans(
     ) {
         Ok((0, _)) => {}
         Ok((n, bytes)) => {
-            println!(
+            eprintln!(
                 "  gc-orphans [{}]: removed {n} orphan part(s) ({bytes} bytes)",
                 plan.table
             )

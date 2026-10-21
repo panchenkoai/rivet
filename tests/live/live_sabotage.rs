@@ -1130,6 +1130,87 @@ fn mongo_live_export(tag: &str) -> (String, Rig, Box<dyn std::any::Any>) {
     (rig.export_name().to_string(), rig, Box::new(guard))
 }
 
+/// `rivet state reset --lock-wait 2` while another process holds the export's run lease (this
+/// cell, through rivet's own lease): it waits, says who holds it, and stops by
+/// `RIVET_STATE_LOCK_TIMEOUT` (exit 2, retryable) twice; the same wait again stops again, and the
+/// remedy, a wait long enough for the holder to let go, takes the lease and resets.
+fn lock_wait_times_out(live_rig: impl Fn() -> (String, Rig, Box<dyn std::any::Any>)) {
+    let timed_out = Refused::by_code("RIVET_STATE_LOCK_TIMEOUT", 2);
+    let (export, mut rig, _guard) = live_rig();
+    rig.run_ok();
+    let key = rig.lease_key();
+    let cfg = rig.config_path().display().to_string();
+    let state_url = rig.state_url(&[]);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (held, is_held) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let state = match state_url {
+            Some(url) => {
+                rivet::state::StateStore::open_at_ref(&rivet::state::StateRef::Postgres(url))
+            }
+            None => rivet::state::StateStore::open(&cfg),
+        }
+        .expect("the rig's state");
+        let _lease = state
+            .try_load_lease(&key)
+            .expect("take the lease")
+            .expect("the cell holds the export's run lease");
+        held.send(()).unwrap();
+        let _ = released.recv();
+    });
+    is_held.recv().expect("the holder took the lease");
+    let reset = [
+        "--lock-wait",
+        "2",
+        "state",
+        "reset",
+        "--export",
+        export.as_str(),
+    ];
+    let waits = [
+        "--lock-wait",
+        "600",
+        "state",
+        "reset",
+        "--export",
+        export.as_str(),
+    ];
+    let said = rig.refuses_twice_and_walks_out(
+        &reset,
+        &[],
+        timed_out,
+        vec![
+            Remedy::wrong(
+                "waits the same two seconds again",
+                Then::Refuses(timed_out),
+                |_| {},
+            ),
+            Remedy::new(
+                "give `--lock-wait` more seconds",
+                Then::DeliversTheSource,
+                move |_| {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let _ = release.send(());
+                    });
+                },
+            )
+            .in_place()
+            .rerun_as(&waits),
+        ],
+    );
+    assert!(
+        said.contains("waiting up to 2 s"),
+        "the wait is said: {said}"
+    );
+    holder.join().expect("the holder let go");
+    recovers(&rig, &[]);
+}
+
+fn lock_wait_times_out_sql(engine: SqlEngine) {
+    lock_wait_times_out(|| live(engine, "sab_wait", Shape::RangeCheckpoint));
+}
+
 fn run_in_progress_sql(engine: SqlEngine) {
     run_in_progress(|| live(engine, "sab_live", Shape::RangeCheckpoint));
 }
@@ -5518,4 +5599,35 @@ fn the_ends_of_each_date_type_are_delivered_or_fail_loudly_mongo() {
             )),
         ),
     ]);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres"]
+fn a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_postgres() {
+    lock_wait_times_out_sql(SqlEngine::Pg);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mysql"]
+fn a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_mysql() {
+    lock_wait_times_out_sql(SqlEngine::Mysql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mssql"]
+fn a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_mssql() {
+    lock_wait_times_out_sql(SqlEngine::Mssql);
+}
+
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_mongo() {
+    lock_wait_times_out(|| mongo_live_export("sab_wait"));
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires docker compose oracle"]
+fn a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_oracle() {
+    lock_wait_times_out_sql(SqlEngine::Oracle);
 }

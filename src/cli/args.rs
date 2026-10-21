@@ -38,7 +38,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_notify: bool,
     /// Wait up to SECONDS for an export's run lease or a table's load lease another live rivet process holds, then stop with RIVET_STATE_LOCK_TIMEOUT (exit 2); 0 stops at once
-    #[arg(long, global = true, value_name = "SECONDS", default_value_t = 600)]
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        default_value_t = 600,
+        env = "RIVET_LOCK_WAIT"
+    )]
     pub lock_wait: u64,
 }
 
@@ -230,6 +236,18 @@ pub enum Commands {
         /// `--pool 1` for the strictly sequential pass.
         #[arg(long, value_name = "N")]
         pool: Option<usize>,
+        /// Take only this export's tables
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Take only this warehouse table
+        #[arg(long, value_name = "TABLE")]
+        table: Option<String>,
+        /// Print the per-table result as JSON to stdout (the result lines go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Write the per-table result as JSON to this file
+        #[arg(long, value_name = "PATH")]
+        summary_output: Option<String>,
     },
     /// Merge each base-and-buffer CDC table's `<table>__changes` buffer into its
     /// base table (`MERGE` by primary key: updates, inserts, deletes flagged as
@@ -254,6 +272,18 @@ pub enum Commands {
         /// at the number of tables. Pass `--pool 1` for the sequential pass.
         #[arg(long, value_name = "N")]
         pool: Option<usize>,
+        /// Take only this export's tables
+        #[arg(short, long)]
+        export: Option<String>,
+        /// Take only this warehouse table
+        #[arg(long, value_name = "TABLE")]
+        table: Option<String>,
+        /// Print the per-table result as JSON to stdout (the result lines go to stderr)
+        #[arg(long)]
+        json: bool,
+        /// Write the per-table result as JSON to this file
+        #[arg(long, value_name = "PATH")]
+        summary_output: Option<String>,
     },
     /// Manage export state
     State {

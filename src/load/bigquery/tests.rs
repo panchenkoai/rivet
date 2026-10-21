@@ -1665,3 +1665,64 @@ fn a_bad_clustering_list_is_refused_and_the_partition_expression_is_the_plans() 
     };
     assert_eq!(loader.partition(part).partition_expr(), Some("DATE(ts)"));
 }
+
+/// A re-baseline buffers one tombstone per live base row its buffer does not hold, over the
+/// source columns only, and reports the rows the buffer gained.
+#[test]
+fn a_rebaseline_buffers_a_tombstone_for_each_base_row_the_buffer_does_not_hold() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let inserted = std::sync::Arc::new(AtomicBool::new(false));
+    let seen_insert = inserted.clone();
+    let stand = Stand::start(move |seen, _| {
+        let table = seen
+            .path
+            .strip_prefix("/bigquery/v2/projects/p/datasets/d/tables/");
+        match (seen.method.as_str(), table) {
+            ("GET", Some(name)) if name.ends_with("/rowAccessPolicies") => return json(200, "{}"),
+            ("GET", Some("t__changes")) => {
+                let rows = if seen_insert.load(Ordering::SeqCst) {
+                    7
+                } else {
+                    5
+                };
+                return json(200, &format!(r#"{{"type":"TABLE","numRows":"{rows}"}}"#));
+            }
+            ("GET", Some(_)) => return json(404, r#"{"error":{"message":"Not found"}}"#),
+            ("PATCH", Some(_)) => return json(200, "{}"),
+            _ => {}
+        }
+        let id = seen.body["jobReference"]["jobId"]
+            .as_str()
+            .unwrap_or("none")
+            .to_string();
+        let sql = seen.body["configuration"]["query"]["query"]
+            .as_str()
+            .unwrap_or("");
+        if sql.starts_with("INSERT INTO `p.d.t__changes`") {
+            seen_insert.store(true, Ordering::SeqCst);
+        }
+        json(
+            200,
+            &format!(
+                r#"{{"jobReference":{{"projectId":"p","jobId":"{id}"}},"status":{{"state":"DONE"}}}}"#
+            ),
+        )
+    });
+    let mut specs = crate::load::tests::spec_ok();
+    let mut meta = specs[0].clone();
+    meta.column_name = "__pos".into();
+    specs.push(meta);
+    let flagged = on(&stand)
+        .flag_absent_from_buffer("t", &specs, &["id".to_string()])
+        .unwrap();
+    assert_eq!(flagged, 2, "the rows the buffer gained");
+    let insert = statements(&stand)
+        .into_iter()
+        .find(|s| s.starts_with("INSERT INTO"))
+        .expect("the tombstones are inserted");
+    assert_eq!(
+        insert,
+        crate::load::cdc::absent_as_deleted_sql("p.d.t", "p.d.t__changes", &["id"], &["id"])
+    );
+    assert!(inserted.load(std::sync::atomic::Ordering::SeqCst));
+}

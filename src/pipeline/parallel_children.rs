@@ -664,6 +664,8 @@ mod forwarded_tests {
     /// The wait is handed on with its seconds; `--no-notify` only when this process was given it.
     #[test]
     fn each_forwarded_global_is_handed_on_as_this_process_holds_it() {
+        crate::notify::silence();
+        assert_eq!(super::forwarded("--no-notify"), ["--no-notify"]);
         let wait = super::forwarded("--lock-wait");
         assert_eq!(wait[0], "--lock-wait");
         assert_eq!(wait[1], crate::state::lock_wait_s().to_string());

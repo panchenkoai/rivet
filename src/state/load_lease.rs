@@ -382,7 +382,8 @@ impl StateStore {
             if waited >= wait {
                 crate::rivet_bail!(
                     crate::error::codes::STATE_LOCK_TIMEOUT,
-                    "{}, held by {}, was still held after {} s (`--lock-wait {}`); nothing was done",
+                    "{}, held by {}, was still held after {} s (`--lock-wait {}`); nothing was \
+                     done. Retry once it ends, or give `--lock-wait` more seconds",
                     what(),
                     self.lease_holder(key)?,
                     waited.as_secs(),

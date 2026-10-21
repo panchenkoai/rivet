@@ -62,42 +62,7 @@ use std::time::{Duration, Instant};
 use super::ipc::ChildEvent;
 use super::{clamp_line, format_bytes, strip_chunked_recovery_hint};
 
-/// Neutralise terminal-control bytes in text that originates outside the
-/// renderer (DB error strings forwarded over IPC, captured child stderr)
-/// before it is written to the operator's terminal.
-///
-/// A malicious or compromised source DB can embed ANSI/OSC escape sequences
-/// in an error message (e.g. `ESC ] 0 ; … BEL` to rewrite the window title,
-/// `ESC [ 2 J` to clear the screen). Those reach us verbatim through the
-/// error-card / child-stderr render paths, so every such string is funnelled
-/// through here first (CWE-150). Each dangerous character is replaced with an
-/// ASCII-safe `\u{NN}` escape rather than dropped, so the operator still sees
-/// that bytes were present without the terminal interpreting them.
-///
-/// Stripped: the C0 controls `U+0000..=U+001F` (except TAB and LF, the only
-/// layout whitespace the renderer relies on — CR is removed because it would
-/// reposition the cursor), DEL `U+007F`, and the C1 controls
-/// `U+0080..=U+009F`. Operating on `char`s means multi-byte display glyphs
-/// (`✓`, `…`, `─`) are preserved intact — their UTF-8 continuation bytes are
-/// never examined in isolation.
-pub(crate) fn sanitize_terminal(text: &str) -> String {
-    let needs_escape = |c: char| {
-        let cp = c as u32;
-        (cp <= 0x1f && c != '\t' && c != '\n') || cp == 0x7f || (0x80..=0x9f).contains(&cp)
-    };
-    if !text.chars().any(needs_escape) {
-        return text.to_string();
-    }
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if needs_escape(c) {
-            out.push_str(&format!("\\u{{{:02x}}}", c as u32));
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+pub(crate) use crate::redact::sanitize_terminal;
 
 /// One unit of work for the UI thread.  Children emit raw `ChildEvent`s; the
 /// reader thread for each child wraps them in [`UiMessage::Event`].  When a

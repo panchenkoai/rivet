@@ -136,6 +136,8 @@ pub struct BigQueryLoader {
     api: Arc<OnceLock<BigQueryApi>>,
     /// Columns loaded under their Parquet name and renamed after, as (file name, warehouse name).
     renames: Vec<crate::load::plan::Rename>,
+    /// Where the client records every job it finishes.
+    journal: crate::load::result::JobJournal,
 }
 
 impl BigQueryLoader {
@@ -150,7 +152,14 @@ impl BigQueryLoader {
             footer_source: None,
             api: Arc::new(OnceLock::new()),
             renames: Vec::new(),
+            journal: Default::default(),
         }
+    }
+
+    /// Record every job this loader runs in `journal`.
+    pub fn journaled(mut self, journal: crate::load::result::JobJournal) -> Self {
+        self.journal = journal;
+        self
     }
 
     /// Partition the table the load creates.
@@ -267,7 +276,8 @@ impl BigQueryLoader {
         if let Some(api) = self.api.get() {
             return Ok(api);
         }
-        let built = BigQueryApi::for_dataset(&self.project, &self.dataset)?;
+        let built =
+            BigQueryApi::for_dataset(&self.project, &self.dataset)?.journaled(self.journal.clone());
         let _ = self.api.set(built);
         Ok(self.api.get().expect("the client was just set"))
     }
@@ -566,6 +576,10 @@ impl TargetLoader for BigQueryLoader {
         // Count before / append (free LOAD DATA INTO) / count after — the delta
         // is what THIS load added; the driver gates it against the manifest total.
         let before = self.count_rows(&changes)?;
+        // No Parquet is no load job: an append of nothing only makes sure the log exists.
+        if uris.is_empty() {
+            return Ok(0);
+        }
         let batches = self.batches(uris, log_partition_decl)?;
         if let [_, _, ..] = batches.as_slice() {
             eprintln!(
@@ -586,6 +600,32 @@ impl TargetLoader for BigQueryLoader {
         }
         let after = self.count_rows(&changes)?;
         Ok(after.saturating_sub(before))
+    }
+
+    fn flag_absent_from_buffer(
+        &self,
+        table: &str,
+        specs: &[TargetColumnSpec],
+        pk: &[String],
+    ) -> Result<u64> {
+        // An empty baseline appended nothing, so the buffer may not exist yet.
+        self.append_changelog(table, specs, &[], pk)?;
+        let changes = format!("{table}__changes");
+        let columns: Vec<&str> = specs
+            .iter()
+            .map(|s| s.column_name.as_str())
+            .filter(|c| !is_meta_column(c))
+            .collect();
+        let keys: Vec<&str> = pk.iter().map(String::as_str).collect();
+        let sql = crate::load::cdc::absent_as_deleted_sql(
+            &self.fqtn(table),
+            &self.fqtn(&changes),
+            &columns,
+            &keys,
+        );
+        let before = self.count_rows(&changes)?;
+        self.run_sql(&sql, "load", &changes)?;
+        Ok(self.count_rows(&changes)?.saturating_sub(before))
     }
 
     fn warehouse(&self) -> crate::load::cdc::Warehouse {

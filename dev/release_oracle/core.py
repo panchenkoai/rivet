@@ -573,7 +573,7 @@ HARNESS_ENV: frozenset[str] = frozenset((
     "RIVET_CDC_STATE_URL", "RIVET_CONC_SRC_CONTAINER", "RIVET_CONC_SRC_URL", "RIVET_CONC_STATE_URL",
     "RIVET_FAILURE_MONGO_URL", "RIVET_FIELD_LOCK", "RIVET_FIELD_MYSQL_CONTAINER", "RIVET_FIELD_REPLAY_BIN",
     "RIVET_FLOW_VERDICTS", "RIVET_GATE_SHARED_STATE", "RIVET_GATE_STATE_URL",
-    "RIVET_HARM_SLACK", "RIVET_HARM_TOL", "RIVET_MIGRATION_CARRIER_BIN",
+    "RIVET_HARM_SLACK", "RIVET_HARM_TOL", "RIVET_LOCK_WAIT", "RIVET_MIGRATION_CARRIER_BIN",
     "RIVET_ORACLE_DOCKER", "RIVET_ORACLE_LATEST_ONLY", "RIVET_ORACLE_LOG", "RIVET_ORACLE_SELFTEST_FLAG",
     "RIVET_ORACLE_VERSIONS", "RIVET_ORACLE_WITHOUT_PREV_RELEASE", "RIVET_ORACLE_WORK",
     "RIVET_PERF_BQ_WALL_TOL", "RIVET_PERF_CPU_TOL", "RIVET_PERF_RSS_TOL", "RIVET_PERF_WALL_TOL",
@@ -612,7 +612,8 @@ def run(
     cwd: Path | None = None,
 ) -> Proc:
     """Run `argv` (a LIST — no shell, so no quoting or word-splitting bugs)."""
-    full_env = {**os.environ, **(env or {})}
+    # A busy lease is graded as the immediate refusal it was before `--lock-wait`; a stage that grades the wait sets it.
+    full_env = {"RIVET_LOCK_WAIT": "0", **os.environ, **(env or {})}
     try:
         p = subprocess.run(
             list(argv),
