@@ -900,6 +900,50 @@ mod tests {
             "every replan landed"
         );
     }
+    /// The same sibling, each of its transactions held past the turn queue's patience (a slow
+    /// or descheduled writer, the CI load of #660): a replan that ran out of patience keeps its
+    /// place, so it still writes within a turn of the sibling's (main: `database is locked` after
+    /// SQLite's busy timeout, every time).
+    #[test]
+    fn a_replan_beside_a_writer_slower_than_the_turn_patience_gets_its_turn() {
+        let (dir, s) = store_on_disk();
+        s.create_chunk_run("run_a", "orders", "deadbeef", 2)
+            .unwrap();
+        s.create_chunk_run("run_b", "other", "deadbeef", 2).unwrap();
+        s.insert_chunk_tasks("run_b", &[(1, 5)]).unwrap();
+        let cfg = dir.path().join("rivet.yaml");
+        let hold = super::super::write_turn::PATIENCE * 2;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let other = StateStore::open(cfg.to_str().unwrap()).expect("second store");
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    other
+                        .transaction(|| {
+                            other.fail_chunk_task("run_b", 0, "x", true)?;
+                            std::thread::sleep(hold);
+                            Ok(())
+                        })
+                        .expect("the sibling");
+                }
+            })
+        };
+        std::thread::sleep(hold / 2);
+        let mut slow = Vec::new();
+        for i in 0..3i64 {
+            let t0 = std::time::Instant::now();
+            let r = s.replan_chunk_tasks("run_a", false, &[(10 + i, 10 + i)]);
+            if r.is_err() || t0.elapsed() > std::time::Duration::from_secs(3) {
+                slow.push(format!("{i}: {r:?} after {:?}", t0.elapsed()));
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(slow.is_empty(), "starved: {slow:?}");
+        assert_eq!(s.count_chunk_tasks_total("run_a").unwrap(), 3);
+    }
+
     #[test]
     fn chunk_claim_complete_and_finalize() {
         let (_dir, s) = store_on_disk();
