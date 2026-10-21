@@ -1,0 +1,14 @@
+diff --git a/src/state/write_turn.rs b/src/state/write_turn.rs
+index 9f848192..80c77baf 100644
+--- a/src/state/write_turn.rs
++++ b/src/state/write_turn.rs
+@@ -98,8 +98,7 @@ pub(super) fn take(db: &Path, patience: Duration) -> Option<Turn> {
+         let left = deadline.saturating_duration_since(Instant::now());
+         if left.is_zero() {
+             q.waiting.retain(|t| *t != me);
+-            let place = !q.overdue;
+-            q.overdue = true;
++            let place = false;
+             drop(q);
+             turns.freed.notify_all();
+             return match place {
