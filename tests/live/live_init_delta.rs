@@ -742,7 +742,7 @@ fn a_generated_single_table_cdc_config_takes_its_baseline_then_only_later_change
     };
 
     run();
-    let out = dir.path().join("output").join(format!("{table}_cdc"));
+    let out = dir.path().join("output/rivet").join(format!("{table}_cdc"));
     assert!(
         parts_in(&out).is_empty(),
         "nothing changed after the anchor, so the STREAM holds no part"
@@ -817,7 +817,7 @@ fn a_generated_multi_table_cdc_config_takes_every_baseline_then_only_the_delta()
     let run = || {
         rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     };
-    let root = dir.path().join("output").join("cdc");
+    let root = dir.path().join("output/rivet").join("cdc");
     let snap = |t: &str| root.join(t).join("snapshot");
     let changes = |t: &str| root.join(t);
 
@@ -1264,10 +1264,408 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
     rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     let snap = dir
         .path()
-        .join("output")
+        .join("output/rivet")
         .join(scaffolded_export(&generated))
         .join("snapshot");
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
+}
+
+/// The local `path:` a single-table scaffold writes to, resolved against its directory.
+fn scaffolded_path(dir: &std::path::Path, generated: &str) -> std::path::PathBuf {
+    let raw = generated
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("path:"))
+        .expect("a local scaffold names its path");
+    dir.join(
+        raw.split('#')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .trim_matches('"'),
+    )
+}
+
+/// Two configs `rivet init -o` writes for one table into one directory, the second pointed at
+/// another place, run in turns with changes between: each destination must hold every source
+/// row. Through 0.32.1 both named one checkpoint, so each stream resumed where the other had
+/// stopped and skipped what it read, exit 0.
+fn two_init_configs_in_one_dir_keep_their_streams_apart((src, _guard, extra): TwoConfigSource) {
+    (src.apply)(&[Op::Ins(1), Op::Ins(2), Op::Ins(3)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let scaffold = |file: &str| {
+        let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+        args.extend(src.init_args.iter().map(String::as_str));
+        args.extend(extra);
+        args.extend(["--output", file]);
+        rivet_ok_in(dir.path(), &args, &[]);
+        std::fs::read_to_string(dir.path().join(file)).unwrap()
+    };
+    let a = scaffold("a.yaml");
+    let b = scaffold("b.yaml").replace("path: ./output/", "path: ./prod-output/");
+    std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
+    let _slots: Vec<Slot> = [&a, &b]
+        .iter()
+        .filter(|g| g.contains("slot:"))
+        .map(|g| Slot::new(scaffolded_slot(g)))
+        .collect();
+    let run = |cfg: &str| {
+        rivet_ok_in(dir.path(), &["run", "-c", cfg], &db);
+    };
+    run("a.yaml");
+    (src.apply)(&[Op::Ins(4), Op::Ins(5)]);
+    run("a.yaml");
+    (src.apply)(&[Op::Ins(6), Op::Ins(7)]);
+    run("b.yaml");
+    (src.apply)(&[Op::Ins(8)]);
+    run("a.yaml");
+    run("b.yaml");
+    let every: std::collections::BTreeSet<i64> = (1..=8).collect();
+    for (name, generated) in [("a.yaml", &a), ("b.yaml", &b)] {
+        let place = scaffolded_path(dir.path(), generated);
+        let dirs: std::collections::BTreeSet<std::path::PathBuf> = files_under(&place)
+            .into_iter()
+            .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
+            .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
+            .collect();
+        let delivered: std::collections::BTreeSet<i64> =
+            dirs.iter().flat_map(|d| ids_in(d)).collect();
+        assert_eq!(
+            delivered,
+            every,
+            "{name} delivered to {} only part of the source (a:\n{a}\nb:\n{b})",
+            place.display()
+        );
+    }
+}
+
+/// A CDC table `id BIGINT, name` on one engine's CDC service, its writer, and what drops it.
+type TwoConfigSource = (CdcSource, Box<dyn std::any::Any>, &'static [&'static str]);
+
+fn two_configs_mysql() -> TwoConfigSource {
+    use mysql::prelude::Queryable as _;
+    let table = unique_name("two_init_my");
+    let pool = mysql::Pool::new(MYSQL_CDC_URL).expect("mysql-cdc");
+    pool.get_conn()
+        .unwrap()
+        .query_drop(format!(
+            "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name VARCHAR(64) NOT NULL)"
+        ))
+        .unwrap();
+    let guard = MysqlCdcTable(table.clone());
+    let t = table.clone();
+    let src = CdcSource {
+        url: MYSQL_CDC_URL.into(),
+        init_args: vec!["--table".into(), table],
+        apply: Box::new(move |ops| {
+            let mut c = pool.get_conn().unwrap();
+            for op in ops {
+                c.query_drop(op_sql(&t, *op)).unwrap();
+            }
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(guard), &[])
+}
+
+fn two_configs_postgres() -> TwoConfigSource {
+    let table = unique_name("two_init_pg");
+    let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect");
+    c.batch_execute(&format!(
+        "CREATE TABLE {table} (id BIGINT PRIMARY KEY, name TEXT NOT NULL)"
+    ))
+    .unwrap();
+    let guard = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
+    let t = table.clone();
+    let src = CdcSource {
+        url: POSTGRES_CDC_URL.into(),
+        init_args: vec!["--table".into(), table],
+        apply: Box::new(move |ops| {
+            let mut c = postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).unwrap();
+            for op in ops {
+                c.batch_execute(&op_sql(&t, *op)).unwrap();
+            }
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(guard), &[])
+}
+
+fn two_configs_mssql() -> TwoConfigSource {
+    let table = unique_name("two_init_ms");
+    let ci = format!("dbo_{table}");
+    mssql_cdc_exec(&format!(
+        "CREATE TABLE dbo.{table} (id BIGINT PRIMARY KEY, name NVARCHAR(64) NOT NULL)"
+    ));
+    let guard = MssqlCdcTable {
+        table: table.clone(),
+        ci: ci.clone(),
+    };
+    enable_cdc(&table, &ci);
+    let t = format!("dbo.{table}");
+    let captured = std::cell::Cell::new(0i64);
+    let src = CdcSource {
+        url: MSSQL_CDC_URL.into(),
+        init_args: vec!["--table".into(), t.clone()],
+        apply: Box::new(move |ops| {
+            for op in ops {
+                mssql_cdc_exec(&op_sql(&t, *op));
+            }
+            captured.set(captured.get() + ops.len() as i64);
+            wait_for_capture(&ci, captured.get());
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(guard), &[])
+}
+
+#[cfg(feature = "oracle")]
+fn two_configs_oracle() -> TwoConfigSource {
+    let t = crate::live_cdc_oracledb::cdc_table(
+        "two_init_ora",
+        "id NUMBER(18) PRIMARY KEY, name VARCHAR2(64) NOT NULL",
+    );
+    let name = t.name().to_string();
+    let src = CdcSource {
+        url: ORACLE_CDC_URL.into(),
+        init_args: vec!["--table".into(), name.clone()],
+        apply: Box::new(move |ops| {
+            for op in ops {
+                ora_exec(&op_sql(&name, *op));
+            }
+        }),
+        bq_id: "id",
+        bq_name: "name",
+        bq_table: None,
+    };
+    (src, Box::new(t), &["--schema", "RIVET"])
+}
+
+/// Two configs that already share one checkpoint (the 0.32.1 `init -o` pair: own destination and
+/// stream objects, one `./cdc/<table>.ckpt`), the checkpoint written before 0.32.2 so it has no
+/// owner record: the first run on this binary claims it, the other config is refused by code on
+/// every run before it reads a change, and the first keeps delivering.
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it(
+    (src, _guard, extra): TwoConfigSource,
+) {
+    (src.apply)(&[Op::Ins(1), Op::Ins(2)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let prev = std::env::var("RIVET_PREV_RELEASE_BIN")
+        .ok()
+        .filter(|b| !b.is_empty());
+    let a_cfg = dir.path().join("a.yaml").display().to_string();
+    let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+    args.extend(src.init_args.iter().map(String::as_str));
+    args.extend(extra);
+    args.extend(["--output", &a_cfg]);
+    match &prev {
+        // The whole pair is the previous release's: its scaffold, its state, its checkpoint.
+        Some(bin) => {
+            let out = run_rivet_as(bin, &args, &[]);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        None => {
+            rivet_ok_in(dir.path(), &args, &[]);
+        }
+    }
+    let a = std::fs::read_to_string(dir.path().join("a.yaml")).unwrap();
+    let ckpt_line = a
+        .lines()
+        .find(|l| l.trim().starts_with("checkpoint:"))
+        .expect("a CDC scaffold names its checkpoint")
+        .to_string();
+    let mut b = a.replace("path: ./output/", "path: ./prod-output/");
+    let slots: Vec<Slot> = match a.split("slot: ").nth(1) {
+        Some(rest) => {
+            let slot = rest
+                .split([',', '}', '\n', ' '])
+                .next()
+                .unwrap()
+                .to_string();
+            b = b.replace(&format!("slot: {slot}"), &format!("slot: {slot}_b"));
+            vec![Slot::new(slot.clone()), Slot::new(format!("{slot}_b"))]
+        }
+        None => Vec::new(),
+    };
+    if let Some(rest) = a.split("server_id: ").nth(1) {
+        let id = rest.split_whitespace().next().unwrap();
+        b = b.replace(
+            &format!("server_id: {id}"),
+            &format!("server_id: {}", id.parse::<u64>().unwrap() + 1),
+        );
+    }
+    assert!(
+        b.contains(&ckpt_line),
+        "the pair shares one checkpoint:\n{b}"
+    );
+    std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
+    match &prev {
+        Some(bin) => {
+            eprintln!("the checkpoint is written by the previous release ({bin})");
+            let out = run_rivet_as(bin, &["run", "--config", &a_cfg], &db);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        _ => {
+            eprintln!(
+                "RIVET_PREV_RELEASE_BIN unset: the checkpoint is written by this binary and its \
+                 owner record removed, the shape a 0.32.1 run leaves"
+            );
+            rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+            let owners: Vec<_> = files_under(dir.path())
+                .into_iter()
+                .filter(|f| f.to_string_lossy().ends_with(".ckpt.owner"))
+                .collect();
+            for owner in owners {
+                std::fs::remove_file(owner).unwrap();
+            }
+        }
+    }
+    (src.apply)(&[Op::Ins(3)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    for attempt in 1..=2 {
+        let out = run_rivet_in_dir(dir.path(), &["run", "-c", "b.yaml"], &db);
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(5), "attempt {attempt}:\n{said}");
+        assert!(
+            said.contains("[RIVET_SOURCE_CDC_CHECKPOINT_SHARED]") && said.contains("a.yaml"),
+            "attempt {attempt}:\n{said}"
+        );
+    }
+    (src.apply)(&[Op::Ins(4)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    assert!(
+        !dir.path().join("prod-output").exists(),
+        "the refused config wrote nothing"
+    );
+    let place = scaffolded_path(dir.path(), &a);
+    let dirs: std::collections::BTreeSet<std::path::PathBuf> = files_under(&place)
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
+        .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    let ids: std::collections::BTreeSet<i64> = dirs.iter().flat_map(|d| ids_in(d)).collect();
+    assert_eq!(
+        ids,
+        (1..=4).collect(),
+        "the claiming config kept delivering"
+    );
+    drop(slots);
+}
+
+/// `rivet init -o a.yaml` again after the first `a.yaml` was moved aside, its stream's checkpoint
+/// still in `./cdc/`: refused by code on both attempts writing nothing; another `-o` name writes a
+/// scaffold that runs.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn init_over_a_taken_cdc_checkpoint_is_refused_twice_and_another_name_runs_mysql() {
+    let (src, _guard, extra) = two_configs_mysql();
+    (src.apply)(&[Op::Ins(1), Op::Ins(2)]);
+    let dir = tempfile::tempdir().expect("config dir");
+    let db = [("DATABASE_URL", src.url.as_str())];
+    let init = |file: &str| {
+        let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
+        args.extend(src.init_args.iter().map(String::as_str));
+        args.extend(extra);
+        args.extend(["--output", file]);
+        run_rivet_in_dir(dir.path(), &args, &[])
+    };
+    assert!(init("a.yaml").status.success());
+    rivet_ok_in(dir.path(), &["run", "-c", "a.yaml"], &db);
+    std::fs::rename(dir.path().join("a.yaml"), dir.path().join("a-old.yaml")).unwrap();
+    for attempt in 1..=2 {
+        let out = init("a.yaml");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(5), "attempt {attempt}:\n{said}");
+        assert!(
+            said.contains("[RIVET_INIT_CDC_NAME_TAKEN]") && said.contains("a-old.yaml"),
+            "attempt {attempt} names the checkpoint's config:\n{said}"
+        );
+        assert!(!dir.path().join("a.yaml").exists(), "nothing was written");
+    }
+    assert!(init("c.yaml").status.success(), "another -o name");
+    (src.apply)(&[Op::Ins(3)]);
+    rivet_ok_in(dir.path(), &["run", "-c", "c.yaml"], &db);
+    let c = std::fs::read_to_string(dir.path().join("c.yaml")).unwrap();
+    let place = scaffolded_path(dir.path(), &c);
+    let dirs: std::collections::BTreeSet<std::path::PathBuf> = files_under(&place)
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|x| x == "parquet"))
+        .filter_map(|f| f.parent().map(std::path::Path::to_path_buf))
+        .collect();
+    let ids: std::collections::BTreeSet<i64> = dirs.iter().flat_map(|d| ids_in(d)).collect();
+    assert_eq!(
+        ids,
+        (1..=3).collect(),
+        "the new config baselines and streams on its own checkpoint"
+    );
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_mysql() {
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_mysql());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_postgres() {
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_postgres());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_mssql() {
+    let _serial = cross_process_serial("mssql_cdc");
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_mssql());
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn two_existing_configs_on_one_checkpoint_the_first_claims_it_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    two_existing_configs_on_one_checkpoint_the_first_claims_it(two_configs_oracle());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn two_init_configs_in_one_dir_keep_their_streams_apart_mysql() {
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_mysql());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn two_init_configs_in_one_dir_keep_their_streams_apart_postgres() {
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_postgres());
+}
+
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mssql-cdc"]
+fn two_init_configs_in_one_dir_keep_their_streams_apart_mssql() {
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_mssql());
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+#[ignore = "live: requires the oracle service with LogMiner prerequisites"]
+fn two_init_configs_in_one_dir_keep_their_streams_apart_oracle() {
+    let _serial = cross_process_serial("oracle_cdc");
+    two_init_configs_in_one_dir_keep_their_streams_apart(two_configs_oracle());
 }
 
 /// The older release whose state `rivet state copy` carries: 0.30.0 (`RIVET_STATE_COPY_FROM_BIN`,
