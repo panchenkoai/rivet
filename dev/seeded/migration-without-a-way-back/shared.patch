@@ -1,13 +1,12 @@
 diff --git a/src/state/migrations.rs b/src/state/migrations.rs
-index eabc9fff..24497ce3 100644
+index adc61cef..07d79a10 100644
 --- a/src/state/migrations.rs
 +++ b/src/state/migrations.rs
-@@ -1483,17 +1483,6 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
+@@ -1517,16 +1517,6 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
          }
      }
  
--    if current > 0
--        && current < SCHEMA_VERSION
+-    if needs_copy(current)
 -        && let Some(copy) = copy_state_before_migration(conn, current)?
 -    {
 -        log::warn!(
@@ -20,11 +19,11 @@ index eabc9fff..24497ce3 100644
      for &(ver, sql) in MIGRATIONS {
          if ver > current {
              log::debug!("state: applying migration v{}", ver);
-@@ -1621,10 +1610,6 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
+@@ -1654,10 +1644,6 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
          })?
          .get(0);
  
--    if current > 0 && current < SCHEMA_VERSION {
+-    if needs_copy(current) {
 -        copy_pg_state_before_migration(client, current)?;
 -    }
 -

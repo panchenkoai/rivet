@@ -1,8 +1,9 @@
 diff --git a/src/state/migrations.rs b/src/state/migrations.rs
+index adc61cef..e955e7f8 100644
 --- a/src/state/migrations.rs
 +++ b/src/state/migrations.rs
-@@ -1147,19 +1147,7 @@
-              a backup."
+@@ -1386,19 +1386,7 @@ fn write_lock_not_taken(db: Option<&str>, e: &rusqlite::Error) -> anyhow::Error
+             ),
          );
      }
 -    // READONLY is a third disease: no process holds the database and no wait ends it.
@@ -19,6 +20,6 @@ diff --git a/src/state/migrations.rs b/src/state/migrations.rs
 -        ));
 -    }
 +    let _ = db;
-     anyhow::anyhow!(
-         "state: could not acquire the migration lock within the busy timeout ({e}). \
-          Another rivet process is migrating this state database; wait for it to \
+     crate::error::coded(
+         crate::error::codes::STATE_MIGRATION_LOCKED,
+         format!(

@@ -1,14 +1,27 @@
 diff --git a/src/pipeline/job.rs b/src/pipeline/job.rs
+index 77ec5447..049f9ed7 100644
 --- a/src/pipeline/job.rs
 +++ b/src/pipeline/job.rs
-@@ -1106,9 +1106,9 @@
+@@ -1126,15 +1126,15 @@ fn ledger_begin_run(
  ) -> Result<()> {
      let prefix = super::finalize::destination_uri_for_manifest(&plan.destination);
      let started_at = chrono::Utc::now().to_rfc3339();
 -    state
--        .begin_run(run_id, &plan.export_name, &prefix, &started_at)
+-        .begin_run_under_lease(
+-            run_id,
+-            &plan.export_name,
+-            &plan.source.state_key(),
+-            &prefix,
+-            &started_at,
+-        )
 -        .map_err(|e| state_not_writable(&plan.export_name, &e))?;
-+    if let Err(e) = state.begin_run(run_id, &plan.export_name, &prefix, &started_at) {
++    if let Err(e) = state.begin_run_under_lease(
++        run_id,
++        &plan.export_name,
++        &plan.source.state_key(),
++        &prefix,
++        &started_at,
++    ) {
 +        log::warn!("{:#}", state_not_writable(&plan.export_name, &e));
 +    }
      super::finalize::write_running_manifest(plan, export_family, run_id, &started_at);

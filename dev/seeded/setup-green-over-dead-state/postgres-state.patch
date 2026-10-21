@@ -1,11 +1,11 @@
 diff --git a/src/cli/dispatch.rs b/src/cli/dispatch.rs
-index e1f70ca2..89b328cb 100644
+index 2a46a2ba..7128ecad 100644
 --- a/src/cli/dispatch.rs
 +++ b/src/cli/dispatch.rs
-@@ -507,7 +507,7 @@ fn dispatch_check(
-         log::error!("check: the state this config uses does not answer: {e:#}");
-     }
-     let errors = crate::redact::errors_logged();
+@@ -540,7 +540,7 @@ fn dispatch_check(
+ 
+ /// `check`'s refusal to call a config ready after it logged `errors` ERROR lines.
+ fn refuse_after_errors(errors: usize) -> Result<()> {
 -    if errors > 0 {
 +    if errors > 0 && errors == usize::MAX {
          crate::rivet_bail!(

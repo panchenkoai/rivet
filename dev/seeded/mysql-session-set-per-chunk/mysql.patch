@@ -1,11 +1,13 @@
+diff --git a/src/source/mysql/mod.rs b/src/source/mysql/mod.rs
+index 0b94c37b..d5c5efbc 100644
 --- a/src/source/mysql/mod.rs
 +++ b/src/source/mysql/mod.rs
-@@ -632,7 +632,7 @@ impl<'a> MysqlSessionGuard<'a> {
-     ) -> Result<Self> {
-         let defaults = plan.defaults(conn)?;
-         let id = conn.connection_id();
--        let given = match plan.keeps_session {
-+        let given = match plan.keeps_session && false {
-             true => plan
-                 .given
-                 .lock()
+@@ -556,7 +556,7 @@ impl SessionPlan {
+     /// The `max_execution_time` connection `id` still holds, or `None` when it must be set from
+     /// scratch: always on a pool that resets a session it is handed back.
+     fn given(&self, id: u32) -> Option<u64> {
+-        if !self.keeps_session {
++        if !self.keeps_session || true {
+             return None;
+         }
+         self.given

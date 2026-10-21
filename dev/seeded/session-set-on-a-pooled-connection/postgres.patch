@@ -1,17 +1,17 @@
 diff --git a/src/connect/postgres.rs b/src/connect/postgres.rs
-index e0ae8aa0..56147221 100644
+index e3027e46..dbec45d9 100644
 --- a/src/connect/postgres.rs
 +++ b/src/connect/postgres.rs
-@@ -151,7 +151,7 @@ fn read_under<T>(
- pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Client> {
-     // Refuse remote plaintext (no `tls:` block) before any dial (CWE-319).
-     super::require_tls_or_loopback(url, tls)?;
+@@ -159,7 +159,7 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
+             .enable_all()
+             .build(),
+     )?;
 -    match tls {
 +    let mut client = match tls {
          Some(cfg) if cfg.mode.is_enforced() => {
              let connector = build_native_tls(cfg)?;
              let make_tls = postgres_native_tls::MakeTlsConnector::new(connector);
-@@ -163,7 +163,12 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
+@@ -171,7 +171,12 @@ pub(crate) fn connect_client(url: &str, tls: Option<&TlsConfig>) -> Result<Clien
                  .map_err(|e| super::describe_connect_error(url, e.into()))
          }
          _ => Client::connect(url, NoTls).map_err(|e| super::describe_connect_error(url, e.into())),
@@ -24,4 +24,4 @@ index e0ae8aa0..56147221 100644
 +    Ok(client)
  }
  
- /// An in-process PostgreSQL server that records what one client sends.
+ /// The environment stop for a process that cannot start a runtime, read off a probe build: `postgres::Config::connect` unwraps its own runtime build (postgres 0.19 `src/config.rs`), so an `EMFILE` there would abort the process instead of failing with a code.

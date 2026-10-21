@@ -426,6 +426,23 @@ pub fn assert_spill_evidence(stderr: &str, cap: usize, own: OwnSpill) {
     }
 }
 
+/// `text` with the timestamp of every log line (`[<rfc3339> LEVEL target] ...`) replaced by `<ts>`, so two runs' output compare by what they said.
+pub fn without_log_stamps(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let stamp = line
+                .strip_prefix('[')
+                .and_then(|rest| rest.split_once(' '))
+                .map(|(ts, _)| ts)
+                .filter(|ts| chrono::DateTime::parse_from_rfc3339(ts).is_ok());
+            match stamp {
+                Some(ts) => format!("[<ts>{}", &line[1 + ts.len()..]),
+                None => line.to_string(),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod spill_tests {
     use super::{OwnSpill, spill_evidence, spill_splits};
@@ -540,5 +557,32 @@ mod ndjson_tests {
     #[should_panic(expected = "is not JSON")]
     fn ndjson_after_ids_refuses_a_line_that_is_not_json() {
         ndjson_after_ids("done: 2 events", "t");
+    }
+}
+
+#[cfg(test)]
+mod log_stamp_tests {
+    use super::without_log_stamps;
+
+    #[test]
+    fn two_runs_that_said_the_same_compare_equal_whatever_second_they_logged_at() {
+        let first = "[2026-10-21T07:58:59Z WARN rivet::load] skipped\nexit 0\n";
+        let second = "[2026-10-21T07:59:04Z WARN rivet::load] skipped\nexit 0\n";
+        assert_ne!(first, second);
+        assert_eq!(without_log_stamps(first), without_log_stamps(second));
+        assert_eq!(
+            without_log_stamps(first),
+            "[<ts> WARN rivet::load] skipped\nexit 0\n"
+        );
+    }
+
+    #[test]
+    fn a_different_message_or_a_bracket_that_is_not_a_stamp_still_differs() {
+        assert_ne!(
+            without_log_stamps("[2026-10-21T07:58:59Z WARN t] one"),
+            without_log_stamps("[2026-10-21T07:59:04Z WARN t] two")
+        );
+        assert_eq!(without_log_stamps("[not-a-stamp x] y"), "[not-a-stamp x] y");
+        assert_eq!(without_log_stamps("[\u{e9}"), "[\u{e9}");
     }
 }

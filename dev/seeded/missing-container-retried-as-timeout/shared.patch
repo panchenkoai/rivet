@@ -1,6 +1,8 @@
+diff --git a/src/error/retry.rs b/src/error/retry.rs
+index 411fe1b4..be4c5164 100644
 --- a/src/error/retry.rs
 +++ b/src/error/retry.rs
-@@ -161,7 +161,7 @@
+@@ -176,7 +176,7 @@ pub fn classify_error(err: &anyhow::Error) -> RetryClass {
      // The store's answer is final by TYPE: a 404 whose response headers happen to
      // carry `keep-alive: timeout=5` (Azurite) must not read as a timeout.
      if let Some(class) = err.chain().find_map(opendal_error).map(classify_opendal) {
@@ -8,4 +10,4 @@
 +        let _ = class;
      }
  
-     // --- Fallback: string-based classification ---
+     // --- A filesystem or socket error: its kind decides, before a path in the text can ---

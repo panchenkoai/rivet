@@ -1,12 +1,13 @@
 diff --git a/src/state/mod.rs b/src/state/mod.rs
+index ba655a3a..17f78a91 100644
 --- a/src/state/mod.rs
 +++ b/src/state/mod.rs
-@@ -263,7 +263,7 @@
-     /// `RIVET_STATE_URL` when it is set, else SQLite next to `config_path`.
-     pub fn open(config_path: &str) -> Result<Self> {
+@@ -406,7 +406,7 @@ impl StateStore {
+     /// Which state `config_path` uses and that it answers, without creating or migrating it: `postgres <redacted url>` or `sqlite <path>`.
+     pub fn probe(config_path: &str) -> Result<String> {
          if let Ok(url) = std::env::var("RIVET_STATE_URL")
 -            && let Some(url) = postgres_state_url(&url)?
 +            && let Ok(Some(url)) = postgres_state_url(&url)
          {
-             return Self::open_postgres(url);
-         }
+             let mut client = connect_pg(url)?;
+             client.simple_query("SELECT 1").map_err(|e| {

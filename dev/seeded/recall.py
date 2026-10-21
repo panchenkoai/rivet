@@ -272,6 +272,16 @@ def recompiled(build_out: str) -> bool:
 # ── the run ───────────────────────────────────────────────────────────────────
 
 
+def record(led: Ledger, out: list[Verdict]) -> None:
+    """One ledger row per graded verdict: CAUGHT passes, N/A is not a row, anything else (MISSED, STALE, BROKEN, NO-CONTROL) fails the gate."""
+    for v in out:
+        msg = f"seeded {v.row.seed} × {v.row.engine}: {v.status} — {v.detail}"
+        if v.status == CAUGHT:
+            led.passed(v.row.engine, "seeded", v.row.seed, "-", msg)
+        elif v.status != NA:
+            led.failed(v.row.engine, "seeded", v.row.seed, "-", msg)
+
+
 def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
     """Grade every row: STALE check, one CONTROL run on the unpatched tree, then one build+run per patch."""
     t0 = time.perf_counter()
@@ -328,12 +338,7 @@ def recall(led: Ledger, rows: list[Row]) -> list[Verdict]:
             verdicts[r] = grade(r, control, seeded)
 
     out = [verdicts.get(r) or grade(r, control, {}) for r in rows]
-    for v in out:
-        msg = f"seeded {v.row.seed} × {v.row.engine}: {v.status} — {v.detail}"
-        if v.status == CAUGHT:
-            led.passed(v.row.engine, "seeded", v.row.seed, "-", msg)
-        elif v.status != NA:
-            led.failed(v.row.engine, "seeded", v.row.seed, "-", msg)
+    record(led, out)
     print(render(out))
     print(f"  seeded-defect recall took {(time.perf_counter() - t0) / 60:.1f} min; logs under {logs}")
     return out
@@ -427,11 +432,20 @@ def self_test() -> int:
     table = render([Verdict(pg, CAUGHT, "t2"), Verdict(Row("s", "mysql", "p", ()), MISSED, "none"),
                     Verdict(Row("s", "mongo", na="x"), NA, "x")])
     assert "recall: 1/2" in table and "MISSED     s × mysql" in table, table
+    for status in (MISSED, STALE, BROKEN, NO_CONTROL):
+        led = Ledger(colour=False)
+        record(led, [Verdict(pg, CAUGHT, "t2"), Verdict(Row("s", "mysql", "p", ()), status, "x"),
+                     Verdict(Row("s", "mongo", na="x"), NA, "x")])
+        assert led.red and [c.status.name for c in led.cells] == ["PASS", "FAIL"], (status, led.cells)
     real = parse_manifest(yaml.safe_load(MANIFEST.read_text()))
     assert not unknown_cells(real), unknown_cells(real)
-    for r in real:
-        if r.patch:
-            assert patch_files((HERE / r.patch).read_text()), f"{r.patch} changes no file"
+    stale = []
+    for patch in sorted({r.patch for r in real if r.patch}):
+        assert patch_files((HERE / patch).read_text()), f"{patch} changes no file"
+        p = sh(["git", "-C", str(ROOT), "apply", "--check", str(HERE / patch)])
+        if p.returncode != 0:
+            stale.append(stale_message(patch.split("/")[0], (HERE / patch).read_text(), p.stdout))
+    assert not stale, "a seed that no longer applies is a STALE row in the gate; re-cut it on this tree: " + "; ".join(stale)
     print(f"self-test ok: seeded recall — manifest ({len(real)} rows), grading, stale and build checks")
     return 0
 

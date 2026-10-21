@@ -1,10 +1,12 @@
+diff --git a/src/state/run_status_store.rs b/src/state/run_status_store.rs
+index 7d0e37c5..d7a3e393 100644
 --- a/src/state/run_status_store.rs
 +++ b/src/state/run_status_store.rs
-@@ -190,7 +190,6 @@
+@@ -191,7 +191,6 @@ impl StateStore {
          started_at: &str,
      ) -> Result<()> {
          self.transaction(|| {
--            self.interrupt_dead_runs(export_name, started_at)?;
-             self.begin_run(run_id, export_name, prefix, started_at)
+-            self.interrupt_dead_runs(export_name, source, started_at)?;
+             self.begin_run(run_id, export_name, prefix, started_at)?;
+             self.record_run_source(run_id, source)
          })
-     }

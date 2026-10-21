@@ -1,9 +1,9 @@
 diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
-index 31a7734d..872f4e5c 100644
+index 0a9cdcaa..fe625018 100644
 --- a/src/source/postgres/cdc.rs
 +++ b/src/source/postgres/cdc.rs
-@@ -764,7 +764,8 @@ impl PgChangeStream {
-                         let commit = Position(json!({ "lsn": lsn }));
+@@ -770,7 +770,8 @@ impl PgChangeStream {
+                         let commit = Position::new(json!({ "lsn": lsn }));
                          // #158: commit LSN on all, committed on the transaction's LAST
                          // event — on disk when it spilled (`TxBuffer::close_transaction`).
 -                        let (head, tail) = tx.close_transaction(&commit, &lsn)?;

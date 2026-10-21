@@ -1,8 +1,10 @@
+diff --git a/src/init/yaml_scaffold.rs b/src/init/yaml_scaffold.rs
+index f81a0e56..df808567 100644
 --- a/src/init/yaml_scaffold.rs
 +++ b/src/init/yaml_scaffold.rs
-@@ -1208,7 +1208,7 @@
-             "      slot: rivet_{}  # logical slot (auto-created); source needs wal_level=logical + a REPLICATION role",
-             ident.to_lowercase()
+@@ -1254,7 +1254,7 @@ omitting differ per engine — see cdc.md)",
+             slot_name(dest.cdc_name_stem.as_deref(), ident),
+             per_cluster_note(dest)
          )),
 -        "mssql" => lines.push(match &info.cdc_capture_instance {
 +        "mssql" => lines.push(match &None::<String> {

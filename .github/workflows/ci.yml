@@ -1303,6 +1303,8 @@ jobs:
       # entry-point guard in tests/offline/release_oracle_entrypoint_guard.rs).
       - name: The release oracle's env-flag grammar is one grammar
         run: python3 -m dev.release_oracle --self-test
+      - name: Release tagging refuses a commit without a green full gate (self-test)
+        run: python3 dev/pytools/release.py --self-test
       # uv: the rig oracle's self-test writes and reads parquet through the pinned duckdb/pyarrow.
       - uses: taiki-e/install-action@v2.87.25
         with:
