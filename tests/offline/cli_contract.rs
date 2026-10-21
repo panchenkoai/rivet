@@ -212,6 +212,32 @@ fn load_and_compact_accept_pool_and_refuse_a_non_numeric_value() {
     }
 }
 
+/// `rivet load` and `rivet compact` on a config with no `load:` block stop by code, exit 1, before
+/// the source or the state is touched, and say what to add.
+#[test]
+fn load_and_compact_without_a_load_block_stop_by_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("rivet.yaml");
+    std::fs::write(
+        &cfg,
+        "source:\n  type: postgres\n  url: \"postgresql://127.0.0.1:1/x\"\nexports:\n  - name: a\n    \
+         table: t\n    mode: full\n    format: parquet\n    destination: { type: local, path: ./out }\n",
+    )
+    .unwrap();
+    for command in ["load", "compact"] {
+        let (code, _out, err) = run(&[command, "--config", cfg.to_str().unwrap()]);
+        assert_eq!(code, 1, "{command}:\n{err}");
+        assert!(
+            err.contains("[RIVET_LOAD_BLOCK_MISSING]") && err.contains("`load:` block"),
+            "{command}:\n{err}"
+        );
+    }
+    assert!(
+        !dir.path().join(".rivet_state.db").exists(),
+        "nothing was opened before the config gate"
+    );
+}
+
 #[test]
 fn unknown_subcommand_exits_nonzero_and_suggests_help() {
     let (code, _stdout, stderr) = run(&["definitely-not-a-real-subcommand"]);
