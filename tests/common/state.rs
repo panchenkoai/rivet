@@ -634,6 +634,44 @@ impl ScratchStateDb {
     }
 }
 
+/// A schema of its own on the state server's `postgres` database, dropped on drop: a PostgreSQL
+/// state that holds nothing, reached through `search_path`, without creating a database.
+pub struct ScratchStateSchema {
+    pub name: String,
+}
+
+impl ScratchStateSchema {
+    /// Create `<tag>_<unique>` on the state server.
+    pub fn new(tag: &str) -> Self {
+        let name = crate::common::unique_name(tag);
+        let mut c = postgres::Client::connect(STATE_ADMIN, postgres::NoTls).expect("state server");
+        c.batch_execute(&format!("CREATE SCHEMA {name}")).unwrap();
+        Self { name }
+    }
+    /// A `RIVET_STATE_URL` whose tables live in this schema.
+    pub fn url(&self) -> String {
+        format!(
+            "postgresql://rivet:rivet@127.0.0.1:5433/postgres?options=-csearch_path%3D{}",
+            self.name
+        )
+    }
+    /// A direct client on it.
+    pub fn client(&self) -> postgres::Client {
+        let mut c = postgres::Client::connect(STATE_ADMIN, postgres::NoTls).expect("state server");
+        c.batch_execute(&format!("SET search_path = {}", self.name))
+            .unwrap();
+        c
+    }
+}
+
+impl Drop for ScratchStateSchema {
+    fn drop(&mut self) {
+        if let Ok(mut c) = postgres::Client::connect(STATE_ADMIN, postgres::NoTls) {
+            let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.name));
+        }
+    }
+}
+
 impl Drop for ScratchStateDb {
     fn drop(&mut self) {
         if let Ok(mut c) = postgres::Client::connect(STATE_ADMIN, postgres::NoTls) {
