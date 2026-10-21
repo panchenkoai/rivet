@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -221,6 +222,10 @@ def restore(tree: Path, snap: dict[Path, bytes]) -> None:
         raise SystemExit(f"{tree} is not clean after restoring the snapshot — stop and inspect:\n{dirty}")
 
 
+#: Every knob the harness reads a Postgres state from: the scratch DB replaces each, so no seed run reaches the shared stand state.
+SCRATCH_STATE_VARS = ("RIVET_TEST_STATE_URL", "RIVET_GATE_STATE_URL", "RIVET_CDC_STATE_URL", "RIVET_CONC_STATE_URL")
+
+
 class Cargo:
     """Builds and runs nextest in the scratch tree with its own target dir and the tree's own rivet binary."""
 
@@ -230,7 +235,11 @@ class Cargo:
                if k not in ("RIVET_BIN", "RIVET_BIN_OVERRIDE", "RIVET_STATE_URL", "RIVET_TEST_STATE_URL")}
         env["CARGO_TARGET_DIR"] = str(base / "target")
         if state_url:
-            env["RIVET_TEST_STATE_URL"] = state_url
+            for var in SCRATCH_STATE_VARS:
+                env[var] = state_url
+            t = urllib.parse.urlsplit(state_url)
+            env["RIVET_TEST_STATE_TOXI_URL"] = urllib.parse.urlunsplit(
+                (t.scheme, f"{t.username}:{t.password}@127.0.0.1:15433", t.path, "", ""))
         self.env = env
 
     @staticmethod
@@ -439,6 +448,16 @@ def self_test() -> int:
         assert led.red and [c.status.name for c in led.cells] == ["PASS", "FAIL"], (status, led.cells)
     real = parse_manifest(yaml.safe_load(MANIFEST.read_text()))
     assert not unknown_cells(real), unknown_cells(real)
+    saved = os.environ.get("RIVET_GATE_STATE_URL")
+    os.environ["RIVET_GATE_STATE_URL"] = "postgresql://u:p@127.0.0.1:5433/rivet_state"
+    try:
+        env = Cargo(Path("/t"), Path("/b"), "postgresql://u:p@127.0.0.1:5433/scratch").env
+    finally:
+        os.environ.pop("RIVET_GATE_STATE_URL")
+        if saved is not None:
+            os.environ["RIVET_GATE_STATE_URL"] = saved
+    assert all(env[v].endswith("/scratch") for v in SCRATCH_STATE_VARS), {v: env.get(v) for v in SCRATCH_STATE_VARS}
+    assert env["RIVET_TEST_STATE_TOXI_URL"] == "postgresql://u:p@127.0.0.1:15433/scratch", env["RIVET_TEST_STATE_TOXI_URL"]
     stale = []
     for patch in sorted({r.patch for r in real if r.patch}):
         assert patch_files((HERE / patch).read_text()), f"{patch} changes no file"

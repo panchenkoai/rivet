@@ -853,13 +853,13 @@ def _text_form_mismatches(parts: list[str], row_of: dict, forms: set[str]) -> li
 
 
 def _state_table(ora, spec: dict, name: str) -> str:
-    """`st.<schema>.<name>` wherever the state DB keeps it (a least-privilege role keeps its own schema; a migration's `rivet_state_backup_v*` copy is never it); asked of the state DB alone, since `duckdb_tables()` would enumerate every attached catalog (mongoc opened ~800 connections doing so)."""
+    """`st.<schema>.<name>` for the table rivet itself reads: `name` resolved through the state connection's search_path (a least-privilege role keeps its own schema), never the first of every schema holding a table of that name (a test's leftover schema, a `rivet_state_backup_v*` copy); asked of the state DB alone, since `duckdb_tables()` would enumerate every attached catalog (mongoc opened ~800 connections doing so)."""
     if not str(spec.get("state") or "").startswith("postgres"):
         return f"st.{name}"
     rows = ora.rows(
         "SELECT * FROM postgres_query('st', "
-        + _lit(f"SELECT table_schema::text FROM information_schema.tables WHERE table_name = {_lit(name)} "
-               "AND table_schema NOT LIKE 'rivet_state_backup_v%'")
+        + _lit("SELECT n.nspname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+               f"WHERE c.oid = to_regclass({_lit(name)})")
         + ")"
     )
     return f"st.{rows[0][0]}.{name}" if rows else f"st.{name}"
