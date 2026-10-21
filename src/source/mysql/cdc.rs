@@ -1126,11 +1126,11 @@ impl MysqlChangeStream {
                     {
                         continue;
                     }
-                    match self.bare_db.get(cfg) {
-                        Some(db) if *db == schema => {}
-                        // Another database's table of that name: the bare name means `db`'s.
-                        Some(_) => return Ok(true),
-                        None => {
+                    match bare_event_route(self.bare_db.get(cfg).map(String::as_str), &schema) {
+                        BareRoute::Captured => {}
+                        // Another database's table of that name: the bare name means another's.
+                        BareRoute::Elsewhere => return Ok(true),
+                        BareRoute::Unresolved => {
                             if let Some(why) =
                                 Self::bare_name_spans_databases(cfg, &self.own_db, &schema)
                             {
@@ -2223,6 +2223,26 @@ impl Iterator for MysqlChangeStream {
     }
 }
 
+/// What a binlog event of `schema` is to a bare configured name the rule resolved to `resolved`.
+#[derive(Debug, PartialEq, Eq)]
+enum BareRoute {
+    /// The database the name means: the event is captured.
+    Captured,
+    /// Another database's table of that name: not captured.
+    Elsewhere,
+    /// The rule resolved nothing at open: the wire guard decides.
+    Unresolved,
+}
+
+/// Route a bare name's event of `schema` by the database the rule resolved it to.
+fn bare_event_route(resolved: Option<&str>, schema: &str) -> BareRoute {
+    match resolved {
+        Some(db) if db == schema => BareRoute::Captured,
+        Some(_) => BareRoute::Elsewhere,
+        None => BareRoute::Unresolved,
+    }
+}
+
 impl ChangeStream for MysqlChangeStream {
     fn row_image(&mut self, _tables: &[String]) -> crate::source::cdc::RowImage {
         self.row_image.clone()
@@ -2433,6 +2453,12 @@ mod tests {
         assert_eq!(db("shop", &[]), None);
         assert_eq!(db("", &[m("archive", base)]), Some("archive".into()));
         assert_eq!(db("", &[m("archive", base), m("old", base)]), None);
+        assert_eq!(bare_event_route(Some("shop"), "shop"), BareRoute::Captured);
+        assert_eq!(
+            bare_event_route(Some("shop"), "archive"),
+            BareRoute::Elsewhere
+        );
+        assert_eq!(bare_event_route(None, "archive"), BareRoute::Unresolved);
     }
 
     #[test]

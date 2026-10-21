@@ -525,13 +525,14 @@ shapes:
         just elected. PostgreSQL's readings are the candidate query, classification
         and the schema probe."
     mysql:
-      sound: "roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds
-        (live_cdc.rs) — MySQL's second reader is the SERVER-WIDE binlog, which the
-        privilege-filtered catalog structurally cannot see, so agreement here means
-        the catalog precheck and the wire guard refuse the same config. RED against
-        removing either half; both postures measured (root sees both databases and
-        bails at the precheck; the `rivet` user's filtered catalog passes and the
-        wire guard bails on the first foreign event)."
+      sound: "mysql_cdc_a_bare_name_captures_its_own_database_beside_a_same_named_table
+        + mysql_cdc_a_bare_name_only_another_database_holds_is_still_captured
+        (live_cdc.rs) — MySQL's readings (the catalog check, the table probe, the
+        schema probe, the baseline read and the SERVER-WIDE binlog routing) take one
+        rule, `bare_name_database`: a bare name means the connection's database when it
+        holds the table, else the one other database that does. Value-checked: the
+        baseline and the changes are the connection database's rows and none of the
+        other's; RED on 0.32.1 (refused at the catalog check, #675)."
     mssql:
       sound: "mssql_cdc_schema_probe_follows_the_capture_instance_not_the_default_schema
         + mssql_cdc_snapshot_leg_reads_the_captured_relation_not_the_default_schema
