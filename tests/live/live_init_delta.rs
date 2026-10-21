@@ -1457,11 +1457,28 @@ fn two_existing_configs_on_one_checkpoint_the_first_claims_it(
     (src.apply)(&[Op::Ins(1), Op::Ins(2)]);
     let dir = tempfile::tempdir().expect("config dir");
     let db = [("DATABASE_URL", src.url.as_str())];
+    let prev = std::env::var("RIVET_PREV_RELEASE_BIN")
+        .ok()
+        .filter(|b| !b.is_empty());
+    let a_cfg = dir.path().join("a.yaml").display().to_string();
     let mut args: Vec<&str> = vec!["init", "--source", &src.url, "--mode", "cdc"];
     args.extend(src.init_args.iter().map(String::as_str));
     args.extend(extra);
-    args.extend(["--output", "a.yaml"]);
-    rivet_ok_in(dir.path(), &args, &[]);
+    args.extend(["--output", &a_cfg]);
+    match &prev {
+        // The whole pair is the previous release's: its scaffold, its state, its checkpoint.
+        Some(bin) => {
+            let out = run_rivet_as(bin, &args, &[]);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        None => {
+            rivet_ok_in(dir.path(), &args, &[]);
+        }
+    }
     let a = std::fs::read_to_string(dir.path().join("a.yaml")).unwrap();
     let ckpt_line = a
         .lines()
@@ -1493,11 +1510,10 @@ fn two_existing_configs_on_one_checkpoint_the_first_claims_it(
         "the pair shares one checkpoint:\n{b}"
     );
     std::fs::write(dir.path().join("b.yaml"), &b).unwrap();
-    let a_cfg = dir.path().join("a.yaml").display().to_string();
-    match std::env::var("RIVET_PREV_RELEASE_BIN") {
-        Ok(bin) if !bin.is_empty() => {
+    match &prev {
+        Some(bin) => {
             eprintln!("the checkpoint is written by the previous release ({bin})");
-            let out = run_rivet_as(&bin, &["run", "--config", &a_cfg], &db);
+            let out = run_rivet_as(bin, &["run", "--config", &a_cfg], &db);
             assert!(
                 out.status.success(),
                 "{}",
