@@ -1,0 +1,14 @@
+diff --git a/src/source/mysql/cdc.rs b/src/source/mysql/cdc.rs
+index 04227bb9..347805a0 100644
+--- a/src/source/mysql/cdc.rs
++++ b/src/source/mysql/cdc.rs
+@@ -319,9 +319,6 @@ impl MysqlChangeStream {
+         own_db: &str,
+         matches: &[crate::source::cdc::identity::CatalogMatch],
+     ) -> Option<String> {
+-        if !own_db.is_empty() && matches.iter().any(|m| m.schema == own_db) {
+-            return Some(own_db.to_string());
+-        }
+         let mut base: Vec<&str> = matches
+             .iter()
+             .filter(|m| m.capturable)

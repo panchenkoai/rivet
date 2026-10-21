@@ -8012,21 +8012,84 @@ fn roast_pg_cdc_folded_twin_refusal_names_both_relations() {
     );
 }
 
-/// MySQL's ambiguity refusal must speak the SAME sentence PostgreSQL does.
-///
-/// Both engines now refuse a configured string that does not name one relation, and
-/// an operator reading two different messages for one class has to learn the class
-/// twice. The shared `identity::resolve_captured_table` is what makes them one
-/// sentence; this test is the contract for wiring MySQL into it.
-///
-/// The engine difference that stays, because it is real: MySQL's
-/// `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE` hands
-/// over the whole server's binlog, so the catalog CANNOT see every database the
-/// capture will receive. Resolution closes what the catalog can see; the wire-side
-/// check (`bare_name_spans_databases`) stays as the backstop for what it cannot.
+/// A second database `db` on the CDC server, readable by `rivet`, holding `table` as `(id INT PRIMARY KEY, v VARCHAR(20))` with `ids`; dropped on drop.
+struct OtherDb(String);
+
+impl OtherDb {
+    fn with(db: &str, table: &str, ids: &[i64]) -> Self {
+        let root = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet").expect("root pool");
+        let mut rc = root.get_conn().expect("root conn");
+        rc.query_drop(format!("DROP DATABASE IF EXISTS {db}"))
+            .unwrap();
+        rc.query_drop(format!("CREATE DATABASE {db}")).unwrap();
+        rc.query_drop(format!(
+            "CREATE TABLE {db}.{table}(id INT PRIMARY KEY, v VARCHAR(20))"
+        ))
+        .unwrap();
+        for id in ids {
+            rc.query_drop(format!("INSERT INTO {db}.{table} VALUES ({id}, 'foreign')"))
+                .unwrap();
+        }
+        rc.query_drop(format!("GRANT SELECT ON {db}.* TO 'rivet'@'%'"))
+            .unwrap();
+        rc.query_drop("FLUSH PRIVILEGES").unwrap();
+        OtherDb(db.to_string())
+    }
+
+    fn insert(&self, table: &str, id: i64) {
+        let root = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet").expect("root pool");
+        root.get_conn()
+            .unwrap()
+            .query_drop(format!(
+                "INSERT INTO {}.{table} VALUES ({id}, 'foreign')",
+                self.0
+            ))
+            .unwrap();
+    }
+}
+
+impl Drop for OtherDb {
+    fn drop(&mut self) {
+        if let Ok(p) = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet")
+            && let Ok(mut rc) = p.get_conn()
+        {
+            let _ = rc.query_drop(format!("DROP DATABASE IF EXISTS {}", self.0));
+        }
+    }
+}
+
+/// Every `id` in every Parquet part under `dir`, recursively, sorted.
+fn ids_read_all(dir: &std::path::Path) -> Vec<i64> {
+    use arrow::array::{Array, Int64Array};
+    let mut ids = Vec::new();
+    for f in crate::common::files_under(dir) {
+        if f.extension().is_none_or(|x| x != "parquet") {
+            continue;
+        }
+        let file = std::fs::File::open(&f).unwrap();
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+            .unwrap()
+            .build()
+            .unwrap();
+        for b in reader {
+            let b = b.unwrap();
+            let col = b.column_by_name("id").expect("an id column");
+            let col = arrow::compute::cast(col, &arrow::datatypes::DataType::Int64).unwrap();
+            let col = col.as_any().downcast_ref::<Int64Array>().unwrap();
+            ids.extend((0..col.len()).map(|i| col.value(i)));
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+/// #675: a bare name means the connection's own database when that database holds it. A
+/// second database holding a table of the same name, with other rows, neither stops the
+/// stream nor reaches it: the baseline and the changes are the connection database's rows.
+/// RED on 0.32.1: refused `RIVET_SOURCE_CDC_TABLE_UNRESOLVED` at the catalog check.
 #[test]
 #[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
-fn roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds() {
+fn mysql_cdc_a_bare_name_captures_its_own_database_beside_a_same_named_table() {
     let _serial = cross_process_serial("mysql_cdc_ambiguity");
     let table = unique_name("rivet_cdc_amb").to_lowercase();
     let mut c = conn();
@@ -8037,53 +8100,183 @@ fn roast_mysql_cdc_refuses_a_bare_name_a_second_database_also_holds() {
     ))
     .unwrap();
     let _t = Table(table.clone());
-    // A second database holding the same name, and GRANTED so this connection's
-    // catalog can see it — that is the half resolution owns. Created as root
-    // because `rivet` cannot create a database, which is itself the reason the
-    // wire-side backstop exists: in production the second database is usually one
-    // this user has no rights on at all.
-    {
-        let root = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet").expect("root pool");
-        let mut rc = root.get_conn().expect("root conn");
-        rc.query_drop("CREATE DATABASE IF NOT EXISTS amb_other")
+    for id in [1, 2] {
+        c.query_drop(format!("INSERT INTO {table} VALUES ({id}, 'own')"))
             .unwrap();
-        rc.query_drop(format!(
-            "CREATE TABLE IF NOT EXISTS amb_other.{table}(zzz INT PRIMARY KEY, qqq VARCHAR(20))"
-        ))
-        .unwrap();
-        rc.query_drop("GRANT SELECT ON amb_other.* TO 'rivet'@'%'")
-            .unwrap();
-        rc.query_drop("FLUSH PRIVILEGES").unwrap();
     }
+    let other = OtherDb::with(&format!("amb_{}", std::process::id()), &table, &[101, 102]);
 
     let d = tempfile::tempdir().unwrap();
-    let ckpt = d.path().join("cdc.ckpt");
-    let rig = Rig::mysql_cdc(&table).checkpoint_path(ckpt);
+    let rig = Rig::mysql_cdc(&table)
+        .checkpoint_path(d.path().join("cdc.ckpt"))
+        .cdc_line("initial: snapshot");
     rig.pin_binlog_here();
-    let said = rig.run_expect_fail();
+    rig.run_ok();
+    c.query_drop(format!("INSERT INTO {table} VALUES (3, 'own')"))
+        .unwrap();
+    other.insert(&table, 103);
+    rig.run_ok();
+    assert_eq!(
+        ids_read_all(&rig.out_dir()),
+        vec![1, 2, 3],
+        "the baseline and the changes are the connection database's rows; the other database's never"
+    );
+}
 
-    {
-        let root = mysql::Pool::new("mysql://root:rivet@127.0.0.1:3307/rivet");
-        if let Ok(p) = root
-            && let Ok(mut rc) = p.get_conn()
-        {
-            let _ = rc.query_drop("DROP DATABASE IF EXISTS amb_other");
-        }
+/// #675, as `rivet init --mode cdc` writes it: the generated config, run as written beside a
+/// second database holding a same-named table with other rows, delivers its own database's rows.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_an_init_config_runs_as_written_beside_a_same_named_table() {
+    let _serial = cross_process_serial("mysql_cdc_ambiguity");
+    let table = unique_name("rivet_cdc_init_amb").to_lowercase();
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, v VARCHAR(20))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+    for id in [1, 2] {
+        c.query_drop(format!("INSERT INTO {table} VALUES ({id}, 'own')"))
+            .unwrap();
     }
-    // The LOAD-BEARING parts, not the exact phrase. The shared sentence was the
-    // original goal, and MySQL earned a more precise one: on this engine the
-    // mechanism is a SERVER-WIDE binlog dump, not schema routing inside one
-    // database, and the message says so. Asserting the wording would make this a
-    // spelling checker; what an operator needs is the other relation's name and a
-    // fix they can type.
-    assert!(
-        said.contains(&format!("amb_other.{table}")),
-        "the refusal must name the other relation — an operator cannot qualify what \
-         they were not told about. Got:\n{said}"
+    let other = OtherDb::with(&format!("amb_init_{}", std::process::id()), &table, &[101]);
+    let d = tempfile::tempdir().unwrap();
+    let cfg = d.path().join("cdc.yaml");
+    let env = [("RIVET_AMB_URL", MYSQL_CDC_URL)];
+    let init = run_rivet_env(
+        &[
+            "init",
+            "--source-env",
+            "RIVET_AMB_URL",
+            "--table",
+            &table,
+            "--mode",
+            "cdc",
+            "-o",
+            cfg.to_str().unwrap(),
+        ],
+        &env,
     );
     assert!(
-        said.to_lowercase().contains("qualify"),
-        "and hand over the fix in the form they must type: {said}"
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let yaml = std::fs::read_to_string(&cfg).unwrap();
+    assert!(
+        yaml.contains(&format!("table: {table}")),
+        "init writes the bare name, as before:\n{yaml}"
+    );
+    let run = |what: &str| {
+        let out = run_rivet_env(&["run", "-c", cfg.to_str().unwrap()], &env);
+        assert!(
+            out.status.success(),
+            "{what}: the generated config must run as written:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    run("first run");
+    c.query_drop(format!("INSERT INTO {table} VALUES (3, 'own')"))
+        .unwrap();
+    other.insert(&table, 102);
+    run("second run");
+    assert_eq!(ids_read_all(&d.path().join("output")), vec![1, 2, 3]);
+}
+
+/// #675 across the upgrade: a stream the previous release anchored and drained with a bare name
+/// continues with this binary after a second database gains a same-named table: the same
+/// destination, no gap, no duplicate, no re-baseline, and none of the other database's rows.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc + RIVET_PREV_RELEASE_BIN"]
+fn mysql_cdc_a_previous_release_stream_continues_beside_a_same_named_table() {
+    let _serial = cross_process_serial("mysql_cdc_ambiguity");
+    let table = unique_name("rivet_cdc_amb_up").to_lowercase();
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, v VARCHAR(20))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+    for id in [1, 2] {
+        c.query_drop(format!("INSERT INTO {table} VALUES ({id}, 'own')"))
+            .unwrap();
+    }
+    let d = tempfile::tempdir().unwrap();
+    let rig = Rig::mysql_cdc(&table)
+        .checkpoint_path(d.path().join("cdc.ckpt"))
+        .cdc_line("initial: snapshot");
+    let Some(old) = rig.as_previous_release() else {
+        return;
+    };
+    rig.pin_binlog_here();
+    old.run_ok();
+    c.query_drop(format!("INSERT INTO {table} VALUES (3, 'own')"))
+        .unwrap();
+    old.run_ok();
+    let other = OtherDb::with(&format!("amb_up_{}", std::process::id()), &table, &[101]);
+    c.query_drop(format!("INSERT INTO {table} VALUES (4, 'own')"))
+        .unwrap();
+    other.insert(&table, 102);
+    rig.run_ok();
+    assert_eq!(
+        ids_read_all(&rig.out_dir()),
+        vec![1, 2, 3, 4],
+        "one baseline, every change once, nothing of the other database"
+    );
+}
+
+/// #675, kept: a bare name the connection's database does not hold, held by exactly ONE other
+/// database, is captured from that one, as before the fix.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_a_bare_name_only_another_database_holds_is_still_captured() {
+    let _serial = cross_process_serial("mysql_cdc_ambiguity");
+    let table = unique_name("rivet_cdc_elsewhere").to_lowercase();
+    let other = OtherDb::with(&format!("amb_else_{}", std::process::id()), &table, &[]);
+    let d = tempfile::tempdir().unwrap();
+    let rig = Rig::mysql_cdc(&table)
+        .checkpoint_path(d.path().join("cdc.ckpt"))
+        .no_oracle("the oracle reads the bare name in the connection's database, which does not hold it; the parts are read below");
+    rig.pin_binlog_here();
+    rig.run_ok();
+    other.insert(&table, 7);
+    other.insert(&table, 8);
+    rig.run_ok();
+    assert_eq!(ids_read_all(&rig.out_dir()), vec![7, 8]);
+}
+
+/// #675: a bare name and the other database's qualified twin in ONE stream would hand one event
+/// to two tables: refused by code at config load, before anything is captured.
+#[test]
+#[ignore = "live: requires docker compose --profile cdc mysql-cdc"]
+fn mysql_cdc_a_bare_name_beside_its_qualified_twin_is_refused() {
+    let _serial = cross_process_serial("mysql_cdc_ambiguity");
+    let table = unique_name("rivet_cdc_twin").to_lowercase();
+    let mut c = conn();
+    c.query_drop(format!("DROP TABLE IF EXISTS {table}"))
+        .unwrap();
+    c.query_drop(format!(
+        "CREATE TABLE {table}(id INT PRIMARY KEY, v VARCHAR(20))"
+    ))
+    .unwrap();
+    let _t = Table(table.clone());
+    let db = format!("amb_twin_{}", std::process::id());
+    let _other = OtherDb::with(&db, &table, &[]);
+    let d = tempfile::tempdir().unwrap();
+    let twin = format!("{db}.{table}");
+    let rig = Rig::mysql_cdc(&table)
+        .checkpoint_path(d.path().join("cdc.ckpt"))
+        .tables(&[&table, &twin]);
+    let said = rig.run_expect_fail();
+    assert!(
+        said.contains("[RIVET_CONFIG_CDC_SHAPE_INVALID]") && said.contains(&twin),
+        "{said}"
     );
 }
 

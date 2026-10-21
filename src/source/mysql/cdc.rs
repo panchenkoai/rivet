@@ -90,6 +90,8 @@ pub(crate) struct MysqlChangeStream {
     /// The connection's own database — what a BARE configured name means. Compared
     /// against each event's schema on the wire; see `bare_name_spans_databases`.
     own_db: String,
+    /// The database each bare configured name means ([`Self::bare_name_database`]), read at open.
+    bare_db: HashMap<String, String>,
     /// The server's `(server_uuid, gtid_executed)` at open, written into EVERY
     /// position this stream persists — the anchor wrote it and the commit save
     /// dropped it, so one captured transaction disarmed the foreign-server refusal.
@@ -309,6 +311,98 @@ impl MysqlChangeStream {
         ))
     }
 
+    /// The database a BARE configured name means, from the catalog's relations of that name: the
+    /// connection's own database when it holds one, else the only database holding a base table of
+    /// it; `None` when none or several do. The one rule the catalog check, the binlog routing and
+    /// the baseline read all take.
+    pub(crate) fn bare_name_database(
+        own_db: &str,
+        matches: &[crate::source::cdc::identity::CatalogMatch],
+    ) -> Option<String> {
+        if !own_db.is_empty() && matches.iter().any(|m| m.schema == own_db) {
+            return Some(own_db.to_string());
+        }
+        let mut base: Vec<&str> = matches
+            .iter()
+            .filter(|m| m.capturable)
+            .map(|m| m.schema.as_str())
+            .collect();
+        base.sort_unstable();
+        base.dedup();
+        match base.as_slice() {
+            [one] => Some((*one).to_string()),
+            _ => None,
+        }
+    }
+
+    /// Every relation outside the system databases the catalog names `table`, views included.
+    fn catalog_matches_of(
+        conn: &mut mysql::Conn,
+        table: &str,
+    ) -> Vec<crate::source::cdc::identity::CatalogMatch> {
+        use mysql::prelude::Queryable as _;
+        conn.exec_map(
+            // NO kind filter: a VIEW sharing the name is a CANDIDATE, not something to hide.
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
+             FROM information_schema.TABLES \
+             WHERE TABLE_NAME = ? \
+               AND TABLE_SCHEMA NOT IN \
+                   ('mysql','information_schema','performance_schema','sys')",
+            (table,),
+            |(schema, table, kind): (String, String, String)| {
+                // Only a BASE TABLE reaches a binlog TABLE_MAP; a VIEW never emits under its own name.
+                let capturable = kind == "BASE TABLE";
+                crate::source::cdc::identity::CatalogMatch {
+                    schema,
+                    table,
+                    kind,
+                    capturable,
+                }
+            },
+        )
+        .unwrap_or_default()
+    }
+
+    /// The database each BARE configured name means on this connection, by [`Self::bare_name_database`].
+    fn bare_name_databases(
+        conn: &mut mysql::Conn,
+        own_db: &str,
+        configured: &[String],
+    ) -> HashMap<String, String> {
+        configured
+            .iter()
+            .filter(|c| !c.contains('.'))
+            .filter_map(|c| {
+                Self::bare_name_database(own_db, &Self::catalog_matches_of(conn, c))
+                    .map(|db| (c.clone(), db))
+            })
+            .collect()
+    }
+
+    /// The relation each configured name reads for its baseline: `<db>.<table>` for a bare name
+    /// the rule resolves, the name itself otherwise; the stream routes by the same answer.
+    pub(crate) fn baseline_reads(
+        url: &str,
+        tls: Option<&TlsConfig>,
+        configured: &[String],
+    ) -> Result<HashMap<String, String>> {
+        use mysql::prelude::Queryable as _;
+        let mut conn = connect_conn(url, tls)?;
+        let own_db: String = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_default();
+        Ok(Self::bare_name_databases(&mut conn, &own_db, configured)
+            .into_iter()
+            .map(|(cfg, db)| {
+                let read = format!("{db}.{cfg}");
+                (cfg, read)
+            })
+            .collect())
+    }
+
     /// Refusal text unless `@@global.binlog_row_metadata` is FULL (`None`: the server has no such variable).
     pub(crate) fn row_metadata_refusal(metadata: Option<&str>) -> Option<String> {
         let setting = match metadata {
@@ -374,10 +468,21 @@ impl MysqlChangeStream {
 
     /// Refuse a table the schema probe could not read, by preparing the probe's own statement: asked before a first run's anchor, never on a resume (a table dropped under a stream is the stream's own refusal).
     fn refuse_absent_tables_on(conn: &mut mysql::Conn, configured_tables: &[String]) -> Result<()> {
+        use mysql::prelude::Queryable as _;
+        let own_db: String = conn
+            .query_first::<Option<String>, _>("SELECT DATABASE()")
+            .ok()
+            .flatten()
+            .flatten()
+            .unwrap_or_default();
+        let bare_db = Self::bare_name_databases(conn, &own_db, configured_tables);
         for table in configured_tables {
-            use mysql::prelude::Queryable as _;
             crate::source::cdc::validate_table_ident(table)?;
-            conn.prep(format!("SELECT * FROM {table}"))
+            // The relation the stream routes the name to, by the one rule.
+            let read = bare_db
+                .get(table)
+                .map_or_else(|| table.clone(), |db| format!("{db}.{table}"));
+            conn.prep(format!("SELECT * FROM {read}"))
                 .map_err(|e| table_probe_refusal(table, server_error_code(&e), &e.to_string()))?;
         }
         Ok(())
@@ -450,31 +555,7 @@ impl MysqlChangeStream {
                         },
                     )
                     .unwrap_or_default(),
-                None => conn
-                    .exec_map(
-                        // NO kind filter: a VIEW sharing the name is a CANDIDATE, not
-                        // something to hide. Filtering it out made resolution pick the
-                        // base table silently while classification refused the view —
-                        // two reads of one fact naming two relations.
-                        "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
-                         FROM information_schema.TABLES \
-                         WHERE TABLE_NAME = ? \
-                           AND TABLE_SCHEMA NOT IN \
-                               ('mysql','information_schema','performance_schema','sys')",
-                        (&table,),
-                        |(schema, table, kind): (String, String, String)| {
-                            // Only a BASE TABLE reaches a binlog TABLE_MAP; a VIEW
-                            // never emits under its own name.
-                            let capturable = kind == "BASE TABLE";
-                            crate::source::cdc::identity::CatalogMatch {
-                                schema,
-                                table,
-                                kind,
-                                capturable,
-                            }
-                        },
-                    )
-                    .unwrap_or_default(),
+                None => Self::catalog_matches_of(conn, &table),
             };
             // The resolved relation, and classification asks about THAT — not about a
             // second lookup of the configured string. The two queries used different
@@ -504,40 +585,33 @@ impl MysqlChangeStream {
                 // genuinely capture it — that is the catalog-visible half of the
                 // ambiguity, and the wire guard covers the half the catalog cannot
                 // see (privilege-filtered `information_schema`).
-                let (mine, foreign): (Vec<_>, Vec<_>) = if schema.is_some() {
-                    (matches.clone(), Vec::new())
-                } else {
-                    matches
-                        .iter()
-                        .cloned()
-                        .partition(|m| m.schema == own_db_for_resolution)
+                let chosen = match schema {
+                    Some(_) => None,
+                    None => Self::bare_name_database(&own_db_for_resolution, &matches),
                 };
-                let live_foreign: Vec<_> =
-                    foreign.iter().filter(|m| m.capturable).cloned().collect();
-                // Our own database holds the name AND a live twin exists elsewhere:
-                // that is the cross-database ambiguity, refused here rather than left
-                // for the wire — the catalog can see this one, so it should be caught
-                // before the stream opens. Crucially this fires even when OUR
-                // candidate is inert (a view): electing the foreign table instead is
-                // what turned a hard refusal into `success, rows: 0`.
-                if !mine.is_empty() && !live_foreign.is_empty() {
+                // A qualified twin in the SAME stream names the other database's table, while the
+                // bare name routes by its own: one event would reach both.
+                if let Some(db) = &chosen
+                    && let Some(twin) = configured.iter().find(|c| {
+                        c.split_once('.')
+                            .is_some_and(|(s, t)| t == table && s != db)
+                    })
+                {
                     crate::rivet_bail!(
                         crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
-                        "mysql cdc: `{cfg}` is unqualified, so it means the connection's \
-                         own database (`{own_db_for_resolution}`) — but `{}` also holds a \
-                         table of that name, and the binlog dump is server-wide, so its \
-                         rows would land in this export under THIS table's names. Qualify \
-                         it (`{own_db_for_resolution}.{cfg}` or `{}.{cfg}`) to say which \
-                         you mean.",
-                        live_foreign[0].schema,
-                        live_foreign[0].schema
+                        "mysql cdc: `{cfg}` is unqualified, so it means `{db}.{cfg}`, while \
+                         `{twin}` in the same stream names another database's table of that \
+                         name. Qualify `{cfg}` (`{db}.{cfg}`) so each table is named once."
                     );
                 }
-                // Otherwise resolve within the scope the bare name actually names.
-                let for_resolution = if mine.is_empty() {
-                    matches.clone()
-                } else {
-                    mine
+                // Resolve within the database the bare name means; with no such database, among all.
+                let for_resolution: Vec<_> = match &chosen {
+                    Some(db) => matches
+                        .iter()
+                        .filter(|m| &m.schema == db)
+                        .cloned()
+                        .collect(),
+                    None => matches.clone(),
                 };
                 let r = crate::source::cdc::identity::resolve_captured_table(cfg, &for_resolution)?;
                 if let Some(note) = &r.note {
@@ -636,6 +710,7 @@ impl MysqlChangeStream {
             .flatten()
             .flatten()
             .unwrap_or_default();
+        let bare_db = Self::bare_name_databases(&mut conn, &own_db, &configured_tables);
         conn.query_drop(format!(
             "SET SESSION net_write_timeout = {DUMP_WRITE_TIMEOUT_SECS}"
         ))
@@ -672,6 +747,7 @@ impl MysqlChangeStream {
             // The connection's own database — the meaning of a bare configured
             // name, and the wire-side comparison's fixed reference.
             own_db,
+            bare_db,
             identity,
             row_image,
         })
@@ -1050,11 +1126,20 @@ impl MysqlChangeStream {
                     {
                         continue;
                     }
-                    if let Some(why) = Self::bare_name_spans_databases(cfg, &self.own_db, &schema) {
-                        crate::rivet_bail!(
-                            crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
-                            "{why}"
-                        );
+                    match bare_event_route(self.bare_db.get(cfg).map(String::as_str), &schema) {
+                        BareRoute::Captured => {}
+                        // Another database's table of that name: the bare name means another's.
+                        BareRoute::Elsewhere => return Ok(true),
+                        BareRoute::Unresolved => {
+                            if let Some(why) =
+                                Self::bare_name_spans_databases(cfg, &self.own_db, &schema)
+                            {
+                                crate::rivet_bail!(
+                                    crate::error::codes::SOURCE_CDC_TABLE_UNRESOLVED,
+                                    "{why}"
+                                );
+                            }
+                        }
                     }
                 }
                 // Provisional position; rewritten to the commit position at XID.
@@ -2138,9 +2223,35 @@ impl Iterator for MysqlChangeStream {
     }
 }
 
+/// What a binlog event of `schema` is to a bare configured name the rule resolved to `resolved`.
+#[derive(Debug, PartialEq, Eq)]
+enum BareRoute {
+    /// The database the name means: the event is captured.
+    Captured,
+    /// Another database's table of that name: not captured.
+    Elsewhere,
+    /// The rule resolved nothing at open: the wire guard decides.
+    Unresolved,
+}
+
+/// Route a bare name's event of `schema` by the database the rule resolved it to.
+fn bare_event_route(resolved: Option<&str>, schema: &str) -> BareRoute {
+    match resolved {
+        Some(db) if db == schema => BareRoute::Captured,
+        Some(_) => BareRoute::Elsewhere,
+        None => BareRoute::Unresolved,
+    }
+}
+
 impl ChangeStream for MysqlChangeStream {
     fn row_image(&mut self, _tables: &[String]) -> crate::source::cdc::RowImage {
         self.row_image.clone()
+    }
+
+    fn resolved_identity(&self, configured: &str) -> Option<(String, String)> {
+        self.bare_db
+            .get(configured)
+            .map(|db| (db.clone(), configured.to_string()))
     }
 
     fn engine(&self) -> crate::source::cdc::CdcEngine {
@@ -2315,6 +2426,41 @@ mod tests {
     /// Checked on the WIRE because no catalog can answer it here: MySQL's
     /// `information_schema` is filtered by PRIVILEGE while `REPLICATION SLAVE` hands
     /// over the whole server's binlog.
+    /// A bare name means the connection's database when that holds the name, else the one other
+    /// database holding a base table of it, else nothing: one answer for check, wire and baseline.
+    #[test]
+    fn a_bare_name_resolves_to_its_own_database_then_to_the_only_other() {
+        let m = |schema: &str, kind: &str| crate::source::cdc::identity::CatalogMatch {
+            schema: schema.into(),
+            table: "orders".into(),
+            kind: kind.into(),
+            capturable: kind == "BASE TABLE",
+        };
+        let db = MysqlChangeStream::bare_name_database;
+        let (base, view) = ("BASE TABLE", "VIEW");
+        assert_eq!(
+            db("shop", &[m("shop", base), m("archive", base)]),
+            Some("shop".into())
+        );
+        assert_eq!(
+            db("shop", &[m("shop", view), m("archive", base)]),
+            Some("shop".into()),
+            "a view of our own is what the name means; the foreign table is never elected"
+        );
+        assert_eq!(db("shop", &[m("archive", base)]), Some("archive".into()));
+        assert_eq!(db("shop", &[m("archive", base), m("old", base)]), None);
+        assert_eq!(db("shop", &[m("archive", view)]), None);
+        assert_eq!(db("shop", &[]), None);
+        assert_eq!(db("", &[m("archive", base)]), Some("archive".into()));
+        assert_eq!(db("", &[m("archive", base), m("old", base)]), None);
+        assert_eq!(bare_event_route(Some("shop"), "shop"), BareRoute::Captured);
+        assert_eq!(
+            bare_event_route(Some("shop"), "archive"),
+            BareRoute::Elsewhere
+        );
+        assert_eq!(bare_event_route(None, "archive"), BareRoute::Unresolved);
+    }
+
     #[test]
     fn a_bare_name_means_the_connections_own_database_and_any_other_is_refused() {
         // The ordinary case: the event is from our own database. Silent — this runs

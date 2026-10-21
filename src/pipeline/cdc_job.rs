@@ -456,6 +456,13 @@ pub(super) fn initial_snapshot_pending(
         }
         _ => None,
     };
+    // MySQL: a bare name's baseline reads the database the stream routes it to (one rule).
+    let mysql_reads = match engine {
+        CdcEngine::Mysql => {
+            crate::source::mysql::cdc::MysqlChangeStream::baseline_reads(&url, tls, &tables)?
+        }
+        _ => Default::default(),
+    };
     let mut table_dests = Vec::with_capacity(tables.len());
     let mut done_flags = Vec::with_capacity(tables.len());
     for t in &tables {
@@ -473,7 +480,10 @@ pub(super) fn initial_snapshot_pending(
             || dest.head("_SUCCESS")?.is_some();
         table_dests.push((
             t.clone(),
-            catalog_read.clone().unwrap_or_else(|| t.clone()),
+            catalog_read
+                .clone()
+                .or_else(|| mysql_reads.get(t).cloned())
+                .unwrap_or_else(|| t.clone()),
             snap_dcfg,
         ));
         done_flags.push(done);
