@@ -739,6 +739,14 @@ scenarios:
     mongo:    { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_mongo }
     oracle:   { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_lock_timeout
+    what: "RIVET_STATE_LOCK_TIMEOUT: `state reset --lock-wait 2` beside a live checkpointed run of the export; it waits, names the holder, and stops by code twice, the same wait again stops again, and `give --lock-wait more seconds` takes the lease once the run ends, then a run delivers the source"
+    postgres: { test: a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_postgres }
+    mysql:    { test: a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_mysql }
+    mssql:    { test: a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_mssql }
+    mongo:    { test: a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_mongo }
+    oracle:   { test: a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_oracle }
+
   - id: beside_run_full
     what: "a second `rivet run` beside a live one, `mode: full` (RESULTS 4 of docs/operator-contract-matrix.yaml, cited here)"
     postgres: { test: a_second_concurrent_full_run_does_not_double_the_prefix_postgres }

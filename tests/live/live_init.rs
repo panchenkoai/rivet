@@ -352,6 +352,41 @@ fn init_mssql_schema_wide_discovers_seeded_table() {
     );
 }
 
+// ─── MongoDB: a whole-database init lists its collections in rivet's order ──
+
+/// `listCollections` has no order, so a whole-database MongoDB init scaffolds its collections
+/// through rivet's one catalog ordering (byte order of the name), the same on every run.
+#[test]
+#[ignore = "live: requires docker compose mongo"]
+fn init_mongo_schema_wide_lists_collections_in_rivets_order() {
+    let db = unique_name("minit_order");
+    let _guard = MongoDbGuard {
+        port: 27017,
+        db: db.clone(),
+    };
+    let m = MongoTest::connect(27017, &db);
+    for c in ["zeta", "alpha", "Mid"] {
+        m.seed_int_id(c, 2);
+    }
+    let url = MongoTest::url(27017, &db);
+    let names = || {
+        let out = run_rivet(&["init", "--source", &url]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("- name: "))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let first = names();
+    assert_eq!(first, ["Mid", "alpha", "zeta"], "byte order of the names");
+    assert_eq!(names(), first, "the same order on every init");
+}
+
 // ─── MongoDB: a forced mode the source cannot run is refused, never rewritten ──
 
 #[test]

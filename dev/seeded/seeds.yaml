@@ -443,6 +443,25 @@ seeds:
       postgres-state:
         na: "the turn queue is SQLite's; PostgreSQL row locks queue writers on the server"
 
+  - name: load-block-missing-uncoded
+    class: "`rivet load` / `rivet compact` on a config without a `load:` block exit 1 with no RIVET_* code, so a scheduler cannot tell the config mistake from another failure"
+    history: "0.32.2 hand sweep block 0 (D2), 2026-10-21: the stop said config has no top-level load block, exit 1, uncoded; through 0.32.1"
+    scope: source
+    patch: load-block-missing-uncoded/shared.patch
+    engines:
+      lib:
+        cells: ["lib:plan_loads_gates_the_load_block_before_any_source_io"]
+      postgres:
+        cells: ["lib:plan_loads_gates_the_load_block_before_any_source_io"]
+      mysql:
+        na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
+      mssql:
+        na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
+      mongo:
+        na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
+      oracle:
+        na: "the stop is the config gate of `rivet load` / `rivet compact`, before any source or warehouse: the lib column carries it"
+
   - name: load-spec-last-writer-of-one-name
     class: "the by-name load spec is one row per export name, so on a state shared by configs of one name reading different sources the last `rivet init` (or run) decides every config's load key"
     history: "client simulation on 0.32.0 (D3) and owner decision 2026-10-18 (v38 approved); measured on main 34ec3d30 with five configs on one PostgreSQL state: the second config's load refused RIVET_LOAD_KEY_COLUMN_INVALID keyed by the fifth one's `code`"
