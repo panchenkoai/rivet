@@ -3237,6 +3237,31 @@ mod tests {
         assert_eq!(d.endpoint, None, "derived from the account: {yaml}");
     }
 
+    /// Each destination kind alone is a bucket scaffold; none is a local one.
+    #[test]
+    fn each_bucket_flag_alone_makes_a_bucket_scaffold() {
+        let azure = InitYamlDestination {
+            azure: Some(InitAzureTarget {
+                container: "c".into(),
+                account: "a".into(),
+                endpoint: None,
+            }),
+            ..Default::default()
+        };
+        let gcs = InitYamlDestination {
+            gcs_bucket: Some("g".into()),
+            ..Default::default()
+        };
+        let s3 = InitYamlDestination {
+            s3_bucket: Some("s".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            [&azure, &gcs, &s3, &InitYamlDestination::default()].map(|d| d.is_bucket()),
+            [true, true, true, false]
+        );
+    }
+
     #[test]
     fn validate_refuses_azure_beside_another_bucket() {
         let azure = Some(InitAzureTarget {
