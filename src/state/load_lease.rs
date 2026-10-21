@@ -17,6 +17,8 @@ pub struct LoadLease<'a> {
     key: String,
     holder: String,
     _file: Option<std::fs::File>,
+    /// The 0.32.1 file of the same key, held shared so a 0.32.1 run of it and this one exclude each other.
+    _legacy: Option<std::fs::File>,
     kept: Option<(Arc<Keeper>, u64)>,
 }
 
@@ -32,7 +34,7 @@ impl LoadLease<'_> {
 impl Drop for LoadLease<'_> {
     fn drop(&mut self) {
         // Unlock before close: a forked child may still hold a copy of the descriptor.
-        if let Some(file) = &self._file {
+        for file in [&self._file, &self._legacy].into_iter().flatten() {
             use std::os::unix::io::AsRawFd;
             unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         }
@@ -67,6 +69,7 @@ impl<'a> LoadLease<'a> {
             key: key.to_string(),
             holder: "h:1:1".to_string(),
             _file: None,
+            _legacy: None,
             kept: Some((keeper, id)),
         }
     }
@@ -347,6 +350,33 @@ fn lease_path(db: &std::path::Path, key: &str) -> std::path::PathBuf {
     db.with_file_name(name)
 }
 
+/// `path` opened and locked `how` (`LOCK_EX` / `LOCK_SH`) without waiting; `None` while another
+/// descriptor holds a lock that excludes it.
+fn flocked(path: &std::path::Path, how: libc::c_int) -> Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::create(path)?;
+    if unsafe { libc::flock(file.as_raw_fd(), how | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(err.into())
+}
+
+/// The lease file 0.32.1 locked for `key` (named by the lossy token alone), while a run of that
+/// release may still hold it: taken shared after the new file, so it excludes a 0.32.1 holder and
+/// no holder of this release. To be removed in 0.34.0. `None` for an in-memory store.
+fn legacy_lease_path(db: &std::path::Path, key: &str) -> Option<std::path::PathBuf> {
+    if db.to_string_lossy() == ":memory:" {
+        return None;
+    }
+    let mut name = db.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(format!(".lease-{}", crate::manifest::file_token(key)));
+    Some(db.with_file_name(name))
+}
+
 impl StateStore {
     /// Try to take the load lease for `key` (the target table); `None` when
     /// another process holds it.
@@ -407,27 +437,33 @@ impl StateStore {
                     key: key.to_string(),
                     holder,
                     _file: None,
+                    _legacy: None,
                     kept: Some((keeper, id)),
                 }))
             }
             StateRef::Sqlite(db) => {
                 use std::os::unix::io::AsRawFd;
-                let file = std::fs::File::create(lease_path(db, key))?;
-                let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-                if rc == 0 {
-                    return Ok(Some(LoadLease {
-                        store: self,
-                        key: key.to_string(),
-                        holder: String::new(),
-                        _file: Some(file),
-                        kept: None,
-                    }));
-                }
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock {
+                let Some(file) = flocked(&lease_path(db, key), libc::LOCK_EX)? else {
                     return Ok(None);
-                }
-                Err(err.into())
+                };
+                let legacy = match legacy_lease_path(db, key) {
+                    Some(old) => match flocked(&old, libc::LOCK_SH)? {
+                        Some(f) => Some(f),
+                        None => {
+                            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                            return Ok(None);
+                        }
+                    },
+                    None => None,
+                };
+                Ok(Some(LoadLease {
+                    store: self,
+                    key: key.to_string(),
+                    holder: String::new(),
+                    _file: Some(file),
+                    _legacy: legacy,
+                    kept: None,
+                }))
             }
         }
     }
@@ -768,5 +804,49 @@ mod lease_file_tests {
             assert!(store.try_load_lease(a).unwrap().is_none(), "{a} is held");
             drop(held);
         }
+    }
+
+    /// A 0.32.1 run (an exclusive lock on the lossy-named file) and a run of this release on the
+    /// same key exclude each other in both orders; two keys that read alike still do not.
+    #[test]
+    fn a_holder_of_the_old_lease_name_and_this_release_exclude_each_other() {
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(dir.path().join("rivet.yaml").to_str().unwrap()).unwrap();
+        let StateRef::Sqlite(db) = store.state_ref.clone() else {
+            panic!("a SQLite state");
+        };
+        let old = legacy_lease_path(&db, "orders x").unwrap();
+        let held_by_0_32_1 = flocked(&old, libc::LOCK_EX)
+            .unwrap()
+            .expect("the old holder");
+        assert!(
+            store.try_load_lease("orders x").unwrap().is_none(),
+            "a 0.32.1 holder excludes"
+        );
+        assert!(
+            store.try_load_lease("orders x").unwrap().is_none(),
+            "and keeps excluding"
+        );
+        unsafe { libc::flock(held_by_0_32_1.as_raw_fd(), libc::LOCK_UN) };
+        drop(held_by_0_32_1);
+        let mine = store
+            .try_load_lease("orders x")
+            .unwrap()
+            .expect("free again");
+        assert!(
+            flocked(&old, libc::LOCK_EX).unwrap().is_none(),
+            "this release holding the key excludes a 0.32.1 run of it"
+        );
+        let alike = store.try_load_lease("orders-x").unwrap();
+        assert!(
+            alike.is_some(),
+            "a key that reads alike is still another lease"
+        );
+        drop((mine, alike));
+        assert!(
+            flocked(&old, libc::LOCK_EX).unwrap().is_some(),
+            "both let go"
+        );
     }
 }
