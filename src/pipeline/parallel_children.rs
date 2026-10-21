@@ -640,35 +640,73 @@ mod child_reaper {
 }
 
 /// The global flags a child inherits from this process; every other global flag is the parent's alone.
-pub const FORWARDED_GLOBALS: &[&str] = &["--no-notify"];
+pub const FORWARDED_GLOBALS: &[&str] = &["--no-notify", "--lock-wait"];
 
-/// Whether this process was given the forwarded global `flag`.
-fn given(flag: &str) -> bool {
+/// The argv that hands the global `flag` on as this process holds it.
+fn forwarded(flag: &str) -> Vec<String> {
     match flag {
-        "--no-notify" => crate::notify::silenced(),
-        _ => false,
+        "--no-notify" if crate::notify::silenced() => vec![flag.to_string()],
+        "--lock-wait" => vec![flag.to_string(), crate::state::lock_wait_s().to_string()],
+        _ => Vec::new(),
     }
 }
 
-/// The argv of the forwarded global flags this process was given.
-fn forwarded_globals() -> Vec<&'static str> {
+/// The argv of the forwarded global flags, as this process holds them.
+fn forwarded_globals() -> Vec<String> {
     FORWARDED_GLOBALS
         .iter()
-        .copied()
-        .filter(|f| given(f))
+        .flat_map(|f| forwarded(f))
         .collect()
 }
 
 #[cfg(test)]
 mod forwarded_tests {
-    /// A silenced process hands `--no-notify` to its children; a parent-only flag is never handed on.
+    /// The wait is handed on with its seconds; `--no-notify` only when this process was given it.
     #[test]
-    fn a_silenced_process_hands_no_notify_to_its_children() {
+    fn each_forwarded_global_is_handed_on_as_this_process_holds_it() {
         crate::notify::silence();
-        assert!(crate::notify::silenced());
-        assert!(super::given("--no-notify"));
-        assert!(!super::given("--json-errors"));
-        assert_eq!(super::forwarded_globals(), ["--no-notify"]);
+        assert_eq!(super::forwarded("--no-notify"), ["--no-notify"]);
+        let wait = super::forwarded("--lock-wait");
+        assert_eq!(wait[0], "--lock-wait");
+        assert_eq!(wait[1], crate::state::lock_wait_s().to_string());
+        assert_eq!(
+            super::forwarded("--no-notify").is_empty(),
+            !crate::notify::silenced()
+        );
+        assert!(super::forwarded("--json-errors").is_empty());
+    }
+
+    /// In a process of its own: the wait set by `--lock-wait` is read back and handed on, and
+    /// `--no-notify` only once this process is silenced.
+    #[test]
+    fn the_forwarded_globals_are_what_this_process_was_given() {
+        const MARK: &str = "rivet_forwarded_globals_child_marker";
+        if std::env::args().any(|a| a == MARK) {
+            crate::state::set_lock_wait(7);
+            assert_eq!(crate::state::lock_wait_s(), 7);
+            assert_eq!(super::forwarded_globals(), ["--lock-wait", "7"]);
+            crate::notify::silence();
+            assert_eq!(
+                super::forwarded_globals(),
+                ["--no-notify", "--lock-wait", "7"]
+            );
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "pipeline::parallel_children::forwarded_tests::the_forwarded_globals_are_what_this_process_was_given",
+                "--skip",
+                MARK,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 

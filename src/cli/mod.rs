@@ -32,6 +32,8 @@ pub fn run_binary() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = parse_cli();
     let json_errors = cli.json_errors;
+    // Process-wide, so only the binary sets it: a library caller of dispatch keeps the immediate answer.
+    crate::state::set_lock_wait(cli.lock_wait);
     if let Err(e) = dispatch(cli) {
         let msg = crate::pipeline::parent_ui::sanitize_terminal(&crate::redact::redact_error(&e));
         let exit_class = crate::error::classify_exit(&e);

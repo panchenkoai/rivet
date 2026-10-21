@@ -418,7 +418,10 @@ pub(crate) fn try_run_lease<'s>(
     export: &str,
     source: &str,
 ) -> Result<Option<crate::state::LoadLease<'s>>> {
-    state.try_load_lease(&run_lease_key(export, source))
+    state.take_lease_waiting(&run_lease_key(export, source), &|| {
+        let run = live_run_label(state, export, source).unwrap_or_else(|_| "a run".to_string());
+        format!("the run lease of export '{export}' ({run})")
+    })
 }
 
 /// How a refusal names the live run of `export` on `source`: by its run-status id, whose last field is the pid.
