@@ -1342,6 +1342,7 @@ fn two_cdc_configs_of_one_cluster_name_their_own_stream_objects() {
 /// bytes, more than 300 columns) leaves each out with the capture's reason, keeps the table it can
 /// capture, and the config runs AS WRITTEN: through 0.32.1 init wrote a CDC export of each, and the
 /// first `rivet run` stopped `RIVET_SOURCE_CDC_TABLE_UNSUPPORTED`.
+#[cfg(feature = "oracle")]
 #[test]
 #[ignore = "live: requires the Oracle CDC stand"]
 fn an_oracle_cdc_scaffold_leaves_out_the_tables_the_capture_refuses_and_runs() {
