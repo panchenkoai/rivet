@@ -484,11 +484,12 @@ def self_test() -> int:
     assert grade(skip, {"t1": "SKIP", "t2": "FAIL"}, {}).status == NO_CONTROL, "a red control is not a stand skip"
     assert grade(skip, {"t1": "SKIP", "t2": "PASS"}, {"t2": "SKIP"}).status == MISSED, \
         "a green control the seed made skip is no catch"
-    for ceiling, red in ((1, False), (0, True)):
+    limit = not_graded_here_ceiling()
+    for n, red in ((limit, False), (limit + 1, True)):
+        rows = [Verdict(Row(f"s{i}", "mysql", "p", ("t1",)), NOT_GRADED_HERE, "skipped") for i in range(n)]
         led = Ledger(colour=False)
-        record(led, [v], ceiling=ceiling)
-        assert [c.status.name for c in led.cells][:1] == ["SKIP"] and led.red is red, (ceiling, led.cells)
-    assert isinstance(not_graded_here_ceiling(), int)
+        record(led, rows)
+        assert sum(c.status.name == "SKIP" for c in led.cells) == n and led.red is red, (n, limit, led.cells)
     for status in (MISSED, STALE, BROKEN, NO_CONTROL):
         led = Ledger(colour=False)
         record(led, [Verdict(pg, CAUGHT, "t2"), Verdict(Row("s", "mysql", "p", ()), status, "x"),
