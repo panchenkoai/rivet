@@ -123,7 +123,32 @@ impl Rig {
         // loudly; the sanctioned mutations are amend_export_lines /
         // replace_export_line.
         self.write_guarded(&cfg, &self.render());
+        self.hand_over_checkpoint(&cfg);
         cfg
+    }
+
+    /// Rigs built around one checkpoint (`checkpoint_path`) are the successive configs of ONE
+    /// stream, each with its own destination: a later rig takes the checkpoint over from an
+    /// earlier rig's `rig.yaml` as an operator does by moving the config. Only a claim another rig
+    /// made is handed over; a claim by any other config file stays, and is the product's refusal.
+    fn hand_over_checkpoint(&self, cfg: &std::path::Path) {
+        if self.mode != "cdc" || self.ckpt_override.is_none() {
+            return;
+        }
+        let mut record = self.checkpoint().into_os_string();
+        record.push(".owner");
+        let Ok(text) = std::fs::read_to_string(&record) else {
+            return;
+        };
+        let owner: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        let theirs = owner["config"].as_str().map(std::path::PathBuf::from);
+        let mine = std::fs::canonicalize(cfg).unwrap_or_else(|_| cfg.to_path_buf());
+        if let Some(theirs) = theirs
+            && theirs.file_name().is_some_and(|n| n == "rig.yaml")
+            && std::fs::canonicalize(&theirs).unwrap_or(theirs) != mine
+        {
+            let _ = std::fs::remove_file(&record);
+        }
     }
 
     /// Append a `cdc:` entry over the same config path, for a second stage that gives the stream a knob it ran without.

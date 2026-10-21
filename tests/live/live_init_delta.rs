@@ -742,7 +742,7 @@ fn a_generated_single_table_cdc_config_takes_its_baseline_then_only_later_change
     };
 
     run();
-    let out = dir.path().join("output").join(format!("{table}_cdc"));
+    let out = dir.path().join("output/rivet").join(format!("{table}_cdc"));
     assert!(
         parts_in(&out).is_empty(),
         "nothing changed after the anchor, so the STREAM holds no part"
@@ -817,7 +817,7 @@ fn a_generated_multi_table_cdc_config_takes_every_baseline_then_only_the_delta()
     let run = || {
         rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     };
-    let root = dir.path().join("output").join("cdc");
+    let root = dir.path().join("output/rivet").join("cdc");
     let snap = |t: &str| root.join(t).join("snapshot");
     let changes = |t: &str| root.join(t);
 
@@ -1264,7 +1264,7 @@ fn a_generated_oracle_cdc_config_has_no_load_block_and_runs_to_parquet() {
     rivet_ok_in(dir.path(), &["run", "-c", "rivet.yaml"], &db);
     let snap = dir
         .path()
-        .join("output")
+        .join("output/rivet")
         .join(scaffolded_export(&generated))
         .join("snapshot");
     assert_eq!(ids_in(&snap), (1..=10).collect::<Vec<i64>>());
