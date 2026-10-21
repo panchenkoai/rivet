@@ -242,6 +242,10 @@ class Cargo:
         env = {k: v for k, v in os.environ.items()
                if k not in ("RIVET_BIN", "RIVET_BIN_OVERRIDE", "RIVET_STATE_URL", "RIVET_TEST_STATE_URL")}
         env["CARGO_TARGET_DIR"] = str(base / "target")
+        # The cells run in the scratch tree: a binary the gate names relative to this checkout (`.gate-baseline/...`) is named from here.
+        for k, v in list(env.items()):
+            if k.endswith("_BIN") and v and not os.path.isabs(v):
+                env[k] = str(ROOT / v)
         if state_url:
             for var in SCRATCH_STATE_VARS:
                 env[var] = state_url
@@ -494,13 +498,16 @@ def self_test() -> int:
     assert not unknown_cells(real), unknown_cells(real)
     saved = os.environ.get("RIVET_GATE_STATE_URL")
     os.environ["RIVET_GATE_STATE_URL"] = "postgresql://u:p@127.0.0.1:5433/rivet_state"
+    os.environ["RIVET_SELFTEST_CARRIER_BIN"] = ".gate-baseline/field/rivet"
     try:
         env = Cargo(Path("/t"), Path("/b"), "postgresql://u:p@127.0.0.1:5433/scratch").env
     finally:
         os.environ.pop("RIVET_GATE_STATE_URL")
+        os.environ.pop("RIVET_SELFTEST_CARRIER_BIN")
         if saved is not None:
             os.environ["RIVET_GATE_STATE_URL"] = saved
     assert all(env[v].endswith("/scratch") for v in SCRATCH_STATE_VARS), {v: env.get(v) for v in SCRATCH_STATE_VARS}
+    assert env["RIVET_SELFTEST_CARRIER_BIN"] == str(ROOT / ".gate-baseline/field/rivet"), env["RIVET_SELFTEST_CARRIER_BIN"]
     assert env["RIVET_TEST_STATE_TOXI_URL"] == "postgresql://u:p@127.0.0.1:15433/scratch", env["RIVET_TEST_STATE_TOXI_URL"]
     stale = []
     for patch in sorted({r.patch for r in real if r.patch}):
