@@ -5,6 +5,8 @@
 use std::path::Path;
 
 const ALWAYS: &str = "${{ !cancelled() }}";
+/// A census step of `E2E matrix`: after an earlier failure too, and only over legs that ran.
+const ALWAYS_WHEN_RUN: &str = "${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}";
 /// The E2E job is a matrix; these run on its `pre` leg only, so once per check.
 const PRE_LEG: &str = "${{ !cancelled() && matrix.leg == 'pre' }}";
 
@@ -80,13 +82,13 @@ const GATES: &[(&str, &str, &str, &str)] = &[
         "e2e-matrix",
         "Self-skip census",
         "python3 -m dev.release_oracle.skip_census target/rivet-skips.log --lacking \"$LACKING\"",
-        ALWAYS,
+        ALWAYS_WHEN_RUN,
     ),
     (
         "e2e-matrix",
         "Rig oracle verdict census",
         "python3 -m dev.release_oracle.skip_census --verdicts target/rivet-oracle.log --lane ci",
-        ALWAYS,
+        ALWAYS_WHEN_RUN,
     ),
 ];
 
@@ -189,7 +191,11 @@ fn the_e2e_legs_are_pre_plus_every_partition_and_the_verdict_job_needs_them() {
         Some("E2E matrix"),
         "branch protection requires this name"
     );
-    assert_eq!(verdict["needs"].as_str(), Some("e2e"));
+    let needs: Vec<&str> = verdict["needs"]
+        .as_sequence()
+        .map(|n| n.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    assert_eq!(needs, ["e2e-scope", "e2e"]);
     assert_eq!(verdict["if"].as_str(), Some("${{ always() }}"));
     let first = &steps_of(&ci, "e2e-matrix")[0];
     assert!(
@@ -200,5 +206,11 @@ fn the_e2e_legs_are_pre_plus_every_partition_and_the_verdict_job_needs_them() {
                 .lines()
                 .any(|l| l.trim() == r#"[ "${{ needs.e2e.result }}" = success ]"#),
         "the verdict job must fail unless every leg succeeded"
+    );
+    // A skipped PR is green only when the scope job succeeded AND said skip.
+    let run = first["run"].as_str().unwrap_or_default();
+    assert!(
+        run.contains(r#"[ "${{ needs.e2e-scope.result }}" = success ] && [ "$SCOPE" = skip ]"#),
+        "a skip must come from a scope job that succeeded: {run}"
     );
 }
