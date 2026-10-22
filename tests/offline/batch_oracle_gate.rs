@@ -237,12 +237,13 @@ fn local_readers(src: &str, outcome: &BTreeSet<String>) -> BTreeSet<String> {
 }
 
 /// A must-fail test's NEGATIVE exit is its outcome; a bare `success()` is not.
-const REFUSAL: [&str; 5] = [
+const REFUSAL: [&str; 6] = [
     "!out.status.success()",
     "!res.status.success()",
     "!output.status.success()",
     "!status.success()",
     "run_expect_fail(",
+    "assert_refused(",
 ];
 
 fn test_chunks(src: &str) -> Vec<(String, String)> {
