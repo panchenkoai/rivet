@@ -1984,8 +1984,10 @@ jobs:
       - name: Rig oracle verdict census
         # A passing test's stderr is hidden, so the verdict log is the only proof the oracle ran. The
         # ceilings are skip_census.VERDICT_CEILINGS, the table the release gate's oracle_verdict_census
-        # cell reads too; each count must land within its noise of the ceiling, both ways.
-        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}
+        # cell reads too; each count must land within its noise of the ceiling, both ways. The
+        # ceilings are totals of the WHOLE matrix, so a run the scope narrowed to some live modules
+        # (`select`) cannot reach them and is not graded here; it is graded on the next full run.
+        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}
         run: python3 -m dev.release_oracle.skip_census --verdicts target/rivet-oracle.log --lane ci
 
 

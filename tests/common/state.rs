@@ -313,6 +313,17 @@ impl StateDb {
     }
 }
 
+/// The state schema this tree's rivet writes, read from a SQLite state it creates.
+pub fn this_trees_state_schema() -> i64 {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db = dir.path().join(".rivet_state.db");
+    drop(rivet::state::StateStore::open_at_path(&db).expect("this tree creates a state"));
+    rusqlite::Connection::open(&db)
+        .expect("the state it created")
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("schema_version")
+}
+
 /// The Postgres state backend the gate grades (`RIVET_GATE_STATE_URL`), handed to every rivet child as `RIVET_STATE_URL`; `None` is SQLite beside the config.
 pub fn state_url_under_test() -> Option<String> {
     std::env::var("RIVET_GATE_STATE_URL")

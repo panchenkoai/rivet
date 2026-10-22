@@ -306,7 +306,7 @@ fn holder_text(holder: &str) -> String {
 }
 
 /// This host's name, the part of a holder id that says where its pid lives.
-fn host_name() -> String {
+pub(super) fn host_name() -> String {
     let mut buf = [0u8; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -386,6 +386,65 @@ fn legacy_lease_path(db: &std::path::Path, key: &str) -> Option<std::path::PathB
     Some(db.with_file_name(name))
 }
 
+/// The first lease file beside the SQLite state `db`, by name, that another open file holds, as `(file name, holder)`; `None` when every one is free.
+pub(super) fn sqlite_lease_held(db: &std::path::Path) -> std::io::Result<Option<(String, String)>> {
+    use std::os::unix::io::AsRawFd;
+    let Some(name) = db.file_name() else {
+        return Ok(None);
+    };
+    let prefix = format!("{}.lease-", name.to_string_lossy());
+    let dir = db
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let mut leases: Vec<String> = std::fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    leases.sort();
+    for lease in leases {
+        let file = std::fs::File::open(dir.join(&lease))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(Some((lease, lease_holder_on_sqlite())));
+        }
+        return Err(err);
+    }
+    Ok(None)
+}
+
+/// The holder of an SQLite-state lease as a sentence names it: the `flock` records no pid.
+fn lease_holder_on_sqlite() -> String {
+    "another rivet process on this host".to_string()
+}
+
+/// The first `state_lease` row, by key, a live holder keeps (unexpired, and not a dead pid on this host), as `(key, holder)`; `None` when there is none or no such table yet.
+pub(super) fn pg_lease_held(
+    tx: &mut impl postgres::GenericClient,
+) -> std::result::Result<Option<(String, String)>, postgres::Error> {
+    let present: bool = tx
+        .query_one("SELECT to_regclass('state_lease') IS NOT NULL", &[])?
+        .get(0);
+    if !present {
+        return Ok(None);
+    }
+    let host = host_name();
+    let rows = tx.query(
+        "SELECT lease_key, holder FROM state_lease WHERE expires_at > now() ORDER BY lease_key",
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+        .find(|(_, holder)| !holder_is_dead_here(holder, &host))
+        .map(|(key, holder)| (key, holder_text(&holder))))
+}
+
 /// How long a take of a lease another live process holds waits, in seconds (`--lock-wait`); 0 answers at once.
 static LOCK_WAIT_S: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -400,15 +459,15 @@ pub fn lock_wait_s() -> u64 {
 }
 
 /// How often a waiting take says again that it is waiting.
-const WAIT_NOTE_EVERY: Duration = Duration::from_secs(60);
+pub(super) const WAIT_NOTE_EVERY: Duration = Duration::from_secs(60);
 
 /// Whether a waiting take says again that it waits: the first time, then once per `every`.
-fn note_due(noted: Option<Instant>, every: Duration) -> bool {
+pub(super) fn note_due(noted: Option<Instant>, every: Duration) -> bool {
     noted.is_none_or(|at| at.elapsed() >= every)
 }
 
 /// The longest pause between two attempts of a waiting take.
-const WAIT_POLL: Duration = Duration::from_secs(1);
+pub(super) const WAIT_POLL: Duration = Duration::from_secs(1);
 
 impl StateStore {
     /// Take `key`, trying again while another live process holds it for up to `--lock-wait`:
@@ -466,7 +525,7 @@ impl StateStore {
     /// Who holds `key`, as far as the state records: a PostgreSQL holder names its host and pid.
     fn lease_holder(&self, key: &str) -> Result<String> {
         if let StateRef::Sqlite(_) = &self.state_ref {
-            return Ok("another rivet process on this host".to_string());
+            return Ok(lease_holder_on_sqlite());
         }
         let holder = self.query_opt(
             "SELECT holder FROM state_lease WHERE lease_key = ?1",

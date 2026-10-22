@@ -1863,6 +1863,156 @@ fn new_beside_a_live_old_run(rig: Rig) {
     recovers(&new, &envs);
 }
 
+/// The state schema version the cell's state holds: its own Postgres database, else the SQLite file beside `rig`'s config.
+fn schema_on(rig: &Rig, db: Option<&ScratchStateDb>) -> i64 {
+    match db {
+        Some(db) => db
+            .client()
+            .query_one("SELECT MAX(version) FROM rivet_schema_version", &[])
+            .expect("rivet_schema_version")
+            .get(0),
+        None => rusqlite::Connection::open(
+            rig.config_path()
+                .parent()
+                .expect("a config directory")
+                .join(".rivet_state.db"),
+        )
+        .expect("the SQLite state")
+        .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+        .expect("schema_version"),
+    }
+}
+
+/// A lease on the cell's state held as another live rivet holds one (an `flock`ed lease file beside the SQLite state, or an unexpired `state_lease` row of a holder on another host); the closure lets it go.
+fn hold_a_lease(rig: &Rig, db: Option<&ScratchStateDb>) -> Box<dyn FnOnce() + Send> {
+    match db {
+        Some(db) => {
+            db.client()
+                .execute(
+                    "INSERT INTO state_lease (lease_key, holder, expires_at) VALUES \
+                     ('sab_cell_holder', 'elsewhere:4242:1', now() + interval '600 seconds')",
+                    &[],
+                )
+                .expect("hold a state_lease row");
+            let url = db.url();
+            Box::new(move || {
+                postgres::Client::connect(&url, postgres::NoTls)
+                    .expect("the scratch state")
+                    .execute(
+                        "DELETE FROM state_lease WHERE lease_key = 'sab_cell_holder'",
+                        &[],
+                    )
+                    .expect("release the state_lease row");
+            })
+        }
+        None => {
+            use std::os::unix::io::AsRawFd;
+            let path = rig
+                .config_path()
+                .parent()
+                .expect("a config directory")
+                .join(".rivet_state.db.lease-sab_cell_holder");
+            let file = std::fs::File::create(&path).expect("a lease file beside the state");
+            // SAFETY: `flock` on a descriptor this cell owns.
+            let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(locked, 0, "fixture: lock the lease file");
+            Box::new(move || {
+                // SAFETY: `flock` on the descriptor this closure owns.
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                drop(file);
+            })
+        }
+    }
+}
+
+/// The previous release holds its run lease, paused after its first fetch (`pg_after_snapshot_open`, so it writes nothing meanwhile), while this build runs the export on the same state (SQLite, or a Postgres state of the cell's own): this build is refused by code with the schema left as it was, the paused run then delivers, and the previous release runs AGAIN on that state and delivers. The refusal is then walked out of beside a lease the cell holds: refused twice, `rivet state reset` is refused the same way, and the remedy (SQLite: run again once the holder ends; Postgres: `--lock-wait`, which waits for it) migrates the state and delivers.
+fn old_runs_again_after_this_build_was_refused_beside_it(engine: SqlEngine, pg_state: bool) {
+    if !pg_state
+        && not_sqlite_state("the SQLite state beside the config, as the previous release keeps it")
+    {
+        return;
+    }
+    let (_table, mut new, _guard) = shaped(engine, "sab_oldagain", Shape::Full);
+    let Some(old) = new.as_previous_release() else {
+        return;
+    };
+    let db = pg_state.then(|| ScratchStateDb::new("sab_oldagain"));
+    let url = db.as_ref().map(ScratchStateDb::url);
+    let envs = on_state(&url);
+    let marker = new
+        .config_path()
+        .with_file_name("paused-under-the-run-lease");
+    let marker_text = marker.display().to_string();
+    let mut paused = envs.clone();
+    paused.push(("RIVET_TEST_PAUSE_AT", "pg_after_snapshot_open:20000"));
+    paused.push(("RIVET_TEST_PAUSE_MARKER", marker_text.as_str()));
+    let met = old.beside_a_live_run(
+        &paused,
+        |_| marker.exists(),
+        |_| {
+            let before = schema_on(&new, db.as_ref());
+            let out = new.run_with_envs(&envs);
+            (before, out, schema_on(&new, db.as_ref()))
+        },
+    );
+    let (run, (before, beside, after)) = met.answered_while_alive();
+    assert_eq!(
+        after, before,
+        "this build, stopped beside a live run of the previous release, moved the state schema from v{before}"
+    );
+    ok(run);
+    ok(old.run_with_envs(&envs));
+    if before == this_trees_state_schema() {
+        assert_refused(&beside, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2));
+        skip_live(&format!(
+            "RIVET_PREV_RELEASE_BIN writes this tree's state schema v{before}: no migration to refuse or walk out of"
+        ));
+        return recovers(&new, &envs);
+    }
+    let refused = Refused::by_code("RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN", 2);
+    assert_refused(&beside, refused);
+    let export = new.export_name().to_string();
+    let reset = ["state", "reset", "--export", export.as_str()];
+    let release = hold_a_lease(&new, db.as_ref());
+    let remedy = match pg_state {
+        false => Remedy::new(
+            "Stop or wait for that run of the older release, then run again",
+            Then::DeliversTheSource,
+            move |_| release(),
+        ),
+        true => Remedy::new(
+            "give `--lock-wait` the seconds it needs",
+            Then::DeliversTheSource,
+            move |_| {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    release();
+                });
+            },
+        )
+        .rerun_as(&["--lock-wait", "600", "run"]),
+    };
+    new.refuses_twice_and_walks_out(
+        &["run"],
+        &envs,
+        refused,
+        vec![
+            Remedy::wrong(
+                "runs `rivet state reset` beside the holder",
+                Then::Refuses(refused),
+                |_| {},
+            )
+            .rerun_as(&reset),
+            remedy.in_place(),
+        ],
+    );
+    assert!(
+        schema_on(&new, db.as_ref()) > before,
+        "the walk ends with this build's schema"
+    );
+    recovers(&new, &envs);
+}
+
 /// An incremental export of a fresh `N`-row table, and what adds three rows to it per step.
 fn growing(engine: SqlEngine, tag: &str) -> (Rig, impl Fn(i64), Box<dyn std::any::Any>) {
     let (table, guard) = seeded(engine, tag);
@@ -5088,6 +5238,20 @@ fn the_two_releases_taking_turns_deliver_or_refuse_mongo() {
         let (rig, _guard) = mongo_rig("sab_rolling");
         versions_alternate(rig, |_| ());
     }
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + RIVET_PREV_RELEASE_BIN"]
+fn the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_sqlite_state_postgres()
+{
+    old_runs_again_after_this_build_was_refused_beside_it(SqlEngine::Pg, false);
+}
+
+#[test]
+#[ignore = "live: requires docker compose postgres + a PostgreSQL state server + RIVET_PREV_RELEASE_BIN"]
+fn the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_postgres_state_postgres()
+ {
+    old_runs_again_after_this_build_was_refused_beside_it(SqlEngine::Pg, true);
 }
 
 #[test]
