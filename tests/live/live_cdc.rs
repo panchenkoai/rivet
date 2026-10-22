@@ -4941,34 +4941,21 @@ fn roast_mysql_cdc_refuses_a_truncate_instead_of_silently_diverging() {
     );
 }
 
-/// An unqualified `table:` captures EVERY schema's relation of that name, and the
-/// foreign rows are RE-LABELLED — so it is refused, not warned about.
+/// An unqualified `table:` means the relation the search_path resolves, and a same-named
+/// relation of another schema never reaches its export.
 ///
-/// `sink::table_matches` matches a bare config name against any schema. It has to:
-/// a MongoDB collection has no schema qualifier and may itself contain dots. On
-/// PostgreSQL that means `table: orders` routes `public.orders` AND
-/// `archive.orders` into one export.
-///
-/// This shipped as a WARNING on 2026-08-25 with the harm described as "interleaved
-/// and indistinguishable". A bughunt the same day measured it and the description
-/// was too kind — the sink matches images by column NAME and falls back to POSITION
-/// when no name matches, so:
-///
-///   same arity  — `public.bhx(id, val)` + `bh2.bhx(zzz, qqq)`:
-///                 `INSERT INTO bh2.bhx VALUES (2,'FROM_OTHER_SCHEMA')` came back as
-///                 `id=2, val='FROM_OTHER_SCHEMA'` — another table's data under this
-///                 table's names.
-///   other arity — a row with every data column NULL, `status: success`.
-///
-/// Neither is recoverable from the output, which is this repo's line between a
-/// warning and a refusal. A warning at run start is also one an unattended
-/// scheduler never reads.
-///
-/// The relkind filter includes matviews (`'m'`): `test_decoding` decodes them, so a
-/// same-named matview produced the interleave with the guard seeing nothing.
+/// History. `sink::table_matches` matches a bare config name against any schema (a MongoDB
+/// collection has no qualifier and may contain dots), so on PostgreSQL `table: orders` once
+/// routed `public.orders` AND `archive.orders` into one export, the foreign rows re-labelled by
+/// column name (`INSERT INTO bh2.bhx VALUES (2,'FROM_OTHER_SCHEMA')` came back as `id=2,
+/// val='FROM_OTHER_SCHEMA'`) or written as all-NULL rows. That was refused from 2026-08-25, which
+/// also refused the config `rivet init` writes for a `public` table beside a same-named table in
+/// another schema (#675). Now the stream drops the other schema's events by the search_path rule
+/// (`routes`), so the config runs and delivers only its own rows, the matview case included
+/// (`test_decoding` decodes a materialized view).
 #[test]
 #[ignore = "live: requires docker compose postgres (wal_level=logical)"]
-fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
+fn roast_pg_cdc_a_bare_table_name_beside_a_same_named_relation_gets_no_foreign_row() {
     let cdc_db = CdcDb::new("cdc_bare");
     let tbl = unique_name("rivet_cdc_bare").to_lowercase();
     let slot = unique_name("rivet_bare_slot").to_lowercase();
@@ -4990,52 +4977,28 @@ fn roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations() {
          INSERT INTO other.{tbl} VALUES (2,'FROM_OTHER_SCHEMA')"
     ))
     .unwrap();
-
     let rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
-    let said = rig.run_expect_fail();
-    // The wording moved when the bare-name block folded into `identity::resolve_
-    // captured_table` — one refusal for every shape of "this string does not name
-    // one relation". The load-bearing assertions are unchanged: the OTHER relation
-    // is named, and the fix is handed over.
-    assert!(
-        said.contains("could mean") && said.contains(&format!("other.{tbl}")),
-        "the refusal must name the other relation — an operator cannot qualify what \
-         they were not told about. Got:\n{said}"
-    );
-    assert!(
-        said.contains("Qualify it"),
-        "and name the fix, not only the fault: {said}"
+    rig.run_ok();
+    assert_eq!(
+        ids_read_all(&rig.out_dir()),
+        vec![1],
+        "only the search_path table's row; never the other schema's"
     );
 
-    // A MATERIALIZED VIEW of the same name is the case the first cut missed: the
-    // relkind filter was `('r','p')`, and `test_decoding` decodes matviews.
+    // A MATERIALIZED VIEW of the same name in another schema is decoded too, and stays out.
     c.batch_execute("DROP SCHEMA other CASCADE").unwrap();
     c.batch_execute(&format!(
         "CREATE SCHEMA mv; CREATE TABLE mv.src(id int, v text); \
          INSERT INTO mv.src VALUES (9,'from_a_matview'); \
-         CREATE MATERIALIZED VIEW mv.{tbl} AS SELECT id, v FROM mv.src"
+         CREATE MATERIALIZED VIEW mv.{tbl} AS SELECT id, v FROM mv.src; \
+         INSERT INTO {tbl} VALUES (3,'only')"
     ))
     .unwrap();
-    let mv_rig = Rig::pg_cdc(&tbl, &slot).source_url(cdc_db.url());
-    let mv_said = mv_rig.run_expect_fail();
-    assert!(
-        mv_said.contains(&format!("mv.{tbl}")),
-        "a matview shares the name and IS decoded, so it must be named too — a \
-         relkind filter of ('r','p') left exactly this invisible. Got:\n{mv_said}"
-    );
-
-    // Not too WIDE: one matching relation is the ordinary case and must still run.
-    c.batch_execute("DROP SCHEMA mv CASCADE").unwrap();
-    c.execute(&format!("INSERT INTO {tbl} VALUES (3,'only')"), &[])
-        .unwrap();
-    let quiet = Rig::pg_cdc(&tbl, &slot)
-        .source_url(cdc_db.url())
-        .oracle_known_defect("delivered-only rows", "known defect: a bare-name capture delivers the WAL rows of a same-named relation in another schema or a matview into this export (PostgreSQL CDC engine step, identity::resolve_captured_table)");
-    let out = quiet.run_ok_capture();
-    assert!(
-        !out.contains("could mean"),
-        "a bare name over ONE relation is the common, correct case — refusing it \
-         would break every working single-schema config. Got:\n{out}"
+    rig.run_ok();
+    assert_eq!(
+        ids_read_all(&rig.out_dir()),
+        vec![1, 3],
+        "the matview's row never reaches this export"
     );
 }
 
@@ -8228,6 +8191,47 @@ fn mysql_cdc_a_previous_release_stream_continues_beside_a_same_named_table() {
         ids_read_all(&rig.out_dir()),
         vec![1, 2, 3, 4],
         "one baseline, every change once, nothing of the other database"
+    );
+}
+
+/// #675 on PostgreSQL: a bare `public` table beside a same-named table in a second schema. A bare
+/// name means what the search_path resolves, so the stream captures that table, baseline and
+/// changes, and none of the other schema's rows. RED on 0.32.2: refused
+/// `RIVET_SOURCE_CDC_TABLE_UNRESOLVED` ("could mean 2 different relations").
+#[test]
+#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
+fn pg_cdc_a_bare_name_captures_its_search_path_table_beside_a_same_named_table() {
+    let table = unique_name("cdc_amb_pg").to_lowercase();
+    let schema = format!("amb_{}", std::process::id());
+    let mut c =
+        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect postgres");
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO {table} VALUES (1, 'own'), (2, 'own'); \
+         DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
+         CREATE TABLE {schema}.{table} (id INT PRIMARY KEY, v TEXT); \
+         INSERT INTO {schema}.{table} VALUES (101, 'foreign');"
+    ))
+    .unwrap();
+    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
+    let slot = unique_name("rivet_amb_slot");
+    let _slot = Slot::new(slot.clone());
+    let rig = Rig::pg_cdc(&table, &slot).cdc_line("initial: snapshot");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rig.run_ok();
+        c.batch_execute(&format!(
+            "INSERT INTO {table} VALUES (3, 'own'); INSERT INTO {schema}.{table} VALUES (102, 'foreign'); \
+             TRUNCATE {schema}.{table};"
+        ))
+        .unwrap();
+        rig.run_ok();
+        ids_read_all(&rig.out_dir())
+    }));
+    let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
+    assert_eq!(
+        outcome.unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        vec![1, 2, 3],
+        "the search_path table's rows, and none of the other schema's; its TRUNCATE is not this stream's"
     );
 }
 
