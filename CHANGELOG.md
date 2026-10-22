@@ -22,6 +22,9 @@
     uncoded);
   - a whole-table pass over a base-and-buffer base that still holds uncompacted changes:
     `RIVET_LOAD_BUFFER_NOT_COMPACTED`.
+  - a 0.32.2 command started while a 0.32.1 run holds a lease on the same state:
+    `RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN`, exit 2, after waiting up to `--lock-wait`; the state is
+    not migrated, so the 0.32.1 run and its next run go on (upgrade once it ends).
 - **`rivet init --mode cdc -o <file>` names the slot, `server_id`, checkpoint and destination after
   the file** (`-o rivet.yaml` -> `./cdc/rivet_<table>.ckpt`, `./output/rivet/<table>_cdc/`). Existing
   configs are read as before.
@@ -30,6 +33,30 @@
 - **PostgreSQL CDC:** the first 0.32.2 run of a stream 0.32.1 left with its slot past its checkpoint
   takes the slot's position once (a warning names both); a slot another reader advanced is refused
   `RIVET_SOURCE_CDC_LOG_GAP` as in every 0.32.x.
+
+- **Every MySQL run opened an extra source connection to detect a proxy.** The fix that keeps
+  ProxySQL multiplexed (0.32.2, literal session SETs) detected the proxy on a connection dialled for
+  that alone, so a batch run opened 4 MySQL connections instead of 2 and a CDC run 3 instead of 2.
+  **Now** the proxy is detected once per source URL per process, on the pool's own first connection,
+  by statements that keep a ProxySQL session multiplexed (`PROXYSQL INTERNAL SESSION`,
+  `SHOW GLOBAL VARIABLES LIKE …` in place of `SELECT @@…`): a batch run opens 2 and a CDC run 2
+  again. **What to do:** nothing.
+
+- **A rivet with a newer state schema, started beside a live run of an older release, migrated the
+  state under that run, even when it was then refused.** Every command opened and migrated the state
+  before it took its lease, so a `rivet run` or `rivet load` refused as busy (`is writing`,
+  `RIVET_STATE_RUN_IN_PROGRESS`) had already moved the state to the new schema, and the next run of
+  the older release on that state was refused `RIVET_STATE_SCHEMA_NEWER` (every release with a state
+  migration; found by the 0.32.2 pre-release gate on the v37 → v38 migration). **Now** a migration
+  first asks whether another live process holds a lease on the state (a locked lease file beside a
+  SQLite state; an unexpired `state_lease` row of a live holder on a PostgreSQL state). While one
+  does, it waits up to `--lock-wait` and then stops with the new `RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN`
+  (busy, exit 2), the state not migrated and nothing written. **Behaviour change:** the first command
+  of a release with a newer state schema, started while a run of the older release holds any lease
+  on the same state, waits for that run or stops by this code instead of migrating the state beside
+  it; a state no live run holds is migrated as before, and state written before the upgrade is
+  unchanged. **What to do:** nothing; a scheduler that retries exit 2 runs the upgrade once the older
+  run ends.
 
 - **A MySQL CDC config written by `rivet init --mode cdc` was refused when another database on the
   server held a table of the same name.** `init` writes the tables unqualified (`tables: [orders]`),
