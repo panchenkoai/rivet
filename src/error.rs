@@ -894,6 +894,11 @@ pub mod codes {
         "RIVET_STATE_RUN_IN_PROGRESS",
         "wait for the run to finish, or stop its process, then repeat the command",
     );
+    /// A migration of the state met a lease that a live rivet process on the state's older schema holds.
+    pub const STATE_UPGRADE_BESIDE_LIVE_RUN: Code = busy(
+        "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN",
+        "run again once the rivet process holding a lease on the state ends; the state was not migrated, and the release that process runs still opens it",
+    );
     /// A resume, reconcile or repair met a stored chunk run planned under another query or other chunk settings.
     pub const STATE_CHUNK_PLAN_CHANGED: Code = refusal(
         "RIVET_STATE_CHUNK_PLAN_CHANGED",
@@ -1723,6 +1728,7 @@ pub mod codes {
         STATE_CHUNK_RUN_SUPERSEDED,
         STATE_KEYSET_SEQUENTIAL_ANCHOR_UNFINISHED,
         STATE_RUN_IN_PROGRESS,
+        STATE_UPGRADE_BESIDE_LIVE_RUN,
         STATE_LOCK_TIMEOUT,
         STATE_CHUNK_CHECKPOINT_GONE,
         STATE_CHUNK_PLAN_CHANGED,
@@ -2192,6 +2198,7 @@ mod tests {
             busy.iter().map(|c| c.id).collect::<Vec<_>>(),
             [
                 "RIVET_STATE_RUN_IN_PROGRESS",
+                "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN",
                 "RIVET_STATE_LOCK_TIMEOUT",
                 "RIVET_STATE_LEASE_LOST",
                 "RIVET_LOAD_TABLE_BUSY"

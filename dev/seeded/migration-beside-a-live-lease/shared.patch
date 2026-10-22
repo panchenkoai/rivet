@@ -1,0 +1,12 @@
+diff --git a/src/state/migrations.rs b/src/state/migrations.rs
+--- a/src/state/migrations.rs
++++ b/src/state/migrations.rs
+@@ -1181,7 +1181,7 @@
+ 
+ /// Refuse to migrate a v`old` state while `held`, a lease on it, is another live process's `(lease, holder)`: the new schema would land under that run.
+ fn refuse_beside_a_live_lease(old: i64, held: Option<(String, String)>) -> Result<()> {
+-    let Some((lease, holder)) = held else {
++    let Some((lease, holder)) = held.filter(|_| false) else {
+         return Ok(());
+     };
+     crate::rivet_bail!(

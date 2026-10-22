@@ -746,6 +746,14 @@ scenarios:
     mongo:    { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_mongo }
     oracle:   { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_oracle }
 
+  - id: refusal_state_upgrade_beside_live_run
+    what: "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN: this build runs an export beside a run of the previous release paused under its run lease on the SQLite state of its older schema; refused with the schema unchanged and the previous release then runs again and delivers; beside a lease file the cell holds it is refused twice, `rivet state reset` is refused the same way, and `Run again once that process ends` (the cell lets go) migrates the state and delivers the source"
+    postgres: { test: the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_sqlite_state_postgres }
+    mysql:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+    mssql:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+    mongo:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+    oracle:   { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+
   - id: refusal_state_lock_timeout
     what: "RIVET_STATE_LOCK_TIMEOUT: `state reset --lock-wait 2` beside a live checkpointed run of the export; it waits, names the holder, and stops by code twice, the same wait again stops again, and `give --lock-wait more seconds` takes the lease once the run ends, then a run delivers the source"
     postgres: { test: a_state_reset_waiting_beside_a_live_run_times_out_and_is_walked_out_postgres }
@@ -1289,6 +1297,14 @@ scenarios:
     mssql:    { test: this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_mssql }
     mongo:    { na: "a MongoDB export is `mode: full` or resumable only, and two concurrent runs of either are open defects whatever the binaries (beside_run_full; RESULTS 11 of docs/operator-contract-matrix.yaml): measured here, the pair doubled the prefix (source 300000, delivered 600000)" }
     oracle:   { test: this_build_beside_a_live_run_of_the_previous_release_delivers_or_refuses_oracle }
+
+  - id: versions_old_again_after_new_refused_beside_it
+    what: "the previous release holds its run lease, paused after its first fetch, on a Postgres state of its older schema (a database of the cell's own) while this build runs the export: this build stops by RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN with the schema unchanged, the paused run delivers, the previous release runs again on that state and delivers (no RIVET_STATE_SCHEMA_NEWER); beside a `state_lease` row the cell holds the refusal is walked out of: refused twice, `rivet state reset` refused the same way, and `give --lock-wait the seconds it needs` waits for the row to go, migrates the state and delivers, then this build delivers again"
+    postgres: { test: the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_postgres_state_postgres }
+    mysql:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+    mssql:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+    mongo:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
+    oracle:   { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
 
   - id: exhaust_destination_volume_full
     what: "the volume under the local destination of a live run filled once the run has committed a part (`TinyVolume`: a 4 MB disk image of the cell's own): the run delivers or fails loudly, every run into the full volume fails loudly, and with the space back a run delivers the source and `validate` passes"

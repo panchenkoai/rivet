@@ -839,6 +839,10 @@ exclude_re = [
     # `two_compacts_at_once_admit_one_and_apply_each_change_once` proves it across
     # two.
     "replace \\| with \\^ in flocked",
+    # `flock(fd, LOCK_EX | LOCK_NB)` in `sqlite_lease_held`: EQUIVALENT for the same reason (2 and 4,
+    # disjoint bits). The probe is graded by
+    # `a_state_behind_this_build_is_not_migrated_while_a_lease_beside_it_is_held`.
+    "replace \\| with \\^ in sqlite_lease_held",
     # `pid > 0` in `holder_is_dead_here` → `>=`: EQUIVALENT. The two differ only at pid 0,
     # and kill(0, 0) signals the caller's own process group, which always exists — so
     # both read "alive". The guard that matters, a negative pid (a process GROUP to
