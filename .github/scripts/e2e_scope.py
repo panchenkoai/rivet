@@ -37,7 +37,7 @@ def e2e_rust_texts(root: Path = ROOT) -> list[str]:
     out = [f.read_text(errors="ignore") for f in (root / "src").rglob("*.rs")]
     for f in (root / "tests").rglob("*.rs"):
         t = f.read_text(errors="ignore")
-        if "#[ignore" in t or "tests/common/" in str(f.relative_to(root)) + "/":
+        if has_ignored(t) or "tests/common/" in str(f.relative_to(root)) + "/":
             out.append(t)
     return out
 
@@ -93,6 +93,17 @@ def e2e_python(root: Path = ROOT) -> set[str]:
     return {str(f.relative_to(root)) for f in seen}
 
 
+#: An ignored test: the `#[ignore` ATTRIBUTE at the start of a line, never the text inside a string.
+IGNORED = re.compile(r"^\s*#\[ignore", re.M)
+#: A module a test file includes, with its optional `#[path = "…"]`.
+MOD_DECL = re.compile(r'^\s*(?:#\[path\s*=\s*"([^"]+)"\]\s*)?(?:pub(?:\([a-z]+\))?\s+)?mod\s+([a-z0-9_]+)\s*;', re.M)
+
+
+def has_ignored(text: str) -> bool:
+    """Whether `text` declares an ignored test."""
+    return IGNORED.search(text) is not None
+
+
 #: A doc compiled into a binary: `include_str!("…docs/x.md")`.
 INCLUDED_DOC = re.compile(r'include_str!\(\s*"((?:\.\./)*(?:docs/[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+\.md))"')
 
@@ -122,8 +133,7 @@ def read_docs(root: Path = ROOT) -> set[str]:
             text = f.read_text(errors="ignore")
             found |= _names(INCLUDED_DOC, text)
             rel = str(f.relative_to(root))
-            if rel.startswith("tests/common/") or (base == "tests" and "#[ignore" in text) \
-                    or (base == "src" and "#[ignore" in text):
+            if rel.startswith("tests/common/") or has_ignored(text):
                 found |= _names(READ_DOC, text)
     return found
 
@@ -132,8 +142,31 @@ def offline_only(path: str, root: Path = ROOT) -> bool:
     """A Rust test file under tests/ (not tests/common/, not a live module) that holds no ignored test: E2E runs only ignored tests."""
     if not (path.startswith("tests/") and path.endswith(".rs")) or path.startswith(("tests/common/", "tests/live/")):
         return False
-    f = root / path
-    return f.is_file() and "#[ignore" not in f.read_text(errors="ignore") and "mod " not in f.read_text(errors="ignore")
+    return _no_ignored_test(root / path, root, set())
+
+
+def _no_ignored_test(f: Path, root: Path, seen: set[Path]) -> bool:
+    """Whether `f` and every module it includes (`mod x;`, `#[path]` honoured) declare no ignored test; a module
+    that cannot be found counts as holding one."""
+    if f in seen:
+        return True
+    seen.add(f)
+    if not f.is_file():
+        return False
+    text = f.read_text(errors="ignore")
+    if has_ignored(text):
+        return False
+    # Submodules of `tests/x.rs` and of a `mod.rs` sit beside it; of any other file, in its stem's directory.
+    here = f.parent if f.name == "mod.rs" or f.parent == root / "tests" else f.parent / f.stem
+    for path_attr, name in MOD_DECL.findall(text):
+        if path_attr:
+            cands = [f.parent / path_attr]
+        else:
+            cands = [here / f"{name}.rs", here / name / "mod.rs"]
+        hit = next((c for c in cands if c.is_file()), None)
+        if hit is None or not _no_ignored_test(hit, root, seen):
+            return False
+    return True
 
 
 #: dev/ Python the E2E lane runs (`e2e_python`), computed once per process.
@@ -346,7 +379,7 @@ def self_test() -> int:
     # What the lane runs: its own steps, the source, and every test file that holds an ignored test
     # (E2E runs `--run-ignored only`; the offline guards run in `Tests`).
     rs = [f.read_text(errors="ignore") for f in (ROOT / "tests").rglob("*.rs")]
-    texts = [lane] + [t for t in rs if "#[ignore" in t] + [f.read_text(errors="ignore") for f in (ROOT / "src").rglob("*.rs")]
+    texts = [lane] + [t for t in rs if has_ignored(t)] + [f.read_text(errors="ignore") for f in (ROOT / "src").rglob("*.rs")]
     for prefix in UNUSED_BY_E2E:
         module = prefix.rstrip("/").replace("/", ".")
         # A file the lane runs on purpose is in ALWAYS_FULL; any other use of the prefix is a finding.
@@ -358,7 +391,21 @@ def self_test() -> int:
     assert classify("dev/release_oracle/rig_oracle.py", read) == "full", "the rig oracle grades every E2E cell"
     assert classify("dev/release_oracle/partner_shape.py", read) == "unused", "a gate-only stage"
     assert classify("tests/offline/ci_gate_steps_guard.rs", read) == "unused"
-    assert classify("tests/offline/live_skip_policy_guard.rs", read) == "full", "it holds an ignored test"
+    # An ignored test is the attribute at the start of a line: the census guard holds `#[ignore]` only in
+    # a fixture string and includes a module by `#[path]`, so a CDC cell's census bump selects by owner.
+    assert classify("tests/cdc_conformance_gate.rs", read) == "unused"
+    assert classify("tests/offline/live_skip_policy_guard.rs", read) == "unused"
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "tests" / "inc").mkdir(parents=True)
+        (root / "tests" / "inc" / "m.rs").write_text("#[test]\n#[ignore = \"live\"]\nfn t() {}\n")
+        (root / "tests" / "in_string.rs").write_text('const S: &str = "\\n#[ignore]\\nfn x() {}";\n')
+        (root / "tests" / "by_path.rs").write_text('#[path = "inc/m.rs"]\nmod m;\n')
+        (root / "tests" / "lost.rs").write_text("mod nowhere;\n")
+        assert offline_only("tests/in_string.rs", root), "a string is not an attribute"
+        assert not offline_only("tests/by_path.rs", root), "an ignored test in a #[path] module counts"
+        assert not offline_only("tests/lost.rs", root), "a module that cannot be found counts as live"
     assert classify("tests/live_suite.rs", read) == "full" and classify("tests/offline_suite.rs", read) == "full"
     mods = module_owners()
     suite = set(re.findall(r"^\s*mod ([a-z0-9_]+);", (ROOT / "tests/live_suite.rs").read_text(), re.M)) - {"common"}
@@ -369,6 +416,8 @@ def self_test() -> int:
     v, _, chosen = select(["src/load/clickhouse.rs", "docs/a.md"], read, mods)
     assert v == "select" and "live_clickhouse_load" in chosen and "live_mysql_resume" not in chosen, chosen
     assert select(["tests/live/live_mysql_resume.rs"], read, mods)[2] == ["live_mysql_resume"]
+    assert select(["src/source/postgres/cdc.rs", "tests/cdc_conformance_gate.rs"], read, mods)[0] == "select", \
+        "a CDC cell's census bump does not force the full E2E"
     for seam in ("src/state/mod.rs", "src/pipeline/job.rs", "src/config/mod.rs", "src/destination/mod.rs",
                  "src/error.rs", "src/types/mod.rs", "Cargo.toml", "build.rs", "tests/common/mod.rs",
                  "docker-compose.yaml", "src/a_new_file.rs", "tests/live_suite.rs"):
