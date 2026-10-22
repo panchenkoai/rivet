@@ -241,6 +241,115 @@ pub(super) fn gcs_delete_prefix(bucket: &str, prefix: &str) {
     }
 }
 
+/// The GCS prefixes a config's exports write to, read from its own `destination` blocks; dropped, it deletes every object under them.
+pub struct ConfigGcsPrefixes(Vec<(String, String)>);
+
+impl ConfigGcsPrefixes {
+    /// The guard over every GCS prefix the config text `config` writes to.
+    pub fn of(config: &str) -> Self {
+        ConfigGcsPrefixes(gcs_prefixes_of(config))
+    }
+
+    /// Each prefix as `gs://<bucket>/<prefix>/`.
+    pub fn urls(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|(b, p)| format!("gs://{b}/{p}/"))
+            .collect()
+    }
+
+    /// Move every file out of each prefix, as a re-baseline remedy says; panics unless none are left.
+    pub fn wipe(&self) {
+        for (bucket, prefix) in &self.0 {
+            gcs_delete_prefix(bucket, prefix);
+            let left = gcs_list(bucket, prefix);
+            assert!(
+                left.is_empty(),
+                "objects left under gs://{bucket}/{prefix}/: {left:?}"
+            );
+        }
+    }
+}
+
+/// Every `(bucket, prefix)` of a `type: gcs` export destination of the config text `config`; panics on none, or on an empty prefix (the whole bucket).
+fn gcs_prefixes_of(config: &str) -> Vec<(String, String)> {
+    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(config).expect("the config is YAML");
+    let found: Vec<(String, String)> = yaml["exports"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .map(|e| &e["destination"])
+        .filter(|d| d["type"].as_str() == Some("gcs"))
+        .map(|d| {
+            let bucket = d["bucket"].as_str().expect("a gcs destination names its bucket");
+            let prefix = d["prefix"].as_str().unwrap_or_default().trim_matches('/');
+            assert!(
+                !prefix.is_empty(),
+                "a gcs destination without a prefix is the whole bucket gs://{bucket}: not a cleanup target"
+            );
+            (bucket.to_string(), prefix.to_string())
+        })
+        .collect();
+    assert!(
+        !found.is_empty(),
+        "the config writes to no GCS prefix:\n{config}"
+    );
+    found
+}
+
+/// The CDC scaffold `rivet init -o rivet.yaml` wrote on 0.32.2 (289744e3), trimmed to its export.
+const GENERATED_CDC_SCAFFOLD: &str = "\
+source:
+  type: postgres
+  url_env: DATABASE_URL  # export DATABASE_URL='<your-url>' before running
+
+exports:
+  - name: hf_probe_orders_cdc
+    table: hf_probe_orders
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc/rivet_hf_probe_orders.ckpt  # resume position; keep it (semantics of
+      initial: snapshot
+    destination:
+      type: gcs
+      bucket: b
+      prefix: exports/rivet/hf_probe_orders_cdc/
+
+load:
+  target: bigquery
+  project: p
+  dataset: d
+";
+
+#[test]
+fn a_generated_configs_gcs_prefix_is_the_one_its_destination_names() {
+    assert_eq!(
+        gcs_prefixes_of(GENERATED_CDC_SCAFFOLD),
+        [(
+            "b".to_string(),
+            "exports/rivet/hf_probe_orders_cdc".to_string()
+        )],
+        "the guard cleans where the scaffold writes, `-o` stem included"
+    );
+}
+
+#[test]
+#[should_panic(expected = "the whole bucket gs://b")]
+fn a_gcs_destination_without_a_prefix_is_never_a_cleanup_target() {
+    gcs_prefixes_of(
+        &GENERATED_CDC_SCAFFOLD.replace("      prefix: exports/rivet/hf_probe_orders_cdc/\n", ""),
+    );
+}
+
+impl Drop for ConfigGcsPrefixes {
+    fn drop(&mut self) {
+        for (bucket, prefix) in &self.0 {
+            gcs_delete_prefix(bucket, prefix);
+        }
+    }
+}
+
 /// Every object name under `gs://bucket/prefix/`.
 pub(super) fn gcs_list(bucket: &str, prefix: &str) -> Vec<String> {
     let list = format!("https://storage.googleapis.com/storage/v1/b/{bucket}/o");

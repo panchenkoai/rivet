@@ -1962,15 +1962,14 @@ fn old_runs_again_after_this_build_was_refused_beside_it(engine: SqlEngine, pg_s
     );
     ok(run);
     ok(old.run_with_envs(&envs));
+    let refused = Refused::beside_a_live_run_at_schema(before);
+    assert_refused(&beside, refused);
     if before == this_trees_state_schema() {
-        assert_refused(&beside, Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2));
         skip_live(&format!(
             "RIVET_PREV_RELEASE_BIN writes this tree's state schema v{before}: no migration to refuse or walk out of"
         ));
         return recovers(&new, &envs);
     }
-    let refused = Refused::by_code("RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN", 2);
-    assert_refused(&beside, refused);
     let export = new.export_name().to_string();
     let reset = ["state", "reset", "--export", export.as_str()];
     let release = hold_a_lease(&new, db.as_ref());

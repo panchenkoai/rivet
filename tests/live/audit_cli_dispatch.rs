@@ -236,9 +236,10 @@ fn a_run_beside_a_live_export_whose_name_reads_alike_delivers() {
     );
 }
 
-/// The upgrade window of a scheduled export: a 0.32.1 run of it (`RIVET_PREV_RELEASE_BIN`) still
-/// going, paused while it holds the run lease, when this binary starts the same export. This one is
-/// refused RIVET_STATE_RUN_IN_PROGRESS (busy, exit 2) and writes nothing; the old run delivers.
+/// The upgrade window of a scheduled export: a run of the previous release (`RIVET_PREV_RELEASE_BIN`)
+/// paused while it holds the run lease when this binary starts the same export. This one is refused
+/// by the busy stop for the schema that run keeps (an older one: RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN,
+/// exit 2), leaves the state's schema and runs as they were, and the old run delivers.
 #[test]
 #[ignore = "live: postgres + RIVET_PREV_RELEASE_BIN"]
 fn a_run_beside_a_live_previous_release_run_of_the_export_is_refused() {
@@ -265,10 +266,19 @@ fn a_run_beside_a_live_previous_release_run_of_the_export_is_refused() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    let runs = "SELECT COUNT(*) FROM run_status WHERE export_name = '{export}'";
+    let (held, ran) = (rig.state_schema(), rig.state_count(runs));
     let mine = rig.cli(&["run"]);
-    let said = String::from_utf8_lossy(&mine.stderr).into_owned();
+    let (schema, recorded) = (rig.state_schema(), rig.state_count(runs));
     let old_ok = live.wait().unwrap().success();
-    assert_eq!(mine.status.code(), Some(2), "busy: {said}");
-    assert!(said.contains("[RIVET_STATE_RUN_IN_PROGRESS]"), "{said}");
+    assert_refused(&mine, Refused::beside_a_live_run_at_schema(held));
+    assert_eq!(
+        schema, held,
+        "this binary, refused beside the live run, moved the state schema"
+    );
+    assert_eq!(
+        recorded, ran,
+        "this binary, refused beside the live run, recorded a run"
+    );
     assert!(old_ok, "the previous release's run delivers");
 }
