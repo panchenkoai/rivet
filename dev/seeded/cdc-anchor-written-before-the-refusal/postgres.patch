@@ -1,16 +1,16 @@
 diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
-index 0a9cdcaa2..68111fa80 100644
+index 22e07e2c..59b11c77 100644
 --- a/src/source/postgres/cdc.rs
 +++ b/src/source/postgres/cdc.rs
-@@ -606,7 +606,6 @@ impl PgChangeStream {
+@@ -614,7 +614,6 @@ impl PgChangeStream {
          let mut client = super::connect_client(conn_str, tls)?;
          // The one prerequisite check of a run, on the stream's own connection and before the
          // slot: its refusals carry rivet's `pg cdc:` prefix, so the setup hint is never prepended.
 -        Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, true)?;
-         let domains = load_domains(&mut client)?;
-         let exists: bool = client
-             .query_one(
-@@ -642,6 +641,7 @@ impl PgChangeStream {
+         let mut bare_schema = HashMap::new();
+         for cfg in configured_tables {
+             if let Some(sch) = search_path_schema(&mut client, cfg)? {
+@@ -656,6 +655,7 @@ impl PgChangeStream {
                  )?;
              }
          }

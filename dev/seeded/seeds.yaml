@@ -3375,3 +3375,22 @@ seeds:
         na: "MongoDB connects through its driver's own pool with no proxy probe"
       oracle:
         na: "Oracle connects through its own session with no proxy probe"
+
+  - name: pg-cdc-bare-name-routes-every-schema
+    class: "a bare PostgreSQL CDC table name is matched against every schema, so a same-named table in another schema refuses the config `rivet init` writes for a `public` table, or routes its rows into the export"
+    history: "2026-10-22 #675 (PostgreSQL half) - a bare `public` table beside a same-named table in a second schema was refused RIVET_SOURCE_CDC_TABLE_UNRESOLVED ('could mean 2 different relations') on every run"
+    scope: source
+    patch: pg-cdc-bare-name-routes-every-schema/postgres.patch
+    engines:
+      postgres:
+        cells:
+        - pg_cdc_a_bare_name_captures_its_search_path_table_beside_a_same_named_table
+        - roast_pg_cdc_a_bare_table_name_beside_a_same_named_relation_gets_no_foreign_row
+      mysql:
+        na: "MySQL's bare-name rule is its own (src/source/mysql/cdc.rs bare_name_database, #677); this seed is the PostgreSQL search_path rule"
+      mssql:
+        na: "SQL Server CDC names its table through the capture instance (`cdc.change_tables`), never by a bare name across schemas"
+      mongo:
+        na: "a MongoDB change stream is opened on the URL's database; a collection is never matched across schemas"
+      oracle:
+        na: "Oracle CDC tables are written OWNER.TABLE by init and LogMiner routes by that qualified name"
