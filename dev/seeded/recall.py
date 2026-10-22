@@ -22,7 +22,7 @@ from pathlib import Path
 import yaml
 
 from dev.release_oracle.core import Ledger, isolate_state_db, nextest_filter, nextest_outcomes, self_skipped
-from dev.release_oracle.live_modules import live_modules_env
+from dev.release_oracle.live_modules import EXCLUSIVE_ENV, exclusive_tests, live_modules_env
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
@@ -280,13 +280,29 @@ class Cargo:
         return p
 
     def run(self, cells, log: Path) -> dict[str, str]:
-        """Run exactly these cells; each one's verdict."""
+        """Run exactly these cells, each as the live-modules stage runs it (a `live+exclusive` one alone, under RIVET_TEST_EXCLUSIVE); each one's verdict."""
+        alone = set(exclusive_tests())
+        shared = [c for c in cells if c.removeprefix(LIB) not in alone]
+        exclusive = [c for c in cells if c.removeprefix(LIB) in alone]
+        out: dict[str, str] = {}
+        why: dict[str, str] = {}
+        for group, extra, suffix in ((shared, {}, ""), (exclusive, EXCLUSIVE_ENV, ".exclusive")):
+            if group:
+                o, w = self._run_group(group, log.with_name(log.stem + suffix + log.suffix), extra)
+                out.update(o)
+                why.update(w)
+        self.skipped = why
+        return out
+
+    def _run_group(self, cells, log: Path, extra: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+        """One nextest run of `cells` under this env plus `extra`, and the leg a self-skip naming the gate's state var owes."""
+        threads = ["--test-threads", "1"] if extra else []
         skip_log = log.with_suffix(".skips")
         skip_log.write_text("")
         p = sh(["cargo", "nextest", "run", "--manifest-path", str(self.tree / "Cargo.toml"),
-                *self.binaries(cells), "--run-ignored", "all", "--no-fail-fast", "--retries", "0",
+                *self.binaries(cells), "--run-ignored", "all", "--no-fail-fast", "--retries", "0", *threads,
                 "-E", nextest_filter([c.removeprefix(LIB) for c in cells])],
-               cwd=self.tree, env={**self.env, "RIVET_SKIP_LOG": str(skip_log)})
+               cwd=self.tree, env={**self.env, **extra, "RIVET_SKIP_LOG": str(skip_log)})
         log.write_text(p.stdout)
         skipped = self_skipped(skip_log)
         out = cell_outcomes(p.stdout, skipped, tuple(cells))
@@ -297,17 +313,16 @@ class Cargo:
             again_log = log.with_suffix(".again.skips")
             again_log.write_text("")
             q = sh(["cargo", "nextest", "run", "--manifest-path", str(self.tree / "Cargo.toml"),
-                    *self.binaries(owed), "--run-ignored", "all", "--no-fail-fast", "--retries", "0",
+                    *self.binaries(owed), "--run-ignored", "all", "--no-fail-fast", "--retries", "0", *threads,
                     "-E", nextest_filter([c.removeprefix(LIB) for c in owed])],
-                   cwd=self.tree, env={**self.env, **self.again[1], "RIVET_SKIP_LOG": str(again_log)})
+                   cwd=self.tree, env={**self.env, **extra, **self.again[1], "RIVET_SKIP_LOG": str(again_log)})
             log.with_suffix(".again.log").write_text(q.stdout)
             second = self_skipped(again_log)
             out.update(cell_outcomes(q.stdout, second, tuple(owed)))
             for c in owed:
                 why.pop(c.removeprefix(LIB), None)
             why.update({k.split("::")[-1]: v for k, v in second.items()})
-        self.skipped = why
-        return out
+        return out, why
 
 
 def recompiled(build_out: str) -> bool:
@@ -536,6 +551,20 @@ def self_test() -> int:
     assert {k: cargo.env.get(k) for k in stage} == stage and cargo.again == again, (
         "recall's child env differs from the live-modules stage's", {k: cargo.env.get(k) for k in stage}, stage)
     assert cargo.env["RIVET_GATE_STATE_URL"] == "", "a SQLite-reading cell runs on SQLite, as in the stage"
+    alone = exclusive_tests()
+    assert alone, "the live suite marks some test live+exclusive"
+    calls: list[tuple[list[str], dict]] = []
+    real_sh = globals()["sh"]
+    globals()["sh"] = lambda argv, cwd=None, env=None, timeout=None: (
+        calls.append((list(argv), env or {})), subprocess.CompletedProcess(argv, 0, ""))[1]
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            cargo.run([alone[0], "a_shared_cell"], Path(d) / "x.log")
+    finally:
+        globals()["sh"] = real_sh
+    runs = {("RIVET_TEST_EXCLUSIVE" in env, alone[0] in " ".join(argv)) for argv, env in calls}
+    assert runs == {(True, True), (False, False)}, (
+        "a live+exclusive cell runs alone under RIVET_TEST_EXCLUSIVE, the others without it", calls)
     assert env["RIVET_SELFTEST_CARRIER_BIN"] == str(ROOT / ".gate-baseline/field/rivet"), env["RIVET_SELFTEST_CARRIER_BIN"]
     assert env["RIVET_TEST_STATE_TOXI_URL"] == "postgresql://u:p@127.0.0.1:15433/scratch", env["RIVET_TEST_STATE_TOXI_URL"]
     stale = []
