@@ -3181,7 +3181,6 @@ seeds:
       postgres:
         cells:
           - "lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"
-          - a_relative_destination_path_moved_by_the_upgrade_is_refused_until_the_files_follow
           - a_relative_path_moved_by_upgrading_the_pinned_release_is_refused_until_the_files_follow
       mysql:
         cells: ["lib:a_relative_path_has_moved_only_when_the_old_place_alone_holds_the_export"]
