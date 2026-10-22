@@ -58,6 +58,18 @@ state each load by their own spec and their own `rivet init` key. A row written 
 source and stays the spec of any source of that name until the source records its own; the v38
 migration rebuilds the table, and the copy it leaves behind restores the v37 shape.
 
+## An upgrade beside a live run of the older release
+
+A migration changes the schema under every process that has the state open, and the older release
+refuses a newer state (`RIVET_STATE_SCHEMA_NEWER`). So before it migrates, rivet asks whether another
+live process holds a lease on the state: on SQLite, a locked `<state>.lease-*` file beside it; on
+PostgreSQL, an unexpired `state_lease` row whose holder is not a dead pid on this host. While one
+does, rivet waits up to `--lock-wait` seconds, then stops with `RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN`
+(exit 2, retryable), naming the lease (the export or table whose run or load holds it) and its
+holder (pid and host on PostgreSQL; on SQLite an `flock` records no pid, and neither records the
+holder's release): nothing is migrated and nothing is written, so the older release keeps running on
+its state. Stop or wait for that run of the older release, then run again.
+
 ## The copy a migration leaves behind
 
 Before a migration runs its first statement, inside the migration lock, rivet writes a copy of the

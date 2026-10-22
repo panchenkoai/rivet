@@ -1179,6 +1179,68 @@ fn copy_state_before_migration(conn: &Connection, old: i64) -> Result<Option<std
     Ok(Some(copy))
 }
 
+/// Refuse to migrate a v`old` state while `held`, a lease on it, is another live process's `(lease, holder)`: the new schema would land under that run.
+fn refuse_beside_a_live_lease(old: i64, held: Option<(String, String)>) -> Result<()> {
+    let Some((lease, holder)) = held else {
+        return Ok(());
+    };
+    crate::rivet_bail!(
+        crate::error::codes::STATE_UPGRADE_BESIDE_LIVE_RUN,
+        "state: this state is at schema v{old} and its lease `{lease}` (the run or load of the \
+         export or table it names) is held by {holder}, a live rivet whose release the lease does \
+         not record: migrating the state to v{SCHEMA_VERSION} now would change its schema under \
+         that run, and an older release cannot open a v{SCHEMA_VERSION} state. Nothing was \
+         migrated and nothing was written. Stop or wait for that run of the older release, then \
+         run again, or give `--lock-wait` the seconds it needs."
+    )
+}
+
+/// The lease beside the SQLite state of `conn` that another live process holds, if any; an in-memory state has none.
+fn sqlite_lease_held(conn: &Connection) -> Result<Option<(String, String)>> {
+    match conn.path().filter(|p| !p.is_empty()) {
+        Some(db) => super::load_lease::sqlite_lease_held(std::path::Path::new(db))
+            .map_err(|e| leases_unreadable(db, &e)),
+        None => Ok(None),
+    }
+}
+
+/// Wait up to `wait` while `held` answers a lease another live process keeps on the state; the check under the migration lock decides after it.
+fn wait_while_a_lease_is_held(
+    wait: std::time::Duration,
+    mut held: impl FnMut() -> Result<Option<(String, String)>>,
+) -> Result<()> {
+    use super::load_lease::{WAIT_NOTE_EVERY, WAIT_POLL, note_due};
+    let started = std::time::Instant::now();
+    let mut noted: Option<std::time::Instant> = None;
+    while let Some((lease, holder)) = held()? {
+        let waited = started.elapsed();
+        if waited >= wait {
+            break;
+        }
+        if note_due(noted, WAIT_NOTE_EVERY) {
+            log::warn!(
+                "state: its lease `{lease}` is held by {holder}: waiting up to {} s for it before \
+                 migrating the state to v{SCHEMA_VERSION} (`--lock-wait`)",
+                wait.as_secs()
+            );
+            noted = Some(std::time::Instant::now());
+        }
+        std::thread::sleep(WAIT_POLL.min(wait - waited));
+    }
+    Ok(())
+}
+
+/// The leases of the state `at` could not be read before a migration; nothing was migrated.
+fn leases_unreadable(at: &str, e: &dyn std::fmt::Display) -> anyhow::Error {
+    crate::error::coded(
+        crate::error::codes::STATE_BACKEND_FAILED,
+        format!(
+            "state: could not read the leases of `{at}` before migrating it to v{SCHEMA_VERSION} \
+             ({e}). Nothing was migrated; the state is as the previous rivet left it."
+        ),
+    )
+}
+
 /// The table names a ladder's `CREATE TABLE` statements define (`IF NOT EXISTS` stripped).
 fn created_table_names(sql: &str) -> std::collections::BTreeSet<String> {
     let lower = sql.to_lowercase();
@@ -1333,8 +1395,14 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
     // Fast path: a database already at this build's version has nothing to
     // migrate, so no write lock. Versions only grow, and the ladder's version row
     // commits with the ladder, so a committed SCHEMA_VERSION is a finished one.
-    if already_current(get_current_version(conn)) {
+    let unlocked = get_current_version(conn);
+    if already_current(unlocked) {
         return Ok(());
+    }
+    if needs_copy(unlocked) {
+        wait_while_a_lease_is_held(std::time::Duration::from_secs(super::lock_wait_s()), || {
+            sqlite_lease_held(conn)
+        })?;
     }
     // ONE writer migrates at a time. `BEGIN IMMEDIATE` takes the database's write
     // lock before anything is read, so the version this process sees cannot be
@@ -1517,6 +1585,9 @@ fn migrate_locked(conn: &Connection) -> Result<()> {
         }
     }
 
+    if needs_copy(current) {
+        refuse_beside_a_live_lease(current, sqlite_lease_held(conn)?)?;
+    }
     if needs_copy(current)
         && let Some(copy) = copy_state_before_migration(conn, current)?
     {
@@ -1593,6 +1664,12 @@ pub(super) fn migrate_pg(client: &mut postgres::Client) -> Result<()> {
     if already_current(unlocked) {
         return Ok(());
     }
+    if needs_copy(unlocked) {
+        wait_while_a_lease_is_held(std::time::Duration::from_secs(super::lock_wait_s()), || {
+            super::load_lease::pg_lease_held(client)
+                .map_err(|e| leases_unreadable("the PostgreSQL state", &super::pg_detail(&e)))
+        })?;
+    }
     // ONE writer migrates at a time, across PROCESSES and HOSTS, under a
     // TRANSACTION-scoped advisory lock: COMMIT/ROLLBACK releases it on the same
     // backend, so it holds behind a transaction-mode pooler (a session lock/unlock
@@ -1655,6 +1732,9 @@ fn migrate_pg_locked(client: &mut postgres::Transaction<'_>) -> Result<()> {
         .get(0);
 
     if needs_copy(current) {
+        let held = super::load_lease::pg_lease_held(client)
+            .map_err(|e| leases_unreadable("the PostgreSQL state", &super::pg_detail(&e)))?;
+        refuse_beside_a_live_lease(current, held)?;
         copy_pg_state_before_migration(client, current)?;
     }
 
@@ -3128,5 +3208,206 @@ mod tests {
         assert_eq!(copies, 0, "no half-written copy is left behind");
         drop(role);
         admin.batch_execute(&reset).unwrap();
+    }
+
+    // ─── A live lease on an older state ──────────────────────────────────────
+
+    /// The lease file `token` beside the state file `db`, locked as a live rivet holds it; released when dropped.
+    fn hold_lease_beside(db: &std::path::Path, token: &str) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+        let mut name = db.file_name().unwrap().to_os_string();
+        name.push(format!(".lease-{token}"));
+        let file = std::fs::File::create(db.with_file_name(name)).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        file
+    }
+
+    /// A state behind this build is not migrated while another open file holds a lease beside it: refused by code with nothing migrated or copied; once the lease is free the same open migrates it, and a current state opens beside a held lease as before.
+    #[test]
+    fn a_state_behind_this_build_is_not_migrated_while_a_lease_beside_it_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".rivet_state.db");
+        let old = SCHEMA_VERSION - 1;
+        let conn = stage_sqlite(&db, old);
+        let held = hold_lease_beside(&db, "chunk-run-orders");
+
+        let e = migrate(&conn).unwrap_err();
+
+        crate::error::assert_coded(&e, "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN", 2);
+        assert_eq!(
+            e.to_string(),
+            format!(
+                "state: this state is at schema v{old} and its lease \
+                 `.rivet_state.db.lease-chunk-run-orders` (the run or load of the export or table \
+                 it names) is held by another rivet process on this host, a live rivet whose \
+                 release the lease does not record: migrating the state to v{SCHEMA_VERSION} now \
+                 would change its schema under that run, and an older release cannot open a \
+                 v{SCHEMA_VERSION} state. Nothing was migrated and nothing was written. Stop or \
+                 wait for that run of the older release, then run again, or give `--lock-wait` the \
+                 seconds it needs."
+            )
+        );
+        assert_eq!(get_current_version(&conn), old, "nothing was migrated");
+        assert_eq!(
+            copies_beside(&db),
+            Vec::<String>::new(),
+            "nothing was copied"
+        );
+
+        drop(held);
+        migrate(&conn).unwrap();
+        assert_eq!(
+            get_current_version(&conn),
+            SCHEMA_VERSION,
+            "free, it migrates"
+        );
+        let _held = hold_lease_beside(&db, "chunk-run-orders");
+        migrate(&conn).unwrap();
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
+    }
+
+    /// The wait asks again until the lease is free, and asks once when there is no time to wait; an unreadable lease stops it.
+    #[test]
+    fn a_migration_waits_for_a_held_lease_only_as_long_as_it_may() {
+        let lease = || Some(("l".to_string(), "h".to_string()));
+        let mut asked = 0;
+        wait_while_a_lease_is_held(std::time::Duration::from_secs(30), || {
+            asked += 1;
+            Ok(if asked < 2 { lease() } else { None })
+        })
+        .unwrap();
+        assert_eq!(asked, 2, "asked until the lease was free");
+        let mut asked = 0;
+        let started = std::time::Instant::now();
+        wait_while_a_lease_is_held(std::time::Duration::ZERO, || {
+            asked += 1;
+            Ok(lease())
+        })
+        .unwrap();
+        assert_eq!(asked, 1, "no wait: asked once");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let mut asked = 0;
+        let started = std::time::Instant::now();
+        wait_while_a_lease_is_held(std::time::Duration::from_millis(1200), || {
+            asked += 1;
+            Ok(lease())
+        })
+        .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= std::time::Duration::from_millis(1150)
+                && took < std::time::Duration::from_millis(1800),
+            "held throughout: waited {took:?} for a 1.2 s wait"
+        );
+        assert_eq!(asked, 3, "asked at 0 s, 1 s and 1.2 s");
+        let e = wait_while_a_lease_is_held(std::time::Duration::from_secs(30), || {
+            Err(anyhow::anyhow!("unreadable"))
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "unreadable");
+    }
+
+    /// Lease files nobody holds (runs that ended) and files of another state in the directory do not stop a migration; the copy is written as before.
+    #[test]
+    fn a_lease_file_nobody_holds_or_of_another_state_does_not_stop_a_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".rivet_state.db");
+        let conn = stage_sqlite(&db, 32);
+        drop(hold_lease_beside(&db, "p.d.orders-00000000000000ff"));
+        let _other = hold_lease_beside(&dir.path().join("other.db"), "orders");
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(get_current_version(&conn), SCHEMA_VERSION);
+        assert_eq!(copies_beside(&db).len(), 1, "the copy is written as before");
+    }
+
+    /// On a PostgreSQL state behind this build a lease row of a live holder stops the migration by code, naming the holder, with nothing migrated or copied; an expired row and a dead pid on this host are not live holders.
+    #[test]
+    fn pg_a_state_behind_this_build_is_not_migrated_while_a_live_holder_keeps_a_lease_row() {
+        let Ok(url) = std::env::var("RIVET_TEST_STATE_URL") else {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL unset");
+        };
+        if !url.starts_with("postgres") {
+            return crate::test_hook::skip_live("RIVET_TEST_STATE_URL is not a postgres URL");
+        }
+        let schema = format!("rivet_lease_mig_test_{}", std::process::id());
+        let old = SCHEMA_VERSION - 1;
+        let mut client = connect_pg(&url).expect("connect pg state");
+        let reset = format!("DROP SCHEMA IF EXISTS {schema} CASCADE;");
+        client.batch_execute(&reset).unwrap();
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema}; SET search_path TO {schema}; \
+                 CREATE TABLE rivet_schema_version (version BIGINT NOT NULL);"
+            ))
+            .unwrap();
+        for &(ver, sql) in PG_MIGRATIONS {
+            if ver <= old {
+                client
+                    .batch_execute(&format!(
+                        "BEGIN; {sql} INSERT INTO rivet_schema_version (version) VALUES ({ver}); COMMIT;"
+                    ))
+                    .unwrap();
+            }
+        }
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let here = super::super::load_lease::host_name();
+        client
+            .execute(
+                "INSERT INTO state_lease (lease_key, holder, expires_at) VALUES \
+                 ('a.expired', 'elsewhere:7:1', now() - interval '1 second'), \
+                 ('b.dead_here', $1, now() + interval '60 seconds'), \
+                 ('c.live', 'elsewhere:4242:1', now() + interval '60 seconds')",
+                &[&format!("{here}:{dead_pid}:1")],
+            )
+            .unwrap();
+        let version = |c: &mut postgres::Client| -> i64 {
+            c.query_one("SELECT MAX(version) FROM rivet_schema_version", &[])
+                .unwrap()
+                .get(0)
+        };
+
+        let copies = |c: &mut postgres::Client| -> i64 {
+            c.query_one(
+                "SELECT COUNT(*) FROM pg_namespace WHERE nspname = $1",
+                &[&pg_backup_schema(old)],
+            )
+            .unwrap()
+            .get(0)
+        };
+        let copies_before = copies(&mut client);
+
+        let e = migrate_pg(&mut client).unwrap_err();
+
+        crate::error::assert_coded(&e, "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN", 2);
+        assert!(
+            e.to_string().starts_with(&format!(
+                "state: this state is at schema v{old} and its lease `c.live` (the run or load of \
+                 the export or table it names) is held by pid 4242 on host elsewhere, a live rivet \
+                 whose release the lease does not record: migrating the state to v{SCHEMA_VERSION} \
+                 now"
+            )),
+            "{e}"
+        );
+        assert_eq!(version(&mut client), old, "nothing was migrated");
+        assert_eq!(copies(&mut client), copies_before, "nothing was copied");
+
+        client
+            .execute("DELETE FROM state_lease WHERE lease_key = 'c.live'", &[])
+            .unwrap();
+        let mut tx = client.transaction().unwrap();
+        assert_eq!(
+            super::super::load_lease::pg_lease_held(&mut tx).unwrap(),
+            None,
+            "an expired row and a dead holder on this host are not live"
+        );
+        drop(tx);
+        client.batch_execute(&reset).unwrap();
     }
 }

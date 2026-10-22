@@ -412,6 +412,22 @@ seeds:
       sqlite-state:
         cells: ["lib:a_migration_copies_the_old_state_beside_it_before_the_first_ddl"]
 
+  - name: migration-beside-a-live-lease
+    class: "a rivet with a newer state schema migrates a state that a live run of the older release holds a lease on, even when it is then refused as busy, so the older release is refused RIVET_STATE_SCHEMA_NEWER on its next run"
+    history: "0.32.2 pre-release gate on main 7fba31c4 after v38 (#650): the two previous-release cells of live_load_lease_keeper red at the rig oracle (`resume-point: export_load_spec` gained `source`) after this tree was refused `is writing` beside a 0.32.1 load holding the lease"
+    scope: state
+    patch: migration-beside-a-live-lease/shared.patch
+    engines:
+      postgres-state:
+        cells:
+          - "lib:pg_a_state_behind_this_build_is_not_migrated_while_a_live_holder_keeps_a_lease_row"
+          - the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_postgres_state_postgres
+          - the_pinned_older_schema_release_is_stopped_at_the_schema_before_this_trees_lease
+      sqlite-state:
+        cells:
+          - "lib:a_state_behind_this_build_is_not_migrated_while_a_lease_beside_it_is_held"
+          - the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_sqlite_state_postgres
+
   - name: setup-green-over-dead-state
     class: "`rivet check` prints `Looks good.` and exits 0 (and `doctor` / `init` stay green) while the state the config uses does not answer, so setup passes and every run after it fails"
     history: "client simulation on 0.32.0, 2026-10-18 (D2): init WARN + exit 0, check ERROR then `Looks good.` exit 0, doctor `All checks passed.` without a state check; measured on main 8afde974 with RIVET_STATE_URL at a closed port: check `Looks good.`, exit 0"

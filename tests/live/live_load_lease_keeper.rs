@@ -782,14 +782,14 @@ fn contend(
     );
 }
 
-/// The previous release and this tree contend for one table's lease, in both orders: one holds it each time. A state this tree migrated past the previous release's schema stops the previous release at the schema, before it reaches the lease; at one schema the lease itself stops it.
+/// The previous release and this tree contend for one table's lease, in both orders: one holds it each time. A state this tree migrated past the previous release's schema stops the previous release at the schema, before it reaches the lease; the previous release holding the lease on its older state stops this tree before it migrates that state; at one schema the lease itself stops either.
 #[test]
 #[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds + RIVET_PREV_RELEASE_BIN"]
 fn the_previous_release_and_this_tree_never_hold_one_lease_together() {
     one_lease_between("lease_compat", "lk_compat", Rig::as_previous_release, false);
 }
 
-/// The pinned release of an older state schema (`RIVET_MIGRATION_CARRIER_BIN`) and this tree contend in both orders: the state this tree migrated stops the older release at the schema, before it reaches the lease.
+/// The pinned release of an older state schema (`RIVET_MIGRATION_CARRIER_BIN`) and this tree contend in both orders: the state this tree migrated stops the older release at the schema, before it reaches the lease, and the older release holding the lease stops this tree before it migrates the state.
 #[test]
 #[ignore = "live: requires postgres + a PostgreSQL state server + BigQuery creds + RIVET_MIGRATION_CARRIER_BIN"]
 fn the_pinned_older_schema_release_is_stopped_at_the_schema_before_this_trees_lease() {
@@ -822,7 +822,11 @@ fn one_lease_between(dataset: &str, label: &str, as_old: fn(&Rig) -> Option<Rig>
         assert!(out.status.success(), "the extract:\n{}", stderr(&out));
         let refusal = if old_holds {
             old_schema = state.schema();
-            "is writing `"
+            if old_schema < this_trees_state_schema() {
+                "[RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN]"
+            } else {
+                "is writing `"
+            }
         } else if state.schema() > old_schema {
             "[RIVET_STATE_SCHEMA_NEWER]"
         } else {
