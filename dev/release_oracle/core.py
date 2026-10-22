@@ -172,6 +172,8 @@ class Ledger:
         # SEPARATE breakdown that is honest about the overlap — spans in different
         # engines run concurrently, so they are ranked, never summed into a total.
         self._spans: list[tuple[str, float]] = []
+        #: Why the stand stopped grading the product mid-run (a disk under its floor); set = STAND-INVALID.
+        self.stand_invalid = ""
 
     # ── printing ──
     def _c(self, code: str, text: str) -> str:
@@ -343,7 +345,9 @@ class Ledger:
         return sum(c.status is Status.INFRA for c in self.cells)
 
     def verdict(self) -> str:
-        """The run's verdict, derived from the rows: a product FAIL outranks an ungraded cell."""
+        """The run's verdict, derived from the rows: a stand that failed mid-run outranks a product FAIL, which outranks an ungraded cell."""
+        if self.stand_invalid:
+            return "STAND-INVALID"
         return "NOT RELEASABLE" if self.red else "NOT GRADED" if self.ungraded_cells else "RELEASE-READY"
 
     def report(self, *, full: bool = False, gate: str = REDUCED_GATE, tree: tuple[str, bool] | None = None) -> int:
@@ -430,6 +434,10 @@ class Ledger:
         if self.ungraded_cells:
             print(self._c("1;35", f"  {self.ungraded_cells} cell(s) NOT GRADED: the oracle's own read failed (see ⚠ above). "
                                   "Not a product verdict; re-run them."))
+        if self.stand_invalid:
+            print(self._c("1;35", f"  STAND-INVALID — {self.stand_invalid} during the run; its reds grade the stand, "
+                                  "not the product. Free the disk and run the gate again."))
+            return 1
         if self.red:
             print(self._c("1;31", "  NOT RELEASABLE — one or more cells failed (see ✗ above)."))
             return 1
