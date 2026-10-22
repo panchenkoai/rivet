@@ -6,7 +6,7 @@ use std::path::Path;
 
 const ALWAYS: &str = "${{ !cancelled() }}";
 /// A census step of `E2E matrix`: after an earlier failure too, and only over legs that ran.
-const ALWAYS_WHEN_RUN: &str = "${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}";
+const ALWAYS_WHEN_RUN: &str = "${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}";
 /// The E2E job is a matrix; these run on its `pre` leg only, so once per check.
 const PRE_LEG: &str = "${{ !cancelled() && matrix.leg == 'pre' }}";
 
