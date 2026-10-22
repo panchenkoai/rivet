@@ -181,7 +181,8 @@ fn the_e2e_legs_are_pre_plus_every_partition_and_the_verdict_job_needs_them() {
     );
     let run = sweep["run"].as_str().unwrap_or_default();
     for flag in [
-        "--partition count:${{ matrix.leg }} ",
+        // Without a measured list (e2e_legs.py) a leg falls back to this partition.
+        "--partition \"count:$LEG\"",
         "--run-ignored only ",
         "--profile pr ",
     ] {
