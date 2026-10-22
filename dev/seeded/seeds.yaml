@@ -3384,7 +3384,6 @@ seeds:
     engines:
       postgres:
         cells:
-        - pg_cdc_a_bare_name_captures_its_search_path_table_beside_a_same_named_table
         - roast_pg_cdc_a_bare_table_name_beside_a_same_named_relation_gets_no_foreign_row
       mysql:
         na: "MySQL's bare-name rule is its own (src/source/mysql/cdc.rs bare_name_database, #677); this seed is the PostgreSQL search_path rule"

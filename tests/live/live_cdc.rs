@@ -4986,6 +4986,10 @@ fn roast_pg_cdc_a_bare_table_name_beside_a_same_named_relation_gets_no_foreign_r
     );
 
     // A MATERIALIZED VIEW of the same name in another schema is decoded too, and stays out.
+    // The other schema's TRUNCATE is not this stream's either: the run is not refused for it.
+    c.batch_execute(&format!("TRUNCATE other.{tbl}")).unwrap();
+    rig.run_ok();
+    assert_eq!(ids_read_all(&rig.out_dir()), vec![1]);
     c.batch_execute("DROP SCHEMA other CASCADE").unwrap();
     c.batch_execute(&format!(
         "CREATE SCHEMA mv; CREATE TABLE mv.src(id int, v text); \
@@ -8191,47 +8195,6 @@ fn mysql_cdc_a_previous_release_stream_continues_beside_a_same_named_table() {
         ids_read_all(&rig.out_dir()),
         vec![1, 2, 3, 4],
         "one baseline, every change once, nothing of the other database"
-    );
-}
-
-/// #675 on PostgreSQL: a bare `public` table beside a same-named table in a second schema. A bare
-/// name means what the search_path resolves, so the stream captures that table, baseline and
-/// changes, and none of the other schema's rows. RED on 0.32.2: refused
-/// `RIVET_SOURCE_CDC_TABLE_UNRESOLVED` ("could mean 2 different relations").
-#[test]
-#[ignore = "live: requires docker compose --profile cdc postgres-cdc"]
-fn pg_cdc_a_bare_name_captures_its_search_path_table_beside_a_same_named_table() {
-    let table = unique_name("cdc_amb_pg").to_lowercase();
-    let schema = format!("amb_{}", std::process::id());
-    let mut c =
-        postgres::Client::connect(POSTGRES_CDC_URL, postgres::NoTls).expect("connect postgres");
-    c.batch_execute(&format!(
-        "DROP TABLE IF EXISTS {table}; CREATE TABLE {table} (id INT PRIMARY KEY, v TEXT); \
-         INSERT INTO {table} VALUES (1, 'own'), (2, 'own'); \
-         DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}; \
-         CREATE TABLE {schema}.{table} (id INT PRIMARY KEY, v TEXT); \
-         INSERT INTO {schema}.{table} VALUES (101, 'foreign');"
-    ))
-    .unwrap();
-    let _t = PgTable::adopt_on(POSTGRES_CDC_URL, table.clone());
-    let slot = unique_name("rivet_amb_slot");
-    let _slot = Slot::new(slot.clone());
-    let rig = Rig::pg_cdc(&table, &slot).cdc_line("initial: snapshot");
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rig.run_ok();
-        c.batch_execute(&format!(
-            "INSERT INTO {table} VALUES (3, 'own'); INSERT INTO {schema}.{table} VALUES (102, 'foreign'); \
-             TRUNCATE {schema}.{table};"
-        ))
-        .unwrap();
-        rig.run_ok();
-        ids_read_all(&rig.out_dir())
-    }));
-    let _ = c.batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"));
-    assert_eq!(
-        outcome.unwrap_or_else(|e| std::panic::resume_unwind(e)),
-        vec![1, 2, 3],
-        "the search_path table's rows, and none of the other schema's; its TRUNCATE is not this stream's"
     );
 }
 
