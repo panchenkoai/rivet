@@ -14,6 +14,7 @@ from a hand list.
 
 from __future__ import annotations
 
+import functools
 import re
 import subprocess
 import sys
@@ -26,7 +27,7 @@ UNUSED_BY_E2E = ("dev/seeded/", ".github/scripts/", "dev/spikes/")
 #: Single files only the mutation and the offline lanes read.
 UNUSED_FILES = (".cargo/mutants.toml",)
 #: Files under those prefixes that still decide E2E: this script itself.
-ALWAYS_FULL = (".github/scripts/e2e_scope.py",)
+ALWAYS_FULL = (".github/scripts/e2e_scope.py", ".github/scripts/e2e_legs.py")
 #: A string literal or `include_str!` that names a file under docs/ (or a top-level *.md).
 READ_DOC = re.compile(r'"((?:\.\./)*(?:docs/[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+\.md))"')
 
@@ -306,6 +307,7 @@ def self_test() -> int:
     assert scope(["Cargo.toml"], read)[0] == "full" and scope(["docker-compose.yaml"], read)[0] == "full"
     assert scope([".github/workflows/ci.yml"], read)[0] == "full"
     assert scope([".github/scripts/e2e_scope.py"], read)[0] == "full", "this script decides E2E"
+    assert scope([".github/scripts/e2e_legs.py"], read)[0] == "full", "the leg planner runs in the lane"
     assert scope([], read)[0] == "full", "an empty diff proves nothing"
     assert scope(["docs/concepts.md", "docs/how-to/new-page.md", "changelog.d/x.md", "CHANGELOG.md", "docs/gifs/a.gif"], read) \
         == ("skip", "docs-only")
@@ -324,7 +326,9 @@ def self_test() -> int:
     texts = [lane] + [t for t in rs if "#[ignore" in t] + [f.read_text(errors="ignore") for f in (ROOT / "src").rglob("*.rs")]
     for prefix in UNUSED_BY_E2E:
         module = prefix.rstrip("/").replace("/", ".")
-        hits = [t for t in texts if prefix in t or f"-m {module}" in t]
+        # A file the lane runs on purpose is in ALWAYS_FULL; any other use of the prefix is a finding.
+        bare = [functools.reduce(lambda t, f: t.replace(f, ""), ALWAYS_FULL, t) for t in texts]
+        hits = [t for t in bare if prefix in t or f"-m {module}" in t]
         assert not hits, f"{prefix} is used by the E2E lane or a test, so it cannot be skippable"
     py = e2e_python()
     assert "dev/release_oracle/rig_oracle.py" in py and "dev/release_oracle/state_lib.py" in py, sorted(py)[:20]
