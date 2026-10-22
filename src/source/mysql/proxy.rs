@@ -171,9 +171,10 @@ pub(super) fn detect_proxy_on_conn<C: Queryable>(conn: &mut C) -> MysqlProxyKind
     // (`PROXYSQL VERSION` exists too but is only accepted on the admin
     // port 6032, not on the client port we connect through.)
     let proxysql_internal_accepted: bool = conn.query_drop("PROXYSQL INTERNAL SESSION").is_ok();
-    let version_comment: Option<String> =
-        conn.query_first("SELECT @@version_comment").unwrap_or(None);
-    let proxy_version: Option<String> = conn.query_first("SELECT @@proxy_version").unwrap_or(None);
+    // `SHOW GLOBAL VARIABLES`, never `SELECT @@…`: ProxySQL stops multiplexing a session that
+    // reads a `@@` variable, and this probe runs on the pool's own first connection.
+    let version_comment = global_variable(conn, "version_comment");
+    let proxy_version = global_variable(conn, "proxy_version");
     // CONNECTION_ID() is server-side: comparing two consecutive calls on the
     // same `Conn` detects transaction-mode multiplexers that hand each
     // statement to a different backend connection.
@@ -189,6 +190,31 @@ pub(super) fn detect_proxy_on_conn<C: Queryable>(conn: &mut C) -> MysqlProxyKind
         proxy_version.as_deref(),
         pair,
     )
+}
+
+/// The value of global variable `name` through `SHOW GLOBAL VARIABLES` (no `@@` read), or `None`.
+fn global_variable<C: Queryable>(conn: &mut C, name: &str) -> Option<String> {
+    conn.query_first::<(String, String), _>(format!("SHOW GLOBAL VARIABLES LIKE '{name}'"))
+        .ok()
+        .flatten()
+        .map(|(_, v)| v)
+}
+
+/// The proxy kind of `url`, probed once per process on `pool`'s own connection: no dial of its own.
+pub(super) fn proxy_kind_of(url: &str, pool: &Pool) -> MysqlProxyKind {
+    static KNOWN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, MysqlProxyKind>>,
+    > = std::sync::OnceLock::new();
+    let known = KNOWN.get_or_init(Default::default);
+    if let Some(kind) = known.lock().unwrap_or_else(|e| e.into_inner()).get(url) {
+        return *kind;
+    }
+    let kind = detect_mysql_proxy_kind(pool);
+    known
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(url.to_string(), kind);
+    kind
 }
 
 /// Emit the one-time connect-time warning for a non-direct proxy kind.

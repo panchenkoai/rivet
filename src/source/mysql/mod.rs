@@ -137,14 +137,11 @@ impl MysqlSource {
         Self::with_kind(pool, keeps_session, proxy_kind)
     }
 
-    /// Connect rivet's own pool to `url`. The proxy probe runs on a connection of its own, closed
-    /// after it: it reads `@@` variables, after which ProxySQL keeps a session on one backend.
+    /// Connect rivet's own pool to `url`. The proxy is probed once per process on the pool's own
+    /// first connection, by statements that leave a ProxySQL session multiplexed: no extra dial.
     fn connect_own(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
         let pool = connect_pool(url, tls)?;
-        let proxy_kind = match dial_conn(url, tls) {
-            Ok(mut probe) => proxy::detect_proxy_on_conn(&mut probe),
-            Err(_) => detect_mysql_proxy_kind(&pool),
-        };
+        let proxy_kind = proxy::proxy_kind_of(url, &pool);
         Ok(Self::with_kind(pool, true, proxy_kind))
     }
 

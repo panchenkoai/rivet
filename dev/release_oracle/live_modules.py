@@ -30,6 +30,10 @@ def live_suite_modules() -> list[str]:
     return re.findall(r"^mod ([a-z0-9_]+);", text, re.M)
 
 
+#: What a `live+exclusive` test runs under, one at a time with nothing else on the stand.
+EXCLUSIVE_ENV = {"RIVET_TEST_EXCLUSIVE": "1"}
+
+
 def exclusive_tests() -> list[str]:
     """Bare names of live tests marked `live+exclusive`: each needs the stand to itself."""
     names = []
@@ -74,5 +78,5 @@ def verify_live_modules(led: Ledger) -> None:
         # with nothing else running, which is the only way they grade anything.
         _run_live_modules(led, "live_modules", "live modules (exclusive)",
                           f"tests that need the stand to themselves ({len(excl)}), one at a time",
-                          left, env={**env, "RIVET_TEST_EXCLUSIVE": "1"}, threads=1, again=again,
+                          left, env={**env, **EXCLUSIVE_ENV}, threads=1, again=again,
                           expr=" | ".join(f"test(/::{n}$/)" for n in excl))

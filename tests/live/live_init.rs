@@ -365,7 +365,10 @@ fn init_mongo_schema_wide_lists_collections_in_rivets_order() {
         db: db.clone(),
     };
     let m = MongoTest::connect(27017, &db);
-    for c in ["zeta", "alpha", "Mid"] {
+    // Eight names: a catalog-ordered listing matches byte order about once in 8! runs.
+    for c in [
+        "zeta", "alpha", "Mid", "beta", "Omega", "gamma", "Delta", "epsilon",
+    ] {
         m.seed_int_id(c, 2);
     }
     let url = MongoTest::url(27017, &db);
@@ -383,7 +386,13 @@ fn init_mongo_schema_wide_lists_collections_in_rivets_order() {
             .collect::<Vec<_>>()
     };
     let first = names();
-    assert_eq!(first, ["Mid", "alpha", "zeta"], "byte order of the names");
+    assert_eq!(
+        first,
+        [
+            "Delta", "Mid", "Omega", "alpha", "beta", "epsilon", "gamma", "zeta"
+        ],
+        "byte order of the names"
+    );
     assert_eq!(names(), first, "the same order on every init");
 }
 

@@ -3356,3 +3356,22 @@ seeds:
       lib:
         cells:
         - lib:a_bare_name_resolves_to_its_own_database_then_to_the_only_other
+
+  - name: mysql-proxy-probe-dials-its-own-connection
+    class: "every MySQL run dials a connection of its own to detect a proxy, so a batch run opens 4 source connections instead of 2 and a CDC run 3 instead of 2"
+    history: "2026-10-22 - found by the 0.32.2 gate (perf[mysql/cdc-conns], perf[mysql/batch-conns-*]) after #661 moved the probe off the pool"
+    scope: source
+    patch: mysql-proxy-probe-dials-its-own-connection/mysql.patch
+    engines:
+      mysql:
+        cells:
+        - a_mysql_batch_run_opens_at_most_two_source_connections
+        - a_mysql_cdc_run_opens_at_most_two_source_connections
+      postgres:
+        na: "the proxy probe is MySQL's (src/source/mysql/mod.rs connect_own); PostgreSQL detects no proxy on connect"
+      mssql:
+        na: "SQL Server's source connects through tiberius with no proxy probe"
+      mongo:
+        na: "MongoDB connects through its driver's own pool with no proxy probe"
+      oracle:
+        na: "Oracle connects through its own session with no proxy probe"

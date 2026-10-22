@@ -1,0 +1,16 @@
+diff --git a/src/source/mysql/mod.rs b/src/source/mysql/mod.rs
+index e155d4a0..dee18c80 100644
+--- a/src/source/mysql/mod.rs
++++ b/src/source/mysql/mod.rs
+@@ -141,7 +141,10 @@ impl MysqlSource {
+     /// first connection, by statements that leave a ProxySQL session multiplexed: no extra dial.
+     fn connect_own(url: &str, tls: Option<&TlsConfig>) -> Result<Self> {
+         let pool = connect_pool(url, tls)?;
+-        let proxy_kind = proxy::proxy_kind_of(url, &pool);
++        let proxy_kind = match dial_conn(url, tls) {
++            Ok(mut probe) => proxy::detect_proxy_on_conn(&mut probe),
++            Err(_) => proxy::proxy_kind_of(url, &pool),
++        };
+         Ok(Self::with_kind(pool, true, proxy_kind))
+     }
+ 
