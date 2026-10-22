@@ -1976,7 +1976,7 @@ fn old_runs_again_after_this_build_was_refused_beside_it(engine: SqlEngine, pg_s
     let release = hold_a_lease(&new, db.as_ref());
     let remedy = match pg_state {
         false => Remedy::new(
-            "Run again once that process ends",
+            "Stop or wait for that run of the older release, then run again",
             Then::DeliversTheSource,
             move |_| release(),
         ),

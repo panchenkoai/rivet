@@ -1186,11 +1186,12 @@ fn refuse_beside_a_live_lease(old: i64, held: Option<(String, String)>) -> Resul
     };
     crate::rivet_bail!(
         crate::error::codes::STATE_UPGRADE_BESIDE_LIVE_RUN,
-        "state: this state is at schema v{old} and its lease `{lease}` is held by {holder}: \
-         migrating it to v{SCHEMA_VERSION} now would change the schema under that live run, and \
-         the release that runs it cannot open a v{SCHEMA_VERSION} state. Nothing was migrated and \
-         nothing was written. Run again once that process ends, or give `--lock-wait` the seconds \
-         it needs."
+        "state: this state is at schema v{old} and its lease `{lease}` (the run or load of the \
+         export or table it names) is held by {holder}, a live rivet whose release the lease does \
+         not record: migrating the state to v{SCHEMA_VERSION} now would change its schema under \
+         that run, and an older release cannot open a v{SCHEMA_VERSION} state. Nothing was \
+         migrated and nothing was written. Stop or wait for that run of the older release, then \
+         run again, or give `--lock-wait` the seconds it needs."
     )
 }
 
@@ -3240,11 +3241,13 @@ mod tests {
             e.to_string(),
             format!(
                 "state: this state is at schema v{old} and its lease \
-                 `.rivet_state.db.lease-chunk-run-orders` is held by another rivet process on this \
-                 host: migrating it to v{SCHEMA_VERSION} now would change the schema under that \
-                 live run, and the release that runs it cannot open a v{SCHEMA_VERSION} state. \
-                 Nothing was migrated and nothing was written. Run again once that process ends, \
-                 or give `--lock-wait` the seconds it needs."
+                 `.rivet_state.db.lease-chunk-run-orders` (the run or load of the export or table \
+                 it names) is held by another rivet process on this host, a live rivet whose \
+                 release the lease does not record: migrating the state to v{SCHEMA_VERSION} now \
+                 would change its schema under that run, and an older release cannot open a \
+                 v{SCHEMA_VERSION} state. Nothing was migrated and nothing was written. Stop or \
+                 wait for that run of the older release, then run again, or give `--lock-wait` the \
+                 seconds it needs."
             )
         );
         assert_eq!(get_current_version(&conn), old, "nothing was migrated");
@@ -3370,25 +3373,30 @@ mod tests {
                 .get(0)
         };
 
+        let copies = |c: &mut postgres::Client| -> i64 {
+            c.query_one(
+                "SELECT COUNT(*) FROM pg_namespace WHERE nspname = $1",
+                &[&pg_backup_schema(old)],
+            )
+            .unwrap()
+            .get(0)
+        };
+        let copies_before = copies(&mut client);
+
         let e = migrate_pg(&mut client).unwrap_err();
 
         crate::error::assert_coded(&e, "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN", 2);
         assert!(
             e.to_string().starts_with(&format!(
-                "state: this state is at schema v{old} and its lease `c.live` is held by pid 4242 \
-                 on host elsewhere: migrating it to v{SCHEMA_VERSION} now"
+                "state: this state is at schema v{old} and its lease `c.live` (the run or load of \
+                 the export or table it names) is held by pid 4242 on host elsewhere, a live rivet \
+                 whose release the lease does not record: migrating the state to v{SCHEMA_VERSION} \
+                 now"
             )),
             "{e}"
         );
         assert_eq!(version(&mut client), old, "nothing was migrated");
-        let copies: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM pg_namespace WHERE nspname = $1",
-                &[&pg_backup_schema(old)],
-            )
-            .unwrap()
-            .get(0);
-        assert_eq!(copies, 0, "nothing was copied");
+        assert_eq!(copies(&mut client), copies_before, "nothing was copied");
 
         client
             .execute("DELETE FROM state_lease WHERE lease_key = 'c.live'", &[])

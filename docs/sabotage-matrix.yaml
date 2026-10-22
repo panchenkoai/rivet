@@ -747,7 +747,7 @@ scenarios:
     oracle:   { test: a_state_reset_beside_a_live_run_is_refused_and_walked_out_oracle }
 
   - id: refusal_state_upgrade_beside_live_run
-    what: "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN: this build runs an export beside a run of the previous release paused under its run lease on the SQLite state of its older schema; refused with the schema unchanged and the previous release then runs again and delivers; beside a lease file the cell holds it is refused twice, `rivet state reset` is refused the same way, and `Run again once that process ends` (the cell lets go) migrates the state and delivers the source"
+    what: "RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN: this build runs an export beside a run of the previous release paused under its run lease on the SQLite state of its older schema; refused with the schema unchanged and the previous release then runs again and delivers; beside a lease file the cell holds it is refused twice, `rivet state reset` is refused the same way, and `Stop or wait for that run of the older release, then run again` (the cell lets go) migrates the state and delivers the source"
     postgres: { test: the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_sqlite_state_postgres }
     mysql:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
     mssql:    { na: "the state migration seam (src/state/migrations.rs, entered by every StateStore open) is the same whatever the source engine: the postgres column carries the row" }
