@@ -289,6 +289,14 @@ impl Rig {
         }
     }
 
+    /// The schema version of the state database this rig's runs use.
+    pub fn state_schema(&self) -> i64 {
+        match self.state_url(&[]) {
+            Some(_) => self.state_count("SELECT MAX(version) FROM rivet_schema_version"),
+            None => self.state_count("SELECT MAX(version) FROM schema_version"),
+        }
+    }
+
     /// `rivet validate` on this rig's export fails twice with exit 3 and names the `RIVET_VERIFY_*` `finding` in its report.
     pub fn validate_fails(&self, finding: &str) {
         let first = said(&self.cli(&["validate"]));

@@ -34,6 +34,14 @@ impl<'a> Refused<'a> {
         Refused { code: None, exit }
     }
 
+    /// The busy stop this tree's rivet gives beside a live run holding a lease on a state at schema `held`: the migration refused under an older one, else the run lease.
+    pub fn beside_a_live_run_at_schema(held: i64) -> Refused<'static> {
+        match held < crate::common::this_trees_state_schema() {
+            true => Refused::by_code("RIVET_STATE_UPGRADE_BESIDE_LIVE_RUN", 2),
+            false => Refused::by_code("RIVET_STATE_RUN_IN_PROGRESS", 2),
+        }
+    }
+
     /// `[CODE] (exit N)` for a verdict line.
     fn named(self) -> String {
         match self.code {

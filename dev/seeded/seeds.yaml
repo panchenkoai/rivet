@@ -427,6 +427,7 @@ seeds:
         cells:
           - "lib:a_state_behind_this_build_is_not_migrated_while_a_lease_beside_it_is_held"
           - the_previous_release_runs_again_after_this_build_was_refused_beside_it_on_sqlite_state_postgres
+          - a_run_beside_a_live_previous_release_run_of_the_export_is_refused
 
   - name: setup-green-over-dead-state
     class: "`rivet check` prints `Looks good.` and exits 0 (and `doctor` / `init` stay green) while the state the config uses does not answer, so setup passes and every run after it fails"
@@ -496,9 +497,7 @@ seeds:
     engines:
       sqlite-state:
         patch: lease-upgrade-window-unguarded/sqlite-state.patch
-        cells:
-          - "lib:a_holder_of_the_old_lease_name_and_this_release_exclude_each_other"
-          - a_run_beside_a_live_previous_release_run_of_the_export_is_refused
+        cells: ["lib:a_holder_of_the_old_lease_name_and_this_release_exclude_each_other"]
       postgres-state:
         na: "a PostgreSQL-state lease is a row keyed by the raw key, unchanged by the rename"
 

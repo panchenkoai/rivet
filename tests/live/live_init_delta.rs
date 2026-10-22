@@ -99,19 +99,6 @@ fn rivet_ok_in(dir: &std::path::Path, args: &[&str], envs: &[(&str, &str)]) -> S
     said
 }
 
-/// Removes the GCS prefix a GENERATED config writes to. `BqLive::cleanup` cannot:
-/// it owns `rivet-live/<uniq>`, while init derives `exports/<table>/` and takes no
-/// prefix flag — so without this every run of this test leaks objects into the
-/// shared bucket.
-struct GcsPrefix(String);
-impl Drop for GcsPrefix {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("timeout")
-            .args(["300", "gcloud", "storage", "rm", "-r", "--quiet", &self.0])
-            .output();
-    }
-}
-
 // ── the warehouse half: init → run → load → compact, per engine ──────────
 
 /// A timestamp type init scores as a cursor candidate, spelled per engine.
@@ -207,7 +194,8 @@ fn warehouse_chain(e: SqlEngine, label: &str) {
     // Guards before the first write: `run` stages into the bucket, `load` into
     // the dataset, and a panic between them must still tear both down.
     let _bq_guard = bq.cleanup(&[&export, &changes]);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let _gcs_guard =
+        ConfigGcsPrefixes::of(&std::fs::read_to_string(cfg).expect("generated config"));
     let db = [("DATABASE_URL", e.url())];
     let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
 
@@ -356,7 +344,8 @@ fn a_full_load_of_an_emptied_source_empties_the_warehouse_table() {
     ]);
     let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
     let _bq_guard = bq.cleanup(&[&export]);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let _gcs_guard =
+        ConfigGcsPrefixes::of(&std::fs::read_to_string(cfg).expect("generated config"));
     let db = [("DATABASE_URL", POSTGRES_URL)];
 
     rivet_ok(&["run", "-c", cfg], &db);
@@ -421,7 +410,8 @@ fn a_compaction_left_half_done_is_finished_by_the_next_one() {
     let changes = format!("{export}__changes");
     let merging = format!("{export}__changes__merging");
     let _bq_guard = bq.cleanup(&[&export, &changes, &merging]);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let _gcs_guard =
+        ConfigGcsPrefixes::of(&std::fs::read_to_string(cfg).expect("generated config"));
     let db = [("DATABASE_URL", POSTGRES_URL)];
     let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
 
@@ -566,7 +556,8 @@ fn a_cyrillic_lookalike_column_lands_under_its_latin_name_with_every_value() {
     let export = scaffolded_export(&std::fs::read_to_string(cfg).expect("generated config"));
     let changes = format!("{export}__changes");
     let _bq_guard = bq.cleanup(&[&export, &changes]);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let _gcs_guard =
+        ConfigGcsPrefixes::of(&std::fs::read_to_string(cfg).expect("generated config"));
     let db = [("DATABASE_URL", POSTGRES_URL)];
     let fq = |t: &str| format!("`{}.{}.{t}`", bq.project, bq.dataset);
     let columns = |t: &str| {
@@ -923,7 +914,8 @@ fn cdc_warehouse_chain(src: CdcSource, bq: &BqLive) {
     let generated = std::fs::read_to_string(cfg).expect("generated config");
     assert!(generated.contains("\nload:"), "{generated}");
     let export = scaffolded_export(&generated);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let _gcs_guard =
+        ConfigGcsPrefixes::of(&std::fs::read_to_string(cfg).expect("generated config"));
     // The CDC export is `<table>_cdc`; the warehouse table is named from the source table.
     let export = src
         .bq_table
@@ -1018,10 +1010,7 @@ fn rebaseline_keeps_the_base(
         }
     }
     let export = scaffolded_export(generated);
-    let _ = std::process::Command::new("timeout")
-        .args(["300", "gcloud", "storage", "rm", "-r", "--quiet"])
-        .arg(format!("gs://{}/exports/{export}/**", bq.bucket))
-        .output();
+    ConfigGcsPrefixes::of(generated).wipe();
     let state =
         rusqlite::Connection::open(dir.join(".rivet_state.db")).expect("the config's state");
     let dropped = state
@@ -1172,20 +1161,20 @@ fn a_generated_cdc_config_drives_run_load_compact_mongo() {
         db: db.clone(),
     };
     let m = MongoTest::connect(27018, &db);
-    m.create_empty_collection("events");
+    let coll = unique_name("events");
+    m.create_empty_collection(&coll);
     cdc_warehouse_chain(
         CdcSource {
             url: MongoTest::url(27018, &db),
-            init_args: vec!["--table".into(), "events".into()],
+            init_args: vec!["--table".into(), coll.clone()],
             apply: Box::new(move |ops| {
                 for op in ops {
                     match *op {
-                        Op::Ins(i) => m.insert_many(
-                            "events",
-                            vec![doc! { "_id": i, "name": format!("r{i}") }],
-                        ),
-                        Op::Rename(i) => m.upsert_set("events", i, "name", "changed"),
-                        Op::Del(i) => m.delete_one("events", i),
+                        Op::Ins(i) => {
+                            m.insert_many(&coll, vec![doc! { "_id": i, "name": format!("r{i}") }])
+                        }
+                        Op::Rename(i) => m.upsert_set(&coll, i, "name", "changed"),
+                        Op::Del(i) => m.delete_one(&coll, i),
                     }
                 }
             }),
@@ -1764,7 +1753,8 @@ fn a_0_30_cdc_state_copied_to_postgres_continues_its_stream_and_owns_its_tables(
     };
     std::fs::write(cfg, &generated).expect("the config with its baseline");
     let export = scaffolded_export(&generated);
-    let _gcs_guard = GcsPrefix(format!("gs://{}/exports/{export}/**", bq.bucket));
+    let _gcs_guard =
+        ConfigGcsPrefixes::of(&std::fs::read_to_string(cfg).expect("generated config"));
     let base = export.trim_end_matches("_cdc").to_string();
     let changes = format!("{base}__changes");
     let _bq_guard = bq.cleanup(&[&base, &changes]);
