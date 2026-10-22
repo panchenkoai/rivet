@@ -1427,6 +1427,7 @@ jobs:
     outputs:
       scope: ${{ steps.scope.outputs.scope }}
       reason: ${{ steps.scope.outputs.reason }}
+      filter: ${{ steps.scope.outputs.filter }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1448,7 +1449,7 @@ jobs:
   e2e-build:
     name: E2E build (nextest archive)
     needs: e2e-scope
-    if: needs.e2e-scope.outputs.scope == 'full'
+    if: needs.e2e-scope.outputs.scope != 'skip'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -1789,10 +1790,16 @@ jobs:
         # `open_defect_` is the one term for every cell that pins an OPEN product defect:
         # it asserts the correct behaviour, so it fails until the fix lands, and only the
         # release gate can read that as an acknowledged red (dev/release_oracle/known_red.py).
+        #
+        # `FILTER` (from `e2e-scope`, empty on a full run) narrows the live_suite binary to the live
+        # modules that exercise the engine, target or destination a PR changed.
+        env:
+          FILTER: ${{ needs.e2e-scope.outputs.filter }}
         run: >-
           cargo nextest run --archive-file "$RUNNER_TEMP/e2e-nextest.tar.zst"
           --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
           --profile pr --run-ignored only --partition count:${{ matrix.leg }}
+          ${FILTER:+-E "$FILTER"}
           -- --skip content_export --skip validates --skip edge_cases
           --skip via_duckdb --skip mongo --skip warehouse_cell
           --skip readable_secondary --skip mssql_checkpoint_follows_a_failover
@@ -1876,15 +1883,15 @@ jobs:
           echo "e2e legs: ${{ needs.e2e.result }}"
           [ "${{ needs.e2e.result }}" = success ]
       - uses: actions/checkout@v7
-        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}
+        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}
       - uses: actions/download-artifact@v8
-        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}
+        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}
         with:
           pattern: e2e-logs-*
           path: e2e-logs
       - name: One log of the whole matrix
         # The ceilings below are totals of the whole E2E check, so the censuses read the legs' logs as one.
-        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}
+        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}
         run: |
           mkdir -p target
           cat e2e-logs/*/rivet-skips.log > target/rivet-skips.log
@@ -1898,7 +1905,7 @@ jobs:
         # so a reader sees what this job does NOT grade. Any other self-skip is a test this job was to
         # run and did not. (Before this step 10 of the 11 live_pg_state tests, among others, passed here
         # in 0.00 s with no record at all; measured 2026-10-02.)
-        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}
+        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}
         env:
           # One prerequisite per line; a skip whose reason names it is explained.
           LACKING: |
@@ -1931,7 +1938,7 @@ jobs:
         # A passing test's stderr is hidden, so the verdict log is the only proof the oracle ran. The
         # ceilings are skip_census.VERDICT_CEILINGS, the table the release gate's oracle_verdict_census
         # cell reads too; each count must land within its noise of the ceiling, both ways.
-        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope == 'full' }}
+        if: ${{ !cancelled() && needs.e2e-scope.outputs.scope != 'skip' }}
         run: python3 -m dev.release_oracle.skip_census --verdicts target/rivet-oracle.log --lane ci
 
 
