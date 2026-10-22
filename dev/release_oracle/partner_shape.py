@@ -110,8 +110,19 @@ def _cleanup(engine: str, url: str, slot: str | None) -> None:
     for t in TABLES:
         _sql(engine, url, f"DROP TABLE IF EXISTS {t};")
     if engine == "postgres" and slot:
-        _psql(url, sql=f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots "
-                       f"WHERE slot_name='{slot}';")
+        _drop_slot(url, slot)
+
+
+def _drop_slot(url: str, slot: str) -> None:
+    """Drop `slot` when it exists: a killed run's leftover before the run, this run's at teardown."""
+    _psql(url, sql=f"SELECT pg_drop_replication_slot('{slot}') FROM pg_replication_slots "
+                   f"WHERE slot_name='{slot}';")
+
+
+def init_slot(body: str) -> str | None:
+    """The replication slot an init config names (`slot: <name>`), or None."""
+    m = re.search(r"^\s*slot:\s*([A-Za-z0-9_]+)", body, re.M)
+    return m.group(1) if m else None
 
 
 def _shape_problems(body: str) -> list[str]:
@@ -169,8 +180,8 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
     slug = f"{work_dir().name}-{os.getpid()}"
     dset = registry.bq_tmp(f"partner_{engine}")
     pfx = f"partner/{engine}/{slug}"
-    # init names the stream `cdc` (MySQL) / `public_cdc` (PostgreSQL) → slot `rivet_<name>`.
-    slot = "rivet_public_cdc" if engine == "postgres" else None
+    # The slot is the one init writes (`slot:`), read from its config below, never spelled here.
+    slot: str | None = None
     _cleanup(engine, url, slot)
     env = {"ORACLE_URL": url}
     try:
@@ -182,6 +193,9 @@ def _one_engine(led: Ledger, engine: str, url: str, proj: str, bucket: str) -> N
                   "--include", *TABLES, "--tls", "disable", "--gcs-bucket", bucket,
                   "-o", str(cfg), env=env, timeout=NO_TIMEOUT)
         body = cfg.read_text() if cfg.is_file() else ""
+        slot = init_slot(body) if engine == "postgres" else None
+        if slot:
+            _drop_slot(url, slot)
         bad = _shape_problems(body) if p.ok else [f"init exit={p.returncode}: {(p.stderr or '')[-200:]}"]
         if not _row(led, engine, "init", not bad,
                     f"init --mode cdc --include {' '.join(TABLES)} → {len(body.splitlines())} lines"

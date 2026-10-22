@@ -574,6 +574,25 @@ def _self_test() -> int:
 
     seeded.self_test()
     guarantees.self_test()
+    import contextlib
+    import io
+
+    from . import stand_sweep
+    stand_sweep.self_test()
+    from .partner_shape import init_slot
+    assert init_slot("    cdc:\n      slot: rivet_rivet_public_cdc  # logical slot\n") == "rivet_rivet_public_cdc"
+    assert init_slot("mode: cdc\n") is None, "a config naming no slot names none"
+    from . import stand_disk
+    stand_disk.self_test()
+    sunk = Ledger(colour=False)
+    sunk._buf = []
+    sunk.failed("mysql", "8.0", "seed", "-", "seed had errors")
+    sunk.stand_invalid = "docker VM under 20 GiB free"
+    said = io.StringIO()
+    with contextlib.redirect_stdout(said):
+        rc = sunk.report()
+    assert rc == 1 and sunk.verdict() == "STAND-INVALID" and "STAND-INVALID" in said.getvalue() \
+        and "NOT RELEASABLE" not in said.getvalue(), "a run whose disk filled reports the stand, not product reds"
     off = Ledger(colour=False)
     off._buf = []
     verify_seeded_recall(off, False)
@@ -1673,6 +1692,11 @@ def main(argv: list[str] | None = None) -> int:
     dropped = scrub_inherited_rivet_env()
     if dropped:
         print(f"  dropped from the inherited environment (the product's, not the gate's): {' '.join(dropped)}")
+    from . import stand_disk
+    refused = stand_disk.start_refusal(stand_disk.free_gib())
+    if refused:
+        print(refused, file=sys.stderr)
+        return 3
     lock = _hold_gate_lock()
     if lock is None:
         print(f"another gate run holds {target_dir() / '.gate.lock'} — two runs in one tree clean "
@@ -1680,6 +1704,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     from .core import set_cell_parallel
     set_cell_parallel(ns.cell_parallel)
+    from . import stand_sweep
+    for line in stand_sweep.sweep():
+        print(f"  {line}")
 
     # A clean-tree run builds the binary itself; only --no-clean needs one up front.
     if ns.no_clean and (not rivet_bin().is_file() or not os.access(rivet_bin(), os.X_OK)):
@@ -1781,6 +1808,7 @@ def main(argv: list[str] | None = None) -> int:
         for line in banner:
             print(line)
 
+        dog = stand_disk.Watchdog().start()
         built: dict = {}
         run_stages(led, build_stages(ns, built))
         if not ns.no_clean and not built.get("ok"):
@@ -1803,6 +1831,7 @@ def main(argv: list[str] | None = None) -> int:
             # A bless run returns before most stages on purpose (run_scenarios), so it cannot grade the matrix.
             if not (ns.bless_local or ns.bless_cdc):
                 led.close_matrix_rows()
+        led.stand_invalid = dog.stop()
         rc = led.report(full=full and not (ns.bless_local or ns.bless_cdc), gate=gate_kind(ns), tree=tree)
         # A run that graded nothing against the previous release has to say so
         # AFTER the verdict, where the reader's eye lands: `RELEASE-READY` is

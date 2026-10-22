@@ -38,14 +38,22 @@ SCEN = "fix_cells"
 GIT = "/usr/bin/git" if Path("/usr/bin/git").exists() else "git"
 FIX = re.compile(r"fix[(:!]")
 TEST = re.compile(r"^#\[test\]\n(?:#\[[^\n]*\n)*(?:pub )?fn (\w+)\(\) \{\n(.*?)^\}", re.M | re.S)
-#: Controls: the neighbour of a fix that must stay as it was, so it is green on the release without the fix.
-SESSION_ZONE_HONOURED = ("control of 4cd95bab: straight to a `+03:00` MySQL server the `SET time_zone` rivet sends is "
-                         "honoured, so the new guard lets the read through and the value is the source's instant in UTC, "
-                         "as v0.32.0 read it; the proxy that drops the SET is the cell that is red there")
-
 #: Fix cells allowed to pass on the previous release, each with its reason. Shrink-only.
 GREEN_ON_PREV: dict[str, str] = {  # ratchet-pin: fix-cells-green-on-previous-release strings
-    "a_server_in_another_time_zone_reads_its_timestamps_as_utc_when_the_set_is_honoured": SESSION_ZONE_HONOURED,
+    "a_load_without_the_source_variable_types_its_table_from_the_runs_spec":
+        "f1d3186a (#654) fixed a regression of #650 (state v38, the load spec keyed by source), which is in no "
+        "release: v0.32.1 reads the one spec it recorded, so the cell is green there by construction",
+    "an_incremental_pass_after_a_state_reset_keeps_what_clickhouse_held_for_two_cycles":
+        "guard beside e153103a (#652): ClickHouse has no base-and-buffer layout, so its log-and-view path never "
+        "landed a whole-table pass over the base; the cell keeps that true. The fix is proven red on v0.32.1 by "
+        "the BigQuery chains' reset step",
+    "mongo_cdc_a_field_added_while_a_run_is_open_is_in_the_document":
+        "control of ff104292 (#665): a MongoDB change lands the whole document in `document`, so a field added "
+        "mid-run was never dropped; the SQL engines' hot ADD COLUMN cells are the ones red there",
+    "mysql_cdc_a_bare_name_beside_its_qualified_twin_is_refused":
+        "guard beside 6abfdd01 (#677): the twin is refused by the existing RIVET_CONFIG_CDC_SHAPE_INVALID check on "
+        "v0.32.1 as on this release; the cell keeps the refusal while the bare-name rule changes, and the "
+        "bare-name cells are the ones red there",
 }  # ratchet-pin: end
 
 
