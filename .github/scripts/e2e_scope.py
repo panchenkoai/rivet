@@ -93,16 +93,38 @@ def e2e_python(root: Path = ROOT) -> set[str]:
     return {str(f.relative_to(root)) for f in seen}
 
 
+#: A doc compiled into a binary: `include_str!("…docs/x.md")`.
+INCLUDED_DOC = re.compile(r'include_str!\(\s*"((?:\.\./)*(?:docs/[A-Za-z0-9_./-]+|[A-Za-z0-9_-]+\.md))"')
+
+
+def _names(pattern: re.Pattern, text: str) -> set[str]:
+    out = set()
+    for m in pattern.finditer(text):
+        name = m.group(1)
+        while name.startswith("../"):
+            name = name[3:]
+        out.add(name)
+    return out
+
+
 def read_docs(root: Path = ROOT) -> set[str]:
-    """Every docs path the Rust the E2E lane runs names: such a file is read by some E2E build or test, so it is never skippable."""
+    """Every doc something the E2E LANE executes reads, so a change to it runs E2E.
+
+    The lane executes the binaries it builds and the ignored (live) tests: a doc counts when it is
+    `include_str!`-ed anywhere under src/ or tests/ (it is in a binary the lane builds), or named
+    by a file of tests/common/ or by a test file that holds an ignored test. A doc only a
+    non-ignored lib or offline unit test reads (cli.md, read by src/error.rs's exit-code table
+    test) does not force E2E: the `Tests` job runs that test on the same PR.
+    """
     found: set[str] = set()
-    if True:
-        for text in e2e_rust_texts(root):
-            for m in READ_DOC.finditer(text):
-                name = m.group(1)
-                while name.startswith("../"):
-                    name = name[3:]
-                found.add(name)
+    for base in ("src", "tests"):
+        for f in (root / base).rglob("*.rs"):
+            text = f.read_text(errors="ignore")
+            found |= _names(INCLUDED_DOC, text)
+            rel = str(f.relative_to(root))
+            if rel.startswith("tests/common/") or (base == "tests" and "#[ignore" in text) \
+                    or (base == "src" and "#[ignore" in text):
+                found |= _names(READ_DOC, text)
     return found
 
 
@@ -314,7 +336,8 @@ def self_test() -> int:
     assert scope(["dev/seeded/seeds.yaml", "docs/a.md"], read)[0] == "skip"
     assert scope(["docs/type-capability-matrix.yaml"], read)[0] == "full", "a live test reads it"
     # Every docs file a test or source file names is full: derived, so a new reader is covered at once.
-    assert scope(["README.md"], read)[0] == "full", "a test reads README.md"
+    assert classify("docs/reference/cli.md", read) == "docs", "only a lib unit test (Tests job) reads cli.md"
+    assert classify("docs/reference/errors.md", read) == "full", "include_str!-ed into a binary the lane builds"
     assert "docs/reference/errors.md" in read, "src/error.rs includes the generated errors reference"
     for path in read:
         assert classify(path, read) == "full", path
