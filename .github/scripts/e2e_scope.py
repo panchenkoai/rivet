@@ -257,13 +257,35 @@ def select_with_owners(paths: list[str], read: set[str], modules: dict[str, set[
     return "select", f"{len(chosen)} of {len(modules)} live modules exercise {what}", chosen, owners
 
 
+#: A test function and its body, up to the next item at column 0.
+TEST_FN = re.compile(r"^#\[test\][^\n]*\n(?:#\[[^\n]*\n)*(?:pub )?fn ([a-z0-9_]+)\(\)[^\n]*\n(.*?)(?=^\S)", re.M | re.S)
+
+
+def kept_by_body(chosen: list[str], owners: set[str], root: Path = ROOT) -> list[str]:
+    """The tests of `chosen` the name rule would drop whose own body names a changed owner: they stay."""
+    foreign = foreign_names(owners)
+    if not foreign:
+        return []
+    f_re, o_re = re.compile(foreign), re.compile(own_names(owners))
+    markers = [re.compile(MODULE_MARKERS[o], re.I) for o in owners if o in MODULE_MARKERS]
+    keep = []
+    for mod in chosen:
+        text = (root / "tests" / "live" / f"{mod}.rs").read_text(errors="ignore") + "\n}\n"
+        for name, body in TEST_FN.findall(text):
+            full = f"{mod}::{name}"
+            if f_re.search(full) and not o_re.search(full) and any(m.search(body) for m in markers):
+                keep.append(full)
+    return sorted(keep)
+
+
 def nextest_filter(chosen: list[str], owners: set[str] = frozenset()) -> str:
     """The nextest expression: every other binary whole, and of `live_suite` the chosen modules, minus their tests
     whose name names only another owner of the changed owners' kind (a `_mssql` test for a MySQL change)."""
     picked = "test(/^(" + "|".join(chosen) + ")::/)"
     foreign = foreign_names(set(owners))
     if foreign:
-        picked = f"({picked} - (test(/{foreign}/) - test(/{own_names(set(owners))}/)))"
+        back = "".join(f" | test(={t})" for t in kept_by_body(chosen, set(owners)))
+        picked = f"({picked} - (test(/{foreign}/) - test(/{own_names(set(owners))}/)){back})"
     return f"not binary(live_suite) | {picked}"
 
 
@@ -333,6 +355,14 @@ def self_test() -> int:
     assert not keep("live_cdc::x_mssql") and not keep("live_cdc::pg_cdc_x") and not keep("live_x::y_mongo")
     assert keep("live_x::upgrade_continues"), "a word inside another word is not a token"
     assert keep("live_x::from_pg_to_mysql"), "a test naming the changed owner stays"
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "tests" / "live").mkdir(parents=True)
+        (Path(d) / "tests" / "live" / "m.rs").write_text(
+            "#[test]\nfn a_cell_mssql() {\n    run(SqlEngine::Mssql);\n}\n"
+            "#[test]\nfn a_parity_mssql() {\n    compare(SqlEngine::Mssql, SqlEngine::Mysql);\n}\n")
+        assert kept_by_body(["m"], {"mysql"}, Path(d)) == ["m::a_parity_mssql"], \
+            "a foreign-named test whose body drives the changed engine is kept"
     print(f"self-test ok: e2e scope — {len(read)} docs files read by the build or tests stay full; "
           f"{len(mods)} live modules mapped to their owners")
     return 0
