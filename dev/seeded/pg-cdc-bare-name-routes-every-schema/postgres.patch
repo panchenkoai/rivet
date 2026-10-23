@@ -1,0 +1,13 @@
+diff --git a/src/source/postgres/cdc.rs b/src/source/postgres/cdc.rs
+index 22e07e2c..a58d5910 100644
+--- a/src/source/postgres/cdc.rs
++++ b/src/source/postgres/cdc.rs
+@@ -1632,7 +1632,7 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
+ /// change event; `None` when it resolves nowhere or to a view, which leaves the election as it was.
+ fn search_path_schema(client: &mut Client, cfg: &str) -> Result<Option<String>> {
+     use anyhow::Context as _;
+-    if cfg.contains('.') {
++    if cfg.contains('.') || !cfg.is_empty() {
+         return Ok(None);
+     }
+     Ok(client

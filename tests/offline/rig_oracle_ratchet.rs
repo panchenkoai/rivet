@@ -243,11 +243,6 @@ fn rust_duckdb_helper_call_sites_never_grow() {
 const KNOWN_DEFECTS: &[(&str, &str, &str)] = &[
     // ratchet-pin: oracle-known-defects strings
     (
-        "roast_pg_cdc_refuses_a_bare_table_name_that_matches_two_relations",
-        "delivered-only rows",
-        "known defect: a bare-name capture delivers the WAL rows",
-    ),
-    (
         "a_pg_failover_to_the_standby_without_a_checkpoint_loses_the_rows_written_during_the_switch",
         "undelivered rows",
         "known defect: a PostgreSQL CDC failover without `cdc.checkpoint` creates a new slot",

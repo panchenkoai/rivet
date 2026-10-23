@@ -20,7 +20,7 @@
 //! crate compiles `source` for tests but has no CDC consumer of its own.
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use postgres::Client;
 use serde_json::json;
@@ -102,6 +102,8 @@ pub(crate) struct PgChangeStream {
     /// The `table:` values this run captures — what a TRUNCATE is checked against
     /// before it is allowed to fail the run. See [`truncate_is_ours`].
     configured_tables: Vec<String>,
+    /// The schema each bare configured name resolves to through the search_path, read at open.
+    bare_schema: HashMap<String, String>,
     /// The nonce of the BARRIER this bounded run emitted at open, if it could.
     ///
     /// Reaching it is an EXACT boundary — everything before it provably committed
@@ -454,6 +456,12 @@ impl PgChangeStream {
                     capturable: r.get::<_, bool>(3),
                 })
                 .collect();
+            // A bare name means the relation the search_path resolves, as every statement of the run
+            // reads it: a same-named relation in another schema is not a candidate.
+            let matches: Vec<_> = match search_path_schema(client, cfg)? {
+                Some(sch) => matches.into_iter().filter(|m| m.schema == sch).collect(),
+                None => matches,
+            };
             let mut resolved: Option<(String, String)> = None;
             if !matches.is_empty() {
                 // The ambiguity decision. A NO-match stays with the schema probe
@@ -607,6 +615,12 @@ impl PgChangeStream {
         // The one prerequisite check of a run, on the stream's own connection and before the
         // slot: its refusals carry rivet's `pg cdc:` prefix, so the setup hint is never prepended.
         Self::refuse_unmet_prerequisites_on(&mut client, configured_tables, mode, true)?;
+        let mut bare_schema = HashMap::new();
+        for cfg in configured_tables {
+            if let Some(sch) = search_path_schema(&mut client, cfg)? {
+                bare_schema.insert(cfg.clone(), sch);
+            }
+        }
         let domains = load_domains(&mut client)?;
         let exists: bool = client
             .query_one(
@@ -710,6 +724,7 @@ impl PgChangeStream {
             owed_through: None,
             frontier_text: None,
             configured_tables: configured_tables.to_vec(),
+            bare_schema,
             barrier_nonce,
             checkpoint: checkpoint.map(std::path::Path::to_path_buf),
         })
@@ -838,7 +853,7 @@ impl PgChangeStream {
                 tx.clear();
             } else if let Some((schema, table)) = truncate_targets(&data)
                 .into_iter()
-                .find(|(sc, tb)| truncate_is_ours(sc, tb, &self.configured_tables))
+                .find(|(sc, tb)| routes(&self.configured_tables, &self.bare_schema, sc, tb))
             {
                 // A TRUNCATE carries no rows, so the parser below has nothing to
                 // build and dropped it silently — leaving the destination holding
@@ -893,6 +908,15 @@ impl PgChangeStream {
                 self.exhausted = true;
                 break;
             } else if let Some(ev) = parse_test_decoding(&lsn, &data, &self.domains)? {
+                // A same-named relation of another schema than the one a bare name means.
+                if is_a_foreign_twin(
+                    &self.configured_tables,
+                    &self.bare_schema,
+                    &ev.schema,
+                    &ev.table,
+                ) {
+                    continue;
+                }
                 // Past the cap the RAW wire row is spilled and the parse above only
                 // proved the line IS a change: a line that decodes to nothing must not
                 // enter the spill, since the tail's length decides which row closes it.
@@ -1601,6 +1625,58 @@ pub(crate) fn truncate_refusal_message(schema: &str, table: &str) -> String {
          Then: {}",
         crate::source::cdc::checkpoint_identity::RECOVER
     )
+}
+
+/// The schema a BARE configured name means: the one the connection's `search_path` resolves it
+/// in (`to_regclass`), as every SQL statement of the run reads it, when that relation can carry a
+/// change event; `None` when it resolves nowhere or to a view, which leaves the election as it was.
+fn search_path_schema(client: &mut Client, cfg: &str) -> Result<Option<String>> {
+    use anyhow::Context as _;
+    if cfg.contains('.') {
+        return Ok(None);
+    }
+    Ok(client
+        .query_opt(
+            "SELECT n.nspname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.oid = to_regclass($1) AND c.relkind IN ('r','m') AND c.relpersistence = 'p'",
+            &[&cfg],
+        )
+        .with_context(|| format!("pg cdc: resolving `{cfg}` through the search_path"))?
+        .map(|r| r.get(0)))
+}
+
+/// Whether a change of `schema.table` is captured: some configured name routes it, a bare name
+/// only in the schema the search_path resolved it to (`bare_schema`; a bare name it resolved
+/// nowhere routes as before). The one rule the catalog check, the TRUNCATE guard and the
+/// stream's routing take.
+pub(crate) fn routes(
+    configured: &[String],
+    bare_schema: &HashMap<String, String>,
+    schema: &str,
+    table: &str,
+) -> bool {
+    configured.is_empty()
+        || configured.iter().any(|c| {
+            crate::source::cdc::sink::table_matches(
+                crate::source::cdc::CdcEngine::Postgres,
+                c,
+                schema,
+                table,
+            ) && bare_schema.get(c).is_none_or(|s| s == schema)
+        })
+}
+
+/// Whether a change of `schema.table` reaches a configured name only as a bare name's same-named
+/// relation of another schema than the one the search_path resolved: dropped, never routed.
+pub(crate) fn is_a_foreign_twin(
+    configured: &[String],
+    bare_schema: &HashMap<String, String>,
+    schema: &str,
+    table: &str,
+) -> bool {
+    !bare_schema.is_empty()
+        && !routes(configured, bare_schema, schema, table)
+        && routes(configured, &HashMap::new(), schema, table)
 }
 
 /// Is a TRUNCATE this run's problem? Same asymmetry as the MySQL undecodable-rows
@@ -2396,6 +2472,43 @@ fn parse_pg_timestamp(val: &str) -> Option<RivetValue> {
 
 #[cfg(test)]
 mod tests {
+    /// A bare name routes only the schema the search_path resolved it to; a qualified name its own;
+    /// a bare name resolved nowhere routes as before.
+    #[test]
+    fn a_bare_name_routes_only_its_search_path_schema() {
+        let cfg = vec![
+            "orders".to_string(),
+            "audit.log".to_string(),
+            "loose".to_string(),
+        ];
+        let bare: HashMap<String, String> = [("orders".to_string(), "public".to_string())].into();
+        assert!(routes(&cfg, &bare, "public", "orders"));
+        assert!(
+            !routes(&cfg, &bare, "sales", "orders"),
+            "a same-named table of another schema"
+        );
+        assert!(routes(&cfg, &bare, "audit", "log"));
+        assert!(!routes(&cfg, &bare, "public", "log"));
+        assert!(
+            routes(&cfg, &bare, "anywhere", "loose"),
+            "unresolved: routes as before"
+        );
+        assert!(
+            routes(&[], &bare, "x", "y"),
+            "no configured table captures everything"
+        );
+        assert!(is_a_foreign_twin(&cfg, &bare, "sales", "orders"));
+        assert!(!is_a_foreign_twin(&cfg, &bare, "public", "orders"));
+        assert!(
+            !is_a_foreign_twin(&cfg, &bare, "public", "unrelated"),
+            "another table is the sink to drop"
+        );
+        assert!(
+            !is_a_foreign_twin(&cfg, &HashMap::new(), "sales", "orders"),
+            "nothing resolved: as before"
+        );
+    }
+
     /// The barrier line, against what the SERVER actually renders.
     ///
     /// The literal below was captured from the pg-cdc stand, not composed: the
@@ -3402,6 +3515,7 @@ mod tests {
             owed_through: None,
             frontier_text: None,
             configured_tables: Vec::new(),
+            bare_schema: HashMap::new(),
             barrier_nonce: None,
             checkpoint: None,
         }
