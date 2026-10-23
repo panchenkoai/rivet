@@ -8,6 +8,8 @@ DAG per source database** (PostgreSQL, MySQL, SQL Server) from a single factory.
 
 The operator package that replaces this recipe's `BashOperator` (retry by error class,
 load and compact tasks, CDC) is [`airflow-provider-rivet`](https://github.com/panchenkoai/airflow-provider-rivet).
+To start from Docker Compose files with demo sources, MinIO and ClickHouse, see the
+[Airflow quickstart](../../airflow-quickstart.md).
 
 > **MongoDB fits the same pattern.** MongoDB is a first-class Rivet source
 > (full + CDC), so a `mongo.yaml` config yields a `rivet_waves_mongo` DAG
