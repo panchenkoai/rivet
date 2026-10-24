@@ -130,7 +130,7 @@ deterministic regardless of the user's shell rc.
 
 ## Where they appear
 
-- [README.md](https://github.com/panchenkoai/rivet/blob/main/README.md) — top-level table of contents.
+- [README.md](https://github.com/rivet-lab/rivet/blob/main/README.md) — top-level table of contents.
 - [docs/README.md](../) — "Start here" section.
 - [docs/getting-started.md](../getting-started.md) (current 4-step layout):
   - `basic.gif` in §3 "Preflight & run".

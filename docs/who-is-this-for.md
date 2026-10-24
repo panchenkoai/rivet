@@ -84,7 +84,7 @@ become any of those, and shoehorning will be painful.
 - **Stateless / ephemeral runners (Kubernetes pods, Lambda, ECS
   tasks).**  Set `RIVET_STATE_URL` to a PostgreSQL state backend so
   cursors and checkpoints survive pod death.  See the
-  [README § Stateless deployment](https://github.com/panchenkoai/rivet/blob/main/README.md#stateless-deployment).
+  [README § Stateless deployment](https://github.com/rivet-lab/rivet/blob/main/README.md#stateless-deployment).
 
 ---
 

@@ -59,7 +59,7 @@ __all__ = ["verify_upgrade_from_field_state", "COMPATIBILITY_FLOOR", "ACCEPTED_D
 SCEN = "upgrade_from_field_state"
 #: The oldest release an upgrade is guaranteed from. It moves only on the owner's word.
 COMPATIBILITY_FLOOR = "0.27.0"
-REPO = "panchenkoai/rivet"
+REPO = "rivet-lab/rivet"
 GCS = "http://127.0.0.1:4443"
 BUCKET = "rivet-field-state"
 ROWS, STEP = 2000, 150

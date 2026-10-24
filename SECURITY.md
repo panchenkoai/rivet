@@ -214,7 +214,7 @@ after `git checkout <tag>`) as an independent cross-check.
 
 Please report suspected vulnerabilities through GitHub's private advisory channel:
 
-- **Preferred:** open a draft Security Advisory at https://github.com/panchenkoai/rivet/security/advisories/new
+- **Preferred:** open a draft Security Advisory at https://github.com/rivet-lab/rivet/security/advisories/new
 - Alternative: email the maintainer listed in `Cargo.toml` with subject `rivet-security:`.
 
 We aim to acknowledge reports within **7 days** and to ship a fix or mitigation within **30 days** for confirmed issues affecting a supported release.

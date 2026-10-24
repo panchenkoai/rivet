@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Homebrew moved to `brew install rivet-lab/tap/rivet`** (the tap is now `rivet-lab/homebrew-tap`;
+  `panchenkoai/rivet/rivet` keeps working through GitHub's redirect). **On Linux the formula installs
+  the glibc 2.28 build:** the one it installed before needed glibc 2.38+ and exited on Ubuntu 22.04,
+  the image Homebrew on Linux runs (0.32.2 and earlier; the published 0.32.2 formula is already
+  fixed). The release pushes the formula as a GitHub App with a one-hour token instead of a personal
+  token, and a failed push now fails the release job instead of being skipped.
+
 ## 0.32.2 — 2026-10-22
 
 **Upgrading from 0.32.1 — read these first:**

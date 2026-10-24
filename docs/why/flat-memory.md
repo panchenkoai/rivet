@@ -77,4 +77,4 @@ accumulated changes) and peak RSS stays flat: the run reads, flushes at
 `rollover`, checkpoints, and acks in a loop, so a larger backlog just means more
 loops, not more memory. The harness self-asserts both the flat RSS and that
 every churned row was captured; details in the
-[performance ledger](https://github.com/panchenkoai/rivet/blob/main/docs/perf-matrix.yaml).
+[performance ledger](https://github.com/rivet-lab/rivet/blob/main/docs/perf-matrix.yaml).

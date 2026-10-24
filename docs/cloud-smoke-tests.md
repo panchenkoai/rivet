@@ -153,7 +153,7 @@ rivet validate --config /tmp/smoke-s3.yaml --prefix "$(rivet validate --config /
 ```
 
 Equivalent recipes for GCS and Azure live under
-[`examples/`](https://github.com/panchenkoai/rivet/tree/main/examples) (`pg_full_azure_sas.yaml`,
+[`examples/`](https://github.com/rivet-lab/rivet/tree/main/examples) (`pg_full_azure_sas.yaml`,
 `mysql_full_azure_sas.yaml`, etc.).
 
 ---
@@ -171,5 +171,5 @@ If a smoke run regresses on a clean checkout, file an issue tagged
 
 Trust-contract violations (manifest fingerprint drift, missing parts under
 `_SUCCESS`, credentials in artifacts) follow the
-[security disclosure path](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md#vulnerability-reporting), not
+[security disclosure path](https://github.com/rivet-lab/rivet/blob/main/SECURITY.md#vulnerability-reporting), not
 the public issue tracker.

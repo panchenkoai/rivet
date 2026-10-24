@@ -6,10 +6,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/panchenkoai/rivet/actions/workflows/ci.yml"><img src="https://github.com/panchenkoai/rivet/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/panchenkoai/rivet/releases/latest"><img src="https://img.shields.io/github/v/release/panchenkoai/rivet?label=release" alt="release"></a>
+  <a href="https://github.com/rivet-lab/rivet/actions/workflows/ci.yml"><img src="https://github.com/rivet-lab/rivet/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/rivet-lab/rivet/releases/latest"><img src="https://img.shields.io/github/v/release/rivet-lab/rivet?label=release" alt="release"></a>
   <a href="docs/reliability-matrix.md"><img src="https://img.shields.io/badge/coverage-reliability%20matrix-blue" alt="coverage"></a>
-  <a href="https://github.com/panchenkoai/rivet/blob/main/LICENSE"><img src="https://img.shields.io/github/license/panchenkoai/rivet" alt="license"></a>
+  <a href="https://github.com/rivet-lab/rivet/blob/main/LICENSE"><img src="https://img.shields.io/github/license/rivet-lab/rivet" alt="license"></a>
   <a href="https://discord.gg/HT5DZNzNU"><img src="https://img.shields.io/badge/Discord-join%20chat-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
 </p>
 
@@ -41,7 +41,7 @@ What is guaranteed, what is at-least-once, and what is not covered: [docs/semant
 ## Quickstart
 
 ```bash
-brew install panchenkoai/rivet/rivet
+brew install rivet-lab/tap/rivet
 export DATABASE_URL="postgresql://user:pass@host/db"
 
 rivet init --source-env DATABASE_URL -o rivet.yaml   # discovers tables, keys, cursors, types
@@ -80,9 +80,9 @@ Put those three lines in cron or [Airflow](docs/recipes/airflow/) and the wareho
 ## Install
 
 ```bash
-brew install panchenkoai/rivet/rivet                   # macOS / Linux
+brew install rivet-lab/tap/rivet                       # macOS / Linux
 cargo install rivet-cli                                # crates.io (the crate is rivet-cli; the binary is rivet), Rust 1.94+
-docker run --rm ghcr.io/panchenkoai/rivet:latest --version
+docker run --rm ghcr.io/rivet-lab/rivet:latest --version
 ```
 
 <details>
@@ -91,8 +91,8 @@ docker run --rm ghcr.io/panchenkoai/rivet:latest --version
 Release assets are versioned (`rivet-<version>-<target>.tar.gz`) and ship with `SHA256SUMS.txt` and a cosign bundle:
 
 ```bash
-VERSION=$(curl -s https://api.github.com/repos/panchenkoai/rivet/releases/latest | grep -oE '"tag_name": *"[^"]+"' | cut -d'"' -f4)
-BASE="https://github.com/panchenkoai/rivet/releases/download/$VERSION"
+VERSION=$(curl -s https://api.github.com/repos/rivet-lab/rivet/releases/latest | grep -oE '"tag_name": *"[^"]+"' | cut -d'"' -f4)
+BASE="https://github.com/rivet-lab/rivet/releases/download/$VERSION"
 curl -L "$BASE/rivet-$VERSION-aarch64-apple-darwin.tar.gz" | tar xz      # or x86_64-apple-darwin,
 sudo mv rivet-*/rivet /usr/local/bin/                                     # x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
 ```
@@ -106,7 +106,7 @@ Verify with `shasum -a 256 -c SHA256SUMS.txt` (macOS) or `sha256sum -c SHA256SUM
 From a container, `localhost` is not your machine — use `host.docker.internal` (Docker Desktop) or `--add-host=host.docker.internal:host-gateway` on Linux.
 
 ```bash
-git clone https://github.com/panchenkoai/rivet.git && cd rivet
+git clone https://github.com/rivet-lab/rivet.git && cd rivet
 cargo build --release          # target/release/rivet
 ```
 
@@ -126,4 +126,4 @@ Running the test suites: [CONTRIBUTING.md § Running tests](CONTRIBUTING.md#runn
 
 > Generated files — `.rivet_state.db`, `plan.json`, `*.journal.jsonl`, the exports themselves — can hold SQL, cursor values and data. Keep them out of git: [SECURITY.md § Sensitive local artifacts](SECURITY.md#sensitive-local-artifacts).
 
-Releases: [CHANGELOG.md](CHANGELOG.md) · roadmap: [rivet_roadmap.md](rivet_roadmap.md) · questions and issues: [GitHub Issues](https://github.com/panchenkoai/rivet/issues) · [Discord](https://discord.gg/HT5DZNzNU).
+Releases: [CHANGELOG.md](CHANGELOG.md) · roadmap: [rivet_roadmap.md](rivet_roadmap.md) · questions and issues: [GitHub Issues](https://github.com/rivet-lab/rivet/issues) · [Discord](https://discord.gg/HT5DZNzNU).

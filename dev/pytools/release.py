@@ -78,7 +78,7 @@ Options:
 # The bash hard-codes this owner in the "watch:" line even though the Homebrew
 # generator derives owner/repo from Cargo.toml. Kept verbatim so the transcript
 # diffs clean; flagged rather than silently "improved".
-ACTIONS_URL = "https://github.com/panchenkoai/rivet/actions/workflows/release.yml"
+ACTIONS_URL = "https://github.com/rivet-lab/rivet/actions/workflows/release.yml"
 #: Where `make release-oracle-full` appends its verdict line (dev/release_oracle/core.py TIMINGS_HISTORY).
 GATE_RECORD = ROOT / "dev" / "release-oracle" / "timings.jsonl"
 #: The only gate kind whose green verdict supports a tag (dev/release_oracle/core.py FULL_GATE).

@@ -12,8 +12,12 @@ Two consequences this module treats as hard rules:
 * A missing entry is a `Fail`, never an empty `sha256`. Homebrew treats an empty
   digest as "no expected value" and would install an unverified bottle.
 * The four asset basenames must stay in lockstep with the workflow's `Package
-  binary` step (`rivet-<tag>-<target>.tar.gz`). A rename there silently breaks
-  the lookup here — which is why the lookup fails loudly instead of skipping.
+  binary` step (`rivet-<tag>-<target>.tar.gz`) and `glibc228.yml` (the Linux
+  `-glibc2.28` builds). A rename there silently breaks the lookup here — which
+  is why the lookup fails loudly instead of skipping.
+* Linux installs the `-glibc2.28` build: the plain Linux build needs glibc 2.38+
+  and exits on Ubuntu 22.04, the image Homebrew on Linux runs (seen 2026-10-24
+  on `homebrew/brew`: `GLIBC_2.38' not found`).
 
 Usage mirrors the bash:
 
@@ -21,6 +25,7 @@ Usage mirrors the bash:
     GITHUB_REPOSITORY=owner/rivet python dev/pytools/homebrew_formula.py
     python dev/pytools/homebrew_formula.py --tag v0.2.0-beta.1
     python dev/pytools/homebrew_formula.py --tag v0.2.0-beta.1 --sums-file artifacts/SHA256SUMS.txt
+    python dev/pytools/homebrew_formula.py --self-test
 """
 
 from __future__ import annotations
@@ -52,9 +57,13 @@ USAGE = (
 TARGETS = (
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu-glibc2.28",
+    "x86_64-unknown-linux-gnu-glibc2.28",
 )
+
+#: Homebrew's `desc`: under 80 characters, no product name, no "CLI" (`brew audit`).
+DESC = "Export PostgreSQL, MySQL, SQL Server, Oracle and MongoDB to Parquet and CSV"
+
 
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
@@ -221,7 +230,7 @@ def render_formula(
 # Re-run it after each release.
 
 class Rivet < Formula
-  desc "CLI to export PostgreSQL and MySQL to Parquet/CSV (local, S3, GCS)"
+  desc "{DESC}"
   homepage "{homepage}"
   version "{version}"
   license "MIT"
@@ -261,6 +270,31 @@ end
 """
 
 
+# ── self-test ──────────────────────────────────────────────────────────────────
+def self_test() -> int:
+    """The rendered formula installs a Linux build that runs on Homebrew's image."""
+    tag = "v9.9.9"
+    sums = {f"rivet-{tag}-{t}.tar.gz": f"{i:064x}" for i, t in enumerate(TARGETS)}
+    sums[f"rivet-{tag}-x86_64-unknown-linux-gnu.tar.gz"] = "f" * 64
+    sums[f"rivet-{tag}-aarch64-unknown-linux-gnu.tar.gz"] = "e" * 64
+    text = render_formula(tag, sums, repository="rivet-lab/rivet", version="9.9.9")
+    linux = text[text.index("on_linux do"):text.index("def install")]
+    urls = re.findall(r'url "([^"]+)"', linux)
+    assert len(urls) == 2 and all(u.endswith("-glibc2.28.tar.gz") for u in urls), urls
+    assert "f" * 64 not in text and "e" * 64 not in text, "a plain Linux build's digest leaked in"
+    assert 'homepage "https://github.com/rivet-lab/rivet"' in text
+    assert len(DESC) < 80 and "CLI" not in DESC and not DESC.lower().startswith("rivet"), DESC
+    del sums[f"rivet-{tag}-aarch64-unknown-linux-gnu-glibc2.28.tar.gz"]
+    try:
+        render_formula(tag, sums, repository="rivet-lab/rivet", version="9.9.9")
+    except shell.Fail:
+        pass
+    else:
+        raise AssertionError("a release without the glibc 2.28 build rendered a formula")
+    print("self-test ok: homebrew formula - Linux installs the glibc 2.28 build, a missing one refuses")
+    return 0
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 class _Parser(argparse.ArgumentParser):
     """argparse with the bash's exit conventions: usage to stderr and exit 1 —
@@ -283,6 +317,8 @@ def _build_parser() -> _Parser:
 
 
 def main_cli(argv: list[str] | None = None) -> int:
+    if list(sys.argv[1:] if argv is None else argv) == ["--self-test"]:
+        return self_test()
     parser = _build_parser()
     try:
         # `parse_known_args` so an unrecognised flag can be reported by NAME,

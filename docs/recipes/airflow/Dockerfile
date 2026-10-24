@@ -16,7 +16,7 @@ RUN set -eux; \
       arm64) rarch=aarch64-unknown-linux-gnu ;; \
       *) echo "unsupported arch: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/panchenkoai/rivet/releases/download/v${RIVET_VERSION}/rivet-v${RIVET_VERSION}-${rarch}.tar.gz" \
+    curl -fsSL "https://github.com/rivet-lab/rivet/releases/download/v${RIVET_VERSION}/rivet-v${RIVET_VERSION}-${rarch}.tar.gz" \
       | tar -xz -C /usr/local/bin --strip-components=1 "rivet-v${RIVET_VERSION}-${rarch}/rivet"; \
     chmod +x /usr/local/bin/rivet; \
     rivet --version

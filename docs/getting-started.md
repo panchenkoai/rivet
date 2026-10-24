@@ -5,7 +5,7 @@ _Last updated: 2026-07-09._
 Rivet exports tables from PostgreSQL, MySQL, and SQL Server (and collections from MongoDB) to Parquet (or CSV) files — locally, to S3, GCS, or Azure Blob Storage. Point it at a database, scaffold a config from your real tables, then run. (MongoDB has its own reference: [reference/mongodb.md](reference/mongodb.md).)
 
 ```bash
-brew install panchenkoai/rivet/rivet
+brew install rivet-lab/tap/rivet
 export DATABASE_URL='postgresql://user:pass@localhost:5432/mydb'
 # `orders` is a placeholder — use one of YOUR tables, or omit --table to scan the whole schema
 rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
@@ -22,13 +22,13 @@ That's the whole flow. The four steps below explain each command, expected outpu
 
 ```bash
 # macOS / Linux — Homebrew (recommended)
-brew install panchenkoai/rivet/rivet
+brew install rivet-lab/tap/rivet
 rivet --version
 ```
 
 ```bash
 # Docker — try without installing anything
-docker run --rm ghcr.io/panchenkoai/rivet:latest --version
+docker run --rm ghcr.io/rivet-lab/rivet:latest --version
 ```
 
 Pre-built binaries are published for **Linux and macOS** (x86-64 + arm64). On
@@ -36,7 +36,7 @@ Pre-built binaries are published for **Linux and macOS** (x86-64 + arm64). On
 is not currently published). Other install paths — `cargo install rivet-cli`,
 build from source, plus the full Docker recipe with database-on-host pointers
 (`host.docker.internal` vs `--network host`) — live in the project
-[README § Installation](https://github.com/panchenkoai/rivet/blob/main/README.md#installation).
+[README § Installation](https://github.com/rivet-lab/rivet/blob/main/README.md#installation).
 Shell completions: `rivet completions bash|zsh|fish`.
 
 ### Try it in 60 seconds — no database of your own
@@ -81,7 +81,7 @@ rivet init --source-env DATABASE_URL --table orders -o rivet.yaml
 
 Full flag reference: [reference/init.md](reference/init.md). For a manually-authored YAML instead of `rivet init`, see [reference/config.md](reference/config.md).
 
-> **State file.** Rivet creates `.rivet_state.db` next to the config (cursors, chunk checkpoints, run history). Add it to `.gitignore` if the folder is version-controlled — see [SECURITY.md § Sensitive local artifacts](https://github.com/panchenkoai/rivet/blob/main/SECURITY.md#sensitive-local-artifacts).
+> **State file.** Rivet creates `.rivet_state.db` next to the config (cursors, chunk checkpoints, run history). Add it to `.gitignore` if the folder is version-controlled — see [SECURITY.md § Sensitive local artifacts](https://github.com/rivet-lab/rivet/blob/main/SECURITY.md#sensitive-local-artifacts).
 
 ## 3 · Preflight & run
 

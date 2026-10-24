@@ -1167,8 +1167,8 @@ Rivet core is **feature-complete for stable extraction with type safety, resourc
 | L1 | P0 | ✅ | Release workflow + matrix (Linux + macOS); green on v0.2.0-beta.2 |
 | L2 | P0 | ✅ | GitHub Release assets published at v0.2.0-beta.2 |
 | L3 | P0 | ✅ | `cargo publish` — rivet-cli v0.2.0-beta.2 published to crates.io |
-| L4 | P1 | ✅ | Docker image via Dockerfile + GHCR (ghcr.io/panchenkoai/rivet) |
-| L5 | P2 | ✅ | Homebrew tap panchenkoai/homebrew-rivet; auto-updated on release |
+| L4 | P1 | ✅ | Docker image via Dockerfile + GHCR (ghcr.io/rivet-lab/rivet) |
+| L5 | P2 | ✅ | Homebrew tap rivet-lab/homebrew-tap; auto-updated on release |
 
 ### Epic N — Advanced features (post-pilot)
 

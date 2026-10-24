@@ -39,7 +39,7 @@ directive to the top of the file.  The example
 already in place:
 
 ```yaml
-# yaml-language-server: $schema=https://raw.githubusercontent.com/panchenkoai/rivet/main/schemas/latest/rivet.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/rivet-lab/rivet/main/schemas/latest/rivet.schema.json
 ```
 
 Or generate a pinned per-version schema from the binary you have

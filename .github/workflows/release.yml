@@ -236,9 +236,11 @@ jobs:
             artifacts/SHA256SUMS.txt.cosign.bundle
             artifacts/*.spdx.json
 
-      # Homebrew tap: https://github.com/<owner>/homebrew-rivet (create empty repo once).
-      # Add repo secret HOMEBREW_TAP_GITHUB_TOKEN (fine-grained or classic PAT) with Contents: Read and write
-      # on homebrew-rivet only.
+      # Homebrew tap: rivet-lab/homebrew-tap (`brew install rivet-lab/tap/rivet`). The push
+      # authenticates as the rivet-release-bot GitHub App (secrets TAP_APP_ID, TAP_APP_PRIVATE_KEY),
+      # installed on homebrew-tap only with Contents: write: each release mints a one-hour token, so
+      # there is no personal token to expire. A failed push fails the job: a release whose tap still
+      # names the previous version is not finished.
       - name: Generate Homebrew formula
         env:
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
@@ -246,24 +248,27 @@ jobs:
           GITHUB_REPOSITORY="${{ github.repository }}" \
             python3 -m dev.pytools.homebrew_formula --tag "${RELEASE_TAG}" --sums-file artifacts/SHA256SUMS.txt
 
+      - name: Mint a token for the Homebrew tap
+        id: tap-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.TAP_APP_ID }}
+          private-key: ${{ secrets.TAP_APP_PRIVATE_KEY }}
+          owner: rivet-lab
+          repositories: homebrew-tap
+
       - name: Push formula to Homebrew tap
-        continue-on-error: true
         env:
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
-          TAP_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN}" ]; then
-            echo "HOMEBREW_TAP_GITHUB_TOKEN not set, skipping tap push"
-            exit 0
-          fi
-          git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/${TAP_OWNER}/homebrew-rivet.git" homebrew-tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/rivet-lab/homebrew-tap.git" homebrew-tap
           mkdir -p homebrew-tap/Formula
           cp packaging/homebrew/rivet.rb homebrew-tap/Formula/rivet.rb
           cd homebrew-tap
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "rivet-release-bot[bot]"
+          git config user.email "rivet-release-bot[bot]@users.noreply.github.com"
           git add Formula/rivet.rb
           if git diff --cached --quiet; then
             echo "No changes to formula"
@@ -271,10 +276,8 @@ jobs:
           fi
           git commit -m "rivet ${RELEASE_TAG}"
           # actions/checkout sets a *global* http.<github>.extraheader carrying
-          # the repo-scoped GITHUB_TOKEN; it overrides the PAT embedded in the
-          # clone URL and makes the cross-repo push fail with "password
-          # authentication is not supported". Blank it for this push so git uses
-          # the tap PAT from the origin URL.
+          # the repo-scoped GITHUB_TOKEN; it overrides the token embedded in the
+          # clone URL. Blank it for this push so git uses the tap token.
           git -c http.https://github.com/.extraheader= push origin HEAD
 
   # `rivet-cli` wheels on PyPI: the binaries of this release (the -glibc2.28 Linux assets and the

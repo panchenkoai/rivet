@@ -1,85 +1,34 @@
 # Homebrew tap for Rivet
 
-Homebrew expects a **separate** Git repository named `homebrew-<tap>`. For `brew tap yourname/rivet`, create:
-
-`https://github.com/yourname/homebrew-rivet`
-
-## Layout
-
-```
-homebrew-rivet/
-  Formula/
-    rivet.rb
-  README.md   # optional
-```
-
-## Generate `rivet.rb`
-
-After you publish a GitHub Release (tag `v…`, assets + `SHA256SUMS.txt` from CI):
-
 ```bash
-cd /path/to/rivet
-
-# Uses version from Cargo.toml and repository URL for GitHub owner/repo
-python3 -m dev.pytools.homebrew_formula
-
-# Or if the app lives under another fork:
-GITHUB_REPOSITORY=panchenkoai/rivet python3 -m dev.pytools.homebrew_formula
+brew install rivet-lab/tap/rivet
 ```
 
-Copy the generated file:
-
-```bash
-cp packaging/homebrew/rivet.rb ../homebrew-rivet/Formula/rivet.rb
-```
-
-Commit and push the tap repo, then:
-
-```bash
-brew tap yourname/rivet
-brew install rivet
-brew test rivet
-```
-
-## One-time tap setup
-
-1. Create an empty repo `yourname/homebrew-rivet` on GitHub.
-2. Add `Formula/rivet.rb` (generated as above).
-3. Optional: add a short README describing `brew tap yourname/rivet`.
+The tap is [`rivet-lab/homebrew-tap`](https://github.com/rivet-lab/homebrew-tap); the formula is
+`Formula/rivet.rb`. Homebrew on Linux installs the `-glibc2.28` build, which runs on the Ubuntu
+22.04 image Homebrew uses.
 
 ## Automatic updates after each release
 
-The [Release workflow](../../.github/workflows/release.yml) always regenerates `packaging/homebrew/rivet.rb` from `artifacts/SHA256SUMS.txt` (no extra download).
+The [Release workflow](../../.github/workflows/release.yml) regenerates `packaging/homebrew/rivet.rb`
+from `artifacts/SHA256SUMS.txt` and pushes it to the tap. The push authenticates as the
+`rivet-release-bot` GitHub App of the `rivet-lab` organisation:
 
-To **push** that formula into the tap automatically:
+- the App is installed on `homebrew-tap` only, with **Contents: Read and write**;
+- the rivet repository holds its id and private key as the secrets `TAP_APP_ID` and
+  `TAP_APP_PRIVATE_KEY`;
+- each release mints a token that lives one hour (`actions/create-github-app-token`), so there is no
+  personal token to renew.
 
-1. Create a GitHub repo named **`homebrew-rivet`** under the **same account/org** as Rivet  
-   (e.g. `panchenkoai/homebrew-rivet` next to `panchenkoai/rivet`). Initialize with a README or leave empty; default branch `main` is fine.
+A failed push fails the release job. To rotate the key: App settings → Private keys → Generate, set
+`TAP_APP_PRIVATE_KEY` to the new `.pem`, then delete the old key there.
 
-2. In the **rivet** repo: **Settings → Secrets and variables → Actions → New repository secret**  
-   - Name: `HOMEBREW_TAP_GITHUB_TOKEN`  
-   - Value: a [fine-grained PAT](https://github.com/settings/tokens?type=beta) or classic PAT with **Contents: Read and write** on **`homebrew-rivet` only** (not the whole account if you can avoid it).
-
-3. On every successful Release (tag `v*`), the workflow commits and pushes `Formula/rivet.rb` to `homebrew-rivet`.
-
-If the secret is missing, the release still completes; only the tap push step is skipped.
-
-### Troubleshooting: `Authentication failed` / `Invalid username or token`
-
-The job clones `https://github.com/<owner>/homebrew-rivet` with **`HOMEBREW_TAP_GITHUB_TOKEN`**. That error means GitHub rejected the token, not the workflow syntax.
-
-1. **Regenerate the secret** in the **rivet** repo: Settings → Secrets and variables → Actions → edit `HOMEBREW_TAP_GITHUB_TOKEN`.
-2. **Fine-grained PAT:** Resource owner = org or user that owns `homebrew-rivet` → Repository access = **only** `homebrew-rivet` → Permission **Contents: Read and write**. Expiration: choose a date you will renew.
-3. **Classic PAT:** scope **`repo`** (or at least repo access to that repository). SSO: if the org uses SAML, **Authorize** the token for the org.
-4. **Paste:** no extra spaces or newlines when saving the secret.
-5. Confirm the tap repo exists: `https://github.com/<owner>/homebrew-rivet` (same `<owner>` as `github.repository_owner` in the workflow).
-
-Until the token is fixed, update the tap manually (copy `packaging/homebrew/rivet.rb` after release, or run `python3 -m dev.pytools.homebrew_formula` locally).
-
-### Manual / local refresh
-
-Same as before — download checksums from the release or use a local `SHA256SUMS.txt`:
+## Manual refresh
 
 ```bash
-python3 -m dev.pytools.homebrew_formula --tag v0.2.0-beta.2 --sums-file path/to/SHA256SUMS.txt
+python3 -m dev.pytools.homebrew_formula --tag v0.32.2                 # downloads SHA256SUMS.txt
+python3 -m dev.pytools.homebrew_formula --tag v0.32.2 --sums-file path/to/SHA256SUMS.txt
+cp packaging/homebrew/rivet.rb ../homebrew-tap/Formula/rivet.rb
 ```
+
+Then commit and push the tap, and check `brew install rivet-lab/tap/rivet && brew test rivet`.

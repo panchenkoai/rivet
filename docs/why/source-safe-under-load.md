@@ -78,6 +78,6 @@ except on SQL Server, and that cost is inherent to the engine, not to Rivet:
 | SQL Server |                       0.78× | the capture Agent duplicates every change into change tables — a second write SQL Server itself performs |
 
 The full per-engine numbers, harnesses, and contracts live in the
-[performance & harm ledger](https://github.com/panchenkoai/rivet/blob/main/docs/perf-matrix.yaml).
+[performance & harm ledger](https://github.com/rivet-lab/rivet/blob/main/docs/perf-matrix.yaml).
 The one operational hazard that *is* per-engine — a CDC reader pinning source
 log retention — is covered on its own page: [CDC cost, per engine](cdc-cost-per-engine.md).

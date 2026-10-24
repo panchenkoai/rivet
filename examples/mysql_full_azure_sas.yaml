@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=https://raw.githubusercontent.com/panchenkoai/rivet/main/schemas/latest/rivet.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/rivet-lab/rivet/main/schemas/latest/rivet.schema.json
 #
 # Rivet Example: MySQL → Full Export → Azure Blob Storage (SAS token)
 #
