@@ -70,7 +70,7 @@ More auth paths (MinIO, Azurite, SAS details): [cloud-auth.md](cloud-auth.md) ·
 ### 1.1 Batch (full / incremental / chunked)
 
 ```bash
-brew install panchenkoai/rivet/rivet          # or: cargo install rivet-cli
+brew install rivet-lab/tap/rivet          # or: cargo install rivet-cli
 
 # Credentials: the password is read without echo, never typed into the command line
 printf 'DB password: '; read -rs DB_PASS; echo

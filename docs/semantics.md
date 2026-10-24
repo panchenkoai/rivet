@@ -58,7 +58,7 @@ The exact state-write ordering is defined by **[ADR-0001 — State Update Invari
 
 ## Retry semantics
 
-Retries are classified by error type in [src/error/retry.rs](https://github.com/panchenkoai/rivet/blob/main/src/error/retry.rs):
+Retries are classified by error type in [src/error/retry.rs](https://github.com/rivet-lab/rivet/blob/main/src/error/retry.rs):
 
 The classifier (`RetryClass`) has two outcomes — `Transient` (retry) and `Permanent` (propagate):
 
@@ -207,7 +207,7 @@ Rivet does **not** currently guarantee:
 - **Continuous / near-real-time replication.** Rivet *does* capture CDC to files (`mode: cdc` — inserts/updates/deletes via a Postgres logical replication slot / MySQL binlog / SQL Server CDC change tables / MongoDB change streams, into typed Parquet/CSV — or the JSON-blob document image for MongoDB — resuming from the last committed log position each run), but it is not a continuously-running stream — changes are captured per invocation, not delivered live. For always-on near-real-time replication use Debezium or Estuary.
 - **Completeness of incremental cursors that can tie.** Incremental resume uses a strict `WHERE cursor > last_value`. If two rows share the high-watermark value and the second becomes visible only *after* the run that advanced the watermark past it — e.g. a low-resolution `updated_at` (second granularity) or rows committed at the same timestamp after the read snapshot — the next run skips them and they are never exported. (Keyset pagination is unaffected: its key is planner-enforced unique + NOT NULL.) Use a **strictly per-row-distinct, monotonic** cursor (a sequence/identity id, or a timestamp with sub-value uniqueness); when the cursor can tie, re-snapshot the affected window with `full`/`chunked` mode.
 - **Automatic cleanup of an interrupted write's temp file.** A crash mid-write on the local destination may leave a dot-prefixed temp file in the target directory — never a partial *final* file (the commit is an atomic `rename`, so the final path is the complete file or absent). The stray temp file is harmless and can be removed manually.
-- **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live/live_schema_drift.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_schema_drift.rs)).
+- **Schema migration handling.** If the source schema changes between runs, Rivet does not migrate the destination; it surfaces a schema-drift error (see [tests/live/live_schema_drift.rs](https://github.com/rivet-lab/rivet/blob/main/tests/live/live_schema_drift.rs)).
 - **Correctness of user-authored SQL.** Rivet executes `query:` verbatim. A query that omits a `WHERE` clause or selects from the wrong table will export the wrong data — there is no semantic validation.
 - **Protection from poorly indexed source queries.** Preflight (`rivet doctor`, `rivet check`) warns about missing cursor indexes and unbounded `ORDER BY`, but it does not refuse to run. The operator decides.
 - **Stdout state safety.** Using stdout with cursor or manifest state is technically allowed but not meaningful; plan validation rejects `stdout + chunked` and `stdout + max_file_size` before execution (ADR-0004 Known Gap).
@@ -220,12 +220,12 @@ Rivet does **not** currently guarantee:
 
 The invariants on this page are exercised by:
 
-- [tests/invariants.rs](https://github.com/panchenkoai/rivet/blob/main/tests/invariants.rs) — ADR-0001 I1–I7 structural contracts.
-- [tests/journal_invariants.rs](https://github.com/panchenkoai/rivet/blob/main/tests/journal_invariants.rs) — RunJournal event ordering.
-- [tests/recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/recovery.rs) — chunk checkpoint resume semantics (I5, I6).
-- [tests/live/live_crash_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_crash_recovery.rs) — crash-and-resume against a live database.
-- [tests/live/live_chunked_recovery.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_chunked_recovery.rs) — chunked resume after partial completion.
-- [tests/live/live_retry_and_faults.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_retry_and_faults.rs) — retry classification under injected faults.
-- [tests/live/live_reconcile_repair.rs](https://github.com/panchenkoai/rivet/blob/main/tests/live/live_reconcile_repair.rs) — reconcile / repair end-to-end.
+- [tests/invariants.rs](https://github.com/rivet-lab/rivet/blob/main/tests/invariants.rs) — ADR-0001 I1–I7 structural contracts.
+- [tests/journal_invariants.rs](https://github.com/rivet-lab/rivet/blob/main/tests/journal_invariants.rs) — RunJournal event ordering.
+- [tests/recovery.rs](https://github.com/rivet-lab/rivet/blob/main/tests/recovery.rs) — chunk checkpoint resume semantics (I5, I6).
+- [tests/live/live_crash_recovery.rs](https://github.com/rivet-lab/rivet/blob/main/tests/live/live_crash_recovery.rs) — crash-and-resume against a live database.
+- [tests/live/live_chunked_recovery.rs](https://github.com/rivet-lab/rivet/blob/main/tests/live/live_chunked_recovery.rs) — chunked resume after partial completion.
+- [tests/live/live_retry_and_faults.rs](https://github.com/rivet-lab/rivet/blob/main/tests/live/live_retry_and_faults.rs) — retry classification under injected faults.
+- [tests/live/live_reconcile_repair.rs](https://github.com/rivet-lab/rivet/blob/main/tests/live/live_reconcile_repair.rs) — reconcile / repair end-to-end.
 
-Invariants and recovery suites run as **named semantic gates** in PR CI ([.github/workflows/ci.yml](https://github.com/panchenkoai/rivet/blob/main/.github/workflows/ci.yml)). Branch protection blocks merges on regression. See [reliability-matrix.md](reliability-matrix.md) for the full coverage matrix.
+Invariants and recovery suites run as **named semantic gates** in PR CI ([.github/workflows/ci.yml](https://github.com/rivet-lab/rivet/blob/main/.github/workflows/ci.yml)). Branch protection blocks merges on regression. See [reliability-matrix.md](reliability-matrix.md) for the full coverage matrix.

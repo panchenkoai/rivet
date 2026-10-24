@@ -53,6 +53,6 @@ from the checkpoint. Continuous streaming is an explicit opt-in
 never start a never-terminating slot-holding stream by accident.
 
 The full per-engine numbers, harnesses, and contracts are in the
-[performance & harm ledger](https://github.com/panchenkoai/rivet/blob/main/docs/perf-matrix.yaml);
+[performance & harm ledger](https://github.com/rivet-lab/rivet/blob/main/docs/perf-matrix.yaml);
 the recovery playbook per symptom is in
 [CDC failure modes](../reference/cdc-failure-modes.md).

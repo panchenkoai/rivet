@@ -172,7 +172,7 @@ Exactly one of `--source`, `--source-env`, `--source-file` must be provided (enf
 
 ![rivet init --discover + jq: ranked cursor + chunk candidates per table](../gifs/discover-artifact.gif)
 
-`rivet init --discover` runs the same introspection but emits a machine-readable JSON document (schema described in [`src/init/artifact.rs`](https://github.com/panchenkoai/rivet/blob/main/src/init/artifact.rs)). Intended consumers: external orchestration tools, code review, and automated config generators.
+`rivet init --discover` runs the same introspection but emits a machine-readable JSON document (schema described in [`src/init/artifact.rs`](https://github.com/rivet-lab/rivet/blob/main/src/init/artifact.rs)). Intended consumers: external orchestration tools, code review, and automated config generators.
 
 ```bash
 rivet init --source "$PG_URL" --schema public --discover -o discovery.json
@@ -197,7 +197,7 @@ The artifact is advisory — same policy as plan prioritization (ADR-0006): no r
 
 ## Docker Compose in this repository
 
-The repo root [`docker-compose.yaml`](https://github.com/panchenkoai/rivet/blob/main/docker-compose.yaml) defines **Postgres** and **MySQL** (`rivet` / `rivet` users, database `rivet`) with the same schema as [`dev/postgres/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/postgres/init.sql) and [`dev/mysql/init.sql`](https://github.com/panchenkoai/rivet/blob/main/dev/mysql/init.sql).
+The repo root [`docker-compose.yaml`](https://github.com/rivet-lab/rivet/blob/main/docker-compose.yaml) defines **Postgres** and **MySQL** (`rivet` / `rivet` users, database `rivet`) with the same schema as [`dev/postgres/init.sql`](https://github.com/rivet-lab/rivet/blob/main/dev/postgres/init.sql) and [`dev/mysql/init.sql`](https://github.com/rivet-lab/rivet/blob/main/dev/mysql/init.sql).
 
 ```bash
 docker compose up -d postgres mysql
@@ -214,7 +214,7 @@ rivet init --source "$PG_URL" --schema public -o rivet_public.yaml
 rivet init --source "$MY_URL" -o rivet_mysql.yaml
 ```
 
-To refresh many files at once (per-table YAMLs plus combined schema snapshots), run [`python3 -m dev.pytools.dev_scripts regen-docker-configs`](https://github.com/panchenkoai/rivet/blob/main/dev/pytools/dev_scripts.py) from the repo root after the DBs are up (and optionally seeded).
+To refresh many files at once (per-table YAMLs plus combined schema snapshots), run [`python3 -m dev.pytools.dev_scripts regen-docker-configs`](https://github.com/rivet-lab/rivet/blob/main/dev/pytools/dev_scripts.py) from the repo root after the DBs are up (and optionally seeded).
 
 ---
 

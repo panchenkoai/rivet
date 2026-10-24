@@ -50,7 +50,7 @@ Getting started (the happy path):
   3. rivet check    column-type & schema report
   4. rivet run      export your data
 
-Docs: https://github.com/panchenkoai/rivet/blob/main/docs/getting-started.md
+Docs: https://github.com/rivet-lab/rivet/blob/main/docs/getting-started.md
 
 ###### **Subcommands:**
 

@@ -12,8 +12,8 @@ build-dir = "target/book"
 [output.html]
 # Project pages are served under /rivet/ — without this, nav/search assets 404.
 site-url = "/rivet/"
-git-repository-url = "https://github.com/panchenkoai/rivet"
-edit-url-template = "https://github.com/panchenkoai/rivet/edit/main/docs/{path}"
+git-repository-url = "https://github.com/rivet-lab/rivet"
+edit-url-template = "https://github.com/rivet-lab/rivet/edit/main/docs/{path}"
 default-theme = "light"
 preferred-dark-theme = "navy"
 no-section-label = true

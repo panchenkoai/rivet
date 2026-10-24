@@ -59,7 +59,7 @@ METADATA = """Metadata-Version: 2.1
 Name: {name}
 Version: {version}
 Summary: The rivet binary: PostgreSQL / MySQL / SQL Server / MongoDB / Oracle to Parquet or CSV, with CDC.
-Home-page: https://github.com/panchenkoai/rivet
+Home-page: https://github.com/rivet-lab/rivet
 License: MIT
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown

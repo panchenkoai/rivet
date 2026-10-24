@@ -6,28 +6,28 @@
 
 class Rivet < Formula
   desc "Export PostgreSQL, MySQL, SQL Server, Oracle and MongoDB to Parquet and CSV"
-  homepage "https://github.com/panchenkoai/rivet"
+  homepage "https://github.com/rivet-lab/rivet"
   version "0.32.2"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.32.2/rivet-v0.32.2-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/rivet-lab/rivet/releases/download/v0.32.2/rivet-v0.32.2-aarch64-apple-darwin.tar.gz"
       sha256 "1a8935ae9ccecb29afb6dcc0565b2e76e34f1b8c5220cc3dfefd2395b7dd53a8"
     end
     on_intel do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.32.2/rivet-v0.32.2-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/rivet-lab/rivet/releases/download/v0.32.2/rivet-v0.32.2-x86_64-apple-darwin.tar.gz"
       sha256 "f067c5b80cd2730e176b3955e5cd4717f5c0ad7b434c5f614f0be46c026e2d8f"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.32.2/rivet-v0.32.2-aarch64-unknown-linux-gnu-glibc2.28.tar.gz"
+      url "https://github.com/rivet-lab/rivet/releases/download/v0.32.2/rivet-v0.32.2-aarch64-unknown-linux-gnu-glibc2.28.tar.gz"
       sha256 "560981d5bc85661d0f7bbbc0fbf13ce1b5a03300533a273bc23a6b436aab1267"
     end
     on_intel do
-      url "https://github.com/panchenkoai/rivet/releases/download/v0.32.2/rivet-v0.32.2-x86_64-unknown-linux-gnu-glibc2.28.tar.gz"
+      url "https://github.com/rivet-lab/rivet/releases/download/v0.32.2/rivet-v0.32.2-x86_64-unknown-linux-gnu-glibc2.28.tar.gz"
       sha256 "1a9868bba04d99b3db569abf26792ed40a01ae0d1b0a182a7dade165a7a09b1d"
     end
   end

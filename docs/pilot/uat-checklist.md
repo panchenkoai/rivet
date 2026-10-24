@@ -8,7 +8,7 @@ For the full pilot instruction sequence (what to run before you get here), see [
 
 **Prerequisites:** completed [Getting Started](../getting-started.md) and at least one successful export.
 
-For the full internal acceptance test plan with detailed suites and smoke-test scripts, see [dev/USER_TEST_PLAN.md](https://github.com/panchenkoai/rivet/blob/main/dev/USER_TEST_PLAN.md).
+For the full internal acceptance test plan with detailed suites and smoke-test scripts, see [dev/USER_TEST_PLAN.md](https://github.com/rivet-lab/rivet/blob/main/dev/USER_TEST_PLAN.md).
 
 ---
 
