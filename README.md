@@ -41,7 +41,7 @@ What is guaranteed, what is at-least-once, and what is not covered: [docs/semant
 ## Quickstart
 
 ```bash
-brew install panchenkoai/rivet/rivet
+brew install rivet-lab/tap/rivet
 export DATABASE_URL="postgresql://user:pass@host/db"
 
 rivet init --source-env DATABASE_URL -o rivet.yaml   # discovers tables, keys, cursors, types
@@ -80,7 +80,7 @@ Put those three lines in cron or [Airflow](docs/recipes/airflow/) and the wareho
 ## Install
 
 ```bash
-brew install panchenkoai/rivet/rivet                   # macOS / Linux
+brew install rivet-lab/tap/rivet                       # macOS / Linux
 cargo install rivet-cli                                # crates.io (the crate is rivet-cli; the binary is rivet), Rust 1.94+
 docker run --rm ghcr.io/panchenkoai/rivet:latest --version
 ```

@@ -121,8 +121,9 @@ For non-major releases:
 - [ ] `release.yml` cross-build matrix green (Linux x86_64/arm64,
       macOS arm64/Intel).
 - [ ] Docker image (multi-arch via native amd64+arm64 runners) tagged.
-- [ ] Homebrew tap PR opened in
-      [`panchenkoai/homebrew-rivet`](https://github.com/panchenkoai/homebrew-rivet).
+- [ ] `release.yml` pushed the formula to
+      [`rivet-lab/homebrew-tap`](https://github.com/rivet-lab/homebrew-tap) (the step fails the
+      job when it cannot), and `brew install rivet-lab/tap/rivet` installs the new version.
 - [ ] crates.io publish dry-run: `cargo publish --dry-run` — **automated**: the
       `pre-push` hook runs `cargo publish --locked --dry-run` whenever the branch
       bumps the crate version vs `main`, so a version-bump push already exercised
