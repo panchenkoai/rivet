@@ -30,6 +30,8 @@ if not Path(CARGO).exists():
 CYRILLIC = re.compile(r"[\u0400-\u04ff]")
 CLOSING = re.compile(r"\b(fix|fixe[sd]|close[sd]?|resolve[sd]?):? +#[0-9]+", re.I)
 TRAILER = re.compile(r"^\s*(co-authored-by|claude-session):", re.I)
+BYTE_SLICE = re.compile(r"\[\s*\.\.\s*[A-Za-z_][\w.]*\.len\(\)\s*\]|\[\s*[A-Za-z_]\w*\s*\.\.\s*[A-Za-z_]\w*\s*\+\s*\w+\s*\]")
+SQL_PARSER = re.compile(r"^\+?\s*(sqlparser|sqlformat|sql-parse|pg_query|sqlparse)\b")
 BINARY = re.compile(r"\.(gif|png|jpg|jpeg|parquet|ico|pdf)$")
 MARK = re.compile(r"ratchet-pin:\s*([\w.-]+)(?:\s+(sum|strings|lines))?(?:\s+(min))?")
 STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
@@ -73,15 +75,31 @@ def text_violations(text: str, where: str, *, message: bool = False) -> list[str
     return out
 
 
+# (path test, pattern, marker that allows the line, rule) for the lines a commit adds.
+ADDED_LINE_RULES = (
+    (lambda p: not BINARY.search(p), CYRILLIC, "allow-cyrillic", "Cyrillic"),
+    (lambda p: p.startswith("src/") and p.endswith(".rs"), re.compile(r"\bcatch_unwind\b"), "allow-catch-unwind",
+     "catch_unwind in src/ (the release is panic=abort: prevent the panic before the call)"),
+    (lambda p: p.startswith("src/") and p.endswith(".rs"), BYTE_SLICE, "allow-byte-slice",
+     "a slice at a computed offset (a &str is cut only at an offset a str search returned, or via get/split_at_checked)"),
+    (lambda p: p.endswith("Cargo.toml"), SQL_PARSER, None, "an SQL parser/lexer dependency (query text is read by src/sql.rs)"),
+)
+
+
 def added_line_violations(diff: str) -> list[str]:
-    """Cyrillic in the lines a unified diff ADDS; a line marked `allow-cyrillic` is test data."""
-    out, path = [], None
+    """ADDED_LINE_RULES over the lines a unified diff ADDS, and a new shell script (Python is the tooling language)."""
+    out, path, new_file = [], None, False
     for line in diff.splitlines():
-        if line.startswith("+++ "):
+        if line.startswith("--- "):
+            new_file = line == "--- /dev/null"
+        elif line.startswith("+++ "):
             path = line[6:] if line.startswith("+++ b/") else None
-        elif line.startswith("+") and path and not BINARY.search(path):
-            if CYRILLIC.search(line) and "allow-cyrillic" not in line:
-                out.append(f"{path}: Cyrillic in an added line: {line[1:].strip()[:100]}")
+            if path and new_file and path.endswith(".sh"):
+                out.append(f"{path}: a new shell script (write it in Python under dev/pytools)")
+        elif line.startswith("+") and path:
+            for applies, pattern, marker, rule in ADDED_LINE_RULES:
+                if applies(path) and pattern.search(line) and not (marker and marker in line):
+                    out.append(f"{path}: {rule} in an added line: {line[1:].strip()[:100]}")
     return out
 
 
@@ -412,7 +430,8 @@ def run_text(args: argparse.Namespace) -> int:
         print(f"REFUSING: {b}", file=sys.stderr)
     if bad:
         print("Commits and PR text are English, carry no attribution trailer, and say `see #N`, never `fixes #N`."
-              " Cyrillic TEST DATA stays with `allow-cyrillic` on its line.", file=sys.stderr)
+              " Cyrillic TEST DATA stays with `allow-cyrillic` on its line; a deliberate catch_unwind or byte slice"
+              " carries `allow-catch-unwind` / `allow-byte-slice` on its line.", file=sys.stderr)
     return 1 if bad else 0
 
 
@@ -432,6 +451,22 @@ def self_test() -> int:
     assert not text_violations(f"x\n# {cyr} comment\n", "m", message=True), "git comment lines are not the message"
     d = f"+++ b/tests/a.rs\n+let t = \"{cyr}\"; // allow-cyrillic\n+++ b/docs/b.md\n+{cyr}\n+++ b/x.png\n+{cyr}\n"
     assert added_line_violations(d) == [f"docs/b.md: Cyrillic in an added line: {cyr}"], added_line_violations(d)
+    rules = (
+        "+++ b/src/a.rs\n+let x = std::panic::catch_unwind(f);\n+if s[..p.len()] == *p {}\n+v.push_str(&s[i..i + n]);\n"
+        "+let ok = catch_unwind(f); // allow-catch-unwind\n+let b = &buf[at..at + 4]; // allow-byte-slice\n"
+        "+let y = s.get(..p.len());\n+let z = &s[a..b];\n"
+        "+++ b/tests/t.rs\n+catch_unwind(|| s[..p.len()]);\n"
+        "+++ b/Cargo.toml\n+sqlparser = \"0.50\"\n+serde = \"1\"\n"
+        "--- /dev/null\n+++ b/dev/new.sh\n+echo hi\n--- a/dev/old.sh\n+++ b/dev/old.sh\n+echo hi\n"
+    )
+    got = [v.split(" in an added line")[0] for v in added_line_violations(rules)]
+    assert got == [
+        "src/a.rs: catch_unwind in src/ (the release is panic=abort: prevent the panic before the call)",
+        "src/a.rs: a slice at a computed offset (a &str is cut only at an offset a str search returned, or via get/split_at_checked)",
+        "src/a.rs: a slice at a computed offset (a &str is cut only at an offset a str search returned, or via get/split_at_checked)",
+        "Cargo.toml: an SQL parser/lexer dependency (query text is read by src/sql.rs)",
+        "dev/new.sh: a new shell script (write it in Python under dev/pytools)",
+    ], got
 
     rs = (
         "const CEILING: usize = 39; // ratchet-pin: silent\n"
